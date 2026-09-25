@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.auth.router import router as auth_router
 from app.auth.service import AuthService
+from app.collector.router import router as collector_router
 from app.db import SessionFactory
 from app.events.router import router as events_router
 
@@ -24,6 +25,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Shanghai Earthquake Emergency API", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(events_router)
+app.include_router(collector_router)
 
 
 @app.get("/health")
