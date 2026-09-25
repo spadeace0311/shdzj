@@ -21,8 +21,10 @@
 - `T1` 是首次正式修订成功提交时的采集器接收时刻。
 - FAN 与 Wolfx 的重复报文不得生成重复修订或 Outbox。
 - 平台内部来源仍为 `cenc`；实际提供方和传输链路只作为审计元数据。
-- 上海本地响应范围包括上海市行政区域及其边界外 50 公里海域。
-- 区域数据缺失时必须返回 `pending`，不得猜测制度响应等级。
+- 上海本地响应范围包括上海市行政区域，以及行政边界外 50 公里内且被显式海域几何
+  覆盖的海域；行政边界全向缓冲不得替代海域掩膜。
+- 行政边界数据缺失或无活动版本时必须返回 `pending`；仅海域掩膜缺失时，
+  行政区域仍可判定，界外部分保守为 false。
 - `event_lifecycle_outbox` 是未来评估编排器使用的稳定接口；本期不引入 Temporal。
 - 采集器不得调用本平台自身的 HTTP 接入接口。
 - 凭据从环境变量或受控密钥文件读取，禁止写入日志或提交到仓库。
@@ -894,7 +896,7 @@ git commit -m "feat: persist collector runtime and dead letters"
   - `RegionContext` 数据类：字段为 `inside_shanghai`、`distance_to_boundary_km`、`boundary_version`、`computed_at`。
   - `RegionRepository.get_active(session) -> RegionBoundary | None`。
   - `RegionContextResolver.resolve(longitude: Decimal, latitude: Decimal) -> RegionContext`。
-  - CLI：`python -m app.regions.cli import --file <path> --version <version> --name <name> --activate`。
+  - CLI：`python -m app.regions.cli import --file <path> --source-uri <https-uri> --version <version> --name <name> --activate`。
 
 - [ ] **步骤 1：加入合成边界夹具**
 
@@ -905,7 +907,10 @@ git commit -m "feat: persist collector runtime and dead letters"
   "features": [
     {
       "type": "Feature",
-      "properties": {"name": "test-shanghai"},
+      "properties": {
+        "name": "synthetic-shanghai-administrative-boundary",
+        "role": "administrative_boundary"
+      },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
@@ -914,6 +919,23 @@ git commit -m "feat: persist collector runtime and dead letters"
           [122.2, 31.9],
           [120.8, 31.9],
           [120.8, 30.6]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "synthetic-east-sea-mask",
+        "role": "maritime_area"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [122.2, 30.6],
+          [123.0, 30.6],
+          [123.0, 31.9],
+          [122.2, 31.9],
+          [122.2, 30.6]
         ]]
       }
     }
@@ -934,22 +956,8 @@ from app.regions.models import RegionBoundary
 from app.regions.service import RegionContextResolver
 
 
-class EmptyRepository:
-    async def get_active(self, session):
-        return None
-
-
-class TestRepository:
-    async def get_active(self, session):
-        result = await session.execute(
-            RegionBoundary.__table__.select().where(RegionBoundary.is_active)
-        )
-        return result.mappings().first()
-
-
-async def test_resolver_resolves_inside_and_outside_with_real_postgis() -> None:
-    repository = TestRepository()
-    resolver = RegionContextResolver(SessionFactory, repository=repository)
+async def test_resolver_distinguishes_land_sea_and_neighbor_land() -> None:
+    resolver = RegionContextResolver(SessionFactory)
     async with SessionFactory() as session:
         async with session.begin():
             await session.execute(delete(RegionBoundary))
@@ -960,28 +968,30 @@ async def test_resolver_resolves_inside_and_outside_with_real_postgis() -> None:
                 "/app/tests/fixtures/shanghai_boundary.geojson",
                 version="test-2026.1",
                 name="test-shanghai",
+                source_uri="https://example.gov.invalid/regions/shanghai.geojson",
                 activate=True,
             )
 
     inside = await resolver.resolve(Decimal("121.5"), Decimal("31.2"))
+    neighbor_land = await resolver.resolve(Decimal("120.7"), Decimal("31.2"))
+    maritime_buffer = await resolver.resolve(Decimal("122.3"), Decimal("31.2"))
     outside = await resolver.resolve(Decimal("122.9"), Decimal("31.2"))
 
     assert inside.inside_shanghai is True
-    assert inside.boundary_version == "test-2026.1"
+    assert neighbor_land.inside_shanghai is False
+    assert neighbor_land.distance_to_boundary_km <= 50
+    assert maritime_buffer.inside_shanghai is True
     assert outside.inside_shanghai is False
-    assert outside.distance_to_boundary_km > 0
+    assert outside.distance_to_boundary_km > 50
 
 
-async def test_resolver_returns_pending_without_boundary() -> None:
-    resolver = RegionContextResolver(
-        SessionFactory,
-        repository=EmptyRepository(),
+async def test_resolver_uses_one_active_boundary_select() -> None:
+    # 直接断言 SQL 语句数量和 WHERE is_active，禁止恢复先 get_active 再按 id 查询。
+    result = await RegionContextResolver(SessionFactory).resolve(
+        Decimal("122.3"), Decimal("31.2")
     )
 
-    result = await resolver.resolve(Decimal("121.5"), Decimal("31.2"))
-
-    assert result.inside_shanghai is None
-    assert result.boundary_version is None
+    assert result.inside_shanghai is True
 ```
 
 - [ ] **步骤 3：运行解析器测试并确认失败**
@@ -1018,13 +1028,18 @@ class RegionBoundary(Base):
     name: Mapped[str] = mapped_column(String(128))
     local_buffer_km: Mapped[Decimal] = mapped_column(Numeric(8, 2), default=Decimal("50"))
     geom = mapped_column(Geometry(geometry_type="MULTIPOLYGON", srid=4326), nullable=False)
-    source_uri: Mapped[str | None] = mapped_column(String(512))
-    checksum: Mapped[str | None] = mapped_column(String(64))
+    maritime_geom = mapped_column(
+        Geometry(geometry_type="MULTIPOLYGON", srid=4326), nullable=False
+    )
+    source_uri: Mapped[str] = mapped_column(String(512))
+    checksum: Mapped[str] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
 ```
 
-迁移 `0007_region_boundaries.py` 使用 `revision = "0007_region_boundaries"`、`down_revision = "0006_collector_runtime"`，创建数据表并为 `geom` 建立 GiST 索引。
+迁移 `0007_region_boundaries.py` 使用 `revision = "0007_region_boundaries"`、
+`down_revision = "0006_collector_runtime"`，创建数据表并为 `geom` 与
+`maritime_geom` 建立 GiST 索引。`source_uri`、`checksum` 均为 NOT NULL。
 
 - [ ] **步骤 5：实现仓储、解析器与导入器**
 
@@ -1035,16 +1050,21 @@ async def get_active(self, session: AsyncSession) -> RegionBoundary | None: ...
 async def activate(self, version: str) -> None: ...
 ```
 
-`RegionContextResolver.resolve` 必须通过一次 PostGIS 查询完成：
+`RegionContextResolver.resolve` 必须通过一条 `SELECT` 同时读取活动行并完成空间计算：
 
 ```sql
 SELECT
   version,
   ST_Covers(geom, point) AS inside_land,
-  ST_DWithin(geom::geography, point::geography, local_buffer_km * 1000) AS in_local_buffer,
+  (
+    NOT ST_Covers(geom, point)
+    AND ST_DWithin(geom::geography, point::geography, local_buffer_km * 1000)
+    AND ST_Covers(maritime_geom, point)
+  ) AS inside_offshore_sea,
   ST_Distance(geom::geography, point::geography) / 1000.0 AS distance_km
 FROM region_boundaries
 WHERE is_active
+LIMIT 1
 ```
 
 其中 `point` 为 `ST_SetSRID(ST_MakePoint(:longitude, :latitude), 4326)`。
@@ -1053,7 +1073,7 @@ WHERE is_active
 
 ```python
 RegionContext(
-    inside_shanghai=True if inside_land or in_local_buffer else False,
+    inside_shanghai=True if inside_land or inside_offshore_sea else False,
     distance_to_boundary_km=Decimal("0") if inside_land else Decimal(str(distance_km)),
     boundary_version=row.version,
     computed_at=datetime.now(UTC),
@@ -1065,13 +1085,18 @@ RegionContext(
 `importer.py` 必须：
 
 - 使用 `json.loads` 读取 UTF-8 GeoJSON。
-- 接受 Polygon 和 MultiPolygon 要素。
-- 将所有多边形合并为一个 `MULTIPOLYGON` WKT。
-- 拒绝空几何、超出 WGS84 范围的坐标以及多个同时启用的版本。
+- FeatureCollection 使用 `role=administrative_boundary` 和 `role=maritime_area`
+  区分行政边界与显式海域掩膜。
+- 接受 Polygon 和 MultiPolygon 要素，并分别合并为 `MULTIPOLYGON` WKT。
+- 行政边界必须存在；海域掩膜缺失时写入空 `MULTIPOLYGON`，界外范围保守为 false。
+- 拒绝空几何、超出 WGS84 范围的坐标、跨 ±180° 日期变更线的线段，以及多个
+  同时启用的版本。
 - 对原始文件字节计算 SHA-256 校验和。
+- 要求显式 HTTP(S) `source_uri`，拒绝缺省值、本地路径和含凭据 URI。
 - 通过 `ST_GeomFromText(:wkt, 4326)` 写入。
 
-`cli.py` 必须支持导入和启用。输出只允许包含版本、要素数量、校验和和启用状态，不得输出文件中的敏感信息或原始几何。
+`cli.py` 必须支持导入和启用，并要求 `--source-uri`。输出只允许包含版本、要素数量、
+校验和和启用状态，不得输出来源 URI、文件中的敏感信息或原始几何。
 
 - [ ] **步骤 6：运行迁移与聚焦测试**
 

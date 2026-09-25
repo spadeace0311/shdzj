@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import func, insert, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,15 +26,20 @@ async def import_geojson(
     *,
     version: str,
     name: str,
+    source_uri: str | None = None,
     activate: bool = False,
 ) -> ImportResult:
+    normalized_source_uri = _validate_source_uri(source_uri)
     source = Path(file_path)
     raw = source.read_bytes()
     checksum = hashlib.sha256(raw).hexdigest()
     normalized_version, normalized_name = _validate_metadata(version, name)
     document = _load_document(raw)
-    polygons, feature_count = _extract_polygons(document)
-    wkt = _multipolygon_wkt(polygons)
+    administrative_polygons, maritime_polygons, feature_count = _extract_polygons(document)
+    administrative_wkt = _multipolygon_wkt(administrative_polygons)
+    maritime_wkt = (
+        _multipolygon_wkt(maritime_polygons) if maritime_polygons else "MULTIPOLYGON EMPTY"
+    )
 
     if activate:
         await session.execute(update(RegionBoundary).values(is_active=False))
@@ -43,8 +49,9 @@ async def import_geojson(
             version=normalized_version,
             name=normalized_name,
             local_buffer_km=Decimal("50"),
-            geom=func.ST_GeomFromText(wkt, 4326),
-            source_uri=str(source),
+            geom=func.ST_GeomFromText(administrative_wkt, 4326),
+            maritime_geom=func.ST_GeomFromText(maritime_wkt, 4326),
+            source_uri=normalized_source_uri,
             checksum=checksum,
             is_active=activate,
         )
@@ -70,6 +77,21 @@ def _validate_metadata(version: str, name: str) -> tuple[str, str]:
     return version.strip(), name.strip()
 
 
+def _validate_source_uri(source_uri: str | None) -> str:
+    if not isinstance(source_uri, str) or not source_uri.strip():
+        raise ValueError("source_uri must be an absolute http(s) URI")
+    normalized = source_uri.strip()
+    if len(normalized) > 512:
+        raise ValueError("source_uri must be at most 512 characters")
+
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("source_uri must be an absolute http(s) URI")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("source_uri must not contain credentials")
+    return normalized
+
+
 def _load_document(raw: bytes) -> dict[str, Any]:
     try:
         text = raw.decode("utf-8")
@@ -85,23 +107,41 @@ def _load_document(raw: bytes) -> dict[str, Any]:
     return document
 
 
-def _extract_polygons(document: dict[str, Any]) -> tuple[list[list[list[list[Decimal]]]], int]:
+def _extract_polygons(
+    document: dict[str, Any],
+) -> tuple[
+    list[list[list[list[Decimal]]]],
+    list[list[list[list[Decimal]]]],
+    int,
+]:
     document_type = document.get("type")
     if document_type == "FeatureCollection":
         features = document.get("features")
         if not isinstance(features, list):
             raise ValueError("FeatureCollection features must be a list")
-        polygons: list[list[list[list[Decimal]]]] = []
+        administrative_polygons: list[list[list[list[Decimal]]]] = []
+        maritime_polygons: list[list[list[list[Decimal]]]] = []
         for feature in features:
             if not isinstance(feature, dict) or feature.get("type") != "Feature":
                 raise ValueError("FeatureCollection entries must be Feature objects")
-            polygons.extend(_geometry_polygons(feature.get("geometry")))
-        return polygons, len(features)
+            properties = feature.get("properties")
+            role = properties.get("role") if isinstance(properties, dict) else None
+            polygons = _geometry_polygons(feature.get("geometry"))
+            if role == "administrative_boundary":
+                administrative_polygons.extend(polygons)
+            elif role == "maritime_area":
+                maritime_polygons.extend(polygons)
+            else:
+                raise ValueError("feature role must be administrative_boundary or maritime_area")
+
+        if not administrative_polygons:
+            raise ValueError("administrative_boundary geometry is required")
+        return administrative_polygons, maritime_polygons, len(features)
 
     if document_type == "Feature":
-        return _geometry_polygons(document.get("geometry")), 1
+        return _geometry_polygons(document.get("geometry")), [], 1
 
-    return _geometry_polygons(document), 1
+    return _geometry_polygons(document), [], 1
 
 
 def _geometry_polygons(
@@ -131,7 +171,11 @@ def _validate_polygon(coordinates: object) -> list[list[list[Decimal]]]:
             raise ValueError("polygon ring is empty")
         if len(ring) < 4:
             raise ValueError("polygon ring must contain at least four coordinates")
-        polygon.append([_validate_position(position) for position in ring])
+        positions = [_validate_position(position) for position in ring]
+        for current, following in zip(positions, positions[1:] + positions[:1]):
+            if abs(following[0] - current[0]) > Decimal("180"):
+                raise ValueError("polygon segment must not cross the antimeridian")
+        polygon.append(positions)
     return polygon
 
 

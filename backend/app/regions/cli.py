@@ -17,6 +17,7 @@ def _build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--file", required=True, type=Path)
     import_parser.add_argument("--version", required=True)
     import_parser.add_argument("--name", required=True)
+    import_parser.add_argument("--source-uri", required=True)
     import_parser.add_argument("--activate", action="store_true")
     return parser
 
@@ -29,6 +30,7 @@ async def _import(args: argparse.Namespace) -> int:
                 args.file,
                 version=args.version,
                 name=args.name,
+                source_uri=args.source_uri,
                 activate=args.activate,
             )
     print(json.dumps(asdict(result), sort_keys=True))

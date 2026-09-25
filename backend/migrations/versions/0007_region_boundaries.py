@@ -34,8 +34,17 @@ def upgrade() -> None:
             ),
             nullable=False,
         ),
-        sa.Column("source_uri", sa.String(length=512), nullable=True),
-        sa.Column("checksum", sa.String(length=64), nullable=True),
+        sa.Column(
+            "maritime_geom",
+            Geometry(
+                geometry_type="MULTIPOLYGON",
+                srid=4326,
+                spatial_index=False,
+            ),
+            nullable=False,
+        ),
+        sa.Column("source_uri", sa.String(length=512), nullable=False),
+        sa.Column("checksum", sa.String(length=64), nullable=False),
         sa.Column(
             "is_active",
             sa.Boolean(),
@@ -74,11 +83,13 @@ def upgrade() -> None:
         ["geom"],
         postgresql_using="gist",
     )
+    op.create_index(
+        "ix_region_boundaries_maritime_geom",
+        "region_boundaries",
+        ["maritime_geom"],
+        postgresql_using="gist",
+    )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_region_boundaries_geom", table_name="region_boundaries")
-    op.drop_index("uq_region_boundaries_single_active", table_name="region_boundaries")
-    op.drop_index("ix_region_boundaries_is_active", table_name="region_boundaries")
-    op.drop_index("ix_region_boundaries_version", table_name="region_boundaries")
     op.drop_table("region_boundaries")

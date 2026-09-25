@@ -3,7 +3,10 @@
   "features": [
     {
       "type": "Feature",
-      "properties": {"name": "test-shanghai"},
+      "properties": {
+        "name": "synthetic-shanghai-administrative-boundary",
+        "role": "administrative_boundary"
+      },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
@@ -12,6 +15,23 @@
           [122.2, 31.9],
           [120.8, 31.9],
           [120.8, 30.6]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "synthetic-east-sea-mask",
+        "role": "maritime_area"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [122.2, 30.6],
+          [123.0, 30.6],
+          [123.0, 31.9],
+          [122.2, 31.9],
+          [122.2, 30.6]
         ]]
       }
     }

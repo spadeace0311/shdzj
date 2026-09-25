@@ -34,6 +34,11 @@ class RegionBoundary(Base):
             "geom",
             postgresql_using="gist",
         ),
+        Index(
+            "ix_region_boundaries_maritime_geom",
+            "maritime_geom",
+            postgresql_using="gist",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -52,8 +57,12 @@ class RegionBoundary(Base):
         Geometry(geometry_type="MULTIPOLYGON", srid=4326, spatial_index=False),
         nullable=False,
     )
-    source_uri: Mapped[str | None] = mapped_column(String(512))
-    checksum: Mapped[str | None] = mapped_column(String(64))
+    maritime_geom = mapped_column(
+        Geometry(geometry_type="MULTIPOLYGON", srid=4326, spatial_index=False),
+        nullable=False,
+    )
+    source_uri: Mapped[str] = mapped_column(String(512))
+    checksum: Mapped[str] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

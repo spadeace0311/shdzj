@@ -1,10 +1,8 @@
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
 
 from geoalchemy2 import Geography
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, not_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.regions.domain import RegionContext
@@ -19,7 +17,7 @@ class RegionContextResolver:
         repository: RegionRepository | None = None,
     ) -> None:
         self._session_factory = session_factory
-        self._repository = repository or RegionRepository(session_factory)
+        self._repository = repository
 
     async def resolve(self, longitude: Decimal, latitude: Decimal) -> RegionContext:
         self._validate_coordinates(longitude, latitude)
@@ -27,11 +25,7 @@ class RegionContextResolver:
 
         try:
             async with self._session_factory() as session:
-                active = await self._repository.get_active(session)
-                if active is None:
-                    return self._pending(computed_at)
-
-                query = self._build_query(active, longitude, latitude)
+                query = self._build_query(longitude, latitude)
                 row = (await session.execute(query)).mappings().one_or_none()
                 if row is None:
                     return self._pending(computed_at)
@@ -41,38 +35,44 @@ class RegionContextResolver:
             return self._pending(computed_at)
 
     @staticmethod
-    def _build_query(active: Any, longitude: Decimal, latitude: Decimal):
+    def _build_query(longitude: Decimal, latitude: Decimal):
         point = func.ST_SetSRID(func.ST_MakePoint(longitude, latitude), 4326)
         boundary_geography = RegionBoundary.geom.cast(Geography)
         point_geography = point.cast(Geography)
-        active_id = active.get("id") if isinstance(active, Mapping) else active.id
-        active_version = active.get("version") if isinstance(active, Mapping) else active.version
-
-        query = select(
-            RegionBoundary.version,
-            func.ST_Covers(RegionBoundary.geom, point).label("inside_land"),
+        inside_land = func.ST_Covers(RegionBoundary.geom, point)
+        inside_offshore_sea = and_(
+            not_(inside_land),
             func.ST_DWithin(
                 boundary_geography,
                 point_geography,
                 RegionBoundary.local_buffer_km * 1000,
-            ).label("in_local_buffer"),
-            (func.ST_Distance(boundary_geography, point_geography) / 1000.0).label("distance_km"),
-        ).where(RegionBoundary.is_active.is_(True))
+            ),
+            func.ST_Covers(RegionBoundary.maritime_geom, point),
+        )
 
-        if active_id is not None:
-            return query.where(RegionBoundary.id == active_id)
-        return query.where(RegionBoundary.version == active_version)
+        return (
+            select(
+                RegionBoundary.version,
+                inside_land.label("inside_land"),
+                inside_offshore_sea.label("inside_offshore_sea"),
+                (func.ST_Distance(boundary_geography, point_geography) / 1000.0).label(
+                    "distance_km"
+                ),
+            )
+            .where(RegionBoundary.is_active.is_(True))
+            .limit(1)
+        )
 
     @staticmethod
-    def _context_from_row(row: Mapping[str, Any], computed_at: datetime) -> RegionContext:
+    def _context_from_row(row, computed_at: datetime) -> RegionContext:
         inside_land = bool(row["inside_land"])
-        in_local_buffer = bool(row["in_local_buffer"])
+        inside_offshore_sea = bool(row["inside_offshore_sea"])
         distance = Decimal(str(row["distance_km"]))
         if not distance.is_finite():
             return RegionContextResolver._pending(computed_at)
 
         return RegionContext(
-            inside_shanghai=inside_land or in_local_buffer,
+            inside_shanghai=inside_land or inside_offshore_sea,
             distance_to_boundary_km=Decimal("0") if inside_land else max(distance, Decimal("0")),
             boundary_version=str(row["version"]),
             computed_at=computed_at,
