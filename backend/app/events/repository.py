@@ -19,7 +19,7 @@ _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
 _REVIEWED_EVENT_KINDS = {EventKind.FORMAL, EventKind.CORRECTION}
 _LOGICAL_EVENT_KINDS = {EventKind.AUTO, EventKind.FORMAL, EventKind.CORRECTION}
-_REAL_EVENT_KINDS = {EventKind.MANUAL, EventKind.FORMAL, EventKind.CORRECTION}
+_REAL_EVENT_KINDS = {EventKind.AUTO, EventKind.MANUAL, EventKind.FORMAL, EventKind.CORRECTION}
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,12 +410,12 @@ def _becomes_current(
 
     current_kind = EventKind(current_revision.revision_kind)
     incoming_kind = event.kind
+    incoming_is_real = incoming_kind in _REAL_EVENT_KINDS
+    current_is_real = current_kind in _REAL_EVENT_KINDS
+    if incoming_is_real != current_is_real:
+        return incoming_is_real
 
     if incoming_kind not in _LOGICAL_EVENT_KINDS:
-        incoming_is_real = incoming_kind in _REAL_EVENT_KINDS
-        current_is_real = current_kind in _REAL_EVENT_KINDS
-        if incoming_is_real != current_is_real:
-            return incoming_is_real
         return _normalize_utc(received_at, "received_at") > _normalize_utc(
             current_revision.created_at,
             "revision.created_at",
@@ -486,6 +486,10 @@ def _apply_current_event_fields(
     canonical.place = event.place
     canonical.geom = geom
     canonical.current_revision_id = revision_id
+    canonical.institutional_level = None
+    canonical.service_level = None
+    canonical.response_suggestion = None
+    canonical.response_rule_version = None
 
 
 def _apply_suggestion_to_revision(

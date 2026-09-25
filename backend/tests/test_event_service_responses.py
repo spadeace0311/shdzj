@@ -451,14 +451,126 @@ def test_manual_replaces_test_or_drill_current_revision() -> None:
     )
 
 
+def test_late_test_or_drill_does_not_replace_current_auto() -> None:
+    event_id = uuid.uuid4()
+    auto_revision = _revision(
+        event_id=event_id,
+        kind=EventKind.AUTO,
+        is_current=True,
+        created_at=RECEIVED_AT,
+    )
+    late = RECEIVED_AT + timedelta(hours=1)
+
+    assert _becomes_current(auto_revision, _event(EventKind.TEST), late) is False
+    assert _becomes_current(auto_revision, _event(EventKind.DRILL), late) is False
+
+
+def test_auto_replaces_test_or_drill_current_revision() -> None:
+    event_id = uuid.uuid4()
+    test_revision = _revision(
+        event_id=event_id,
+        kind=EventKind.TEST,
+        is_current=True,
+        created_at=RECEIVED_AT,
+    )
+
+    assert (
+        _becomes_current(
+            test_revision,
+            _event(EventKind.AUTO),
+            RECEIVED_AT + timedelta(seconds=1),
+        )
+        is True
+    )
+
+
+async def test_new_current_revision_without_snapshot_clears_event_redundancy() -> None:
+    event = _canonical_event(event_id=uuid.uuid4())
+    event.institutional_level = "major"
+    event.service_level = 2
+    event.response_suggestion = {"institutional_level": "major"}
+    event.response_rule_version = "2026.1"
+
+    current_revision = _revision(
+        event_id=event.id,
+        kind=EventKind.FORMAL,
+        is_current=True,
+    )
+    current_revision.institutional_level = "major"
+    current_revision.service_level = 2
+    current_revision.response_suggestion = {"institutional_level": "major"}
+    current_revision.response_rule_version = "2026.1"
+    event.current_revision_id = current_revision.id
+
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source="cenc",
+        source_message_id="CENC-2026-0001",
+        message_kind=EventKind.CORRECTION.value,
+        received_at=RECEIVED_AT + timedelta(minutes=5),
+        checksum="b" * 64,
+        payload={"reportType": "correction"},
+    )
+    session = _AppendSession(None, event, 1, current_revision)
+    incoming = _event(EventKind.CORRECTION)
+
+    result = await EventRepository().append_revision(session, raw, incoming)
+
+    assert result.is_current is True
+    assert event.institutional_level is None
+    assert event.service_level is None
+    assert event.response_suggestion is None
+    assert event.response_rule_version is None
+    assert current_revision.institutional_level == "major"
+    assert current_revision.response_suggestion == {"institutional_level": "major"}
+
+
 async def test_list_query_orders_real_events_before_test_and_drill() -> None:
     session = _ListSession()
 
     await EventRepository().list_current_events(session)
 
-    sql, _ = _compiled(session.statement)
+    sql, params = _compiled(session.statement)
     assert "CASE" in sql
     assert "ORDER BY" in sql
+    event_types = next(value for value in params.values() if isinstance(value, list))
+    assert "auto" in event_types
+
+
+class _AppendResult:
+    rowcount = 1
+
+
+class _AppendSession:
+    def __init__(self, *scalar_results: object) -> None:
+        self._scalar_results = list(scalar_results)
+        self.scalar_statements: list[object] = []
+        self.added: list[object] = []
+        self.flushed: list[object] = []
+        self.executed: list[tuple[object, object]] = []
+
+    async def scalar(self, statement: object) -> object:
+        self.scalar_statements.append(statement)
+        if not self._scalar_results:
+            raise AssertionError("unexpected scalar query")
+        return self._scalar_results.pop(0)
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
+
+    async def flush(self) -> None:
+        for value in self.added:
+            if getattr(value, "id", None) is None:
+                value.id = uuid.uuid4()
+            self.flushed.append(value)
+
+    async def execute(
+        self,
+        statement: object,
+        parameters: dict[str, object] | None = None,
+    ) -> _AppendResult:
+        self.executed.append((statement, parameters))
+        return _AppendResult()
 
 
 class _ListResult:
