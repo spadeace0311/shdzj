@@ -178,6 +178,7 @@ class CollectorSupervisor:
         trigger_reason: str,
         *,
         allow_spool: bool,
+        record_success: bool = True,
     ) -> str:
         try:
             result = await self._coordinator.ingest(envelope, trigger_reason)
@@ -187,6 +188,7 @@ class CollectorSupervisor:
                 trigger_reason,
                 exc,
                 allow_spool=allow_spool,
+                record_success=record_success,
             )
         except Exception as exc:
             if isinstance(exc, asyncio.CancelledError):
@@ -195,7 +197,8 @@ class CollectorSupervisor:
 
         if result is None:
             return "skipped"
-        await self._record_success(envelope)
+        if record_success:
+            await self._record_success(envelope)
         return "ingested"
 
     async def _handle_storage_failure(
@@ -205,6 +208,7 @@ class CollectorSupervisor:
         _original_error: Exception,
         *,
         allow_spool: bool,
+        record_success: bool,
     ) -> str:
         if not allow_spool:
             return "critical"
@@ -221,7 +225,8 @@ class CollectorSupervisor:
                 return await self._handle_dead_letter(envelope, exc, True)
             if result is None:
                 return "skipped"
-            await self._record_success(envelope)
+            if record_success:
+                await self._record_success(envelope)
             return "ingested"
 
         try:
@@ -316,15 +321,28 @@ class CollectorSupervisor:
         # ordering is reserved for explicit recovery batches in process_envelopes.
         pending.sort(key=lambda pair: pair[1].received_at)
         for path, envelope in pending:
+            successful_items: list[CollectorEnvelope] = []
             for item in self._coordinator.expand(envelope):
                 outcome = await self._process_expanded(
                     item,
                     _RECOVERY,
                     allow_spool=False,
+                    record_success=False,
                 )
                 if outcome == "critical":
                     return False
-            self._spool.remove(path)
+                if outcome == "ingested":
+                    successful_items.append(item)
+            try:
+                self._spool.remove(path)
+            except OSError:
+                logger.exception(
+                    "collector spool removal failed path=%s",
+                    path,
+                )
+                return False
+            for item in successful_items:
+                await self._record_success(item)
         return True
 
     async def _mark_critical_and_stop(self) -> None:

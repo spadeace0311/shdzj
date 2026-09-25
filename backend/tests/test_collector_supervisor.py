@@ -15,6 +15,7 @@ from app.collector.domain import (
 )
 from app.collector.models import CollectorRuntimeState
 from app.collector.service import CollectorService
+from app.collector.spool import CollectorSpool
 from app.collector.supervisor import CollectorSupervisor
 from app.db import engine
 from app.events.domain import EventKind
@@ -95,6 +96,12 @@ class RecoveryCoordinator(RecordingCoordinator):
         return None
 
 
+class SuccessfulCoordinator(RecordingCoordinator):
+    async def ingest(self, envelope: CollectorEnvelope, trigger_reason: str = "live"):
+        self.calls.append(envelope)
+        return object()
+
+
 class RecordingCollectorService:
     def __init__(
         self,
@@ -103,6 +110,7 @@ class RecordingCollectorService:
         watermarks: dict[str, datetime | None] | None = None,
     ) -> None:
         self.dead_letters: list[dict[str, object]] = []
+        self.successes: list[tuple[str, datetime, datetime | None]] = []
         self.last_processed_source_time = None
         self.fail_dead_letter = fail_dead_letter
         self.watermarks = watermarks
@@ -116,6 +124,7 @@ class RecordingCollectorService:
         return self.last_processed_source_time
 
     async def update_after_success(self, provider: str, ingested_at, source_time) -> None:
+        self.successes.append((provider, ingested_at, source_time))
         self.last_processed_source_time = source_time
 
     async def record_dead_letter(self, **kwargs) -> None:
@@ -466,6 +475,44 @@ async def test_runtime_spool_drain_failure_stops_before_newer_live_item() -> Non
 
     assert coordinator.ingested_order == []
     assert len(list(spool.pending)) == 1
+    assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_spool_removal_failure_stops_without_reporting_success(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = RecordingCollectorService()
+    spool = CollectorSpool(tmp_path, max_bytes=1_000_000)
+    spool.append(envelope())
+    path, retained = next(spool.iter_pending())
+    original_unlink = type(path).unlink
+
+    def fail_unlink(self, *args, **kwargs):
+        if self == path:
+            raise OSError("unlink failed")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "unlink", fail_unlink)
+    coordinator = SuccessfulCoordinator()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=spool,
+        fan_collector=NoopFanCollector(),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    await asyncio.wait_for(supervisor.run(stop_event), timeout=1)
+
+    assert stop_event.is_set()
+    assert coordinator.calls == [retained]
+    assert service.successes == []
+    assert path.exists()
+    assert list(spool.iter_pending()) == [(path, retained)]
     assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
 
 

@@ -4,10 +4,32 @@
 
 ## 1. 启动
 
-从仓库根目录执行以下命令。
+### 1.1 复制环境变量模板
+
+从仓库根目录执行：
 
 ```powershell
 Copy-Item .env.example .env
+```
+
+### 1.2 在迁移和启动前替换全部占位值
+
+编辑 `.env`，至少完成以下替换。不要在实际值仍为模板占位值或空值时继续执行迁移和启动命令。
+
+- `POSTGRES_PASSWORD`：改为独立的高强度数据库密码。
+- `DATABASE_URL`：使用同一个数据库密码，并按 URL 规则编码；Compose 内数据库主机必须是 `postgres`。
+- `JWT_SECRET`：改为至少 16 个字符的独立随机值，不得继续使用模板值。
+- `SUPERADMIN_INITIAL_PASSWORD`：改为至少 16 个字符的独立随机值。
+- `FAN_APP_ID`：填写有效的 FAN Studio 客户端标识；留空时才回退到 `CENC_APP_ID`。
+- `FAN_API_KEY`：填写有效的 FAN Studio 密钥。
+
+collector 在 Compose 中强制启用。没有有效 FAN 客户端标识和 `FAN_API_KEY` 时，collector 不是可安全启动状态，也不会形成可验证的主备采集链路。没有凭据时可以运行数据库迁移、API 和不含 collector 的测试，但不得把 collector 的启动失败误判为实时采集已部署。
+
+### 1.3 启动数据库、迁移和完整服务
+
+仅在 1.2 的数据库、JWT、超级管理员和 FAN 值均已替换且有效后执行：
+
+```powershell
 docker compose --env-file .env -f infra/compose.yaml up -d postgres
 docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
 docker compose --env-file .env -f infra/compose.yaml up -d api collector frontend
@@ -107,7 +129,7 @@ docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql -U ea
 docker compose --env-file .env -f infra/compose.yaml run --rm api python -m app.collector.replay --dead-letter <死信-UUID>
 ```
 
-重放会把持久化的单个事件重新包装为 supervisor 消费的 `{"No1": raw_payload}` 结构，并使用原始 `received_at` 和 `recovery` 触发原因。成功状态为 `resolved`；失败时记录保持 `open` 并增加错误摘要。
+重放会把持久化的单个事件重新包装为 supervisor 消费的 `{"No1": raw_payload}` 结构，并使用原始 `received_at` 和 `recovery` 触发原因。状态为 `open` 时首次成功变为 `retried`；从 `retried` 或 `resolved` 再次成功才变为 `resolved`。失败时记录恢复为 `open` 并增加错误摘要。
 
 ## 7. Spool 与数据库故障恢复
 
@@ -118,6 +140,8 @@ docker compose --env-file .env -f infra/compose.yaml exec collector sh -lc "find
 ```
 
 数据库恢复后的正常路径是：collector 下一次 drain 按 `received_at` 顺序重放 spool，成功后删除文件，再继续接收 live 数据。
+
+spool 只有在文件删除和目录 `fsync` 均成功后才算排空；此后 supervisor 才上报该 envelope 的成功水位。unlink 失败时文件保留；unlink 或目录 `fsync` 失败时 drain 进入 `critical` 并停止，不报告成功。若 `fsync` 失败发生在文件已经从当前命名空间删除之后，重启后仍按语义指纹幂等处理，禁止把该失败静默当作成功。
 
 恢复演练：
 

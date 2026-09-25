@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -95,6 +96,7 @@ async def test_fan_auto_then_wolfx_formal_creates_one_trigger(session_factory) -
         "ReportTime": "2026-09-25T01:04:00Z",
         "magnitude": 5.1,
     }
+    formal_received_at = datetime(2026, 9, 25, 1, 5, tzinfo=UTC)
 
     auto_outcome = await coordinator.ingest(
         CollectorEnvelope(
@@ -108,7 +110,7 @@ async def test_fan_auto_then_wolfx_formal_creates_one_trigger(session_factory) -
         CollectorEnvelope(
             provider=CollectorProvider.WOLFX,
             lane=CollectorLane.HTTP,
-            received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+            received_at=formal_received_at,
             payload={"No1": formal},
         ),
         trigger_reason="recovery",
@@ -123,9 +125,18 @@ async def test_fan_auto_then_wolfx_formal_creates_one_trigger(session_factory) -
         count = await session.scalar(
             select(func.count())
             .select_from(EventLifecycleOutbox)
-            .where(EventLifecycleOutbox.event_id == formal_outcome.event_id)
+            .where(
+                EventLifecycleOutbox.event_id == UUID(formal_outcome.event_id),
+                EventLifecycleOutbox.trigger_type == "assessment.requested",
+            )
+        )
+        t1_at = await session.scalar(
+            select(EarthquakeEvent.t1_at).where(
+                EarthquakeEvent.id == UUID(formal_outcome.event_id)
+            )
         )
     assert count == 1
+    assert t1_at == formal_received_at
 
 
 async def test_wolfx_formal_reaches_lifecycle_when_fan_is_unavailable(

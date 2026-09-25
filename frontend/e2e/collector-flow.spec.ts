@@ -8,9 +8,14 @@ test("collector status remains visible when backup is serving events", async ({ 
 
   await page.getByRole("link", { name: "采集状态" }).click();
 
-  await expect(page.getByText(/总体状态：/)).toBeVisible();
-  await expect(page.getByText("FAN 主链路")).toBeVisible();
-  await expect(page.getByText("Wolfx 备用链路")).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /总体状态：(正常|降级)/ }),
+  ).toBeVisible();
+  const wolfxRow = page.getByRole("row").filter({ hasText: "Wolfx 备用链路" });
+  await expect(wolfxRow).toContainText("正常");
+  await expect(wolfxRow).toContainText("已连接");
+  await expect(wolfxRow.locator("td").nth(3)).not.toHaveText("-");
+  await expect(wolfxRow.locator("td").nth(8)).toHaveText("200");
 });
 
 test("formal recovery ingest reaches the lifecycle list", async ({ page }) => {

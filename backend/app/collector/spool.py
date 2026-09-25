@@ -78,11 +78,8 @@ class CollectorSpool:
         yield from pending
 
     def remove(self, path: Path) -> None:
-        try:
-            path.unlink(missing_ok=True)
-            self._fsync_directory()
-        except OSError:
-            pass
+        path.unlink(missing_ok=True)
+        self._fsync_directory()
 
     def _usage_bytes(self) -> int:
         total = 0
@@ -113,14 +110,9 @@ class CollectorSpool:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
-        try:
-            fd = os.open(self._directory, flags)
-        except OSError:
-            return
+        fd = os.open(self._directory, flags)
         try:
             os.fsync(fd)
-        except OSError:
-            pass
         finally:
             os.close(fd)
 
