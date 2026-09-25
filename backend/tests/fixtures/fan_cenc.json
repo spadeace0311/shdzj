@@ -1,0 +1,80 @@
+{
+  "initial": {
+    "type": "initial_all",
+    "cenc": {
+      "Data": {
+        "No1": {
+          "id": "CENC-2026-0001",
+          "eventId": "CENC-2026-0001",
+          "shockTime": "2026-09-25T01:00:01Z",
+          "infoTypeName": "正式(已核实)",
+          "placeName": "测试位置一",
+          "latitude": 31.2,
+          "longitude": 121.5,
+          "magnitude": 5.1,
+          "depth": 10
+        }
+      }
+    }
+  },
+  "query_response": {
+    "type": "query_response",
+    "cenc": {
+      "Data": {
+        "No1": {
+          "id": "CENC-2026-0002",
+          "eventId": "CENC-2026-0002",
+          "shockTime": "2026-09-25T01:00:02Z",
+          "infoTypeName": "自动",
+          "placeName": "测试位置二",
+          "latitude": 31.3,
+          "longitude": 121.6,
+          "magnitude": 4.2,
+          "depth": 8
+        }
+      }
+    }
+  },
+  "cenclist_response": {
+    "type": "cenclist_response",
+    "Data": {
+      "newer_raw_key": {
+        "id": "CENC-2026-0002",
+        "eventId": "CENC-2026-0002",
+        "shockTime": "2026-09-25T01:00:02Z",
+        "infoTypeName": "自动",
+        "placeName": "测试位置二",
+        "latitude": 31.3,
+        "longitude": 121.6,
+        "magnitude": 4.2,
+        "depth": 8
+      },
+      "older_raw_key": {
+        "id": "CENC-2026-0001",
+        "eventId": "CENC-2026-0001",
+        "shockTime": "2026-09-25T01:00:01Z",
+        "infoTypeName": "正式(已核实)",
+        "placeName": "测试位置一",
+        "latitude": 31.2,
+        "longitude": 121.5,
+        "magnitude": 5.1,
+        "depth": 10
+      }
+    }
+  },
+  "update": {
+    "type": "update",
+    "source": "cenc",
+    "Data": {
+      "id": "CENC-2026-0003",
+      "eventId": "CENC-2026-0003",
+      "shockTime": "2026-09-25T01:00:03Z",
+      "infoTypeName": "正式(已核实)",
+      "placeName": "测试位置三",
+      "latitude": 31.4,
+      "longitude": 121.7,
+      "magnitude": 3.9,
+      "depth": 12
+    }
+  }
+}
