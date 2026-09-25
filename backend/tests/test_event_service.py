@@ -551,7 +551,7 @@ async def test_history_source_alias_wins_before_spatial_tolerance_and_keeps_iden
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, None, existing, 2, current_revision, "formal", None)
+    session = _RecordingSession(None, None, existing, 2, current_revision, ["formal"], None)
     repeated_auto = _event(
         source_event_id="CENC-AUTO-1",
         report_time=RECEIVED_AT + timedelta(minutes=1),
@@ -603,7 +603,7 @@ async def test_old_formal_after_newer_correction_is_saved_but_not_current() -> N
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 3, current_revision, "correction", None)
+    session = _RecordingSession(None, existing, 3, current_revision, ["correction"], None)
     old_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -650,7 +650,7 @@ async def test_late_formal_without_explicit_order_does_not_replace_correction() 
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 2, current_revision, "correction", None)
+    session = _RecordingSession(None, existing, 2, current_revision, ["correction"], None)
     late_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -694,7 +694,7 @@ async def test_formal_with_later_report_time_can_replace_correction() -> None:
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 2, current_revision, "correction", None)
+    session = _RecordingSession(None, existing, 2, current_revision, ["correction"], None)
     later_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -738,7 +738,7 @@ async def test_correction_without_explicit_order_replaces_formal() -> None:
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision, "formal", None)
+    session = _RecordingSession(None, existing, 1, current_revision, ["formal"], None)
     correction = _event(
         kind=EventKind.CORRECTION,
         source_event_id="CENC-FORMAL-2",

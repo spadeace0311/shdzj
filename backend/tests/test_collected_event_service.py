@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -8,6 +9,7 @@ from app.collector.domain import CollectorLane, CollectorProvider
 from app.db import SessionFactory, engine
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
+from app.events.repository import EventRepository
 from app.events.response_rules import ResponseInput
 from app.events.service import EventService
 from app.events.sources.cenc import CencAdapter
@@ -199,6 +201,46 @@ async def test_recovery_trigger_reason_is_persisted(session_factory) -> None:
     )
 
     assert await outbox_reason(session_factory, result.revision_id) == "recovery"
+
+
+async def test_first_reviewed_correction_is_classified_as_formal(session_factory) -> None:
+    service = collected_service(session_factory)
+    result = await service.ingest_collected(**collected_event(kind="correction"))
+
+    assert result.event_kind is EventKind.FORMAL
+    assert result.lifecycle_state == "formal_triggered"
+    assert result.t1_at is not None
+    assert result.triggered_assessment is True
+    assert await outbox_count(session_factory, result.event_id) == 1
+
+    async with session_factory() as session:
+        event = await session.get(EarthquakeEvent, uuid.UUID(result.event_id))
+        revision = await session.get(EarthquakeRevision, uuid.UUID(result.revision_id))
+
+    assert event is not None
+    assert revision is not None
+    assert event.event_type == "formal"
+    assert revision.revision_kind == "formal"
+
+
+async def test_enqueue_assessment_is_guarded_noop(session_factory) -> None:
+    service = collected_service(session_factory)
+    result = await service.ingest_collected(**collected_event(kind="formal"))
+    repository = EventRepository(session_factory)
+
+    async with session_factory() as session:
+        async with session.begin():
+            added = await repository.enqueue_assessment(
+                session,
+                event_id=result.event_id,
+                revision_id=result.revision_id,
+                revision_no=result.revision_no,
+                trigger_reason="live",
+                created_at=result.t1_at or datetime.now(UTC),
+            )
+
+    assert added is False
+    assert await outbox_count(session_factory, result.event_id) == 1
 
 
 async def test_late_older_reviewed_revision_is_stored_without_new_outbox(

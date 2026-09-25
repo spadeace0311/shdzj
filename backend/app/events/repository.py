@@ -18,6 +18,7 @@ from app.events.models import (
     EventLifecycleOutbox,
     RawMessage,
 )
+from app.events.lifecycle import classify_reviewed_kind
 from app.events.response_rules import ResponseSuggestion
 from app.regions.domain import RegionContext
 
@@ -213,7 +214,7 @@ class EventRepository:
             await session.flush()
             revision_no = 1
             current_revision = None
-            has_reviewed_kind = False
+            existing_reviewed_kinds: tuple[EventKind, ...] = ()
         else:
             latest_revision_no = await session.scalar(
                 select(func.max(EarthquakeRevision.revision_no)).where(
@@ -222,16 +223,17 @@ class EventRepository:
             )
             revision_no = int(latest_revision_no or 0) + 1
             current_revision = await self._get_current_revision(session, canonical)
-            has_reviewed_kind = await session.scalar(
-                select(EarthquakeRevision.revision_kind)
-                .where(
+            reviewed_kind_values = await session.scalar(
+                select(func.array_agg(EarthquakeRevision.revision_kind)).where(
                     EarthquakeRevision.event_id == canonical.id,
                     EarthquakeRevision.revision_kind.in_(
                         tuple(kind.value for kind in _REVIEWED_EVENT_KINDS)
                     ),
                 )
-                .limit(1)
-            ) is not None
+            )
+            existing_reviewed_kinds = tuple(
+                EventKind(value) for value in (reviewed_kind_values or ())
+            )
 
         if semantic_fingerprint is not None and canonical_existed:
             duplicate_revision = await session.scalar(
@@ -250,7 +252,7 @@ class EventRepository:
                     is_new=False,
                 )
 
-        revision_kind = _resolve_revision_kind(event.kind, has_reviewed_kind)
+        revision_kind = _resolve_revision_kind(event.kind, existing_reviewed_kinds)
         becomes_current = _becomes_current(
             current_revision,
             event,
@@ -628,10 +630,12 @@ def _apply_current_event_fields(
 
 def _resolve_revision_kind(
     incoming_kind: EventKind,
-    has_reviewed_kind: bool,
+    existing_reviewed_kinds: tuple[EventKind, ...],
 ) -> EventKind:
-    if incoming_kind is EventKind.FORMAL and has_reviewed_kind:
-        return EventKind.CORRECTION
+    if incoming_kind is EventKind.AUTO:
+        return EventKind.AUTO
+    if incoming_kind in _REVIEWED_EVENT_KINDS:
+        return classify_reviewed_kind(existing_reviewed_kinds)
     return incoming_kind
 
 

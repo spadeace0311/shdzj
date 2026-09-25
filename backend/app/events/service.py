@@ -169,7 +169,7 @@ class EventService:
                             suggestion,
                             suggestion_payload,
                         )
-                    await self._repository.enqueue_assessment(
+                    triggered_assessment = await self._repository.enqueue_assessment(
                         session,
                         event_id=result.event_id,
                         revision_id=result.revision_id,
@@ -177,7 +177,6 @@ class EventService:
                         trigger_reason=trigger_reason,
                         created_at=normalized_received_at,
                     )
-                    triggered_assessment = True
 
                 (
                     institutional_level,

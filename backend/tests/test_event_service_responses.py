@@ -159,11 +159,13 @@ class _AtomicRepository:
         suggestion_error: bool = False,
         current_levels: tuple[str | None, int | None] = ("major", 2),
         append_is_current: bool = True,
+        enqueue_result: bool = True,
     ) -> None:
         self.events = events
         self.suggestion_error = suggestion_error
         self.current_levels = current_levels
         self.append_is_current = append_is_current
+        self.enqueue_result = enqueue_result
         self.suggestion_calls = 0
 
     async def acquire_ingest_lock(self, session: object, source: str) -> None:
@@ -226,7 +228,7 @@ class _AtomicRepository:
     ) -> bool:
         del session, event_id, revision_id, revision_no, trigger_reason, created_at
         self.events.append("enqueue_assessment")
-        return True
+        return self.enqueue_result
 
     async def set_revision_suggestion(
         self,
@@ -425,6 +427,21 @@ async def test_service_without_context_returns_existing_current_suggestion() -> 
     assert outcome.service_level == 3
 
 
+async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
+    events: list[str] = []
+    repository = _AtomicRepository(events, enqueue_result=False)
+    service = EventService(_AtomicSessionFactory(events), repository=repository)
+
+    outcome = await service.ingest_with_response_suggestion(
+        _payload(),
+        _event(EventKind.FORMAL),
+        None,
+    )
+
+    assert "enqueue_assessment" in events
+    assert outcome.triggered_assessment is False
+
+
 async def test_non_current_formal_with_context_keeps_current_suggestion() -> None:
     events: list[str] = []
     repository = _AtomicRepository(
@@ -546,7 +563,7 @@ async def test_new_current_revision_without_snapshot_clears_event_redundancy() -
         checksum="b" * 64,
         payload={"reportType": "correction"},
     )
-    session = _AppendSession(None, event, 1, current_revision, "formal", None)
+    session = _AppendSession(None, event, 1, current_revision, ["formal"], None)
     incoming = _event(EventKind.CORRECTION)
 
     result = await EventRepository().append_revision(

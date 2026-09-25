@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
+from app.events.domain import EventKind
 from app.events.repository import (
     EventDetailRecord,
     EventIngestResult,
@@ -120,12 +121,17 @@ class FakeEventService:
             result.event_id,
             (None, None),
         )
+        lifecycle_state = (
+            "correction_triggered"
+            if getattr(event, "kind", None) is EventKind.CORRECTION
+            else "formal_triggered"
+        )
         return LifecycleIngestOutcome(
             event_id=result.event_id,
             revision_id=result.revision_id,
             revision_no=result.revision_no,
             event_kind=result.event_kind,
-            lifecycle_state="formal_triggered",
+            lifecycle_state=lifecycle_state,
             is_current=result.is_current,
             is_new=True,
             triggered_assessment=True,
@@ -167,6 +173,8 @@ def test_ingest_formal_event() -> None:
     assert body["revision_no"] == 1
     assert body["institutional_level"] == "major"
     assert body["service_level"] == 2
+    assert body["lifecycle_state"] == "formal_triggered"
+    assert body["t1_at"] == "2026-09-17T02:31:00Z"
 
 
 def test_ingest_auto_event_has_no_response_suggestion() -> None:
@@ -203,6 +211,8 @@ def test_correction_appends_revision() -> None:
     assert response.json()["event_kind"] == "correction"
     assert response.json()["institutional_level"] == "major"
     assert response.json()["service_level"] == 2
+    assert response.json()["lifecycle_state"] == "correction_triggered"
+    assert response.json()["t1_at"] == "2026-09-17T02:31:00Z"
 
 
 def test_manual_event_requires_source() -> None:
