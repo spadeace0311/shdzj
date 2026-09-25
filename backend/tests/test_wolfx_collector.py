@@ -246,6 +246,53 @@ async def test_run_polls_immediately_then_waits_interval() -> None:
     ]
 
 
+async def test_run_clears_recovery_since_after_first_full_poll() -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return httpx.Response(200, json=FIXTURE)
+        return httpx.Response(200, json={"No1": FIXTURE["No1"]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    stop_event = asyncio.Event()
+    delays: list[float] = []
+
+    async def sleep_once_then_stop(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 1:
+            return
+        await stop_event.wait()
+
+    collector = WolfxCollector(
+        url="https://wolfx.test/cenc_eqlist.json",
+        poll_interval_seconds=13,
+        client=client,
+        now=fixed_now,
+        sleep=sleep_once_then_stop,
+        recovery_since=datetime(2026, 9, 25, 1, 1, 30, tzinfo=UTC),
+    )
+    envelopes: list[object] = []
+
+    async def on_envelope(envelope) -> None:
+        envelopes.append(envelope)
+
+    task = asyncio.create_task(
+        collector.run(on_envelope=on_envelope, on_health=AsyncMock(), stop_event=stop_event)
+    )
+    await wait_until(lambda: len(envelopes) == 2)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+    await client.aclose()
+
+    assert [
+        item.payload[next(iter(item.payload))]["EventID"] for item in envelopes
+    ] == ["CENC-REVIEWED-2026092502", "CENC-AUTO-2026092501"]
+    assert request_count == 2
+
+
 async def test_run_emits_healthy_on_empty_response() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={})

@@ -73,17 +73,17 @@ class CollectorSupervisor:
         await self._set_provider_state(CollectorProvider.FAN, "starting")
         await self._set_provider_state(CollectorProvider.WOLFX, "starting")
 
-        watermark = await self._load_watermark()
-        if watermark is None:
+        watermarks = await self._load_watermarks()
+        if not any(value is not None for value in watermarks.values()):
             self._bootstrap_cutoff = self._now() - timedelta(
                 hours=self._settings.cenc_bootstrap_lookback_hours
             )
         else:
             self._bootstrap_cutoff = None
         if hasattr(self._fan_collector, "recovery_since"):
-            self._fan_collector.recovery_since = watermark
+            self._fan_collector.recovery_since = watermarks[CollectorProvider.FAN]
         if hasattr(self._wolfx_collector, "recovery_since"):
-            self._wolfx_collector.recovery_since = watermark
+            self._wolfx_collector.recovery_since = watermarks[CollectorProvider.WOLFX]
 
         if not await self._replay_spool():
             await self._mark_critical_and_stop()
@@ -333,17 +333,19 @@ class CollectorSupervisor:
         if self._stop_event is not None:
             self._stop_event.set()
 
-    async def _load_watermark(self) -> datetime | None:
-        values: list[datetime] = []
-        for provider in (CollectorProvider.FAN, CollectorProvider.WOLFX):
+    async def _load_watermarks(self) -> dict[CollectorProvider, datetime | None]:
+        values: dict[CollectorProvider, datetime | None] = {
+            CollectorProvider.FAN: None,
+            CollectorProvider.WOLFX: None,
+        }
+        for provider in values:
             try:
                 value = await self._service.get_last_processed_source_time(provider.value)
             except Exception:
                 logger.exception("collector watermark load failed")
                 continue
-            if value is not None:
-                values.append(value)
-        return max(values) if values else None
+            values[provider] = value
+        return values
 
     async def _enqueue_envelope(self, envelope: CollectorEnvelope) -> None:
         if self._queue is None:

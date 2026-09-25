@@ -400,6 +400,48 @@ async def test_query_is_sent_after_configured_interval() -> None:
     await asyncio.wait_for(task, timeout=1)
 
 
+async def test_fan_collector_clears_recovery_since_after_first_history_frame() -> None:
+    recovery_since = datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC)
+    older_query = {
+        "type": "query_response",
+        "cenc": {"Data": FIXTURE["initial"]["cenc"]["Data"]},
+    }
+    websocket = FakeWebSocket(
+        (
+            json.dumps({"type": "auth_success"}),
+            json.dumps(FIXTURE["cenclist_response"]),
+            json.dumps(older_query),
+        )
+    )
+
+    async def connect(url: str):
+        return websocket
+
+    collector = FanCollector(
+        app_id="app-id",
+        api_key="secret",
+        urls=("wss://primary",),
+        query_interval_seconds=60,
+        connect=connect,
+        sleep=never_sleep,
+        now=fixed_now,
+        recovery_since=recovery_since,
+    )
+    envelopes = EnvelopeRecorder()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        collector.run(on_envelope=envelopes, on_health=AsyncMock(), stop_event=stop_event)
+    )
+
+    await asyncio.wait_for(websocket.drained.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert [
+        item.payload[next(iter(item.payload))]["id"] for item in envelopes.envelopes
+    ] == ["CENC-2026-0002", "CENC-2026-0001"]
+
+
 async def test_callback_exception_propagates_without_reconnect() -> None:
     websocket = FakeWebSocket(
         (

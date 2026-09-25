@@ -32,6 +32,7 @@ class FanParseResult:
     auth_state: str | None = None
     heartbeat: bool = False
     error_text: str | None = None
+    history_frame: bool = False
 
 
 class FanMessageParser:
@@ -62,21 +63,27 @@ class FanMessageParser:
             if isinstance(data, dict) and data:
                 data = _filter_history_payload(data, recovery_since)
                 if not data:
-                    return FanParseResult()
-                return FanParseResult(envelope=self._envelope(data, received_at))
-            return FanParseResult()
+                    return FanParseResult(history_frame=True)
+                return FanParseResult(
+                    envelope=self._envelope(data, received_at),
+                    history_frame=True,
+                )
+            return FanParseResult(history_frame=True)
 
         if message_type == "cenclist_response":
             history = message.get("Data")
             if not isinstance(history, dict) or not history:
-                return FanParseResult()
+                return FanParseResult(history_frame=True)
             items = [item for item in history.values() if isinstance(item, dict)]
             items = _filter_history_items(items, recovery_since)
             if not items:
-                return FanParseResult()
+                return FanParseResult(history_frame=True)
             items.sort(key=_history_sort_key)
             normalized = {f"No{index}": item for index, item in enumerate(items, start=1)}
-            return FanParseResult(envelope=self._envelope(normalized, received_at))
+            return FanParseResult(
+                envelope=self._envelope(normalized, received_at),
+                history_frame=True,
+            )
 
         if message_type == "update":
             if message.get("source") != "cenc":
@@ -213,6 +220,7 @@ class FanCollector:
         self._consecutive_failures = 0
         self._reconnect_count = 0
         self._last_error: str | None = None
+        self._history_recovery_applied = False
 
     async def run(
         self,
@@ -315,6 +323,9 @@ class FanCollector:
             parsed = self._parse_message(message)
             if parsed is None:
                 continue
+            if parsed.history_frame and not self._history_recovery_applied:
+                self._history_recovery_applied = True
+                self._recovery_since = None
             if parsed.auth_state == "success":
                 self._authenticated = True
                 self._last_error = None

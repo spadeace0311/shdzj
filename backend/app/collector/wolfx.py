@@ -120,6 +120,7 @@ class WolfxCollector:
 
     async def _poll_once(
         self,
+        recovery_since: datetime | None = None,
     ) -> tuple[list[CollectorEnvelope], int, datetime]:
         response = await self._client.get(self._url, timeout=10.0)
         response.raise_for_status()
@@ -127,7 +128,7 @@ class WolfxCollector:
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Wolfx response must be a JSON object")
-        envelopes = self._parser.parse(payload, received_at, self._recovery_since)
+        envelopes = self._parser.parse(payload, received_at, recovery_since)
         return envelopes, response.status_code, received_at
 
     async def run(
@@ -139,11 +140,12 @@ class WolfxCollector:
         stop_event = stop_event or asyncio.Event()
         self._reset_state()
         await self._emit_health(on_health, "starting")
+        recovery_since = self._recovery_since
 
         try:
             while not stop_event.is_set():
                 try:
-                    envelopes, status, received_at = await self._poll_once()
+                    envelopes, status, received_at = await self._poll_once(recovery_since)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -154,6 +156,7 @@ class WolfxCollector:
                     await self._wait_for_stop(stop_event, self._next_delay())
                     continue
 
+                recovery_since = None
                 self._record_success(envelopes, status, received_at)
                 for envelope in envelopes:
                     await on_envelope(envelope)

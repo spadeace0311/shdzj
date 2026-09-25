@@ -96,15 +96,23 @@ class RecoveryCoordinator(RecordingCoordinator):
 
 
 class RecordingCollectorService:
-    def __init__(self, *, fail_dead_letter: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_dead_letter: bool = False,
+        watermarks: dict[str, datetime | None] | None = None,
+    ) -> None:
         self.dead_letters: list[dict[str, object]] = []
         self.last_processed_source_time = None
         self.fail_dead_letter = fail_dead_letter
+        self.watermarks = watermarks
 
     async def persist_health(self, update: ProviderHealthUpdate) -> None:
         return None
 
     async def get_last_processed_source_time(self, provider: str):
+        if self.watermarks is not None:
+            return self.watermarks.get(provider)
         return self.last_processed_source_time
 
     async def update_after_success(self, provider: str, ingested_at, source_time) -> None:
@@ -157,6 +165,16 @@ class PushFanCollector:
         for envelope in self.envelopes:
             await on_envelope(envelope)
         await stop_event.wait()
+
+
+class RecoveryBoundSpy:
+    def __init__(self) -> None:
+        self.recovery_since = None
+        self.started = asyncio.Event()
+
+    async def run(self, **kwargs) -> None:
+        self.started.set()
+        await kwargs["stop_event"].wait()
 
 
 async def fake_sleep(_delay: float) -> None:
@@ -394,6 +412,90 @@ async def test_replay_keeps_spool_file_when_dead_letter_persistence_fails() -> N
     assert stop_event.is_set()
     assert list(spool.pending) == [(Path("spool-1"), malformed)]
     assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_runtime_spool_drain_failure_stops_before_newer_live_item() -> None:
+    # A storage-fails live and is spooled, then its startup-equivalent drain also
+    # fails. This is deliberately terminal: collection stops instead of letting
+    # newer C run ahead of the retained A file.
+    service = RecordingCollectorService()
+    spool = RecordingSpool()
+    coordinator = RecoveryCoordinator(remaining_failures={"A": 5})
+    stop_event = asyncio.Event()
+    received_at = datetime(2026, 9, 25, 1, 5, tzinfo=UTC)
+    envelopes = [
+        CollectorEnvelope(
+            provider=CollectorProvider.WOLFX,
+            lane=CollectorLane.HTTP,
+            received_at=received_at,
+            payload={
+                "No1": {
+                    **reviewed_wolfx_event(),
+                    "EventID": "A",
+                    "ReportTime": "2026-09-25T01:04:00Z",
+                }
+            },
+        ),
+        CollectorEnvelope(
+            provider=CollectorProvider.WOLFX,
+            lane=CollectorLane.HTTP,
+            received_at=received_at,
+            payload={
+                "No1": {
+                    **reviewed_wolfx_event(),
+                    "EventID": "C",
+                    "ReportTime": "2026-09-25T01:06:00Z",
+                }
+            },
+        ),
+    ]
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=spool,
+        fan_collector=PushFanCollector(envelopes),
+        wolfx_collector=NoopWolfxCollector(),
+        sleep=fake_sleep,
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(stop_event.wait(), timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+
+    assert coordinator.ingested_order == []
+    assert len(list(spool.pending)) == 1
+    assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_supervisor_assigns_independent_provider_watermarks() -> None:
+    fan_watermark = datetime(2026, 9, 25, 1, 4, tzinfo=UTC)
+    wolfx_watermark = datetime(2026, 9, 25, 1, 2, tzinfo=UTC)
+    service = RecordingCollectorService(
+        watermarks={"fan": fan_watermark, "wolfx": wolfx_watermark}
+    )
+    fan_collector = RecoveryBoundSpy()
+    wolfx_collector = RecoveryBoundSpy()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(),
+        spool=RecordingSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=wolfx_collector,
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(fan_collector.started.wait(), timeout=1)
+    await asyncio.wait_for(wolfx_collector.started.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert fan_collector.recovery_since == fan_watermark
+    assert wolfx_collector.recovery_since == wolfx_watermark
 
 
 async def test_update_after_success_advances_watermark_and_health_does_not_overwrite_ingest_time(
