@@ -23,6 +23,8 @@ const PROVIDER_LABELS: Record<CollectorProviderStatus["provider"], string> = {
   wolfx: "Wolfx 备用链路",
 };
 
+const PROVIDER_ORDER: CollectorProviderStatus["provider"][] = ["fan", "wolfx"];
+
 function stateLabel(state: CollectorState): string {
   return OVERALL_STATE_LABELS[state];
 }
@@ -44,6 +46,10 @@ export function CollectorStatusPage() {
   useEffect(() => {
     void loadStatus();
   }, [loadStatus]);
+
+  const providerStatuses = new Map(
+    collectorStatus?.providers.map((provider) => [provider.provider, provider]),
+  );
 
   return (
     <section className="page-section" aria-labelledby="collector-status-title">
@@ -135,27 +141,56 @@ export function CollectorStatusPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {collectorStatus.providers.map((provider) => (
-                    <tr key={provider.provider}>
-                      <td className="collector-provider-name">
-                        {PROVIDER_LABELS[provider.provider]}
-                      </td>
-                      <td>
-                        <span className={`collector-state collector-state--${provider.state}`}>
-                          {stateLabel(provider.state)}
-                        </span>
-                      </td>
-                      <td>{provider.connected ? "已连接" : "未连接"}</td>
-                      <td>{formatDateTime(provider.last_connected_at)}</td>
-                      <td>{formatDateTime(provider.last_message_at)}</td>
-                      <td>{formatDateTime(provider.last_success_at)}</td>
-                      <td>{provider.consecutive_failures}</td>
-                      <td>{provider.reconnect_count}</td>
-                      <td>{provider.last_http_status ?? "-"}</td>
-                      <td className="collector-error-cell">{provider.last_error || "无"}</td>
-                      <td>{formatDateTime(provider.updated_at)}</td>
-                    </tr>
-                  ))}
+                  {PROVIDER_ORDER.map((providerName) => {
+                    const provider = providerStatuses.get(providerName);
+                    return (
+                      <tr
+                        key={providerName}
+                        className={provider ? undefined : "collector-provider-row--missing"}
+                      >
+                        <td className="collector-provider-name">
+                          {PROVIDER_LABELS[providerName]}
+                        </td>
+                        {provider ? (
+                          <>
+                            <td>
+                              <span className={`collector-state collector-state--${provider.state}`}>
+                                {stateLabel(provider.state)}
+                              </span>
+                            </td>
+                            <td>{provider.connected ? "已连接" : "未连接"}</td>
+                            <td>{formatDateTime(provider.last_connected_at)}</td>
+                            <td>{formatDateTime(provider.last_message_at)}</td>
+                            <td>{formatDateTime(provider.last_success_at)}</td>
+                            <td>{provider.consecutive_failures}</td>
+                            <td>{provider.reconnect_count}</td>
+                            <td>{provider.last_http_status ?? "-"}</td>
+                            <td className="collector-error-cell">
+                              {provider.last_error || "无"}
+                            </td>
+                            <td>{formatDateTime(provider.updated_at)}</td>
+                          </>
+                        ) : (
+                          <>
+                            <td>
+                              <span className="collector-state collector-state--missing">
+                                状态未上报
+                              </span>
+                            </td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                            <td>-</td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

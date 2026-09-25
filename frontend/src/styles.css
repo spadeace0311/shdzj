@@ -594,6 +594,10 @@ a:hover {
   border-bottom: 0;
 }
 
+.collector-provider-row--missing td {
+  background: #fafbfc;
+}
+
 .collector-provider-name {
   color: var(--text);
   font-weight: 700;
@@ -626,6 +630,12 @@ a:hover {
 .collector-state--degraded {
   background: var(--amber-soft);
   color: var(--amber);
+}
+
+.collector-state--missing {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--text-muted);
 }
 
 .collector-state--critical,

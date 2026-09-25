@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import { getCollectorStatus } from "../src/api/client";
@@ -87,4 +87,41 @@ test("manually refreshes collector state", async () => {
 
   expect(await screen.findByText("总体状态：降级")).toBeInTheDocument();
   await waitFor(() => expect(getCollectorStatusMock).toHaveBeenCalledTimes(2));
+});
+
+test("shows Wolfx as unreported when only FAN has a runtime row", async () => {
+  getCollectorStatusMock.mockResolvedValue({
+    ...degradedStatus,
+    overall_state: "critical",
+    providers: [degradedStatus.providers[0]],
+  });
+
+  render(<CollectorStatusPage />);
+
+  expect(await screen.findByText("总体状态：严重")).toBeInTheDocument();
+  const wolfxRow = screen.getByText("Wolfx 备用链路").closest("tr");
+  expect(wolfxRow).not.toBeNull();
+  expect(within(wolfxRow as HTMLTableRowElement).getByText("状态未上报")).toBeInTheDocument();
+  expect(within(wolfxRow as HTMLTableRowElement).queryByText("未连接")).not.toBeInTheDocument();
+  expect(within(wolfxRow as HTMLTableRowElement).queryByText("0")).not.toBeInTheDocument();
+});
+
+test("shows both providers as unreported when no runtime rows exist", async () => {
+  getCollectorStatusMock.mockResolvedValue({
+    ...degradedStatus,
+    overall_state: "critical",
+    providers: [],
+  });
+
+  render(<CollectorStatusPage />);
+
+  expect(await screen.findByText("总体状态：严重")).toBeInTheDocument();
+  for (const label of ["FAN 主链路", "Wolfx 备用链路"]) {
+    const row = screen.getByText(label).closest("tr");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLTableRowElement).getByText("状态未上报")).toBeInTheDocument();
+  }
+  expect(screen.queryByText("正常")).not.toBeInTheDocument();
+  expect(screen.queryByText("已连接")).not.toBeInTheDocument();
+  expect(screen.queryByText("未连接")).not.toBeInTheDocument();
 });
