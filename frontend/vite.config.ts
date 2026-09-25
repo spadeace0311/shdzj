@@ -16,6 +16,7 @@ export default {
     globals: true,
     setupFiles: ["./tests/setup.ts"],
     css: true,
+    include: ["./tests/**/*.{test,spec}.{ts,tsx}"],
   },
 } satisfies UserConfig & {
   test: {
@@ -23,5 +24,6 @@ export default {
     globals: boolean;
     setupFiles: string[];
     css: boolean;
+    include: string[];
   };
 };
