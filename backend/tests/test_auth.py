@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from app.auth.router import get_auth_service, get_current_user
@@ -157,6 +158,19 @@ def test_login_for_inactive_user_returns_401() -> None:
     assert response.status_code == 401
 
 
+def test_login_for_unknown_user_returns_401() -> None:
+    service = FakeAuthService([])
+
+    with _client(auth_service=service) as client:
+        response = client.post(
+            "/api/v1/auth/login",
+            data={"username": "does-not-exist", "password": "any-password"},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
 def test_me_returns_current_user_without_password_hash() -> None:
     service = FakeAuthService(
         [FakeUser(SUPERADMIN_USERNAME, hash_password(SUPERADMIN_PASSWORD), "superadmin", "sh")]
@@ -214,6 +228,69 @@ def test_me_with_expired_token_returns_401() -> None:
         response = client.get(
             "/api/v1/auth/me",
             headers={"Authorization": f"Bearer {expired}"},
+        )
+
+    assert response.status_code == 401
+
+
+def test_me_rejects_token_for_unknown_user() -> None:
+    token = create_access_token("deleted-user", "viewer")
+    service = FakeAuthService([])
+
+    with _client(auth_service=service) as client:
+        response = client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_database_role_takes_precedence_over_token_role() -> None:
+    token = create_access_token("viewer-user", "superadmin")
+    service = FakeAuthService(
+        [FakeUser("viewer-user", hash_password("not-used-password"), "viewer")]
+    )
+
+    with _client(auth_service=service, event_service=FakeEventService()) as client:
+        me = client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        manual = client.post(
+            "/api/v1/events/manual",
+            json=_manual_payload(),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert me.status_code == 200
+    assert me.json()["role"] == "viewer"
+    assert manual.status_code == 403
+
+
+@pytest.mark.parametrize("algorithm", ("none", "HS384"))
+def test_me_rejects_tokens_signed_with_unexpected_algorithm(algorithm: str) -> None:
+    now = datetime.now(UTC)
+    payload = {
+        "sub": SUPERADMIN_USERNAME,
+        "role": "superadmin",
+        "iat": now,
+        "exp": now + timedelta(hours=1),
+    }
+    if algorithm == "none":
+        token = jwt.encode(payload, "", algorithm="none")
+    else:
+        token = jwt.encode(
+            payload,
+            settings.jwt_secret.get_secret_value(),
+            algorithm=algorithm,
+        )
+
+    with _client() as client:
+        response = client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
         )
 
     assert response.status_code == 401
