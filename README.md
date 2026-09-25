@@ -88,7 +88,7 @@ E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表�
 
 - `E2E_SUPERADMIN_PASSWORD`（必填）：超级管理员密码。测试代码不包含密码。
 - `E2E_BASE_URL`（可选）：前端地址，默认 `http://localhost:5173`。
-- `E2E_API_BASE_URL`（可选）：API 基地址。留空时通过 Vite 的 `/api` 相对路径代理；直连 API 时设为 `http://localhost:8000`。
+- `E2E_API_BASE_URL`（可选）：只影响 Playwright `APIRequestContext` 发出的 API 请求。留空时这些请求使用 Vite 的 `/api` 相对路径；设为绝对地址时，只有测试中的 API 请求直连该地址，页面 UI 的 `/api` 请求仍走 Vite 代理。
 
 通过 Compose 运行：
 
@@ -98,16 +98,16 @@ docker compose -f infra/compose.yaml run --rm `
   frontend npm run test:e2e
 ```
 
-直连 API 时（要求 API 已暴露在 `http://localhost:8000`，且前端或 API 已处理 CORS）：
+需要让 Playwright 的 API 测试请求直连时，在 Compose 容器内应使用服务名 `http://api:8000`，不是容器内的 `localhost`：
 
 ```powershell
 docker compose -f infra/compose.yaml run --rm `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
-  -e E2E_API_BASE_URL="http://localhost:8000" `
+  -e E2E_API_BASE_URL="http://api:8000" `
   frontend npm run test:e2e
 ```
 
-默认相对路径依赖 Compose 网络内的 Vite 代理：`frontend` 容器将 `/api` 转发到 `http://api:8000`。如果没有运行在 Compose 网络内，请改用 `E2E_API_BASE_URL` 直连，并确认跨域配置。
+页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发，代理目标当前为 `http://api:8000`。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的 API 测试请求，不会把页面 UI 的 API 基地址改成其他值。Playwright `APIRequestContext` 在浏览器上下文之外发送 HTTP 请求，因此不受浏览器 CORS 限制；页面 UI 的 `/api` 请求则依赖 Vite 代理，通常无需跨域配置。若要脱离 Compose 网络在宿主机直接运行前端，需要自行让 Vite 的代理目标指向宿主机可访问的 API 地址，并相应设置 `E2E_BASE_URL`。
 
 ## 本工作区验证状态
 

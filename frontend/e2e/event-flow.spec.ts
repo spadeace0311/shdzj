@@ -76,8 +76,10 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
   });
 
   await refreshListWithoutReload(page);
-  await expect(page.getByText(place)).toBeVisible();
-  await page.getByRole("link", { name: place }).click();
+  const row = page.getByRole("row").filter({ hasText: place });
+  await expect(row).toContainText("重大响应");
+  await expect(row).toContainText("服务响应二级");
+  await row.getByRole("link", { name: place }).click();
 
   await expect(page.getByRole("heading", { level: 1, name: place })).toBeVisible();
   await expect(page.getByText("重大响应")).toBeVisible();
@@ -89,7 +91,7 @@ test("drill event keeps its identifier visible in list and detail", async ({ pag
   await loginThroughUi(page);
 
   const runId = Date.now().toString();
-  const place = `演练事件 E2E ${runId}`;
+  const place = `浦东新区 E2E ${runId}`;
   const token = await getApiToken(request);
   const response = await request.post(apiUrl("/api/v1/events/manual"), {
     headers: {
@@ -116,9 +118,15 @@ test("drill event keeps its identifier visible in list and detail", async ({ pag
   await refreshListWithoutReload(page);
   await page.getByLabel("事件类型").selectOption("drill");
   const row = page.getByRole("row").filter({ hasText: place });
-  await expect(row).toContainText("演练");
+  await expect(row.getByText("演练", { exact: true })).toBeVisible();
   await row.getByRole("link", { name: place }).click();
 
   await expect(page.getByRole("heading", { level: 1, name: place })).toBeVisible();
-  await expect(page.getByText("演练")).toBeVisible();
+  await expect(page.locator(".kind-tag").getByText("演练", { exact: true })).toBeVisible();
+});
+
+test("anonymous detail route redirects to login", async ({ page }) => {
+  await page.goto("/events/not-a-real-id");
+  await expect(page.getByRole("heading", { name: "事件控制台" })).toBeVisible();
+  await expect(page.getByLabel("用户名")).toBeVisible();
 });
