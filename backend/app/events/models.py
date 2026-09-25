@@ -30,6 +30,8 @@ class RawMessage(Base):
     source: Mapped[str] = mapped_column(String(32), index=True)
     source_message_id: Mapped[str | None] = mapped_column(String(128), index=True)
     message_kind: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str | None] = mapped_column(String(32), index=True)
+    ingest_lane: Mapped[str | None] = mapped_column(String(32), index=True)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         index=True,
@@ -62,6 +64,14 @@ class EarthquakeEvent(Base):
     response_suggestion: Mapped[dict | None] = mapped_column(JSONB)
     response_rule_version: Mapped[str | None] = mapped_column(String(32))
     current_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    t1_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lifecycle_state: Mapped[str] = mapped_column(
+        String(32),
+        default="auto_pending",
+        server_default=text("'auto_pending'"),
+        index=True,
+    )
+    latest_trigger_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
@@ -86,6 +96,13 @@ class EarthquakeRevision(Base):
             "event_id",
             unique=True,
             postgresql_where=text("is_current"),
+        ),
+        Index(
+            "uq_earthquake_revisions_semantic_fingerprint",
+            "event_id",
+            "semantic_fingerprint",
+            unique=True,
+            postgresql_where=text("semantic_fingerprint IS NOT NULL"),
         ),
     )
 
@@ -114,6 +131,14 @@ class EarthquakeRevision(Base):
     service_level: Mapped[int | None] = mapped_column(Integer)
     response_suggestion: Mapped[dict | None] = mapped_column(JSONB)
     response_rule_version: Mapped[str | None] = mapped_column(String(32))
+    semantic_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    provider: Mapped[str | None] = mapped_column(String(32), index=True)
+    ingest_lane: Mapped[str | None] = mapped_column(String(32), index=True)
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    inside_shanghai: Mapped[bool | None] = mapped_column(Boolean)
+    distance_to_boundary_km: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
+    region_boundary_version: Mapped[str | None] = mapped_column(String(64), index=True)
+    region_computed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_current: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -127,3 +152,41 @@ class EarthquakeRevision(Base):
     )
 
     event: Mapped[EarthquakeEvent] = relationship(back_populates="revisions")
+
+
+class EventLifecycleOutbox(Base):
+    __tablename__ = "event_lifecycle_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            "revision_id",
+            "trigger_type",
+            name="uq_event_lifecycle_outbox_event_revision_type",
+        ),
+        Index("ix_event_lifecycle_outbox_pending", "status", "available_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("earthquake_events.id", ondelete="CASCADE"),
+        index=True,
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("earthquake_revisions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    trigger_type: Mapped[str] = mapped_column(String(64))
+    trigger_reason: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("now()"),
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("now()"),
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)

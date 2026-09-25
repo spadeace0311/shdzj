@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.auth import models as auth_models  # noqa: F401
 from app.config import settings
 from app.db import Base
+
+# Importing this module registers lifecycle tables, including EventLifecycleOutbox.
 from app.events import models as event_models  # noqa: F401
 
 config = context.config
