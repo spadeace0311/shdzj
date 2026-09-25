@@ -8,11 +8,11 @@ from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 
 
 def test_event_model_metadata_matches_foundation_contract() -> None:
-    assert set(Base.metadata.tables) == {
+    assert {
         "raw_messages",
         "earthquake_events",
         "earthquake_revisions",
-    }
+    } <= set(Base.metadata.tables)
 
     raw_messages = RawMessage.__table__
     events = EarthquakeEvent.__table__

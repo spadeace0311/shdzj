@@ -20,6 +20,9 @@ services:
       context: ../backend
     env_file:
       - ../.env
+    environment:
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET is required}"
+      SUPERADMIN_INITIAL_PASSWORD: "${SUPERADMIN_INITIAL_PASSWORD:?SUPERADMIN_INITIAL_PASSWORD is required}"
     command:
       - uvicorn
       - app.main:app
