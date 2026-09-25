@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import func, select, text, update
+from sqlalchemy import case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
@@ -19,6 +19,7 @@ _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
 _REVIEWED_EVENT_KINDS = {EventKind.FORMAL, EventKind.CORRECTION}
 _LOGICAL_EVENT_KINDS = {EventKind.AUTO, EventKind.FORMAL, EventKind.CORRECTION}
+_REAL_EVENT_KINDS = {EventKind.MANUAL, EventKind.FORMAL, EventKind.CORRECTION}
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,17 @@ class EventIngestResult:
     revision_no: int
     event_kind: EventKind
     is_current: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EventIngestOutcome:
+    event_id: str
+    revision_id: str
+    revision_no: int
+    event_kind: EventKind
+    is_current: bool
+    institutional_level: str | None
+    service_level: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,29 +238,63 @@ class EventRepository:
             is_current=becomes_current,
         )
 
-    async def set_response_suggestion(
+    async def set_revision_suggestion(
         self,
         session: AsyncSession,
-        event_id: str,
+        revision_id: str,
         suggestion: ResponseSuggestion,
         suggestion_payload: dict,
     ) -> None:
-        event = await session.get(
-            EarthquakeEvent,
-            uuid.UUID(event_id),
+        try:
+            revision_uuid = uuid.UUID(revision_id)
+        except (TypeError, ValueError) as exc:
+            raise LookupError(f"revision not found: {revision_id}") from exc
+
+        revision = await session.get(
+            EarthquakeRevision,
+            revision_uuid,
             with_for_update=True,
         )
+        if revision is None:
+            raise LookupError(f"revision not found: {revision_id}")
+        _apply_suggestion_to_revision(revision, suggestion, suggestion_payload)
+
+        if revision.is_current:
+            event = await session.get(
+                EarthquakeEvent,
+                revision.event_id,
+                with_for_update=True,
+            )
+            if event is None:
+                raise LookupError(f"event not found: {revision.event_id}")
+            _apply_suggestion_to_event(event, suggestion, suggestion_payload)
+
+    async def get_current_response_levels(
+        self,
+        session: AsyncSession,
+        event_id: str,
+    ) -> tuple[str | None, int | None]:
+        try:
+            event_uuid = uuid.UUID(event_id)
+        except (TypeError, ValueError) as exc:
+            raise LookupError(f"event not found: {event_id}") from exc
+
+        event = await session.get(EarthquakeEvent, event_uuid)
         if event is None:
             raise LookupError(f"event not found: {event_id}")
-        event.institutional_level = suggestion.institutional_level
-        event.service_level = suggestion.service_level
-        event.response_suggestion = suggestion_payload
-        event.response_rule_version = suggestion.rule_version
+        return event.institutional_level, event.service_level
 
     async def list_current_events(
         self,
         session: AsyncSession,
     ) -> list[EventSummaryRecord]:
+        real_event_rank = case(
+            (
+                EarthquakeEvent.event_type.in_(tuple(kind.value for kind in _REAL_EVENT_KINDS)),
+                0,
+            ),
+            else_=1,
+        )
         rows = await session.execute(
             select(EarthquakeEvent, EarthquakeRevision)
             .join(
@@ -257,6 +303,7 @@ class EventRepository:
             )
             .where(EarthquakeEvent.current_revision_id.is_not(None))
             .order_by(
+                real_event_rank.asc(),
                 EarthquakeEvent.origin_time.desc(),
                 EarthquakeEvent.id.desc(),
             )
@@ -365,8 +412,10 @@ def _becomes_current(
     incoming_kind = event.kind
 
     if incoming_kind not in _LOGICAL_EVENT_KINDS:
-        if current_kind in _REVIEWED_EVENT_KINDS:
-            return False
+        incoming_is_real = incoming_kind in _REAL_EVENT_KINDS
+        current_is_real = current_kind in _REAL_EVENT_KINDS
+        if incoming_is_real != current_is_real:
+            return incoming_is_real
         return _normalize_utc(received_at, "received_at") > _normalize_utc(
             current_revision.created_at,
             "revision.created_at",
@@ -437,6 +486,28 @@ def _apply_current_event_fields(
     canonical.place = event.place
     canonical.geom = geom
     canonical.current_revision_id = revision_id
+
+
+def _apply_suggestion_to_revision(
+    revision: EarthquakeRevision,
+    suggestion: ResponseSuggestion,
+    suggestion_payload: dict,
+) -> None:
+    revision.institutional_level = suggestion.institutional_level
+    revision.service_level = suggestion.service_level
+    revision.response_suggestion = suggestion_payload
+    revision.response_rule_version = suggestion.rule_version
+
+
+def _apply_suggestion_to_event(
+    event: EarthquakeEvent,
+    suggestion: ResponseSuggestion,
+    suggestion_payload: dict,
+) -> None:
+    event.institutional_level = suggestion.institutional_level
+    event.service_level = suggestion.service_level
+    event.response_suggestion = suggestion_payload
+    event.response_rule_version = suggestion.rule_version
 
 
 def _event_summary_record(

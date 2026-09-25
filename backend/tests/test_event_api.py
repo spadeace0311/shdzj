@@ -4,10 +4,14 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
-from app.events.repository import EventIngestResult
+from app.events.repository import (
+    EventDetailRecord,
+    EventIngestOutcome,
+    EventIngestResult,
+    EventSummaryRecord,
+)
 from app.events.response_rules import ResponseSuggestion
 from app.events.router import get_event_service
-from app.events.schemas import EventDetailResponse, EventSummaryResponse
 from app.main import app
 
 
@@ -56,8 +60,9 @@ class FakeEventService:
             causes=(),
             rule_version="2026.1",
         )
-        self.summaries: list[EventSummaryResponse] = []
-        self.details: dict[str, EventDetailResponse] = {}
+        self._current_suggestions: dict[str, tuple[str | None, int | None]] = {}
+        self.summaries: list[EventSummaryRecord] = []
+        self.details: dict[str, EventDetailRecord] = {}
 
     async def ingest(
         self,
@@ -91,14 +96,41 @@ class FakeEventService:
         self._ingested[key] = result
         return result
 
-    async def apply_response_suggestion(self, event_id: str, value: object) -> ResponseSuggestion:
-        del event_id, value
-        return self.suggestion
+    async def ingest_with_response_suggestion(
+        self,
+        raw_payload: dict[str, object],
+        event: object,
+        response_input: object | None = None,
+        received_at: datetime | None = None,
+    ) -> EventIngestOutcome:
+        del received_at
+        key = json.dumps(raw_payload, sort_keys=True, ensure_ascii=False)
+        result = self._ingested.get(key)
+        if result is None:
+            result = await self.ingest(raw_payload, event)
+        if response_input is not None:
+            self._current_suggestions[result.event_id] = (
+                self.suggestion.institutional_level,
+                self.suggestion.service_level,
+            )
+        institutional_level, service_level = self._current_suggestions.get(
+            result.event_id,
+            (None, None),
+        )
+        return EventIngestOutcome(
+            event_id=result.event_id,
+            revision_id=result.revision_id,
+            revision_no=result.revision_no,
+            event_kind=result.event_kind,
+            is_current=result.is_current,
+            institutional_level=institutional_level,
+            service_level=service_level,
+        )
 
-    async def list_events(self) -> list[EventSummaryResponse]:
+    async def list_events(self) -> list[EventSummaryRecord]:
         return self.summaries
 
-    async def get_event(self, event_id: str) -> EventDetailResponse:
+    async def get_event(self, event_id: str) -> EventDetailRecord:
         if event_id not in self.details:
             raise LookupError(f"event not found: {event_id}")
         return self.details[event_id]
@@ -234,8 +266,8 @@ def test_duplicate_auto_and_formal_messages_are_idempotent() -> None:
 def test_list_events_returns_summaries() -> None:
     service = FakeEventService()
     service.summaries = [
-        EventSummaryResponse(
-            id="event-1",
+        EventSummaryRecord(
+            event_id="event-1",
             source="cenc",
             event_kind="formal",
             place="Shanghai Pudong",
@@ -261,8 +293,8 @@ def test_list_events_returns_summaries() -> None:
 
 def test_get_event_returns_detail() -> None:
     service = FakeEventService()
-    detail = EventDetailResponse(
-        id="event-1",
+    detail = EventDetailRecord(
+        event_id="event-1",
         source="cenc",
         place="Shanghai Pudong",
         magnitude=Decimal("5.2"),
@@ -313,3 +345,56 @@ def test_formal_without_region_context_ingests_without_suggestion() -> None:
     assert response.json()["event_kind"] == "formal"
     assert response.json()["institutional_level"] is None
     assert response.json()["service_level"] is None
+
+
+def test_formal_without_region_context_returns_existing_current_suggestion() -> None:
+    service = FakeEventService()
+    client = _client(service)
+
+    first = client.post("/api/v1/ingest/formal", json=_formal_payload())
+    second = client.post(
+        "/api/v1/ingest/formal",
+        json=_formal_payload(region_context=False),
+    )
+
+    assert first.status_code == 201
+    assert first.json()["institutional_level"] == "major"
+    assert second.status_code == 201
+    assert second.json()["institutional_level"] == "major"
+    assert second.json()["service_level"] == 2
+
+
+def test_manual_event_with_naive_origin_time_returns_422() -> None:
+    client = _client(FakeEventService())
+
+    response = client.post(
+        "/api/v1/events/manual",
+        json={
+            "origin_time": "2026-09-17T02:30:05",
+            "longitude": 121.54,
+            "latitude": 31.22,
+            "magnitude": 3.2,
+            "depth_km": 8.0,
+            "source": "shanghai-network",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_manual_event_with_blank_source_returns_422() -> None:
+    client = _client(FakeEventService())
+
+    response = client.post(
+        "/api/v1/events/manual",
+        json={
+            "origin_time": "2026-09-17T02:30:05Z",
+            "longitude": 121.54,
+            "latitude": 31.22,
+            "magnitude": 3.2,
+            "depth_km": 8.0,
+            "source": "   ",
+        },
+    )
+
+    assert response.status_code == 422

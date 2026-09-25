@@ -27,6 +27,10 @@ def test_event_model_metadata_matches_foundation_contract() -> None:
     assert revisions.c.source_report_time.nullable is True
     assert revisions.c.source_report_number.type.python_type is int
     assert revisions.c.source_report_number.nullable is True
+    assert revisions.c.institutional_level.nullable is True
+    assert revisions.c.service_level.nullable is True
+    assert revisions.c.response_rule_version.nullable is True
+    assert revisions.c.response_suggestion.nullable is True
     assert any(
         index.dialect_options["postgresql"].get("using") == "gist"
         for index in events.indexes

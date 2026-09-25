@@ -110,6 +110,10 @@ class EarthquakeRevision(Base):
     depth_km: Mapped[Decimal] = mapped_column(Numeric(8, 2))
     magnitude: Mapped[Decimal] = mapped_column(Numeric(4, 1))
     place: Mapped[str] = mapped_column(String(256))
+    institutional_level: Mapped[str | None] = mapped_column(String(32))
+    service_level: Mapped[int | None] = mapped_column(Integer)
+    response_suggestion: Mapped[dict | None] = mapped_column(JSONB)
+    response_rule_version: Mapped[str | None] = mapped_column(String(32))
     is_current: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

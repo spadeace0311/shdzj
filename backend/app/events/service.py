@@ -7,6 +7,7 @@ from app.config import settings
 from app.events.domain import NormalizedEvent
 from app.events.repository import (
     EventDetailRecord,
+    EventIngestOutcome,
     EventIngestResult,
     EventRepository,
     EventSummaryRecord,
@@ -14,9 +15,7 @@ from app.events.repository import (
 from app.events.response_rules import (
     ResponseInput,
     ResponseRuleEngine,
-    ResponseSuggestion,
 )
-from app.events.schemas import EventDetailResponse, EventSummaryResponse
 
 
 class EventService:
@@ -50,71 +49,72 @@ class EventService:
                 )
                 return await self._repository.append_revision(session, raw, event)
 
-    async def apply_response_suggestion(
+    async def ingest_with_response_suggestion(
+        self,
+        raw_payload: dict[str, object],
+        event: NormalizedEvent,
+        response_input: ResponseInput | None = None,
+        received_at: datetime | None = None,
+    ) -> EventIngestOutcome:
+        if not isinstance(event, NormalizedEvent):
+            raise TypeError("event must be a NormalizedEvent")
+        EventRepository.validate_payload(raw_payload)
+        normalized_received_at = _normalize_received_at(received_at)
+        suggestion = None
+        if response_input is not None:
+            engine = ResponseRuleEngine.from_yaml(settings.response_rules_path)
+            suggestion = engine.suggest(response_input)
+        suggestion_payload = None
+        if suggestion is not None:
+            suggestion_payload = asdict(suggestion)
+            suggestion_payload["causes"] = list(suggestion.causes)
+
+        async with self._session_factory() as session:
+            async with session.begin():
+                await self._repository.acquire_ingest_lock(session, event.source)
+                raw = await self._repository.get_or_create_raw_message(
+                    session,
+                    raw_payload,
+                    event,
+                    normalized_received_at,
+                )
+                result = await self._repository.append_revision(session, raw, event)
+                if suggestion is not None:
+                    await self._repository.set_revision_suggestion(
+                        session,
+                        result.revision_id,
+                        suggestion,
+                        suggestion_payload,
+                    )
+                (
+                    institutional_level,
+                    service_level,
+                ) = await self._repository.get_current_response_levels(
+                    session,
+                    result.event_id,
+                )
+        return EventIngestOutcome(
+            event_id=result.event_id,
+            revision_id=result.revision_id,
+            revision_no=result.revision_no,
+            event_kind=result.event_kind,
+            is_current=result.is_current,
+            institutional_level=institutional_level,
+            service_level=service_level,
+        )
+
+    async def list_events(self) -> list[EventSummaryRecord]:
+        async with self._session_factory() as session:
+            async with session.begin():
+                return await self._repository.list_current_events(session)
+
+    async def get_event(
         self,
         event_id: str,
-        value: ResponseInput,
-    ) -> ResponseSuggestion:
-        engine = ResponseRuleEngine.from_yaml(settings.response_rules_path)
-        suggestion = engine.suggest(value)
+    ) -> EventDetailRecord:
         async with self._session_factory() as session:
             async with session.begin():
-                suggestion_payload = asdict(suggestion)
-                suggestion_payload["causes"] = list(suggestion.causes)
-                await self._repository.set_response_suggestion(
-                    session,
-                    event_id,
-                    suggestion,
-                    suggestion_payload,
-                )
-        return suggestion
-
-    async def list_events(self) -> list[EventSummaryResponse]:
-        async with self._session_factory() as session:
-            async with session.begin():
-                records = await self._repository.list_current_events(session)
-        return [_summary_response(record) for record in records]
-
-    async def get_event(self, event_id: str) -> EventDetailResponse:
-        async with self._session_factory() as session:
-            async with session.begin():
-                record = await self._repository.get_current_event(session, event_id)
-        return _detail_response(record)
-
-
-def _summary_response(record: EventSummaryRecord) -> EventSummaryResponse:
-    return EventSummaryResponse(
-        id=record.event_id,
-        source=record.source,
-        event_kind=record.event_kind,
-        place=record.place,
-        magnitude=record.magnitude,
-        depth_km=record.depth_km,
-        origin_time=record.origin_time,
-        longitude=record.longitude,
-        latitude=record.latitude,
-        institutional_level=record.institutional_level,
-        service_level=record.service_level,
-        revision_no=record.revision_no,
-    )
-
-
-def _detail_response(record: EventDetailRecord) -> EventDetailResponse:
-    return EventDetailResponse(
-        id=record.event_id,
-        source=record.source,
-        place=record.place,
-        magnitude=record.magnitude,
-        depth_km=record.depth_km,
-        origin_time=record.origin_time,
-        longitude=record.longitude,
-        latitude=record.latitude,
-        institutional_level=record.institutional_level,
-        service_level=record.service_level,
-        response_suggestion=record.response_suggestion,
-        response_rule_version=record.response_rule_version,
-        revision_no=record.revision_no,
-    )
+                return await self._repository.get_current_event(session, event_id)
 
 
 def _normalize_received_at(value: datetime | None) -> datetime:
