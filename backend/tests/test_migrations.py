@@ -1,9 +1,187 @@
 import ast
+import subprocess
+import uuid
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import inspect, text
+from sqlalchemy.ext.asyncio import create_async_engine
 
+BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
+REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
+OLD_REGION_REVISION = "0007_region_boundaries"
+MIGRATION_TEST_VERSION = "migration-test-0008"
+
+
+def _alembic(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["alembic", *args],
+        cwd=BACKEND_DIR,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError(
+            f"alembic {' '.join(args)} failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
+
+
+def _current_revision() -> str:
+    result = _alembic("current")
+    revision_lines = [
+        line.strip().split()[0]
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.lstrip().startswith("INFO")
+    ]
+    assert revision_lines
+    return revision_lines[-1]
+
+
+def _set_revision(target: str) -> None:
+    current = _current_revision()
+    if current == target:
+        return
+
+    alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    scripts = ScriptDirectory.from_config(alembic_config)
+    target_revision = scripts.get_revision(target)
+    current_ancestors: set[str] = set()
+    pending = [scripts.get_revision(current)]
+    while pending:
+        revision = pending.pop()
+        if revision.revision in current_ancestors:
+            continue
+        current_ancestors.add(revision.revision)
+        down_revisions = revision.down_revision
+        if down_revisions is None:
+            continue
+        if isinstance(down_revisions, tuple):
+            pending.extend(scripts.get_revision(item) for item in down_revisions)
+        else:
+            pending.append(scripts.get_revision(down_revisions))
+    if target_revision.revision in current_ancestors:
+        _alembic("downgrade", target)
+    else:
+        _alembic("upgrade", target)
+
+
+async def _delete_migration_test_rows() -> None:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM region_boundaries WHERE version = :version"),
+                {"version": MIGRATION_TEST_VERSION},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _insert_old_region_boundary(
+    *,
+    source_uri: str | None,
+    checksum: str | None,
+) -> None:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO region_boundaries (
+                        id,
+                        version,
+                        name,
+                        local_buffer_km,
+                        geom,
+                        source_uri,
+                        checksum,
+                        is_active
+                    )
+                    VALUES (
+                        CAST(:id AS uuid),
+                        :version,
+                        'migration-test',
+                        50,
+                        ST_GeomFromText(
+                            'MULTIPOLYGON (((120.8 30.6, 122.2 30.6, 122.2 31.9,
+                                             120.8 31.9, 120.8 30.6)))',
+                            4326
+                        ),
+                        :source_uri,
+                        :checksum,
+                        false
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "version": MIGRATION_TEST_VERSION,
+                    "source_uri": source_uri,
+                    "checksum": checksum,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _region_boundary_state(
+    *,
+    include_maritime: bool = True,
+) -> dict[str, object]:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(_inspect_region_columns)
+            maritime_expression = (
+                "ST_IsEmpty(maritime_geom)" if include_maritime else "NULL::boolean"
+            )
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            f"""
+                        SELECT
+                            source_uri,
+                            checksum,
+                            {maritime_expression} AS maritime_empty,
+                            ST_Covers(
+                                geom,
+                                ST_SetSRID(ST_MakePoint(121.5, 31.2), 4326)
+                            ) AS administrative_covers
+                        FROM region_boundaries
+                        WHERE version = :version
+                        """
+                        ),
+                        {"version": MIGRATION_TEST_VERSION},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        return {"columns": columns, "row": dict(row)}
+    finally:
+        await engine.dispose()
+
+
+def _inspect_region_columns(connection) -> dict[str, dict[str, object]]:
+    return {
+        column["name"]: column for column in inspect(connection).get_columns("region_boundaries")
+    }
+
+
+def _database_url() -> str:
+    from app.config import settings
+
+    return settings.database_url
 
 
 def test_migration_identifiers_fit_alembic_version_column() -> None:
@@ -26,3 +204,70 @@ def test_migration_identifiers_fit_alembic_version_column() -> None:
                     oversized.append(f"{migration.name}:{node.target.id}={identifier}")
 
     assert oversized == []
+
+
+def test_migration_head_includes_region_maritime_forward_fix() -> None:
+    alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+
+    assert (
+        ScriptDirectory.from_config(alembic_config).get_current_head() == REGION_MARITIME_REVISION
+    )
+
+
+async def test_0008_backfills_old_rows_and_downgrade_upgrade_is_reversible() -> None:
+    _set_revision(OLD_REGION_REVISION)
+    await _delete_migration_test_rows()
+    await _insert_old_region_boundary(
+        source_uri="https://example.gov.invalid/regions/shanghai.geojson",
+        checksum="a" * 64,
+    )
+
+    try:
+        _set_revision(REGION_MARITIME_REVISION)
+        upgraded = await _region_boundary_state()
+
+        assert upgraded["columns"]["maritime_geom"]["nullable"] is False
+        assert upgraded["columns"]["source_uri"]["nullable"] is False
+        assert upgraded["columns"]["checksum"]["nullable"] is False
+        assert upgraded["row"]["maritime_empty"] is True
+        assert upgraded["row"]["administrative_covers"] is True
+        assert upgraded["row"]["source_uri"].startswith("https://")
+        assert upgraded["row"]["checksum"] == "a" * 64
+
+        _set_revision(OLD_REGION_REVISION)
+        downgraded = await _region_boundary_state(include_maritime=False)
+
+        assert "maritime_geom" not in downgraded["columns"]
+        assert downgraded["columns"]["source_uri"]["nullable"] is True
+        assert downgraded["columns"]["checksum"]["nullable"] is True
+        assert downgraded["row"]["administrative_covers"] is True
+
+        _set_revision(REGION_MARITIME_REVISION)
+        re_upgraded = await _region_boundary_state()
+
+        assert re_upgraded["row"]["maritime_empty"] is True
+        assert re_upgraded["row"]["source_uri"].startswith("https://")
+        assert re_upgraded["row"]["checksum"] == "a" * 64
+    finally:
+        await _delete_migration_test_rows()
+        _set_revision(REGION_MARITIME_REVISION)
+
+
+async def test_0008_fails_when_old_row_has_null_audit_data() -> None:
+    _set_revision(OLD_REGION_REVISION)
+    await _delete_migration_test_rows()
+    await _insert_old_region_boundary(
+        source_uri=None,
+        checksum="b" * 64,
+    )
+
+    try:
+        result = _alembic("upgrade", REGION_MARITIME_REVISION, check=False)
+
+        assert result.returncode != 0
+        assert "source_uri" in result.stderr or "source_uri" in result.stdout
+        assert _current_revision() == OLD_REGION_REVISION
+    finally:
+        await _delete_migration_test_rows()
+        _set_revision(REGION_MARITIME_REVISION)
