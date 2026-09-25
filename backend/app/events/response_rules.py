@@ -53,11 +53,13 @@ class ResponseRuleEngine:
             self._config["institutional"]["downgrade"]["local_depth_gt_km"]
         )
         if value.inside_shanghai and value.depth_km > local_depth_threshold:
-            institutional = self._downgrade(institutional)
-            causes.append(
-                f"震源深度大于{self._number_text(local_depth_threshold)}公里，制度响应建议降低一级"
-            )
-            downgraded = True
+            downgraded_level = self._downgrade_if_allowed(institutional)
+            if downgraded_level is not None:
+                institutional = downgraded_level
+                causes.append(
+                    f"震源深度大于{self._number_text(local_depth_threshold)}公里，制度响应建议降低一级"
+                )
+                downgraded = True
 
         boundary = self._config["institutional"]["downgrade"]["external_boundary_distance_km"]
         boundary_min = self._decimal(boundary["min_inclusive"])
@@ -67,12 +69,14 @@ class ResponseRuleEngine:
             and value.distance_to_boundary_km is not None
             and boundary_min <= value.distance_to_boundary_km <= boundary_max
         ):
-            institutional = self._downgrade(institutional)
-            causes.append(
-                f"外省震中距上海边界{self._number_text(boundary_min)}至"
-                f"{self._number_text(boundary_max)}公里，制度响应建议降低一级"
-            )
-            downgraded = True
+            downgraded_level = self._downgrade_if_allowed(institutional)
+            if downgraded_level is not None:
+                institutional = downgraded_level
+                causes.append(
+                    f"外省震中距上海边界{self._number_text(boundary_min)}至"
+                    f"{self._number_text(boundary_max)}公里，制度响应建议降低一级"
+                )
+                downgraded = True
 
         intensity_threshold = self._decimal(
             self._config["trigger"]["default_max_intensity_threshold"]
@@ -116,7 +120,7 @@ class ResponseRuleEngine:
                 if value.depth_km > self._decimal(
                     self._config["service"]["downgrade_location_depth_gt_km"]
                 ):
-                    return min(4, level + 1)
+                    return min(self._service_max_level(), level + 1)
                 return level
         return None
 
@@ -134,6 +138,15 @@ class ResponseRuleEngine:
             return False
         maximum = band.get("max_exclusive")
         return maximum is None or value < Decimal(str(maximum))
+
+    def _service_max_level(self) -> int:
+        return max(int(band["level"]) for band in self._config["service"]["bands"])
+
+    def _downgrade_if_allowed(self, level: str) -> str | None:
+        if level in ("none", "pending"):
+            return None
+        candidate = self._downgrade(level)
+        return candidate if candidate != level else None
 
     def _downgrade(self, level: str) -> str:
         order = [str(item) for item in self._config["institutional"]["downgrade"]["order"]]

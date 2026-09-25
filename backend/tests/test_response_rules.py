@@ -1,6 +1,8 @@
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+import yaml
 
 from app.config import settings
 from app.events.response_rules import (
@@ -12,6 +14,13 @@ from app.events.response_rules import (
 
 def _engine() -> ResponseRuleEngine:
     return ResponseRuleEngine.from_yaml(settings.response_rules_path)
+
+
+def _bundled_rule_config() -> dict:
+    config_path = (
+        Path(__file__).resolve().parents[2] / "config" / "response_rules" / "shanghai-2026.yaml"
+    )
+    return yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
 
 def _suggest(
@@ -133,6 +142,20 @@ def test_external_negative_deaths_has_no_institutional_recommendation() -> None:
     assert result.downgraded is False
 
 
+def test_external_missing_deaths_inside_boundary_window_does_not_report_downgrade() -> None:
+    result = _suggest(
+        magnitude="4.4",
+        depth_km="10",
+        inside_shanghai=False,
+        distance_to_boundary_km="30",
+    )
+
+    assert result.institutional_level == "none"
+    assert result.service_level is None
+    assert result.downgraded is False
+    assert not any("降低一级" in cause for cause in result.causes)
+
+
 @pytest.mark.parametrize("distance_km", ["20", "100"])
 def test_external_boundary_edges_are_inclusive(distance_km: str) -> None:
     result = _suggest(
@@ -199,6 +222,15 @@ def test_local_depth_downgrade_is_strictly_above_60_km(
     assert result.downgraded is downgraded
 
 
+def test_local_below_band_depth_downgrade_does_not_report_downgrade() -> None:
+    result = _suggest(magnitude="2.5", depth_km="80", inside_shanghai=True)
+
+    assert result.institutional_level == "none"
+    assert result.service_level is None
+    assert result.downgraded is False
+    assert not any("降低一级" in cause for cause in result.causes)
+
+
 @pytest.mark.parametrize(
     ("depth_km", "service_level"),
     [
@@ -225,6 +257,25 @@ def test_service_depth_downgrade_caps_at_level_four() -> None:
     assert result.institutional_level == "none"
     assert result.service_level == 4
     assert result.downgraded is True
+
+
+def test_service_max_level_is_driven_by_band_configuration() -> None:
+    config = _bundled_rule_config()
+    config["service"]["bands"] = [{"min": 3.0, "max_exclusive": 4.0, "level": 5}]
+    engine = ResponseRuleEngine(config)
+
+    result = engine.suggest(
+        ResponseInput(
+            magnitude=Decimal("3.0"),
+            depth_km=Decimal("80"),
+            inside_shanghai=True,
+            distance_to_boundary_km=None,
+            deaths=None,
+            max_intensity=None,
+        )
+    )
+
+    assert result.service_level == 5
 
 
 def test_missing_shanghai_relation_is_pending() -> None:
