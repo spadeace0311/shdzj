@@ -90,6 +90,12 @@ class _AuthenticationFailed(Exception):
     pass
 
 
+class _CallbackFailure(Exception):
+    def __init__(self, original: Exception) -> None:
+        self.original = original
+        super().__init__(str(original))
+
+
 def _nested_data(message: dict[str, object], *keys: str) -> object:
     value: object = message
     for key in keys:
@@ -138,6 +144,7 @@ class FanCollector:
 
     def _reset_state(self) -> None:
         self._connected = False
+        self._authenticated = False
         self._last_http_status: int | None = None
         self._last_connected_at: datetime | None = None
         self._last_message_at: datetime | None = None
@@ -169,6 +176,8 @@ class FanCollector:
                     await self._emit_health(on_health, "degraded")
                     await self._wait_for_stop(stop_event, self._next_delay())
                     url_index = (url_index + 1) % len(self._urls)
+                except _CallbackFailure as exc:
+                    raise exc.original
                 except Exception:
                     if stop_event.is_set():
                         break
@@ -178,6 +187,9 @@ class FanCollector:
                     url_index = (url_index + 1) % len(self._urls)
         finally:
             if stop_event.is_set():
+                self._connected = False
+                self._last_http_status = None
+                self._authenticated = False
                 await self._emit_health(on_health, "stopped")
 
     async def _run_connection(
@@ -187,6 +199,7 @@ class FanCollector:
         on_health: HealthCallback,
         stop_event: asyncio.Event,
     ) -> None:
+        self._authenticated = False
         websocket = await self._connect(url)
         try:
             self._connected = True
@@ -221,7 +234,10 @@ class FanCollector:
                 if error is not None:
                     raise error
         finally:
-            await websocket.close()
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     async def _receive_loop(
         self,
@@ -239,21 +255,30 @@ class FanCollector:
             if parsed is None:
                 continue
             if parsed.auth_state == "success":
+                self._authenticated = True
+                self._last_error = None
+                self._consecutive_failures = 0
                 continue
             if parsed.auth_state == "failed":
+                self._authenticated = False
                 raise _AuthenticationFailed
             if parsed.heartbeat:
                 continue
             if parsed.envelope is None:
                 continue
 
-            self._last_http_status = None
-            self._last_message_at = parsed.envelope.received_at
-            self._last_success_at = parsed.envelope.received_at
-            self._consecutive_failures = 0
-            self._last_error = None
-            await on_envelope(parsed.envelope)
-            await self._emit_health(on_health, "healthy")
+            try:
+                if self._authenticated:
+                    self._last_http_status = None
+                    self._last_message_at = parsed.envelope.received_at
+                    self._last_success_at = parsed.envelope.received_at
+                    self._consecutive_failures = 0
+                    self._last_error = None
+                await on_envelope(parsed.envelope)
+                if self._authenticated:
+                    await self._emit_health(on_health, "healthy")
+            except Exception as exc:
+                raise _CallbackFailure(exc) from exc
 
     async def _heartbeat_loop(self, websocket: Any, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -271,20 +296,22 @@ class FanCollector:
             return _STOPPED
         recv_task = asyncio.create_task(websocket.recv())
         stop_task = asyncio.create_task(stop_event.wait())
-        done, pending = await asyncio.wait(
-            {recv_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if stop_task in done:
-            return _STOPPED
-        return await recv_task
+        try:
+            done, _ = await asyncio.wait(
+                {recv_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done:
+                return _STOPPED
+            return await recv_task
+        finally:
+            for task in (recv_task, stop_task):
+                task.cancel()
+            for task in (recv_task, stop_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     def _parse_message(self, message: object) -> FanParseResult | None:
         if isinstance(message, dict):
@@ -322,17 +349,19 @@ class FanCollector:
             return
         sleep_task = asyncio.create_task(self._sleep(delay))
         stop_task = asyncio.create_task(stop_event.wait())
-        done, pending = await asyncio.wait(
-            {sleep_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        try:
+            await asyncio.wait(
+                {sleep_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (sleep_task, stop_task):
+                task.cancel()
+            for task in (sleep_task, stop_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     def _health(self, state: str) -> ProviderHealthUpdate:
         return ProviderHealthUpdate(
