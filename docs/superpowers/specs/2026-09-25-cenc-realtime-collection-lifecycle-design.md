@@ -85,7 +85,7 @@ Wolfx HTTP 低频轮询 (备用链路) ─┘
 
 `collector` 与 API 共用后端代码、领域模型和数据库，但运行生命周期完全独立。API 重启、升级和前端故障不影响采集器；采集器重启不影响 API 和已有事件。
 
-采集器直接调用领域服务，不通过 API 的 HTTP 接入接口回灌自身消息。现有 `POST /api/v1/ingest/*` 接口继续保留，用于受控补录、人工测试、故障回放和联调。
+采集器直接调用领域服务，不通过 API 的 HTTP 接入接口回灌自身消息。现有 `POST /api/v1/ingest/auto` 继续保留为兼容入口且不触发评估；`POST /api/v1/ingest/formal` 和 `POST /api/v1/ingest/correction` 用于受控补录和故障恢复，并按 `trigger_reason=recovery` 进入同一生命周期事务，生成审计记录和评估 Outbox。
 
 ## 5. 组件设计
 
@@ -96,7 +96,7 @@ Wolfx HTTP 低频轮询 (备用链路) ─┘
 - 连接 FAN Studio WebSocket 主地址。
 - 认证成功后订阅 CENC 地震列表。
 - 周期发送查询消息，维持心跳和增量获取。
-- 处理 `auth_success`、`auth_fail`、`initial_all`、`query_response` 和 `update` 消息。
+- 处理 `auth_success`、`auth_fail`、`initial_all`、`query_response`、`cenclist_response` 和 `update` 消息。
 - 记录消息到达时间、提供方、原始消息类型和原始 JSON。
 - 断线时指数退避重连，并轮换备用地址。
 - 向 `CollectorCoordinator` 提交标准化前的 `CollectorEnvelope`。
@@ -140,6 +140,7 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 - 自动速报只维护待定事件。
 - 首个正式报设置 `T1`，生成评估触发。
 - 内容发生变化的后续正式测定生成 `correction` 修订和新评估触发。
+- 只有新且当前正式修订产生评估触发；乱序旧修订只保留审计记录。
 - 语义重复报文不创建修订或新触发。
 - 晚到自动报不替换正式报。
 
@@ -164,7 +165,10 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 - 认证结果消息。
 - 初始全量响应。
 - 查询响应。
+- `cenclist_response` 历史列表响应。
 - 增量更新消息。
+
+`initial_all` 和 `query_response` 的 CENC 业务数据位于顶层来源键 `message["cenc"]["Data"]`；`cenclist_response` 的 `Data` 为历史事件对象映射。
 
 规范的客户端标识配置名为 `FAN_APP_ID`。现有 `CENC_APP_ID` 仅作为兼容别名，在未配置 `FAN_APP_ID` 时回退读取；二者都只表示 FAN Studio 客户端标识，不表示 Kanameishi 私有接口凭据。
 
@@ -186,7 +190,7 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CENC_COLLECTOR_ENABLED` | `true` | 是否启动实时采集器 |
+| `CENC_COLLECTOR_ENABLED` | `false` | 是否启动实时采集器；Compose 中 collector 服务显式设为 `true` |
 | `FAN_APP_ID` | 必填 | FAN Studio 客户端标识；缺省时兼容读取 `CENC_APP_ID` |
 | `FAN_API_KEY` | 必填 | FAN Studio 密钥，使用 `SecretStr` |
 | `FAN_WS_PRIMARY_URL` | `wss://ws.fanstudio.tech/all` | FAN 主地址 |
@@ -196,6 +200,8 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 | `WOLFX_POLL_INTERVAL_SECONDS` | `10` | Wolfx 轮询间隔 |
 | `CENC_BOOTSTRAP_LOOKBACK_HOURS` | `24` | 首次启动处理窗口 |
 | `COLLECTOR_STALE_AFTER_SECONDS` | `60` | 链路无有效消息的降级阈值 |
+| `COLLECTOR_SPOOL_DIR` | `/var/lib/collector-spool` | 数据库故障时的本地持久化缓冲目录 |
+| `COLLECTOR_MAX_SPOOL_BYTES` | `1073741824` | spool 容量上限；达到上限时停止接收并告警 |
 
 所有凭据只从环境或受控密钥文件读取。示例文件和日志不得包含真实密钥。
 
@@ -205,7 +211,7 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 
 `raw_messages` 新增：
 
-- `provider`：`fan` 或 `wolfx`，记录实际接收提供方。
+- `provider`：`fan`、`wolfx` 或 `api`，记录实际接收提供方。
 - `ingest_lane`：`websocket` 或 `http`，记录实际传输链路。
 
 `earthquake_events` 新增：
@@ -217,9 +223,10 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 `earthquake_revisions` 新增：
 
 - `semantic_fingerprint`：同一事件内唯一的语义指纹。
-- `provider`：`fan` 或 `wolfx`，仅用于审计，不改变 CENC 内部来源。
+- `provider`：`fan`、`wolfx` 或 `api`，仅用于审计，不改变 CENC 内部来源。
 - `ingest_lane`：`websocket` 或 `http`。
 - `ingested_at`：采集器成功接收报文的时刻。
+- `inside_shanghai`、`distance_to_boundary_km`、`region_boundary_version`、`region_computed_at`：本次修订使用的区域边界快照。
 
 ### 7.2 语义指纹
 
@@ -268,6 +275,7 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 - 最后连接成功时间。
 - 最后有效报文时间。
 - 最后成功入库时间。
+- 最后成功处理的来源时间水位，用于恢复时按来源时间补漏。
 - 连续失败次数。
 - 重连次数。
 - 最后错误摘要和更新时间。
@@ -327,6 +335,9 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 
 - 正常运行重启使用数据库检查点补录遗漏报文。
 - 首次部署只自动处理最近 24 小时事件。
+- `last_processed_source_time` 只作为上游恢复查询/补漏窗口的下界，不得过滤 live、spool 或死信报文。
+- 启动时必须先清空 spool，再恢复实时接收；运行中数据库恢复后也必须先排空 spool，再处理新的实时队列项。
+- 早于当前水位的 spool/死信报文仍进入同一生命周期流程，由语义指纹和“新且当前”规则决定保存与是否触发。
 - 恢复期间形成的正式报触发使用 `trigger_reason=recovery`。
 - 早于首次启动窗口的历史数据不自动触发评估，必须通过受控回放命令处理。
 
@@ -359,8 +370,9 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 ### 10.3 持久化
 
 - 数据库临时不可用时，采集消息在有界内存队列中短暂等待，并记录接收时刻。
-- 数据库恢复后按接收顺序重试。
-- 超过队列上限或等待上限时，保留可恢复的原始消息记录并告警；无法可靠保留时不得假报成功。
+- 存储重试仍失败或队列溢出时，将原始业务 envelope 原子写入本地 spool，并记录接收时刻。
+- 数据库恢复后按接收时间升序重放 spool，成功一条删除一条；排空顺序必须早于后续 live 消息。
+- spool 写入失败或容量耗尽时停止 supervisor 并告警；无法可靠保留时不得继续假装接收成功。
 - 认证消息和无业务值的协议控制消息不写入原始报文表。
 
 ### 10.4 死信
@@ -387,6 +399,10 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 - 当前区域边界版本。
 - 最近一次成功入库事件 ID。
 
+`CollectorStatusService` 统一聚合运行状态、开放死信数量、当前边界版本和最近入库事件；路由层不直接拼装数据库查询。
+
+正式报和修订兼容接口的成功响应必须包含落库后的 `lifecycle_state` 与 `t1_at`，供受控补录、故障恢复调用方和端到端测试确认生命周期结果。
+
 ### 11.2 管理页面
 
 现有前端新增采集状态页：
@@ -402,6 +418,7 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 ## 12. 安全与审计
 
 - 密钥使用 `SecretStr` 或受控密钥文件，不写入日志、异常、接口响应和前端。
+- 共享 `Settings` 默认禁用 collector；仅 collector 服务显式启用并要求凭据，API 和数据库迁移不因缺少 FAN 密钥而失败。
 - 死信只保存业务报文，不保存认证报文。
 - 状态接口要求认证和角色授权。
 - 原始报文、提供方、传输链路、接收时间和语义指纹均可追溯。
@@ -454,7 +471,9 @@ Wolfx 在 FAN 正常时仍持续运行，用于补漏和核对，不因主链路
 - 自动报不产生评估触发。
 - 首次正式报在事务提交后产生唯一 Outbox，并固定记录 `T1`。
 - 内容变化的正式修订生成新修订和新 Outbox，不重置 `T1`。
+- 乱序到达的旧正式修订不生成新的评估触发。
 - 采集器重启后可补录持久化检查点之后的遗漏报文。
+- 数据库故障期间的消息可保存在本地 spool，并在恢复后按原接收时间补录。
 - 首次启动不会把超过 24 小时的历史事件自动当作实时事件触发。
 - FAN 认证失败、断线、Wolfx 失败和双链路失败均能正确降级并出现在状态接口。
 - 区域边界缺失时制度响应为 `pending`，不生成虚构等级。
