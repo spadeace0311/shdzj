@@ -111,6 +111,22 @@ def test_wolfx_parser_ignores_unknown_types() -> None:
     }
 
 
+def test_wolfx_parser_recovery_since_is_inclusive_and_excludes_older_history() -> None:
+    parser = WolfxMessageParser()
+    equal_boundary = datetime(2026, 9, 25, 1, 1, 0, tzinfo=UTC)
+    newer_boundary = datetime(2026, 9, 25, 1, 1, 1, tzinfo=UTC)
+
+    equal_result = parser.parse(FIXTURE, fixed_now(), equal_boundary)
+    filtered_result = parser.parse(FIXTURE, fixed_now(), newer_boundary)
+
+    assert {
+        item.payload[next(iter(item.payload))]["EventID"] for item in equal_result
+    } == {"CENC-AUTO-2026092501", "CENC-REVIEWED-2026092502"}
+    assert [
+        item.payload[next(iter(item.payload))]["EventID"] for item in filtered_result
+    ] == ["CENC-REVIEWED-2026092502"]
+
+
 async def test_poll_once_returns_502_as_failure() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(502, text="bad gateway")

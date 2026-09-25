@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -49,7 +49,6 @@ class CollectorService:
             "last_http_status": update.last_http_status,
             "last_connected_at": update.last_connected_at,
             "last_message_at": update.last_message_at,
-            "last_success_at": update.last_success_at,
             "consecutive_failures": update.consecutive_failures,
             "reconnect_count": update.reconnect_count,
             "last_error": update.last_error,
@@ -101,7 +100,20 @@ class CollectorService:
             index_elements=[CollectorRuntimeState.provider],
             set_={
                 "last_success_at": statement.excluded.last_success_at,
-                "last_processed_source_time": statement.excluded.last_processed_source_time,
+                "last_processed_source_time": case(
+                    (
+                        CollectorRuntimeState.last_processed_source_time.is_(None),
+                        statement.excluded.last_processed_source_time,
+                    ),
+                    (
+                        statement.excluded.last_processed_source_time.is_(None),
+                        CollectorRuntimeState.last_processed_source_time,
+                    ),
+                    else_=func.greatest(
+                        CollectorRuntimeState.last_processed_source_time,
+                        statement.excluded.last_processed_source_time,
+                    ),
+                ),
                 "updated_at": statement.excluded.updated_at,
             },
         )

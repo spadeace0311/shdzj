@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import datetime
@@ -12,6 +13,8 @@ from app.collector.domain import (
     CollectorLane,
     CollectorProvider,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CollectorSpool:
@@ -68,6 +71,7 @@ class CollectorSpool:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 envelope = self._deserialize(payload)
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                self._quarantine(path, "invalid spool file")
                 continue
             pending.append((path, envelope))
         pending.sort(key=lambda pair: pair[1].received_at)
@@ -82,7 +86,9 @@ class CollectorSpool:
 
     def _usage_bytes(self) -> int:
         total = 0
-        for path in self._directory.glob("*.json"):
+        for path in self._directory.iterdir():
+            if not path.is_file():
+                continue
             try:
                 total += path.stat().st_size
             except OSError:
@@ -117,3 +123,11 @@ class CollectorSpool:
             pass
         finally:
             os.close(fd)
+
+    def _quarantine(self, path: Path, reason: str) -> None:
+        quarantine_path = path.with_suffix(path.suffix + ".corrupt")
+        try:
+            os.replace(path, quarantine_path)
+            logger.error("collector spool quarantined corrupt file path=%s reason=%s", path, reason)
+        except OSError:
+            logger.exception("collector spool failed to quarantine corrupt file path=%s", path)

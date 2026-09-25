@@ -15,6 +15,7 @@ from app.collector.domain import (
     CollectorProvider,
     ProviderHealthUpdate,
 )
+from app.events.sources.cenc import CencAdapter
 
 _STOPPED = object()
 
@@ -36,7 +37,12 @@ class FanParseResult:
 class FanMessageParser:
     """Translate FAN Studio websocket frames into collector envelopes."""
 
-    def parse(self, message: dict[str, object], received_at: datetime) -> FanParseResult:
+    def parse(
+        self,
+        message: dict[str, object],
+        received_at: datetime,
+        recovery_since: datetime | None = None,
+    ) -> FanParseResult:
         if not isinstance(message, dict):
             return FanParseResult()
 
@@ -54,6 +60,9 @@ class FanMessageParser:
         if message_type in {"initial_all", "query_response"}:
             data = _nested_data(message, "cenc", "Data")
             if isinstance(data, dict) and data:
+                data = _filter_history_payload(data, recovery_since)
+                if not data:
+                    return FanParseResult()
                 return FanParseResult(envelope=self._envelope(data, received_at))
             return FanParseResult()
 
@@ -62,10 +71,11 @@ class FanMessageParser:
             if not isinstance(history, dict) or not history:
                 return FanParseResult()
             items = [item for item in history.values() if isinstance(item, dict)]
+            items = _filter_history_items(items, recovery_since)
+            if not items:
+                return FanParseResult()
             items.sort(key=_history_sort_key)
             normalized = {f"No{index}": item for index, item in enumerate(items, start=1)}
-            if not normalized:
-                return FanParseResult()
             return FanParseResult(envelope=self._envelope(normalized, received_at))
 
         if message_type == "update":
@@ -111,6 +121,47 @@ def _history_sort_key(item: dict[str, object]) -> tuple[str, str]:
     return (shock_time, event_id)
 
 
+def _history_source_time(item: dict[str, object]) -> datetime | None:
+    try:
+        event = CencAdapter().parse(item)
+        return event.report_time or event.origin_time
+    except Exception:
+        return None
+
+
+def _filter_history_items(
+    items: list[dict[str, object]],
+    recovery_since: datetime | None,
+) -> list[dict[str, object]]:
+    if recovery_since is None:
+        return items
+    retained: list[dict[str, object]] = []
+    for item in items:
+        source_time = _history_source_time(item)
+        if source_time is None or source_time >= recovery_since:
+            retained.append(item)
+    return retained
+
+
+def _filter_history_payload(
+    payload: dict[str, object],
+    recovery_since: datetime | None,
+) -> dict[str, object]:
+    if recovery_since is None:
+        return payload
+    return {
+        key: item
+        for key, item in payload.items()
+        if isinstance(key, str)
+        and key.startswith("No")
+        and isinstance(item, dict)
+        and (
+            (source_time := _history_source_time(item)) is None
+            or source_time >= recovery_since
+        )
+    }
+
+
 async def _default_connect(url: str) -> Any:
     return await websocket_connect(url)
 
@@ -128,6 +179,7 @@ class FanCollector:
         sleep: SleepCallback | None = None,
         now: ClockCallback | None = None,
         rng: random.Random | None = None,
+        recovery_since: datetime | None = None,
     ) -> None:
         self._app_id = app_id
         self._api_key = api_key
@@ -140,7 +192,16 @@ class FanCollector:
         self._sleep = sleep or asyncio.sleep
         self._now = now or (lambda: datetime.now(UTC))
         self._rng = rng or random.Random()
+        self._recovery_since = recovery_since
         self._reset_state()
+
+    @property
+    def recovery_since(self) -> datetime | None:
+        return self._recovery_since
+
+    @recovery_since.setter
+    def recovery_since(self, value: datetime | None) -> None:
+        self._recovery_since = value
 
     def _reset_state(self) -> None:
         self._connected = False
@@ -329,7 +390,9 @@ class FanCollector:
             return None
         if not isinstance(payload, dict):
             return None
-        return self._parser.parse(payload, self._now())
+        if self._recovery_since is None:
+            return self._parser.parse(payload, self._now())
+        return self._parser.parse(payload, self._now(), self._recovery_since)
 
     def _record_failure(self, error_text: str) -> None:
         self._connected = False

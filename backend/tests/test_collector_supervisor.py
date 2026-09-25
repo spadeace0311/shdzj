@@ -1,12 +1,24 @@
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy import delete
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.collector.coordinator import CollectorCoordinator
-from app.collector.domain import CollectorEnvelope, CollectorLane, CollectorProvider
+from app.collector.domain import (
+    CollectorEnvelope,
+    CollectorLane,
+    CollectorProvider,
+    ProviderHealthUpdate,
+)
+from app.collector.models import CollectorRuntimeState
+from app.collector.service import CollectorService
 from app.collector.supervisor import CollectorSupervisor
+from app.db import engine
 from app.events.domain import EventKind
-from app.events.repository import LifecycleIngestOutcome
+from app.events.service import LifecycleIngestOutcome
 from app.regions.domain import RegionContext
 
 
@@ -64,10 +76,33 @@ class RecordingCoordinator:
         return None
 
 
+class RecoveryCoordinator(RecordingCoordinator):
+    def __init__(self, remaining_failures: dict[str, int]) -> None:
+        super().__init__()
+        self.remaining_failures = remaining_failures
+        self.ingested_order: list[str] = []
+        self.c_ingested = asyncio.Event()
+
+    async def ingest(self, envelope: CollectorEnvelope, trigger_reason: str = "live"):
+        self.calls.append(envelope)
+        event_id = str(envelope.payload["No1"]["EventID"])
+        if self.remaining_failures.get(event_id, 0) > 0:
+            self.remaining_failures[event_id] -= 1
+            raise SQLAlchemyError("storage unavailable")
+        self.ingested_order.append(event_id)
+        if event_id == "C":
+            self.c_ingested.set()
+        return None
+
+
 class RecordingCollectorService:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_dead_letter: bool = False) -> None:
         self.dead_letters: list[dict[str, object]] = []
         self.last_processed_source_time = None
+        self.fail_dead_letter = fail_dead_letter
+
+    async def persist_health(self, update: ProviderHealthUpdate) -> None:
+        return None
 
     async def get_last_processed_source_time(self, provider: str):
         return self.last_processed_source_time
@@ -76,6 +111,8 @@ class RecordingCollectorService:
         self.last_processed_source_time = source_time
 
     async def record_dead_letter(self, **kwargs) -> None:
+        if self.fail_dead_letter:
+            raise SQLAlchemyError("dead-letter storage unavailable")
         self.dead_letters.append(kwargs)
 
     async def record_spool_overflow(self, **kwargs) -> None:
@@ -108,6 +145,22 @@ class NoopFanCollector:
 class NoopWolfxCollector:
     async def run(self, **kwargs) -> None:
         return None
+
+
+class PushFanCollector:
+    def __init__(self, envelopes: list[CollectorEnvelope]) -> None:
+        self.envelopes = envelopes
+
+    async def run(self, **kwargs) -> None:
+        on_envelope = kwargs["on_envelope"]
+        stop_event = kwargs["stop_event"]
+        for envelope in self.envelopes:
+            await on_envelope(envelope)
+        await stop_event.wait()
+
+
+async def fake_sleep(_delay: float) -> None:
+    return None
 
 
 def collector_settings():
@@ -266,3 +319,127 @@ async def test_recovery_spool_is_not_filtered_by_newer_watermark() -> None:
     await supervisor.process_envelopes([older], trigger_reason="recovery")
 
     assert coordinator.calls == [older]
+
+
+async def test_live_spooled_item_is_replayed_before_newer_live_item() -> None:
+    service = RecordingCollectorService()
+    spool = RecordingSpool()
+    coordinator = RecoveryCoordinator(remaining_failures={"A": 4})
+    stop_event = asyncio.Event()
+    received_at = datetime(2026, 9, 25, 1, 5, tzinfo=UTC)
+    envelopes = [
+        CollectorEnvelope(
+            provider=CollectorProvider.WOLFX,
+            lane=CollectorLane.HTTP,
+            received_at=received_at,
+            payload={
+                "No1": {
+                    **reviewed_wolfx_event(),
+                    "EventID": "A",
+                    "ReportTime": "2026-09-25T01:04:00Z",
+                }
+            },
+        ),
+        CollectorEnvelope(
+            provider=CollectorProvider.WOLFX,
+            lane=CollectorLane.HTTP,
+            received_at=received_at,
+            payload={
+                "No1": {
+                    **reviewed_wolfx_event(),
+                    "EventID": "C",
+                    "ReportTime": "2026-09-25T01:06:00Z",
+                }
+            },
+        ),
+    ]
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=spool,
+        fan_collector=PushFanCollector(envelopes),
+        wolfx_collector=NoopWolfxCollector(),
+        sleep=fake_sleep,
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(coordinator.c_ingested.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert coordinator.ingested_order == ["A", "C"]
+    assert list(spool.pending) == []
+
+
+async def test_replay_keeps_spool_file_when_dead_letter_persistence_fails() -> None:
+    service = RecordingCollectorService(fail_dead_letter=True)
+    spool = RecordingSpool()
+    malformed = envelope()
+    spool.pending = [(Path("spool-1"), malformed)]
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(fail_with=ValueError("invalid CENC depth")),
+        spool=spool,
+        fan_collector=NoopFanCollector(),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    await asyncio.wait_for(supervisor.run(stop_event), timeout=1)
+
+    assert stop_event.is_set()
+    assert list(spool.pending) == [(Path("spool-1"), malformed)]
+    assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_update_after_success_advances_watermark_and_health_does_not_overwrite_ingest_time(
+    session_factory,
+) -> None:
+    await engine.dispose()
+    try:
+        service = CollectorService(session_factory)
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(delete(CollectorRuntimeState))
+
+        older = datetime(2026, 9, 25, 1, 4, tzinfo=UTC)
+        newer = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+        ingest_at = datetime(2026, 9, 25, 1, 7, tzinfo=UTC)
+
+        await service.update_after_success("fan", ingest_at, newer)
+        await service.update_after_success("fan", ingest_at, older)
+
+        assert await service.get_last_processed_source_time("fan") == newer
+
+        health_time = datetime(2026, 9, 25, 1, 8, tzinfo=UTC)
+        await service.persist_health(
+            ProviderHealthUpdate(
+                provider=CollectorProvider.FAN,
+                state="healthy",
+                connected=True,
+                last_http_status=200,
+                last_connected_at=health_time,
+                last_message_at=health_time,
+                last_success_at=health_time,
+                consecutive_failures=0,
+                reconnect_count=0,
+                last_error=None,
+                updated_at=health_time,
+            )
+        )
+
+        async with session_factory() as session:
+            row = await session.get(CollectorRuntimeState, "fan")
+            assert row is not None
+            assert row.last_success_at == ingest_at
+            assert row.last_processed_source_time == newer
+
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(delete(CollectorRuntimeState))
+    finally:
+        await engine.dispose()

@@ -94,6 +94,41 @@ def test_parse_fan_update_requires_cenc_source() -> None:
     assert ignored.envelope is None
 
 
+def test_parse_fan_recovery_since_filters_history_but_not_live_update() -> None:
+    parser = FanMessageParser()
+    recovery_since = datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC)
+
+    history = parser.parse(
+        FIXTURE["cenclist_response"],
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=recovery_since,
+    )
+    update = parser.parse(
+        FIXTURE["update"],
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=recovery_since,
+    )
+
+    assert history.envelope is not None
+    assert list(history.envelope.payload) == ["No1"]
+    assert history.envelope.payload["No1"]["id"] == "CENC-2026-0002"
+    assert update.envelope is not None
+    assert update.envelope.payload["No1"]["id"] == "CENC-2026-0003"
+
+
+def test_parse_fan_recovery_since_is_inclusive_for_equal_source_time() -> None:
+    history = FanMessageParser().parse(
+        FIXTURE["cenclist_response"],
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=datetime(2026, 9, 25, 1, 0, 1, tzinfo=UTC),
+    )
+
+    assert history.envelope is not None
+    assert {
+        item["id"] for item in history.envelope.payload.values()
+    } == {"CENC-2026-0001", "CENC-2026-0002"}
+
+
 async def fake_sleep(delay: float) -> None:
     return None
 

@@ -37,3 +37,14 @@ def test_spool_rejects_write_over_capacity(tmp_path) -> None:
         pass
     else:
         raise AssertionError("spool must reject writes beyond capacity")
+
+
+def test_spool_quarantines_corrupt_file_and_accounts_for_capacity(tmp_path) -> None:
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+    spool = CollectorSpool(tmp_path, max_bytes=1_000_000)
+
+    assert list(spool.iter_pending()) == []
+    assert not corrupt.exists()
+    assert len(list(tmp_path.glob("*.corrupt"))) == 1
+    assert spool._usage_bytes() > 0

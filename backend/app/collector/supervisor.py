@@ -52,6 +52,7 @@ class CollectorSupervisor:
         self._queue: asyncio.Queue[CollectorEnvelope] | None = None
         self._stop_event: asyncio.Event | None = None
         self._bootstrap_cutoff: datetime | None = None
+        self._pending_spool = False
 
     @property
     def provider_states(self) -> dict[str, str]:
@@ -79,11 +80,15 @@ class CollectorSupervisor:
             )
         else:
             self._bootstrap_cutoff = None
+        if hasattr(self._fan_collector, "recovery_since"):
+            self._fan_collector.recovery_since = watermark
+        if hasattr(self._wolfx_collector, "recovery_since"):
+            self._wolfx_collector.recovery_since = watermark
 
         if not await self._replay_spool():
-            await self._set_provider_state(CollectorProvider.FAN, "critical")
-            await self._set_provider_state(CollectorProvider.WOLFX, "critical")
+            await self._mark_critical_and_stop()
             return
+        self._pending_spool = False
 
         tasks = [
             asyncio.create_task(
@@ -104,6 +109,11 @@ class CollectorSupervisor:
 
         try:
             while not stop_event.is_set():
+                if self._pending_spool:
+                    if not await self._replay_spool():
+                        await self._mark_critical_and_stop()
+                        break
+                    self._pending_spool = False
                 try:
                     envelope = await asyncio.wait_for(
                         self._queue.get(),
@@ -181,8 +191,7 @@ class CollectorSupervisor:
         except Exception as exc:
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            await self._record_dead_letter(envelope, exc)
-            return "dead_letter"
+            return await self._handle_dead_letter(envelope, exc, allow_spool)
 
         if result is None:
             return "skipped"
@@ -209,23 +218,16 @@ class CollectorSupervisor:
             except Exception as exc:
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                await self._record_dead_letter(envelope, exc)
-                return "dead_letter"
+                return await self._handle_dead_letter(envelope, exc, True)
             if result is None:
                 return "skipped"
             await self._record_success(envelope)
             return "ingested"
 
         try:
-            self._spool.append(envelope)
+            return self._spool_envelope(envelope)
         except Exception:
-            logger.exception("collector spool append failed")
-            await self._set_provider_state(CollectorProvider.FAN, "critical")
-            await self._set_provider_state(CollectorProvider.WOLFX, "critical")
-            if self._stop_event is not None:
-                self._stop_event.set()
-            return "critical"
-        return "spooled"
+            return await self._spool_failed()
 
     async def _record_success(self, envelope: CollectorEnvelope) -> None:
         source_time = self._source_time(envelope)
@@ -238,24 +240,65 @@ class CollectorSupervisor:
         except Exception:
             logger.exception("collector watermark update failed")
 
-    async def _record_dead_letter(
+    async def _persist_dead_letter(
         self,
         envelope: CollectorEnvelope,
         exc: Exception,
     ) -> None:
         category = classify_collector_error(exc)
+        await self._service.record_dead_letter(
+            provider=envelope.provider.value,
+            lane=envelope.lane.value,
+            raw_payload=_first_item(envelope.payload),
+            received_at=envelope.received_at,
+            error_category=category,
+            error_message=self._safe_error_text(exc),
+            source_message_id=self._source_message_id(envelope),
+        )
+
+    async def _handle_dead_letter(
+        self,
+        envelope: CollectorEnvelope,
+        exc: Exception,
+        allow_spool: bool,
+    ) -> str:
+        if not allow_spool:
+            try:
+                await self._persist_dead_letter(envelope, exc)
+            except Exception:
+                logger.exception("collector dead-letter persistence failed")
+                await self._mark_critical_and_stop()
+                return "critical"
+            return "dead_letter"
+
         try:
-            await self._service.record_dead_letter(
-                provider=envelope.provider.value,
-                lane=envelope.lane.value,
-                raw_payload=_first_item(envelope.payload),
-                received_at=envelope.received_at,
-                error_category=category,
-                error_message=self._safe_error_text(exc),
-                source_message_id=self._source_message_id(envelope),
-            )
+            await self._persist_dead_letter(envelope, exc)
+            return "dead_letter"
         except Exception:
-            logger.exception("collector dead-letter write failed")
+            pass
+
+        for delay in _RETRY_DELAYS:
+            await self._sleep(delay)
+            try:
+                await self._persist_dead_letter(envelope, exc)
+            except Exception:
+                continue
+            return "dead_letter"
+
+        try:
+            return self._spool_envelope(envelope)
+        except Exception:
+            return await self._spool_failed()
+
+    def _spool_envelope(self, envelope: CollectorEnvelope) -> str:
+        self._spool.append(envelope)
+        self._pending_spool = True
+        return "spooled"
+
+    async def _spool_failed(self) -> str:
+        logger.exception("collector spool append failed")
+        await self._mark_critical_and_stop()
+        return "critical"
 
     async def _process_live(self, envelope: CollectorEnvelope) -> None:
         for item in self._coordinator.expand(envelope):
@@ -269,6 +312,8 @@ class CollectorSupervisor:
 
     async def _replay_spool(self) -> bool:
         pending = list(self._spool.iter_pending())
+        # Startup/drain replay preserves durable received_at order. Source-time
+        # ordering is reserved for explicit recovery batches in process_envelopes.
         pending.sort(key=lambda pair: pair[1].received_at)
         for path, envelope in pending:
             for item in self._coordinator.expand(envelope):
@@ -281,6 +326,12 @@ class CollectorSupervisor:
                     return False
             self._spool.remove(path)
         return True
+
+    async def _mark_critical_and_stop(self) -> None:
+        await self._set_provider_state(CollectorProvider.FAN, "critical")
+        await self._set_provider_state(CollectorProvider.WOLFX, "critical")
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     async def _load_watermark(self) -> datetime | None:
         values: list[datetime] = []
@@ -301,13 +352,9 @@ class CollectorSupervisor:
             self._queue.put_nowait(envelope)
         except asyncio.QueueFull:
             try:
-                self._spool.append(envelope)
+                self._spool_envelope(envelope)
             except Exception:
-                logger.exception("collector queue overflow spool write failed")
-                await self._set_provider_state(CollectorProvider.FAN, "critical")
-                await self._set_provider_state(CollectorProvider.WOLFX, "critical")
-                if self._stop_event is not None:
-                    self._stop_event.set()
+                await self._spool_failed()
 
     async def _on_health(self, update: ProviderHealthUpdate) -> None:
         self._health[update.provider] = update.state

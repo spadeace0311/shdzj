@@ -15,6 +15,7 @@ from app.collector.domain import (
     CollectorProvider,
     ProviderHealthUpdate,
 )
+from app.events.sources.cenc import CencAdapter
 
 
 EnvelopeCallback = Callable[[CollectorEnvelope], Awaitable[None]]
@@ -32,6 +33,7 @@ class WolfxMessageParser:
         self,
         payload: dict[str, object],
         received_at: datetime,
+        recovery_since: datetime | None = None,
     ) -> list[CollectorEnvelope]:
         if not isinstance(payload, dict):
             return []
@@ -46,6 +48,10 @@ class WolfxMessageParser:
                 continue
             if item.get("type") not in {"automatic", "reviewed"}:
                 continue
+            if recovery_since is not None:
+                source_time = _source_time(item)
+                if source_time is not None and source_time < recovery_since:
+                    continue
             envelopes.append(
                 CollectorEnvelope(
                     provider=CollectorProvider.WOLFX,
@@ -55,6 +61,14 @@ class WolfxMessageParser:
                 )
             )
         return envelopes
+
+
+def _source_time(item: dict[str, object]) -> datetime | None:
+    try:
+        event = CencAdapter().parse(item)
+        return event.report_time or event.origin_time
+    except Exception:
+        return None
 
 
 class WolfxCollector:
@@ -68,6 +82,7 @@ class WolfxCollector:
         sleep: SleepCallback | None = None,
         now: ClockCallback | None = None,
         rng: random.Random | None = None,
+        recovery_since: datetime | None = None,
     ) -> None:
         if not url:
             raise ValueError("a Wolfx CENC URL is required")
@@ -78,7 +93,16 @@ class WolfxCollector:
         self._sleep = sleep or asyncio.sleep
         self._now = now or (lambda: datetime.now(UTC))
         self._rng = rng or random.Random()
+        self._recovery_since = recovery_since
         self._reset_state()
+
+    @property
+    def recovery_since(self) -> datetime | None:
+        return self._recovery_since
+
+    @recovery_since.setter
+    def recovery_since(self, value: datetime | None) -> None:
+        self._recovery_since = value
 
     def _reset_state(self) -> None:
         self._connected = False
@@ -103,7 +127,8 @@ class WolfxCollector:
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Wolfx response must be a JSON object")
-        return self._parser.parse(payload, received_at), response.status_code, received_at
+        envelopes = self._parser.parse(payload, received_at, self._recovery_since)
+        return envelopes, response.status_code, received_at
 
     async def run(
         self,
