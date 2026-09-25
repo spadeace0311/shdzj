@@ -2,6 +2,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.auth.router import require_role
 from app.db import SessionFactory
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.repository import (
@@ -90,6 +91,7 @@ async def ingest_correction(
 async def create_manual_event(
     request: ManualEventRequest,
     service: EventService = Depends(get_event_service),
+    _current_user: object = Depends(require_role("superadmin", "group_leader", "group_deputy")),
 ) -> EventIngestResponse:
     try:
         event = NormalizedEvent(

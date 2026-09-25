@@ -1,8 +1,28 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
+from app.auth.router import router as auth_router
+from app.auth.service import AuthService
+from app.db import SessionFactory
 from app.events.router import router as events_router
 
-app = FastAPI(title="Shanghai Earthquake Emergency API")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        await AuthService(SessionFactory).bootstrap_superadmin()
+    except Exception as exc:
+        logger.exception("Superadmin bootstrap failed")
+        raise RuntimeError("Superadmin bootstrap failed; the database may be unavailable") from exc
+    yield
+
+
+app = FastAPI(title="Shanghai Earthquake Emergency API", lifespan=lifespan)
+app.include_router(auth_router)
 app.include_router(events_router)
 
 

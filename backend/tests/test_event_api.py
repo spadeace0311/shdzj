@@ -4,6 +4,8 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
+from app.auth.router import get_current_user
+from app.auth.service import AuthUser
 from app.events.repository import (
     EventDetailRecord,
     EventIngestOutcome,
@@ -136,8 +138,16 @@ class FakeEventService:
         return self.details[event_id]
 
 
-def _client(service: FakeEventService) -> TestClient:
+def _client(
+    service: FakeEventService,
+    *,
+    current_user: AuthUser | None = None,
+) -> TestClient:
     app.dependency_overrides[get_event_service] = lambda: service
+    if current_user is None:
+        app.dependency_overrides.pop(get_current_user, None)
+    else:
+        app.dependency_overrides[get_current_user] = lambda: current_user
     return TestClient(app)
 
 
@@ -191,7 +201,10 @@ def test_correction_appends_revision() -> None:
 
 
 def test_manual_event_requires_source() -> None:
-    client = _client(FakeEventService())
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
 
     response = client.post(
         "/api/v1/events/manual",
@@ -208,7 +221,10 @@ def test_manual_event_requires_source() -> None:
 
 
 def test_manual_event_returns_created() -> None:
-    client = _client(FakeEventService())
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
 
     response = client.post(
         "/api/v1/events/manual",
@@ -365,7 +381,10 @@ def test_formal_without_region_context_returns_existing_current_suggestion() -> 
 
 
 def test_manual_event_with_naive_origin_time_returns_422() -> None:
-    client = _client(FakeEventService())
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
 
     response = client.post(
         "/api/v1/events/manual",
@@ -383,7 +402,10 @@ def test_manual_event_with_naive_origin_time_returns_422() -> None:
 
 
 def test_manual_event_with_blank_source_returns_422() -> None:
-    client = _client(FakeEventService())
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
 
     response = client.post(
         "/api/v1/events/manual",
