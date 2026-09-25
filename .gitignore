@@ -20,3 +20,4 @@ test-results/
 *.pyc
 *.pyo
 *.log
+*.tsbuildinfo
