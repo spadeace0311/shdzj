@@ -29,7 +29,7 @@ async function loginThroughUi(page: Page): Promise<void> {
 async function refreshListWithoutReload(page: Page): Promise<void> {
   await page.getByRole("link", { name: "人工触发" }).click();
   await expect(page.getByRole("heading", { name: "创建人工地震事件" })).toBeVisible();
-  await page.getByRole("link", { name: "事件列表" }).click();
+  await page.getByRole("link", { name: "事件列表", exact: true }).click();
   await expect(page.getByRole("heading", { name: "地震事件列表" })).toBeVisible();
 }
 
@@ -49,15 +49,19 @@ async function getApiToken(request: APIRequestContext): Promise<string> {
 test("formal CENC event exposes dual response suggestions", async ({ page }) => {
   await loginThroughUi(page);
 
-  const runId = Date.now().toString();
+  const runId = crypto.randomUUID();
+  const longitudeSeed = Number.parseInt(runId.slice(0, 8), 16);
+  const latitudeSeed = Number.parseInt(runId.slice(9, 17), 16);
+  const longitude = 120 + (longitudeSeed % 7000) / 1000;
+  const latitude = 29 + (latitudeSeed % 3000) / 1000;
   const place = `上海浦东新区 E2E ${runId}`;
   const response = await page.request.post(apiUrl("/api/v1/ingest/formal"), {
     data: {
       eventId: `CENC-E2E-${runId}`,
       reportType: "formal",
       originTime: "2026-09-17T02:30:05Z",
-      longitude: 121.54,
-      latitude: 31.22,
+      longitude,
+      latitude,
       magnitude: 5.2,
       depth: 12,
       place,
