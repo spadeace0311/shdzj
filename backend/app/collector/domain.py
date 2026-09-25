@@ -21,10 +21,14 @@ class CollectorEnvelope:
     lane: CollectorLane
     received_at: datetime
     payload: dict[str, object] = field(repr=False)
+    trigger_reason: str = "live"
+    recovery_complete: bool = False
 
     def __post_init__(self) -> None:
         if self.received_at.tzinfo is None or self.received_at.utcoffset() is None:
             raise ValueError("received_at must include timezone information")
+        if self.trigger_reason not in {"live", "recovery"}:
+            raise ValueError("trigger_reason must be either 'live' or 'recovery'")
         object.__setattr__(self, "received_at", self.received_at.astimezone(UTC))
         object.__setattr__(self, "payload", dict(self.payload))
 

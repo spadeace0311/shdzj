@@ -23,6 +23,8 @@ def test_event_lifecycle_orm_metadata_contract() -> None:
 
     assert {"provider", "ingest_lane"} <= set(raw_messages.c.keys())
     assert {"t1_at", "lifecycle_state", "latest_trigger_revision_id"} <= set(events.c.keys())
+    assert events.c.lifecycle_state.default.arg == "not_applicable"
+    assert str(events.c.lifecycle_state.server_default.arg) == "'not_applicable'"
     assert {
         "semantic_fingerprint",
         "provider",

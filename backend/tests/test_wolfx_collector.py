@@ -127,6 +127,43 @@ def test_wolfx_parser_recovery_since_is_inclusive_and_excludes_older_history() -
     ] == ["CENC-REVIEWED-2026092502"]
 
 
+def test_wolfx_parser_marks_complete_recovery_poll() -> None:
+    result = WolfxMessageParser().parse_result(
+        FIXTURE,
+        fixed_now(),
+        datetime(2026, 9, 25, 1, 1, 30, tzinfo=UTC),
+    )
+
+    assert result.complete is True
+    assert [item.trigger_reason for item in result.envelopes] == ["recovery"]
+    assert [item.recovery_complete for item in result.envelopes] == [True]
+
+
+def test_wolfx_parser_does_not_complete_malformed_full_list() -> None:
+    result = WolfxMessageParser().parse_result(
+        {
+            "No1": FIXTURE["No1"],
+            "No2": "not-a-mapping",
+        },
+        fixed_now(),
+        datetime(2026, 9, 25, 1, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.complete is False
+    assert result.envelopes[0].recovery_complete is False
+
+
+def test_wolfx_parser_treats_empty_object_as_complete() -> None:
+    result = WolfxMessageParser().parse_result(
+        {},
+        fixed_now(),
+        datetime(2026, 9, 25, 1, 0, 0, tzinfo=UTC),
+    )
+
+    assert result.complete is True
+    assert result.envelopes == []
+
+
 async def test_poll_once_returns_502_as_failure() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(502, text="bad gateway")
@@ -246,7 +283,7 @@ async def test_run_polls_immediately_then_waits_interval() -> None:
     ]
 
 
-async def test_run_clears_recovery_since_after_first_full_poll() -> None:
+async def test_run_applies_recovery_bound_only_until_supervisor_clears_it() -> None:
     request_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -254,7 +291,7 @@ async def test_run_clears_recovery_since_after_first_full_poll() -> None:
         request_count += 1
         if request_count == 1:
             return httpx.Response(200, json=FIXTURE)
-        return httpx.Response(200, json={"No1": FIXTURE["No1"]})
+        return httpx.Response(200, json=FIXTURE)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     stop_event = asyncio.Event()
@@ -278,19 +315,70 @@ async def test_run_clears_recovery_since_after_first_full_poll() -> None:
 
     async def on_envelope(envelope) -> None:
         envelopes.append(envelope)
+        if envelope.recovery_complete:
+            collector.recovery_since = None
 
     task = asyncio.create_task(
         collector.run(on_envelope=on_envelope, on_health=AsyncMock(), stop_event=stop_event)
     )
-    await wait_until(lambda: len(envelopes) == 2)
+    await wait_until(lambda: len(envelopes) == 3)
     stop_event.set()
     await asyncio.wait_for(task, timeout=1)
     await client.aclose()
 
     assert [
         item.payload[next(iter(item.payload))]["EventID"] for item in envelopes
-    ] == ["CENC-REVIEWED-2026092502", "CENC-AUTO-2026092501"]
+    ] == [
+        "CENC-REVIEWED-2026092502",
+        "CENC-AUTO-2026092501",
+        "CENC-REVIEWED-2026092502",
+    ]
+    assert [item.trigger_reason for item in envelopes] == [
+        "recovery",
+        "live",
+        "live",
+    ]
     assert request_count == 2
+
+
+async def test_empty_complete_recovery_poll_emits_completion_boundary() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    stop_event = asyncio.Event()
+    collector = WolfxCollector(
+        url="https://wolfx.test/cenc_eqlist.json",
+        poll_interval_seconds=10,
+        client=client,
+        now=fixed_now,
+        sleep=no_sleep,
+        recovery_since=datetime(2026, 9, 25, 1, 0, 0, tzinfo=UTC),
+    )
+    envelopes: list[object] = []
+
+    async def on_envelope(envelope) -> None:
+        envelopes.append(envelope)
+        stop_event.set()
+
+    await asyncio.wait_for(
+        collector.run(
+            on_envelope=on_envelope,
+            on_health=AsyncMock(),
+            stop_event=stop_event,
+        ),
+        timeout=1,
+    )
+    await client.aclose()
+
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert envelope.payload == {}
+    assert envelope.trigger_reason == "recovery"
+    assert envelope.recovery_complete is True
 
 
 async def test_run_emits_healthy_on_empty_response() -> None:

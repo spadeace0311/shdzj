@@ -1,5 +1,7 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 
+import type { EventIngestResponse } from "../src/types";
+
 const USERNAME = process.env.E2E_SUPERADMIN_USERNAME ?? "superadmin";
 const API_BASE_URL = (process.env.E2E_API_BASE_URL ?? "").replace(/\/+$/, "");
 
@@ -84,6 +86,9 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
   );
   const place = `上海浦东新区 E2E ${runId}`;
   const response = await page.request.post(apiUrl("/api/v1/ingest/formal"), {
+    headers: {
+      Authorization: `Bearer ${await getApiToken(page.request)}`,
+    },
     data: {
       eventId: `CENC-E2E-${runId}`,
       reportType: "formal",
@@ -102,7 +107,7 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
     },
   });
 
-  const responsePayload = (await response.json()) as { event_kind?: string };
+  const responsePayload = (await response.json()) as EventIngestResponse;
   expect(response.status(), JSON.stringify(responsePayload)).toBe(201);
   expect(responsePayload).toMatchObject({
     event_kind: "formal",

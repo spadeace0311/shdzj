@@ -390,10 +390,55 @@ async def test_new_event_and_first_revision_use_structured_point_geometry() -> N
     assert canonical.geom.srid == 4326
     assert canonical.geom.data == "POINT(121.540000 31.220000)"
     assert canonical.current_revision_id == revision.id
+    assert canonical.lifecycle_state == "auto_pending"
     assert revision.is_current is True
     assert result.revision_no == 1
     assert result.event_kind is EventKind.AUTO
     assert result.is_current is True
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [EventKind.MANUAL, EventKind.TEST, EventKind.DRILL],
+)
+async def test_non_cenc_events_use_not_applicable_state_without_t1(
+    kind: EventKind,
+) -> None:
+    repository = EventRepository()
+    session = _RecordingSession(None, None, None, None)
+    raw = _raw_message()
+    event = _event(kind=kind)
+
+    await _append_revision(repository, session, raw, event)
+
+    canonical = next(value for value in session.added if isinstance(value, EarthquakeEvent))
+    assert canonical.lifecycle_state == "not_applicable"
+    assert canonical.t1_at is None
+
+
+async def test_non_cenc_current_revision_clears_stale_t1() -> None:
+    repository = EventRepository()
+    raw = _raw_message()
+    event = _event(kind=EventKind.MANUAL, source_event_id=None)
+    existing = _canonical_event(
+        event=event,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.MANUAL,
+    )
+    existing.t1_at = RECEIVED_AT
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=1,
+        kind=EventKind.MANUAL,
+        is_current=True,
+        created_at=RECEIVED_AT - timedelta(minutes=1),
+    )
+    session = _RecordingSession(None, existing, 1, current_revision, None)
+
+    await _append_revision(repository, session, raw, event)
+
+    assert existing.lifecycle_state == "not_applicable"
+    assert existing.t1_at is None
 
 
 async def test_exact_source_lookup_locks_event_and_appends_current_formal_revision() -> None:

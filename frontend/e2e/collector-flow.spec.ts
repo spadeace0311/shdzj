@@ -1,4 +1,19 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+import type { EventIngestResponse } from "../src/types";
+
+async function getApiToken(page: Page): Promise<string> {
+  const response = await page.request.post("/api/v1/auth/login", {
+    form: {
+      username: process.env.E2E_SUPERADMIN_USERNAME ?? "superadmin",
+      password: process.env.E2E_SUPERADMIN_PASSWORD ?? "",
+    },
+  });
+  expect(response.status()).toBe(200);
+  const payload = (await response.json()) as { access_token?: string };
+  expect(typeof payload.access_token).toBe("string");
+  return payload.access_token as string;
+}
 
 test("collector status remains visible when backup is serving events", async ({ page }) => {
   await page.goto("/");
@@ -28,7 +43,11 @@ test("formal recovery ingest reaches the lifecycle list", async ({ page }) => {
   const seed = Number.parseInt(runId.replaceAll("-", "").slice(0, 8), 16);
   const originTime = new Date(Date.UTC(2030, 0, 1) + seed * 1_000).toISOString();
   const place = `上海正式报 E2E ${runId}`;
+  const token = await getApiToken(page);
   const response = await page.request.post("/api/v1/ingest/formal", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
     data: {
       eventId: `CENC-FORMAL-${runId}`,
       reportType: "formal",
@@ -46,10 +65,7 @@ test("formal recovery ingest reaches the lifecycle list", async ({ page }) => {
       },
     },
   });
-  const responsePayload = (await response.json()) as {
-    event_kind: string;
-    lifecycle_state: string;
-  };
+  const responsePayload = (await response.json()) as EventIngestResponse;
   expect(response.status(), JSON.stringify(responsePayload)).toBe(201);
   expect(responsePayload).toMatchObject({
     event_kind: "formal",

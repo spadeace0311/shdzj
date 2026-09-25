@@ -66,6 +66,8 @@ class CollectorCoordinator:
                     lane=envelope.lane,
                     received_at=envelope.received_at,
                     payload={key: item},
+                    trigger_reason=envelope.trigger_reason,
+                    recovery_complete=envelope.recovery_complete,
                 )
                 for key, item in items
             ]

@@ -54,8 +54,20 @@ test("renders dual response levels", async () => {
 
 test("keeps test and drill identifiers visible", async () => {
   listEventsMock.mockResolvedValue([
-    { ...formalEvent, id: "event-test", event_kind: "test", institutional_level: null },
-    { ...formalEvent, id: "event-drill", event_kind: "drill", institutional_level: null },
+    {
+      ...formalEvent,
+      id: "event-test",
+      event_kind: "test",
+      institutional_level: null,
+      lifecycle_state: "not_applicable",
+    },
+    {
+      ...formalEvent,
+      id: "event-drill",
+      event_kind: "drill",
+      institutional_level: null,
+      lifecycle_state: "not_applicable",
+    },
   ]);
 
   renderListPage();
@@ -63,6 +75,8 @@ test("keeps test and drill identifiers visible", async () => {
   const table = await screen.findByRole("table");
   expect(within(table).getByText("测试")).toBeInTheDocument();
   expect(within(table).getByText("演练")).toBeInTheDocument();
+  expect(within(table).getAllByText("不适用")).toHaveLength(2);
+  expect(within(table).queryByText("自动待定")).not.toBeInTheDocument();
 });
 
 test("renders an empty state when no events are available", async () => {

@@ -67,8 +67,8 @@ class EarthquakeEvent(Base):
     t1_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     lifecycle_state: Mapped[str] = mapped_column(
         String(32),
-        default="auto_pending",
-        server_default=text("'auto_pending'"),
+        default="not_applicable",
+        server_default=text("'not_applicable'"),
         index=True,
     )
     latest_trigger_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))

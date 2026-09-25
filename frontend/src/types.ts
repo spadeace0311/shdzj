@@ -38,7 +38,8 @@ export interface CollectorStatus {
 export type EventLifecycleState =
   | "auto_pending"
   | "formal_triggered"
-  | "correction_triggered";
+  | "correction_triggered"
+  | "not_applicable";
 
 export interface EventSummary {
   id: string;
@@ -103,6 +104,8 @@ export interface EventIngestResponse {
   event_kind?: string;
   institutional_level?: string | null;
   service_level?: number | null;
+  lifecycle_state?: EventLifecycleState | null;
+  t1_at?: string | null;
 }
 
 export interface TokenResponse {
@@ -166,6 +169,9 @@ export function formatLifecycleState(value: string | null | undefined): string {
   }
   if (value === "correction_triggered") {
     return "修订已触发评估";
+  }
+  if (value === "not_applicable") {
+    return "不适用";
   }
   return "未进入生命周期";
 }

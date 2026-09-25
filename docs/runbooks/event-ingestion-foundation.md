@@ -68,11 +68,13 @@ React + Vite 前端
 | `GET /api/v1/events` | 无 | 返回当前修订事件列表 |
 | `GET /api/v1/events/{event_id}` | 无 | 返回当前修订和当前响应建议 |
 | `POST /api/v1/ingest/auto` | 无 | 当前未实现接入 API Key |
-| `POST /api/v1/ingest/formal` | 无 | 当前未实现接入 API Key |
-| `POST /api/v1/ingest/correction` | 无 | 当前未实现接入 API Key |
+| `POST /api/v1/ingest/formal` | Bearer token | 仅 `superadmin`、`group_leader`、`group_deputy` |
+| `POST /api/v1/ingest/correction` | Bearer token | 仅 `superadmin`、`group_leader`、`group_deputy` |
 | `POST /api/v1/events/manual` | Bearer token | 仅 `superadmin`、`group_leader`、`group_deputy` |
 
-因此当前 API 只能部署在受控网络中，不应直接暴露到互联网。计划中的接入 API Key 不属于本子系统已交付能力。
+自动速报兼容接口仍无认证；正式报、更正报和人工事件接口要求具备已授权角色的
+Bearer token。未授权请求返回 `401`，角色不足返回 `403`。当前 API 仍应部署在
+受控网络中，不应直接暴露到互联网。
 
 一次接入的主要数据流如下：
 
@@ -282,6 +284,19 @@ POST /api/v1/ingest/formal
 正式报告会追加或建立正式修订。请求携带 `regionContext` 时，系统独立计算上海市制度响应和中国地震局应急服务响应建议；没有 `regionContext` 时不会凭空推断区域关系。
 
 ```powershell
+$credential = Get-Credential -Message "输入具备采集恢复权限的账号"
+$loginBody = @{
+  username = $credential.UserName
+  password = $credential.GetNetworkCredential().Password
+}
+$token = (
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://localhost:8000/api/v1/auth/login" `
+    -Body $loginBody
+).access_token
+$headers = @{ Authorization = "Bearer $token" }
+
 $formalPayload = @{
   eventId = "CENC-FORMAL-RUNBOOK-01"
   reportType = "formal"
@@ -304,6 +319,7 @@ $formalPayload = @{
 $formalResult = Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8000/api/v1/ingest/formal" `
+  -Headers $headers `
   -ContentType "application/json" `
   -Body $formalPayload
 
@@ -345,6 +361,7 @@ $correctionPayload = @{
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8000/api/v1/ingest/correction" `
+  -Headers $headers `
   -ContentType "application/json" `
   -Body $correctionPayload
 ```
@@ -796,7 +813,8 @@ docker compose --env-file .env -f infra/compose.yaml run --rm `
 
 当前主要残余风险：
 
-- CENC 自动/正式/更正接入接口尚未增加 API Key，必须依赖受控网络。
+- CENC 自动速报兼容接口尚未增加 API Key；正式报、更正报和人工事件接口依赖
+  Bearer token 和角色授权，整个 API 仍必须部署在受控网络中。
 - 当前没有外部 CENC 定时采集器；`CENC_APP_ID` 和 `CENC_API_BASE_URL` 尚未参与代码逻辑。
 - 当前没有修订历史 API，运维核验全部修订需要直接查询数据库。
 - 原始报文以 JSONB 保存，不是原始字节归档。

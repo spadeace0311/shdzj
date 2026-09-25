@@ -1,6 +1,7 @@
 import ast
 import subprocess
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from alembic.config import Config
@@ -11,9 +12,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
+LATEST_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"
 MIGRATION_TEST_VERSION = "migration-test-0008"
+NON_CENC_MIGRATION_TEST_PREFIX = "migration-test-noncenc-"
+_USE_DATABASE_DEFAULT = object()
 
 
 def _alembic(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -178,6 +182,158 @@ def _inspect_region_columns(connection) -> dict[str, dict[str, object]]:
     }
 
 
+async def _delete_non_cenc_migration_test_rows() -> None:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM earthquake_events
+                    WHERE canonical_source_id LIKE :prefix
+                    """
+                ),
+                {"prefix": f"{NON_CENC_MIGRATION_TEST_PREFIX}%"},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _insert_non_cenc_migration_test_event(
+    *,
+    suffix: str,
+    event_type: str,
+    lifecycle_state: str | None | object = "auto_pending",
+    t1_at: str | None = "2026-09-25T01:00:00+00:00",
+) -> None:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            parameters = {
+                "id": str(uuid.uuid4()),
+                "source": "test",
+                "canonical_source_id": f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}",
+                "event_type": event_type,
+                "origin_time": datetime(2026, 9, 25, 1, 0, tzinfo=UTC),
+                "place": f"migration test {suffix}",
+                "t1_at": datetime.fromisoformat(t1_at) if t1_at else None,
+            }
+            if lifecycle_state is _USE_DATABASE_DEFAULT:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO earthquake_events (
+                            id,
+                            source,
+                            canonical_source_id,
+                            event_type,
+                            origin_time,
+                            longitude,
+                            latitude,
+                            depth_km,
+                            magnitude,
+                            place,
+                            geom,
+                            t1_at
+                        )
+                        VALUES (
+                            CAST(:id AS uuid),
+                            :source,
+                            :canonical_source_id,
+                            :event_type,
+                            :origin_time,
+                            121.5,
+                            31.2,
+                            10,
+                            4.5,
+                            :place,
+                            ST_SetSRID(ST_MakePoint(121.5, 31.2), 4326),
+                            :t1_at
+                        )
+                        """
+                    ),
+                    parameters,
+                )
+                return
+
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO earthquake_events (
+                        id,
+                        source,
+                        canonical_source_id,
+                        event_type,
+                        origin_time,
+                        longitude,
+                        latitude,
+                        depth_km,
+                        magnitude,
+                        place,
+                        geom,
+                        lifecycle_state,
+                        t1_at
+                    )
+                    VALUES (
+                        CAST(:id AS uuid),
+                        :source,
+                        :canonical_source_id,
+                        :event_type,
+                        :origin_time,
+                        121.5,
+                        31.2,
+                        10,
+                        4.5,
+                        :place,
+                        ST_SetSRID(ST_MakePoint(121.5, 31.2), 4326),
+                        :lifecycle_state,
+                        :t1_at
+                    )
+                    """
+                ),
+                {**parameters, "lifecycle_state": lifecycle_state},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _non_cenc_lifecycle_migration_state() -> dict[str, object]:
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection:
+            default = await connection.scalar(
+                text(
+                    """
+                    SELECT column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'earthquake_events'
+                      AND column_name = 'lifecycle_state'
+                    """
+                )
+            )
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT canonical_source_id, event_type, lifecycle_state, t1_at
+                            FROM earthquake_events
+                            WHERE canonical_source_id LIKE :prefix
+                            ORDER BY canonical_source_id
+                            """
+                        ),
+                        {"prefix": f"{NON_CENC_MIGRATION_TEST_PREFIX}%"},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return {"default": str(default), "rows": [dict(row) for row in rows]}
+    finally:
+        await engine.dispose()
+
+
 def _database_url() -> str:
     from app.config import settings
 
@@ -206,13 +362,11 @@ def test_migration_identifiers_fit_alembic_version_column() -> None:
     assert oversized == []
 
 
-def test_migration_head_includes_region_maritime_forward_fix() -> None:
+def test_migration_head_includes_non_cenc_lifecycle_fix() -> None:
     alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
 
-    assert (
-        ScriptDirectory.from_config(alembic_config).get_current_head() == REGION_MARITIME_REVISION
-    )
+    assert ScriptDirectory.from_config(alembic_config).get_current_head() == LATEST_REVISION
 
 
 async def test_0008_backfills_old_rows_and_downgrade_upgrade_is_reversible() -> None:
@@ -251,7 +405,7 @@ async def test_0008_backfills_old_rows_and_downgrade_upgrade_is_reversible() -> 
         assert re_upgraded["row"]["checksum"] == "a" * 64
     finally:
         await _delete_migration_test_rows()
-        _set_revision(REGION_MARITIME_REVISION)
+        _set_revision(LATEST_REVISION)
 
 
 async def test_0008_fails_when_old_row_has_null_audit_data() -> None:
@@ -270,4 +424,73 @@ async def test_0008_fails_when_old_row_has_null_audit_data() -> None:
         assert _current_revision() == OLD_REGION_REVISION
     finally:
         await _delete_migration_test_rows()
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0009_backfills_non_cenc_events_and_downgrade_upgrade_is_reversible() -> None:
+    _set_revision(REGION_MARITIME_REVISION)
+    await _delete_non_cenc_migration_test_rows()
+    for suffix, event_type in (
+        ("manual", "manual"),
+        ("test", "test"),
+        ("drill", "drill"),
+        ("auto", "auto"),
+    ):
+        await _insert_non_cenc_migration_test_event(
+            suffix=suffix,
+            event_type=event_type,
+        )
+
+    try:
+        _set_revision(LATEST_REVISION)
+        upgraded = await _non_cenc_lifecycle_migration_state()
+
+        assert "not_applicable" in upgraded["default"]
+        upgraded_rows = {
+            row["canonical_source_id"]: row for row in upgraded["rows"]
+        }
+        for suffix in ("manual", "test", "drill"):
+            row = upgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}"]
+            assert row["lifecycle_state"] == "not_applicable"
+            assert row["t1_at"] is None
+        auto_row = upgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}auto"]
+        assert auto_row["lifecycle_state"] == "auto_pending"
+        assert auto_row["t1_at"] is not None
+
+        await _insert_non_cenc_migration_test_event(
+            suffix="default",
+            event_type="test",
+            lifecycle_state=_USE_DATABASE_DEFAULT,
+            t1_at=None,
+        )
+        defaulted = await _non_cenc_lifecycle_migration_state()
+        default_row = next(
+            row
+            for row in defaulted["rows"]
+            if row["canonical_source_id"]
+            == f"{NON_CENC_MIGRATION_TEST_PREFIX}default"
+        )
+        assert default_row["lifecycle_state"] == "not_applicable"
+        assert default_row["t1_at"] is None
+
         _set_revision(REGION_MARITIME_REVISION)
+        downgraded = await _non_cenc_lifecycle_migration_state()
+
+        assert "auto_pending" in downgraded["default"]
+        downgraded_rows = {
+            row["canonical_source_id"]: row for row in downgraded["rows"]
+        }
+        for suffix in ("manual", "test", "drill", "default"):
+            assert (
+                downgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}"][
+                    "lifecycle_state"
+                ]
+                == "auto_pending"
+            )
+
+        _set_revision(LATEST_REVISION)
+        re_upgraded = await _non_cenc_lifecycle_migration_state()
+        assert "not_applicable" in re_upgraded["default"]
+    finally:
+        await _delete_non_cenc_migration_test_rows()
+        _set_revision(LATEST_REVISION)

@@ -62,6 +62,7 @@ test.each([
     service_level: null,
     response_suggestion: null,
     response_rule_version: null,
+    lifecycle_state: "not_applicable",
   });
 
   renderDetail(`event-${kind}`);
@@ -69,6 +70,7 @@ test.each([
   const section = (await screen.findByText("当前修订")).closest("section");
   expect(section).not.toBeNull();
   expect(screen.getByText(label)).toBeInTheDocument();
+  expect(screen.getByText("不适用")).toBeInTheDocument();
 });
 
 test("renders an old suggestion snapshot without causes", async () => {

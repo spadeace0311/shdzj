@@ -132,20 +132,24 @@ docker compose --env-file .env -f infra/compose.yaml run --rm `
 
 运行手册明确区分了本子系统已实现能力、预留配置和后续平台能力。涉及 CENC 定时采集、评估引擎、制图、任务协同、AI、备份自动化和每日测试调度的交接，不应把本子系统描述为已经包含这些功能。
 
-## 本工作区验证状态
+## 验证状态
 
-本次交付在 `2026-09-25` 的 Z440 工作区完成真实运行验证：
+当前 CENC 实时采集生命周期修复的迁移头、测试命令和结果记录在
+[Final Fix Wave 报告](.superpowers/sdd/2026-09-25-cenc-realtime-collection-lifecycle-implementation-plan/final-fix-report.md)。
+
+以下内容是 `2026-09-25` 基础事件子系统的历史验证快照，不代表当前分支的
+Alembic revision、测试数量或 E2E 范围：
 
 - Docker Desktop `4.92.0`、Docker Engine `29.8.0` 正常运行。
-- PostgreSQL `16`、PostGIS `3.4.3` 容器正常运行，Alembic 已迁移至 `0004_users`。
+- PostgreSQL `16`、PostGIS `3.4.3` 容器正常运行，当时 Alembic 已迁移至 `0004_users`。
 - `docker compose --env-file .env -f infra/compose.yaml config --quiet` 通过。
 - `docker compose --env-file .env -f infra/compose.yaml build api` 通过。
-- 后端测试套件在真实 PostgreSQL/PostGIS 环境下为 `180 passed`（其中 `test_event_tables_and_postgis_exist` 直接验证建表结果和 PostGIS 扩展），Ruff 检查通过。
+- 当时后端测试套件在真实 PostgreSQL/PostGIS 环境下为 `180 passed`（其中 `test_event_tables_and_postgis_exist` 直接验证建表结果和 PostGIS 扩展），Ruff 检查通过。
 - API `/health` 返回 `200`；正式报接入后返回重大响应和服务响应二级，并能从详情接口读取。
-- 前端 `npm test` 为 `23 passed`，`npm run typecheck` 和 `npm run build` 通过。
-- 宿主机 Vite 加真实 API 加 Playwright Chromium 的三条 E2E 用例全部通过。
+- 当时前端 `npm test` 为 `23 passed`，`npm run typecheck` 和 `npm run build` 通过。
+- 当时宿主机 Vite 加真实 API 加 Playwright Chromium 的 E2E 用例通过。
 
-尚未完成：
+该历史快照中的未完成事项：
 
 - 前端容器镜像构建未完成，原因是 `mcr.microsoft.com/playwright:v1.49.1-noble` 基础镜像较大且当前网络下载极慢；本轮改以宿主机 Vite 和 Playwright Chromium 完成前端与 E2E 验证。
 - 尚未连接真实 CENC 上游采集器；当前验证使用兼容 CENC JSON 的正式报接入请求。

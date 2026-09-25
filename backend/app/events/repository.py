@@ -302,8 +302,9 @@ class EventRepository:
 
         if becomes_current:
             _apply_current_event_fields(canonical, event, revision.id, geom, revision_kind)
-            if revision_kind in _LOGICAL_EVENT_KINDS:
-                canonical.lifecycle_state = _lifecycle_state_for_kind(revision_kind)
+            canonical.lifecycle_state = _lifecycle_state_for_kind(revision_kind)
+            if revision_kind in {EventKind.MANUAL, EventKind.TEST, EventKind.DRILL}:
+                canonical.t1_at = None
         if revision_kind is EventKind.FORMAL and becomes_current and canonical.t1_at is None:
             canonical.t1_at = _normalize_utc(ingested_at, "ingested_at")
         canonical.updated_at = raw.received_at
@@ -650,7 +651,9 @@ def _lifecycle_state_for_kind(event_kind: EventKind) -> str:
         return "formal_triggered"
     if event_kind is EventKind.CORRECTION:
         return "correction_triggered"
-    raise ValueError(f"unsupported lifecycle event kind: {event_kind.value}")
+    if event_kind in {EventKind.MANUAL, EventKind.TEST, EventKind.DRILL}:
+        return "not_applicable"
+    raise ValueError(f"unsupported event kind: {event_kind.value}")
 
 
 def _coerce_uuid(value: object) -> object:

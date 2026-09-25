@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 import re
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Awaitable, Callable
 
@@ -26,6 +27,12 @@ ClockCallback = Callable[[], datetime]
 _NO_KEY = re.compile(r"^No\d+$")
 
 
+@dataclass(frozen=True, slots=True)
+class WolfxParseResult:
+    envelopes: list[CollectorEnvelope]
+    complete: bool
+
+
 class WolfxMessageParser:
     """Translate the Wolfx CENC eqlist payload into collector envelopes."""
 
@@ -35,21 +42,33 @@ class WolfxMessageParser:
         received_at: datetime,
         recovery_since: datetime | None = None,
     ) -> list[CollectorEnvelope]:
+        return self.parse_result(payload, received_at, recovery_since).envelopes
+
+    def parse_result(
+        self,
+        payload: dict[str, object],
+        received_at: datetime,
+        recovery_since: datetime | None = None,
+    ) -> WolfxParseResult:
         if not isinstance(payload, dict):
-            return []
+            return WolfxParseResult(envelopes=[], complete=False)
 
         keys = [key for key in payload if isinstance(key, str) and _NO_KEY.fullmatch(key)]
         keys.sort(key=lambda key: int(key[2:]))
 
         envelopes: list[CollectorEnvelope] = []
+        complete = True
         for key in keys:
             item = payload[key]
             if not isinstance(item, dict):
+                complete = False
                 continue
             if item.get("type") not in {"automatic", "reviewed"}:
                 continue
+            source_time = _source_time(item)
+            if source_time is None:
+                complete = False
             if recovery_since is not None:
-                source_time = _source_time(item)
                 if source_time is not None and source_time < recovery_since:
                     continue
             envelopes.append(
@@ -58,9 +77,15 @@ class WolfxMessageParser:
                     lane=CollectorLane.HTTP,
                     received_at=received_at,
                     payload={key: item},
+                    trigger_reason=(
+                        "recovery" if recovery_since is not None else "live"
+                    ),
                 )
             )
-        return envelopes
+        if recovery_since is not None and complete:
+            if envelopes:
+                envelopes[-1] = replace(envelopes[-1], recovery_complete=True)
+        return WolfxParseResult(envelopes=envelopes, complete=complete)
 
 
 def _source_time(item: dict[str, object]) -> datetime | None:
@@ -128,7 +153,23 @@ class WolfxCollector:
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Wolfx response must be a JSON object")
-        envelopes = self._parser.parse(payload, received_at, recovery_since)
+        result = self._parser.parse_result(
+            payload,
+            received_at,
+            recovery_since,
+        )
+        envelopes = result.envelopes
+        if recovery_since is not None and result.complete and not envelopes:
+            envelopes.append(
+                CollectorEnvelope(
+                    provider=CollectorProvider.WOLFX,
+                    lane=CollectorLane.HTTP,
+                    received_at=received_at,
+                    payload={},
+                    trigger_reason="recovery",
+                    recovery_complete=True,
+                )
+            )
         return envelopes, response.status_code, received_at
 
     async def run(
@@ -140,12 +181,13 @@ class WolfxCollector:
         stop_event = stop_event or asyncio.Event()
         self._reset_state()
         await self._emit_health(on_health, "starting")
-        recovery_since = self._recovery_since
 
         try:
             while not stop_event.is_set():
                 try:
-                    envelopes, status, received_at = await self._poll_once(recovery_since)
+                    envelopes, status, received_at = await self._poll_once(
+                        self._recovery_since
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -156,7 +198,6 @@ class WolfxCollector:
                     await self._wait_for_stop(stop_event, self._next_delay())
                     continue
 
-                recovery_since = None
                 self._record_success(envelopes, status, received_at)
                 for envelope in envelopes:
                     await on_envelope(envelope)
@@ -180,7 +221,7 @@ class WolfxCollector:
         self._last_http_status = status
         self._last_connected_at = received_at
         self._last_success_at = received_at
-        if envelopes:
+        if any(envelope.payload for envelope in envelopes):
             self._last_message_at = received_at
         self._consecutive_failures = 0
         self._last_error = None

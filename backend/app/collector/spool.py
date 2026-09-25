@@ -37,6 +37,8 @@ class CollectorSpool:
                 "lane": envelope.lane.value,
                 "received_at": envelope.received_at.isoformat(),
                 "payload": envelope.payload,
+                "trigger_reason": envelope.trigger_reason,
+                "recovery_complete": envelope.recovery_complete,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -117,6 +119,8 @@ class CollectorSpool:
             lane=CollectorLane(str(payload["lane"])),
             received_at=received_at,
             payload=payload["payload"],
+            trigger_reason=str(payload.get("trigger_reason", "live")),
+            recovery_complete=bool(payload.get("recovery_complete", False)),
         )
 
     def _fsync_directory(self) -> None:

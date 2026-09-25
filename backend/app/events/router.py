@@ -42,7 +42,7 @@ async def ingest_auto(
 ) -> EventIngestResponse:
     event = _parse_cenc(payload, EventKind.AUTO)
     result = await _ingest(service, payload, event)
-    return _ingest_response(result, None)
+    return _ingest_response(result, None, lifecycle_state="auto_pending")
 
 
 @router.post(
@@ -53,6 +53,7 @@ async def ingest_auto(
 async def ingest_formal(
     payload: dict[str, object] = Body(...),
     service: EventService = Depends(get_event_service),
+    _current_user: object = Depends(require_role("superadmin", "group_leader", "group_deputy")),
 ) -> EventIngestResponse:
     event = _parse_cenc(payload, EventKind.FORMAL)
     region_context = _parse_region_context(payload)
@@ -75,6 +76,7 @@ async def ingest_formal(
 async def ingest_correction(
     payload: dict[str, object] = Body(...),
     service: EventService = Depends(get_event_service),
+    _current_user: object = Depends(require_role("superadmin", "group_leader", "group_deputy")),
 ) -> EventIngestResponse:
     event = _parse_cenc(payload, EventKind.CORRECTION)
     region_context = _parse_region_context(payload)
@@ -115,7 +117,7 @@ async def create_manual_event(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     payload = request.model_dump(mode="json")
     result = await _ingest(service, payload, event)
-    return _ingest_response(result, None)
+    return _ingest_response(result, None, lifecycle_state="not_applicable")
 
 
 @router.get("/events", response_model=list[EventSummaryResponse])
@@ -232,6 +234,8 @@ def _to_domain_region_context(
 def _ingest_response(
     result: EventIngestResult,
     suggestion: object | None,
+    *,
+    lifecycle_state: str | None,
 ) -> EventIngestResponse:
     del suggestion
     return EventIngestResponse(
@@ -241,7 +245,7 @@ def _ingest_response(
         event_kind=result.event_kind.value,
         institutional_level=None,
         service_level=None,
-        lifecycle_state=None,
+        lifecycle_state=lifecycle_state,
         t1_at=None,
     )
 

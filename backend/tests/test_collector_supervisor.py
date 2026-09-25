@@ -1,5 +1,6 @@
 import asyncio
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,10 +14,12 @@ from app.collector.domain import (
     CollectorProvider,
     ProviderHealthUpdate,
 )
+from app.collector.fan import FanCollector
 from app.collector.models import CollectorRuntimeState
 from app.collector.service import CollectorService
 from app.collector.spool import CollectorSpool
 from app.collector.supervisor import CollectorSupervisor
+from app.collector.wolfx import WolfxMessageParser
 from app.db import engine
 from app.events.domain import EventKind
 from app.events.service import LifecycleIngestOutcome
@@ -65,6 +68,7 @@ class RecordingEventService:
 class RecordingCoordinator:
     def __init__(self, fail_with: Exception | None = None) -> None:
         self.calls: list[CollectorEnvelope] = []
+        self.trigger_reasons: list[str] = []
         self.fail_with = fail_with
 
     def expand(self, envelope: CollectorEnvelope) -> list[CollectorEnvelope]:
@@ -72,6 +76,7 @@ class RecordingCoordinator:
 
     async def ingest(self, envelope: CollectorEnvelope, trigger_reason: str = "live"):
         self.calls.append(envelope)
+        self.trigger_reasons.append(trigger_reason)
         if self.fail_with is not None:
             raise self.fail_with
         return None
@@ -111,12 +116,13 @@ class RecordingCollectorService:
     ) -> None:
         self.dead_letters: list[dict[str, object]] = []
         self.successes: list[tuple[str, datetime, datetime | None]] = []
+        self.health_updates: list[ProviderHealthUpdate] = []
         self.last_processed_source_time = None
         self.fail_dead_letter = fail_dead_letter
         self.watermarks = watermarks
 
     async def persist_health(self, update: ProviderHealthUpdate) -> None:
-        return None
+        self.health_updates.append(update)
 
     async def get_last_processed_source_time(self, provider: str):
         if self.watermarks is not None:
@@ -154,6 +160,11 @@ class RecordingSpool:
         ]
 
 
+class FailingAppendSpool(RecordingSpool):
+    def append(self, envelope: CollectorEnvelope) -> Path:
+        raise OSError("spool unavailable")
+
+
 class NoopFanCollector:
     async def run(self, **kwargs) -> None:
         return None
@@ -167,6 +178,7 @@ class NoopWolfxCollector:
 class PushFanCollector:
     def __init__(self, envelopes: list[CollectorEnvelope]) -> None:
         self.envelopes = envelopes
+        self.recovery_since = None
 
     async def run(self, **kwargs) -> None:
         on_envelope = kwargs["on_envelope"]
@@ -183,6 +195,85 @@ class RecoveryBoundSpy:
 
     async def run(self, **kwargs) -> None:
         self.started.set()
+        await kwargs["stop_event"].wait()
+
+
+class FanCriticalWebSocket:
+    def __init__(self) -> None:
+        self._frames = [
+            json.dumps({"type": "auth_success"}),
+            json.dumps({"type": "query_response", "cenc": {"Data": None}}),
+            json.dumps(
+                {
+                    "type": "query_response",
+                    "cenc": {"Data": {"No1": reviewed_wolfx_event()}},
+                }
+            ),
+        ]
+        self._closed = asyncio.Event()
+        self.closed = False
+
+    async def send(self, payload: str) -> None:
+        return None
+
+    async def recv(self) -> object:
+        if self._frames:
+            return self._frames.pop(0)
+        await self._closed.wait()
+        raise asyncio.CancelledError
+
+    async def close(self) -> None:
+        self.closed = True
+        self._closed.set()
+
+
+class HealthPulseCollector:
+    def __init__(
+        self,
+        provider: CollectorProvider,
+        health_time: datetime,
+    ) -> None:
+        self._provider = provider
+        self._health_time = health_time
+        self.recovery_since = None
+
+    async def run(self, **kwargs) -> None:
+        await kwargs["on_health"](
+            ProviderHealthUpdate(
+                provider=self._provider,
+                state="healthy",
+                connected=True,
+                last_http_status=200,
+                last_connected_at=self._health_time,
+                last_message_at=self._health_time,
+                last_success_at=self._health_time,
+                consecutive_failures=0,
+                reconnect_count=0,
+                last_error=None,
+                updated_at=self._health_time,
+            )
+        )
+        await kwargs["stop_event"].wait()
+
+
+class ParsingWolfxCollector:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        received_at: datetime,
+    ) -> None:
+        self._payload = payload
+        self._received_at = received_at
+        self.recovery_since = None
+
+    async def run(self, **kwargs) -> None:
+        result = WolfxMessageParser().parse_result(
+            self._payload,
+            self._received_at,
+            self.recovery_since,
+        )
+        for envelope in result.envelopes:
+            await kwargs["on_envelope"](envelope)
         await kwargs["stop_event"].wait()
 
 
@@ -586,6 +677,375 @@ async def test_supervisor_assigns_independent_provider_watermarks() -> None:
 
     assert fan_collector.recovery_since == fan_watermark
     assert wolfx_collector.recovery_since == wolfx_watermark
+
+
+async def test_provider_without_watermark_gets_its_own_lookback_bound() -> None:
+    fan_watermark = datetime(2026, 9, 25, 1, 4, tzinfo=UTC)
+    service = RecordingCollectorService(watermarks={"fan": fan_watermark, "wolfx": None})
+    fan_collector = RecoveryBoundSpy()
+    wolfx_collector = RecoveryBoundSpy()
+    stop_event = asyncio.Event()
+    fixed_now = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(),
+        spool=RecordingSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=wolfx_collector,
+        now=lambda: fixed_now,
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(fan_collector.started.wait(), timeout=1)
+    await asyncio.wait_for(wolfx_collector.started.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert fan_collector.recovery_since == fan_watermark
+    assert wolfx_collector.recovery_since == fixed_now - timedelta(hours=24)
+
+
+async def test_fan_watermark_does_not_disable_wolfx_first_start_cutoff() -> None:
+    now = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
+    old_formal = {
+        **reviewed_wolfx_event(),
+        "EventID": "CENC-OLD",
+        "time": "2026-09-25T10:00:00Z",
+        "ReportTime": "2026-09-25T11:00:00Z",
+    }
+    new_formal = {
+        **reviewed_wolfx_event(),
+        "EventID": "CENC-NEW",
+        "time": "2026-09-25T13:00:00Z",
+        "ReportTime": "2026-09-25T13:05:00Z",
+    }
+    service = RecordingCollectorService(
+        watermarks={
+            "fan": datetime(2026, 9, 25, 1, 0, tzinfo=UTC),
+            "wolfx": None,
+        }
+    )
+    event_service = RecordingEventService()
+    coordinator = CollectorCoordinator(
+        event_service,
+        RecordingRegionResolver(),
+    )
+    wolfx_collector = ParsingWolfxCollector(
+        {"No1": old_formal, "No2": new_formal},
+        now,
+    )
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=RecordingSpool(),
+        fan_collector=NoopFanCollector(),
+        wolfx_collector=wolfx_collector,
+        now=lambda: now,
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if event_service.calls:
+            break
+        await asyncio.sleep(0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert [call["event"].source_event_id for call in event_service.calls] == [
+        "CENC-NEW"
+    ]
+    assert event_service.calls[0]["trigger_reason"] == "recovery"
+    assert wolfx_collector.recovery_since is None
+
+
+async def test_supervisor_honors_envelope_provenance_and_clears_after_completion() -> None:
+    bound = datetime(2026, 9, 25, 1, 0, tzinfo=UTC)
+    service = RecordingCollectorService(
+        watermarks={"fan": bound, "wolfx": datetime(2026, 9, 25, 1, 0, tzinfo=UTC)}
+    )
+    coordinator = RecordingCoordinator()
+    envelopes = [
+        CollectorEnvelope(
+            provider=CollectorProvider.FAN,
+            lane=CollectorLane.WEBSOCKET,
+            received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+            payload={"No1": {**reviewed_wolfx_event(), "EventID": "A"}},
+            trigger_reason="recovery",
+        ),
+        CollectorEnvelope(
+            provider=CollectorProvider.FAN,
+            lane=CollectorLane.WEBSOCKET,
+            received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+            payload={"No1": {**reviewed_wolfx_event(), "EventID": "B"}},
+            trigger_reason="recovery",
+            recovery_complete=True,
+        ),
+        CollectorEnvelope(
+            provider=CollectorProvider.FAN,
+            lane=CollectorLane.WEBSOCKET,
+            received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+            payload={"No1": {**reviewed_wolfx_event(), "EventID": "C"}},
+            trigger_reason="live",
+        ),
+    ]
+    fan_collector = PushFanCollector(envelopes)
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=RecordingSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if len(coordinator.calls) == 3:
+            break
+        await asyncio.sleep(0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert coordinator.trigger_reasons == ["recovery", "recovery", "live"]
+    assert fan_collector.recovery_since is None
+
+
+async def test_active_recovery_bound_drops_old_live_frame_before_completion() -> None:
+    bound = datetime(2026, 9, 25, 1, 0, tzinfo=UTC)
+    service = RecordingCollectorService(
+        watermarks={"fan": bound, "wolfx": bound}
+    )
+    coordinator = RecordingCoordinator()
+    old_live = CollectorEnvelope(
+        provider=CollectorProvider.FAN,
+        lane=CollectorLane.WEBSOCKET,
+        received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+        payload={
+            "No1": {
+                **reviewed_wolfx_event(),
+                "EventID": "OLD-LIVE",
+                "ReportTime": "2026-09-25T00:45:00Z",
+            }
+        },
+        trigger_reason="live",
+    )
+    completion = CollectorEnvelope(
+        provider=CollectorProvider.FAN,
+        lane=CollectorLane.WEBSOCKET,
+        received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+        payload={},
+        trigger_reason="recovery",
+        recovery_complete=True,
+    )
+    fan_collector = PushFanCollector([old_live, completion])
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=RecordingSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if coordinator.calls and fan_collector.recovery_since is None:
+            break
+        await asyncio.sleep(0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert coordinator.calls == [completion]
+    assert fan_collector.recovery_since is None
+
+
+async def test_recovery_completion_does_not_clear_bound_after_dead_letter() -> None:
+    bound = datetime(2026, 9, 25, 1, 0, tzinfo=UTC)
+    service = RecordingCollectorService(
+        watermarks={"fan": bound, "wolfx": bound}
+    )
+    completion = CollectorEnvelope(
+        provider=CollectorProvider.FAN,
+        lane=CollectorLane.WEBSOCKET,
+        received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+        payload={"No1": {"id": "MALFORMED"}},
+        trigger_reason="recovery",
+        recovery_complete=True,
+    )
+    fan_collector = PushFanCollector([completion])
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(fail_with=ValueError("invalid history")),
+        spool=RecordingSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if service.dead_letters:
+            break
+        await asyncio.sleep(0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert service.dead_letters
+    assert fan_collector.recovery_since == bound
+
+
+async def test_critical_state_survives_real_collector_task_shutdown() -> None:
+    fixed_now = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+    service = RecordingCollectorService()
+    websocket = FanCriticalWebSocket()
+
+    async def connect(url: str):
+        return websocket
+
+    fan_collector = FanCollector(
+        app_id="app-id",
+        api_key="secret",
+        urls=("wss://primary",),
+        query_interval_seconds=60,
+        connect=connect,
+        sleep=fake_sleep,
+        now=lambda: fixed_now,
+    )
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(fail_with=SQLAlchemyError("database unavailable")),
+        spool=FailingAppendSpool(),
+        fan_collector=fan_collector,
+        wolfx_collector=NoopWolfxCollector(),
+        sleep=fake_sleep,
+        now=lambda: fixed_now,
+    )
+
+    await asyncio.wait_for(supervisor.run(stop_event), timeout=2)
+
+    fan_states = [
+        update.state
+        for update in service.health_updates
+        if update.provider is CollectorProvider.FAN
+    ]
+    assert supervisor.provider_states["fan"] == "critical"
+    assert fan_states[-1] == "critical"
+    assert "stopped" not in fan_states[fan_states.index("critical") + 1 :]
+
+
+async def test_critical_state_survives_real_shutdown_in_persisted_runtime_state(
+    session_factory,
+) -> None:
+    fixed_now = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+    await engine.dispose()
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(delete(CollectorRuntimeState))
+
+        service = CollectorService(session_factory)
+        websocket = FanCriticalWebSocket()
+
+        async def connect(url: str):
+            return websocket
+
+        fan_collector = FanCollector(
+            app_id="app-id",
+            api_key="secret",
+            urls=("wss://primary",),
+            query_interval_seconds=60,
+            connect=connect,
+            sleep=fake_sleep,
+            now=lambda: fixed_now,
+        )
+        stop_event = asyncio.Event()
+        supervisor = CollectorSupervisor(
+            settings=collector_settings(),
+            service=service,
+            coordinator=RecordingCoordinator(
+                fail_with=SQLAlchemyError("database unavailable")
+            ),
+            spool=FailingAppendSpool(),
+            fan_collector=fan_collector,
+            wolfx_collector=NoopWolfxCollector(),
+            sleep=fake_sleep,
+            now=lambda: fixed_now,
+        )
+
+        await asyncio.wait_for(supervisor.run(stop_event), timeout=2)
+
+        async with session_factory() as session:
+            row = await session.get(CollectorRuntimeState, "fan")
+            assert row is not None
+            assert row.state == "critical"
+    finally:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(delete(CollectorRuntimeState))
+        await engine.dispose()
+
+
+async def test_connected_provider_degrades_after_no_recent_message() -> None:
+    started_at = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+    clock = {"now": started_at}
+    service = RecordingCollectorService()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(),
+        spool=RecordingSpool(),
+        fan_collector=HealthPulseCollector(CollectorProvider.FAN, started_at),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: clock["now"],
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if any(
+            update.provider is CollectorProvider.FAN and update.state == "healthy"
+            for update in service.health_updates
+        ):
+            break
+        await asyncio.sleep(0)
+
+    clock["now"] = started_at + timedelta(seconds=61)
+    degraded_observed = False
+    for _ in range(100):
+        if any(
+            update.provider is CollectorProvider.FAN and update.state == "degraded"
+            for update in service.health_updates
+        ):
+            degraded_observed = True
+            break
+        await asyncio.sleep(0.01)
+    assert degraded_observed is True
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    fan_updates = [
+        update
+        for update in service.health_updates
+        if update.provider is CollectorProvider.FAN
+    ]
+    assert any(update.state == "healthy" for update in fan_updates)
+    degraded_update = next(
+        update for update in fan_updates if update.state == "degraded"
+    )
+    assert degraded_update.connected is True
+    assert degraded_update.last_error == "no recent messages"
+    assert fan_updates[-1].state == "stopped"
 
 
 async def test_update_after_success_advances_watermark_and_health_does_not_overwrite_ingest_time(

@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.auth.router import get_current_user
@@ -152,7 +153,7 @@ class FakeEventService:
 def _client(
     service: FakeEventService,
     *,
-    current_user: AuthUser | None = None,
+    current_user: AuthUser | None = AuthUser("operator", "group_leader", None),
 ) -> TestClient:
     app.dependency_overrides[get_event_service] = lambda: service
     if current_user is None:
@@ -163,7 +164,10 @@ def _client(
 
 
 def test_ingest_formal_event() -> None:
-    client = _client(FakeEventService())
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
 
     response = client.post("/api/v1/ingest/formal", json=_formal_payload())
 
@@ -175,6 +179,52 @@ def test_ingest_formal_event() -> None:
     assert body["service_level"] == 2
     assert body["lifecycle_state"] == "formal_triggered"
     assert body["t1_at"] == "2026-09-17T02:31:00Z"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/v1/ingest/formal", _formal_payload()),
+        (
+            "/api/v1/ingest/correction",
+            {**_formal_payload(), "reportType": "correction"},
+        ),
+    ],
+)
+def test_recovery_ingest_requires_authentication(
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    client = _client(FakeEventService(), current_user=None)
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/v1/ingest/formal", _formal_payload()),
+        (
+            "/api/v1/ingest/correction",
+            {**_formal_payload(), "reportType": "correction"},
+        ),
+    ],
+)
+def test_recovery_ingest_rejects_disallowed_role(
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("viewer", "viewer", None),
+    )
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 403
 
 
 def test_ingest_auto_event_has_no_response_suggestion() -> None:
@@ -259,6 +309,8 @@ def test_manual_event_returns_created() -> None:
     assert body["event_kind"] == "test"
     assert body["institutional_level"] is None
     assert body["service_level"] is None
+    assert body["lifecycle_state"] == "not_applicable"
+    assert body["t1_at"] is None
 
 
 def test_invalid_cenc_payload_returns_400() -> None:
@@ -383,7 +435,7 @@ def test_get_event_returns_current_revision_event_kind() -> None:
         response_suggestion=None,
         response_rule_version=None,
         revision_no=1,
-        lifecycle_state="auto_pending",
+        lifecycle_state="not_applicable",
         t1_at=None,
     )
     service.details["event-drill"] = detail
@@ -393,6 +445,7 @@ def test_get_event_returns_current_revision_event_kind() -> None:
 
     assert response.status_code == 200
     assert response.json()["event_kind"] == "drill"
+    assert response.json()["lifecycle_state"] == "not_applicable"
 
 
 def test_get_missing_event_returns_404() -> None:

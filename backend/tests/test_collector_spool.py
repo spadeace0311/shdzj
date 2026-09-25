@@ -24,6 +24,24 @@ def test_spool_round_trip_preserves_receipt_time(tmp_path) -> None:
     assert list(spool.iter_pending()) == []
 
 
+def test_spool_round_trip_preserves_recovery_provenance(tmp_path) -> None:
+    envelope = CollectorEnvelope(
+        provider=CollectorProvider.FAN,
+        lane=CollectorLane.WEBSOCKET,
+        received_at=datetime(2026, 9, 25, 1, 5, tzinfo=UTC),
+        payload={"No1": {"EventID": "CENC-1"}},
+        trigger_reason="recovery",
+        recovery_complete=True,
+    )
+    spool = CollectorSpool(tmp_path, max_bytes=1_000_000)
+
+    path = spool.append(envelope)
+    _, restored = next(spool.iter_pending())
+
+    assert restored == envelope
+    spool.remove(path)
+
+
 def test_spool_rejects_write_over_capacity(tmp_path) -> None:
     spool = CollectorSpool(tmp_path, max_bytes=1)
 

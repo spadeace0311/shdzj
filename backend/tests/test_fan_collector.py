@@ -129,6 +129,61 @@ def test_parse_fan_recovery_since_is_inclusive_for_equal_source_time() -> None:
     } == {"CENC-2026-0001", "CENC-2026-0002"}
 
 
+def test_parse_fan_marks_history_recovery_and_live_update() -> None:
+    parser = FanMessageParser()
+    recovery_since = datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC)
+
+    history = parser.parse(
+        FIXTURE["cenclist_response"],
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=recovery_since,
+    )
+    update = parser.parse(
+        FIXTURE["update"],
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=recovery_since,
+    )
+
+    assert history.envelope is not None
+    assert history.envelope.trigger_reason == "recovery"
+    assert history.recovery_complete is True
+    assert update.envelope is not None
+    assert update.envelope.trigger_reason == "live"
+    assert update.recovery_complete is False
+
+
+def test_parse_fan_invalid_cenclist_response_does_not_complete_recovery() -> None:
+    parsed = FanMessageParser().parse(
+        {"type": "cenclist_response"},
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC),
+    )
+
+    assert parsed.history_frame is True
+    assert parsed.recovery_complete is False
+
+
+def test_parse_fan_unparseable_history_item_does_not_complete_recovery() -> None:
+    parsed = FanMessageParser().parse(
+        {
+            "type": "cenclist_response",
+            "Data": {
+                "No1": next(
+                    iter(FIXTURE["cenclist_response"]["Data"].values())
+                ),
+                "No2": {"id": "CENC-INCOMPLETE"},
+            },
+        },
+        datetime(2026, 9, 25, 1, 6, tzinfo=UTC),
+        recovery_since=datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC),
+    )
+
+    assert parsed.history_frame is True
+    assert parsed.recovery_complete is False
+    assert parsed.envelope is not None
+    assert parsed.envelope.recovery_complete is False
+
+
 async def fake_sleep(delay: float) -> None:
     return None
 
@@ -400,8 +455,21 @@ async def test_query_is_sent_after_configured_interval() -> None:
     await asyncio.wait_for(task, timeout=1)
 
 
-async def test_fan_collector_clears_recovery_since_after_first_history_frame() -> None:
+async def test_fan_collector_waits_for_cenclist_before_accepting_old_history() -> None:
     recovery_since = datetime(2026, 9, 25, 1, 0, 2, tzinfo=UTC)
+    newer_query = {
+        "type": "query_response",
+        "cenc": {
+            "Data": {
+                "No1": {
+                    **FIXTURE["initial"]["cenc"]["Data"]["No1"],
+                    "id": "CENC-2026-NEWER",
+                    "eventId": "CENC-2026-NEWER",
+                    "shockTime": "2026-09-25T01:00:03Z",
+                }
+            }
+        },
+    }
     older_query = {
         "type": "query_response",
         "cenc": {"Data": FIXTURE["initial"]["cenc"]["Data"]},
@@ -409,6 +477,8 @@ async def test_fan_collector_clears_recovery_since_after_first_history_frame() -
     websocket = FakeWebSocket(
         (
             json.dumps({"type": "auth_success"}),
+            json.dumps(newer_query),
+            json.dumps(older_query),
             json.dumps(FIXTURE["cenclist_response"]),
             json.dumps(older_query),
         )
@@ -428,18 +498,33 @@ async def test_fan_collector_clears_recovery_since_after_first_history_frame() -
         recovery_since=recovery_since,
     )
     envelopes = EnvelopeRecorder()
+
+    async def clear_bound_after_completion(envelope) -> None:
+        envelopes.envelopes.append(envelope)
+        if envelope.recovery_complete:
+            collector.recovery_since = None
+
     stop_event = asyncio.Event()
     task = asyncio.create_task(
-        collector.run(on_envelope=envelopes, on_health=AsyncMock(), stop_event=stop_event)
+        collector.run(
+            on_envelope=clear_bound_after_completion,
+            on_health=AsyncMock(),
+            stop_event=stop_event,
+        )
     )
 
     await asyncio.wait_for(websocket.drained.wait(), timeout=1)
     stop_event.set()
     await asyncio.wait_for(task, timeout=1)
 
+    assert [item.trigger_reason for item in envelopes.envelopes] == [
+        "recovery",
+        "recovery",
+        "live",
+    ]
     assert [
         item.payload[next(iter(item.payload))]["id"] for item in envelopes.envelopes
-    ] == ["CENC-2026-0002", "CENC-2026-0001"]
+    ] == ["CENC-2026-NEWER", "CENC-2026-0002", "CENC-2026-0001"]
 
 
 async def test_callback_exception_propagates_without_reconnect() -> None:

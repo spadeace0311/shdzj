@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
 
@@ -49,9 +50,17 @@ class CollectorSupervisor:
             CollectorProvider.FAN: "starting",
             CollectorProvider.WOLFX: "starting",
         }
+        self._last_health_updates: dict[
+            CollectorProvider,
+            ProviderHealthUpdate,
+        ] = {}
+        self._healthy_since: dict[CollectorProvider, datetime] = {}
         self._queue: asyncio.Queue[CollectorEnvelope] | None = None
         self._stop_event: asyncio.Event | None = None
-        self._bootstrap_cutoff: datetime | None = None
+        self._recovery_bounds: dict[CollectorProvider, datetime | None] = {
+            CollectorProvider.FAN: None,
+            CollectorProvider.WOLFX: None,
+        }
         self._pending_spool = False
 
     @property
@@ -74,16 +83,21 @@ class CollectorSupervisor:
         await self._set_provider_state(CollectorProvider.WOLFX, "starting")
 
         watermarks = await self._load_watermarks()
-        if not any(value is not None for value in watermarks.values()):
-            self._bootstrap_cutoff = self._now() - timedelta(
-                hours=self._settings.cenc_bootstrap_lookback_hours
-            )
-        else:
-            self._bootstrap_cutoff = None
+        for provider in (CollectorProvider.FAN, CollectorProvider.WOLFX):
+            bound = watermarks[provider]
+            if bound is None:
+                bound = self._now() - timedelta(
+                    hours=self._settings.cenc_bootstrap_lookback_hours
+                )
+            self._recovery_bounds[provider] = bound
         if hasattr(self._fan_collector, "recovery_since"):
-            self._fan_collector.recovery_since = watermarks[CollectorProvider.FAN]
+            self._fan_collector.recovery_since = self._recovery_bounds[
+                CollectorProvider.FAN
+            ]
         if hasattr(self._wolfx_collector, "recovery_since"):
-            self._wolfx_collector.recovery_since = watermarks[CollectorProvider.WOLFX]
+            self._wolfx_collector.recovery_since = self._recovery_bounds[
+                CollectorProvider.WOLFX
+            ]
 
         if not await self._replay_spool():
             await self._mark_critical_and_stop()
@@ -120,6 +134,7 @@ class CollectorSupervisor:
                         timeout=0.5,
                     )
                 except asyncio.TimeoutError:
+                    await self._enforce_message_staleness()
                     continue
                 await self._process_live(envelope)
         except asyncio.CancelledError:
@@ -306,14 +321,27 @@ class CollectorSupervisor:
         return "critical"
 
     async def _process_live(self, envelope: CollectorEnvelope) -> None:
-        for item in self._coordinator.expand(envelope):
-            cutoff = self._bootstrap_cutoff
+        expanded = self._coordinator.expand(envelope)
+        all_settled = True
+        for item in expanded:
+            trigger_reason = item.trigger_reason
+            bound = self._recovery_bounds[item.provider]
             source_time = self._source_time(item)
-            if cutoff is not None and source_time is not None:
-                if source_time < cutoff:
-                    continue
-                self._bootstrap_cutoff = None
-            await self._process_expanded(item, _LIVE, allow_spool=True)
+            if (
+                bound is not None
+                and source_time is not None
+                and source_time < bound
+            ):
+                continue
+            outcome = await self._process_expanded(
+                item,
+                trigger_reason,
+                allow_spool=True,
+            )
+            if outcome in {"spooled", "critical", "dead_letter"}:
+                all_settled = False
+        if envelope.recovery_complete and all_settled:
+            self._clear_recovery_bound(envelope.provider)
 
     async def _replay_spool(self) -> bool:
         pending = list(self._spool.iter_pending())
@@ -322,6 +350,7 @@ class CollectorSupervisor:
         pending.sort(key=lambda pair: pair[1].received_at)
         for path, envelope in pending:
             successful_items: list[CollectorEnvelope] = []
+            all_settled = True
             for item in self._coordinator.expand(envelope):
                 outcome = await self._process_expanded(
                     item,
@@ -331,6 +360,8 @@ class CollectorSupervisor:
                 )
                 if outcome == "critical":
                     return False
+                if outcome in {"spooled", "dead_letter"}:
+                    all_settled = False
                 if outcome == "ingested":
                     successful_items.append(item)
             try:
@@ -343,7 +374,19 @@ class CollectorSupervisor:
                 return False
             for item in successful_items:
                 await self._record_success(item)
+            if envelope.recovery_complete and all_settled:
+                self._clear_recovery_bound(envelope.provider)
         return True
+
+    def _clear_recovery_bound(self, provider: CollectorProvider) -> None:
+        self._recovery_bounds[provider] = None
+        collector = (
+            self._fan_collector
+            if provider is CollectorProvider.FAN
+            else self._wolfx_collector
+        )
+        if hasattr(collector, "recovery_since"):
+            collector.recovery_since = None
 
     async def _mark_critical_and_stop(self) -> None:
         await self._set_provider_state(CollectorProvider.FAN, "critical")
@@ -377,11 +420,48 @@ class CollectorSupervisor:
                 await self._spool_failed()
 
     async def _on_health(self, update: ProviderHealthUpdate) -> None:
+        if self._health.get(update.provider) == "critical" and update.state != "critical":
+            return
+        update = self._effective_health_update(update)
+        self._last_health_updates[update.provider] = update
         self._health[update.provider] = update.state
         try:
             await self._service.persist_health(update)
         except Exception:
             logger.exception("collector health persistence failed")
+
+    async def _enforce_message_staleness(self) -> None:
+        for update in list(self._last_health_updates.values()):
+            if update.state != "healthy" or not update.connected:
+                continue
+            effective = self._effective_health_update(update)
+            if effective.state != update.state:
+                await self._on_health(effective)
+
+    def _effective_health_update(
+        self,
+        update: ProviderHealthUpdate,
+    ) -> ProviderHealthUpdate:
+        if update.state != "healthy":
+            if update.state in {"starting", "critical", "stopped"}:
+                self._healthy_since.pop(update.provider, None)
+            return update
+
+        if update.last_message_at is not None:
+            self._healthy_since[update.provider] = update.last_message_at
+        else:
+            self._healthy_since.setdefault(update.provider, self._now())
+
+        anchor = self._healthy_since[update.provider]
+        stale_after = timedelta(seconds=self._settings.collector_stale_after_seconds)
+        if update.connected and self._now() - anchor > stale_after:
+            return replace(
+                update,
+                state="degraded",
+                last_error="no recent messages",
+                updated_at=self._now(),
+            )
+        return update
 
     async def _set_provider_state(
         self,

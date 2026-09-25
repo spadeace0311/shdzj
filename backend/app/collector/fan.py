@@ -33,6 +33,7 @@ class FanParseResult:
     heartbeat: bool = False
     error_text: str | None = None
     history_frame: bool = False
+    recovery_complete: bool = False
 
 
 class FanMessageParser:
@@ -65,24 +66,46 @@ class FanMessageParser:
                 if not data:
                     return FanParseResult(history_frame=True)
                 return FanParseResult(
-                    envelope=self._envelope(data, received_at),
+                    envelope=self._envelope(
+                        data,
+                        received_at,
+                        trigger_reason=(
+                            "recovery" if recovery_since is not None else "live"
+                        ),
+                    ),
                     history_frame=True,
                 )
             return FanParseResult(history_frame=True)
 
         if message_type == "cenclist_response":
             history = message.get("Data")
-            if not isinstance(history, dict) or not history:
+            if not isinstance(history, dict):
                 return FanParseResult(history_frame=True)
+            complete = all(
+                isinstance(item, dict)
+                and _history_source_time(item) is not None
+                for item in history.values()
+            )
             items = [item for item in history.values() if isinstance(item, dict)]
             items = _filter_history_items(items, recovery_since)
             if not items:
-                return FanParseResult(history_frame=True)
+                return FanParseResult(
+                    history_frame=True,
+                    recovery_complete=complete and recovery_since is not None,
+                )
             items.sort(key=_history_sort_key)
             normalized = {f"No{index}": item for index, item in enumerate(items, start=1)}
             return FanParseResult(
-                envelope=self._envelope(normalized, received_at),
+                envelope=self._envelope(
+                    normalized,
+                    received_at,
+                    trigger_reason=(
+                        "recovery" if recovery_since is not None else "live"
+                    ),
+                    recovery_complete=complete and recovery_since is not None,
+                ),
                 history_frame=True,
+                recovery_complete=complete and recovery_since is not None,
             )
 
         if message_type == "update":
@@ -90,16 +113,31 @@ class FanMessageParser:
                 return FanParseResult()
             data = message.get("Data")
             if isinstance(data, dict) and data:
-                return FanParseResult(envelope=self._envelope({"No1": data}, received_at))
+                return FanParseResult(
+                    envelope=self._envelope(
+                        {"No1": data},
+                        received_at,
+                        trigger_reason="live",
+                    )
+                )
 
         return FanParseResult()
 
-    def _envelope(self, payload: dict[str, object], received_at: datetime) -> CollectorEnvelope:
+    def _envelope(
+        self,
+        payload: dict[str, object],
+        received_at: datetime,
+        *,
+        trigger_reason: str,
+        recovery_complete: bool = False,
+    ) -> CollectorEnvelope:
         return CollectorEnvelope(
             provider=CollectorProvider.FAN,
             lane=CollectorLane.WEBSOCKET,
             received_at=received_at,
             payload=payload,
+            trigger_reason=trigger_reason,
+            recovery_complete=recovery_complete,
         )
 
 
@@ -220,7 +258,6 @@ class FanCollector:
         self._consecutive_failures = 0
         self._reconnect_count = 0
         self._last_error: str | None = None
-        self._history_recovery_applied = False
 
     async def run(
         self,
@@ -323,9 +360,6 @@ class FanCollector:
             parsed = self._parse_message(message)
             if parsed is None:
                 continue
-            if parsed.history_frame and not self._history_recovery_applied:
-                self._history_recovery_applied = True
-                self._recovery_since = None
             if parsed.auth_state == "success":
                 self._authenticated = True
                 self._last_error = None
@@ -336,17 +370,28 @@ class FanCollector:
                 raise _AuthenticationFailed
             if parsed.heartbeat:
                 continue
-            if parsed.envelope is None:
+            envelope = parsed.envelope
+            if envelope is None and parsed.recovery_complete:
+                envelope = CollectorEnvelope(
+                    provider=CollectorProvider.FAN,
+                    lane=CollectorLane.WEBSOCKET,
+                    received_at=self._now(),
+                    payload={},
+                    trigger_reason="recovery",
+                    recovery_complete=True,
+                )
+            if envelope is None:
                 continue
 
             try:
                 if self._authenticated:
                     self._last_http_status = None
-                    self._last_message_at = parsed.envelope.received_at
-                    self._last_success_at = parsed.envelope.received_at
+                    if envelope.payload:
+                        self._last_message_at = envelope.received_at
+                    self._last_success_at = envelope.received_at
                     self._consecutive_failures = 0
                     self._last_error = None
-                await on_envelope(parsed.envelope)
+                await on_envelope(envelope)
                 if self._authenticated:
                     await self._emit_health(on_health, "healthy")
             except Exception as exc:
