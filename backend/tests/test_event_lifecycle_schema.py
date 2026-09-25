@@ -1,9 +1,16 @@
+from pathlib import Path
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import UniqueConstraint, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import settings
 from app.events import models as event_models
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+
+
+BACKEND_DIR = Path(__file__).parents[1]
 
 
 def test_event_lifecycle_orm_metadata_contract() -> None:
@@ -75,6 +82,10 @@ def test_event_lifecycle_orm_metadata_contract() -> None:
 
 
 async def test_event_lifecycle_schema_contract() -> None:
+    alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    expected_migration_version = ScriptDirectory.from_config(alembic_config).get_current_head()
+
     engine = create_async_engine(settings.database_url)
     async with engine.connect() as connection:
         schema = await connection.run_sync(
@@ -106,7 +117,7 @@ async def test_event_lifecycle_schema_contract() -> None:
         migration_version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
     await engine.dispose()
 
-    assert migration_version == "0005_event_lifecycle"
+    assert migration_version == expected_migration_version
     assert "event_lifecycle_outbox" in schema["tables"]
     assert {"provider", "ingest_lane"} <= schema["columns"]["raw_messages"]
     assert {"t1_at", "lifecycle_state", "latest_trigger_revision_id"} <= schema["columns"][
