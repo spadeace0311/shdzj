@@ -478,22 +478,19 @@ async def test_runtime_spool_drain_failure_stops_before_newer_live_item() -> Non
     assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
 
 
-async def test_spool_removal_failure_stops_without_reporting_success(
+async def test_spool_remove_commit_failure_keeps_pending_without_success(
     tmp_path,
     monkeypatch,
 ) -> None:
     service = RecordingCollectorService()
     spool = CollectorSpool(tmp_path, max_bytes=1_000_000)
-    spool.append(envelope())
-    path, retained = next(spool.iter_pending())
-    original_unlink = type(path).unlink
+    retained = envelope()
+    path = spool.append(retained)
 
-    def fail_unlink(self, *args, **kwargs):
-        if self == path:
-            raise OSError("unlink failed")
-        return original_unlink(self, *args, **kwargs)
+    def fail_directory_fsync() -> None:
+        raise OSError("directory fsync failed")
 
-    monkeypatch.setattr(type(path), "unlink", fail_unlink)
+    monkeypatch.setattr(spool, "_fsync_directory", fail_directory_fsync)
     coordinator = SuccessfulCoordinator()
     stop_event = asyncio.Event()
     supervisor = CollectorSupervisor(
@@ -511,8 +508,54 @@ async def test_spool_removal_failure_stops_without_reporting_success(
     assert stop_event.is_set()
     assert coordinator.calls == [retained]
     assert service.successes == []
-    assert path.exists()
-    assert list(spool.iter_pending()) == [(path, retained)]
+    deleting_path = path.with_name(path.name + ".deleting")
+    assert not path.exists()
+    assert deleting_path.exists()
+    assert list(spool.iter_pending()) == [(deleting_path, retained)]
+    assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_spool_remove_final_fsync_failure_stops_without_success(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = RecordingCollectorService()
+    spool = CollectorSpool(tmp_path, max_bytes=1_000_000)
+    retained = envelope()
+    path = spool.append(retained)
+    calls = 0
+
+    def fail_directory_fsync() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("final directory fsync failed")
+
+    monkeypatch.setattr(spool, "_fsync_directory", fail_directory_fsync)
+    coordinator = SuccessfulCoordinator()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=spool,
+        fan_collector=NoopFanCollector(),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    await asyncio.wait_for(supervisor.run(stop_event), timeout=1)
+
+    # The ingest committed before removal. The first directory sync durably
+    # committed deletion, so the final cleanup failure must not report success
+    # or claim the payload is still pending.
+    assert calls == 2
+    assert stop_event.is_set()
+    assert coordinator.calls == [retained]
+    assert service.successes == []
+    assert not path.exists()
+    assert not path.with_name(path.name + ".deleting").exists()
+    assert list(spool.iter_pending()) == []
     assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
 
 

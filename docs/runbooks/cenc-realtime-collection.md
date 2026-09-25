@@ -136,12 +136,16 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api python -m app.
 collector 在数据库不可用时先重试，仍失败时把单个 envelope 以 JSON 文件写入 `/var/lib/collector-spool`。检查待恢复文件：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml exec collector sh -lc "find /var/lib/collector-spool -maxdepth 1 -type f -name '*.json' -printf '%TY-%Tm-%TdT%TH:%TM:%TS %f\n' | sort"
+docker compose --env-file .env -f infra/compose.yaml exec collector sh -lc "find /var/lib/collector-spool -maxdepth 1 -type f \( -name '*.json' -o -name '*.json.deleting' \) -printf '%TY-%Tm-%TdT%TH:%TM:%TS %f\n' | sort"
 ```
 
 数据库恢复后的正常路径是：collector 下一次 drain 按 `received_at` 顺序重放 spool，成功后删除文件，再继续接收 live 数据。
 
-spool 只有在文件删除和目录 `fsync` 均成功后才算排空；此后 supervisor 才上报该 envelope 的成功水位。unlink 失败时文件保留；unlink 或目录 `fsync` 失败时 drain 进入 `critical` 并停止，不报告成功。若 `fsync` 失败发生在文件已经从当前命名空间删除之后，重启后仍按语义指纹幂等处理，禁止把该失败静默当作成功。
+spool 删除是两阶段状态转换。`remove()` 先把 `*.json` 原子重命名为 `*.json.deleting`，再对该目录执行 `fsync`。`*.json.deleting` 在重启时仍按待处理报文加载并重放；只有这次目录 `fsync` 成功才算删除已持久提交。重命名或首次目录 `fsync` 失败时 collector 进入 `critical` 并停止，不报告成功，报文仍可从 `*.json` 或 `*.json.deleting` 恢复。
+
+持久删除提交后，collector 才删除 `*.json.deleting` 并再次同步目录。若后续 unlink 或最终目录 `fsync` 失败，removal 错误仍会向上传播并停止 collector，但此时不能声称原文件名仍保留：coordinator 的入库事务已经提交，且首次目录 `fsync` 已持久提交删除。重启后该报文可能已不存在，也可能仍以 `*.json.deleting` 出现并按语义指纹幂等重放；两种状态都不会丢失报文，也不会静默报告成功水位。
+
+Windows 不提供 POSIX 目录 `fsync`，collector 在该平台不会打开目录。原子重命名、unlink 和恢复标记共同保证：崩溃后报文要么仍以待处理文件出现并重放，要么其入库事务和删除提交已经生效。支持目录 `fsync` 的 POSIX 文件系统仍严格传播所有打开、同步、重命名和删除错误。
 
 恢复演练：
 

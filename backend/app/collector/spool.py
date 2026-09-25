@@ -66,7 +66,9 @@ class CollectorSpool:
 
     def iter_pending(self) -> Iterator[tuple[Path, CollectorEnvelope]]:
         pending: list[tuple[Path, CollectorEnvelope]] = []
-        for path in self._directory.glob("*.json"):
+        for path in self._directory.iterdir():
+            if not path.is_file() or not self._is_pending_file(path):
+                continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 envelope = self._deserialize(payload)
@@ -78,7 +80,18 @@ class CollectorSpool:
         yield from pending
 
     def remove(self, path: Path) -> None:
-        path.unlink(missing_ok=True)
+        if path.name.endswith(".json.deleting"):
+            deleting_path = path
+        elif path.name.endswith(".json"):
+            deleting_path = path.with_name(path.name + ".deleting")
+            os.replace(path, deleting_path)
+        else:
+            raise ValueError(f"not a collector spool file: {path}")
+
+        # The rename starts the logical delete commit. Until this directory
+        # sync succeeds, iter_pending() treats the .deleting file as pending.
+        self._fsync_directory()
+        deleting_path.unlink(missing_ok=True)
         self._fsync_directory()
 
     def _usage_bytes(self) -> int:
@@ -107,14 +120,18 @@ class CollectorSpool:
         )
 
     def _fsync_directory(self) -> None:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
+        if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            return
+        flags = os.O_RDONLY | os.O_DIRECTORY
         fd = os.open(self._directory, flags)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _is_pending_file(path: Path) -> bool:
+        return path.name.endswith(".json") or path.name.endswith(".json.deleting")
 
     def _quarantine(self, path: Path, reason: str) -> None:
         quarantine_path = path.with_suffix(path.suffix + ".corrupt")
