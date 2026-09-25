@@ -54,8 +54,7 @@ class CencAdapter:
         "Magnitude",
         "Depth",
     }
-    _FAN_EQ_FIELDS = {
-        "id",
+    _FAN_EQ_COMMON_FIELDS = {
         "shockTime",
         "infoTypeName",
         "placeName",
@@ -147,10 +146,10 @@ class CencAdapter:
         )
 
     def _parse_fan_eq(self, payload: dict[str, object]) -> NormalizedEvent:
-        _require_fields(payload, self._FAN_EQ_FIELDS)
+        _require_fields(payload, self._FAN_EQ_COMMON_FIELDS)
         return _build_event(
             kind=_fan_report_kind(payload["infoTypeName"]),
-            source_event_id=_required_text(payload, "id"),
+            source_event_id=_required_any_text(payload, ("id", "eventId")),
             origin_time=_parse_origin_time(payload["shockTime"], "shockTime"),
             longitude=_decimal_field(payload, "longitude"),
             latitude=_decimal_field(payload, "latitude"),
@@ -179,17 +178,17 @@ class CencAdapter:
 
 def _detect_shape(payload: dict[str, object]) -> _PayloadShape:
     keys = set(payload)
-    exact_matches = [
-        shape
-        for shape, required in (
-            (_PayloadShape.INTERNAL, CencAdapter._INTERNAL_FIELDS),
-            (_PayloadShape.WOLFX_EQ, CencAdapter._WOLFX_EQ_FIELDS),
-            (_PayloadShape.WOLFX_EEW, CencAdapter._WOLFX_EEW_FIELDS),
-            (_PayloadShape.FAN_EQ, CencAdapter._FAN_EQ_FIELDS),
-            (_PayloadShape.FAN_EEW, CencAdapter._FAN_EEW_FIELDS),
-        )
-        if required <= keys
-    ]
+    exact_matches: list[_PayloadShape] = []
+    for shape, required in (
+        (_PayloadShape.INTERNAL, CencAdapter._INTERNAL_FIELDS),
+        (_PayloadShape.WOLFX_EQ, CencAdapter._WOLFX_EQ_FIELDS),
+        (_PayloadShape.WOLFX_EEW, CencAdapter._WOLFX_EEW_FIELDS),
+        (_PayloadShape.FAN_EEW, CencAdapter._FAN_EEW_FIELDS),
+    ):
+        if required <= keys:
+            exact_matches.append(shape)
+    if CencAdapter._FAN_EQ_COMMON_FIELDS <= keys and {"id", "eventId"} & keys:
+        exact_matches.append(_PayloadShape.FAN_EQ)
     if len(exact_matches) > 1:
         raise ValueError("ambiguous CENC payload shape")
     if exact_matches:
@@ -200,9 +199,9 @@ def _detect_shape(payload: dict[str, object]) -> _PayloadShape:
         partial_matches.append(_PayloadShape.WOLFX_EEW)
     if {"type", "EventID"} <= keys:
         partial_matches.append(_PayloadShape.WOLFX_EQ)
-    if {"id", "shockTime"} <= keys:
+    if {"infoTypeName", "shockTime"} <= keys and {"id", "eventId"} & keys:
         partial_matches.append(_PayloadShape.FAN_EQ)
-    if {"eventId", "shockTime"} <= keys:
+    if {"eventId", "shockTime", "updates"} <= keys:
         partial_matches.append(_PayloadShape.FAN_EEW)
     if len(partial_matches) > 1:
         raise ValueError("ambiguous CENC payload shape")
@@ -304,6 +303,14 @@ def _required_text(payload: dict[str, object], field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"invalid CENC {field}")
     return value.strip()
+
+
+def _required_any_text(payload: dict[str, object], fields: tuple[str, ...]) -> str:
+    for field in fields:
+        value = payload.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise ValueError(f"missing CENC event id: {list(fields)}")
 
 
 def _optional_text(value: object) -> str | None:

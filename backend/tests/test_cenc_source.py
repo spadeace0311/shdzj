@@ -209,6 +209,36 @@ def test_parse_fan_cenc_determination_formal_contract(info_type: str) -> None:
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
 
 
+@pytest.mark.parametrize(
+    ("info_type", "expected_kind"),
+    [
+        ("正式测定", EventKind.FORMAL),
+        ("自动测定", EventKind.AUTO),
+    ],
+)
+def test_parse_realtime_fan_cenc_determination_without_updates(
+    info_type: str,
+    expected_kind: EventKind,
+) -> None:
+    event = CencAdapter().parse(
+        {
+            "eventId": "FAN-REALTIME-2026091701",
+            "createTime": "2026-09-17 10:35:00",
+            "shockTime": "2026-09-17 10:30:05",
+            "infoTypeName": info_type,
+            "placeName": "华东某地",
+            "latitude": 31.22,
+            "longitude": 121.54,
+            "magnitude": 5.2,
+            "depth": 12.0,
+        }
+    )
+
+    assert event.kind is expected_kind
+    assert event.source_event_id == "FAN-REALTIME-2026091701"
+    assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+
+
 def test_parse_fan_cenc_eew_contract() -> None:
     event = CencAdapter().parse(
         {
