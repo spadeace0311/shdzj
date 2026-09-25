@@ -24,11 +24,15 @@ async def replay_dead_letter(
         raise LookupError(f"dead letter not found: {dead_letter_id}")
 
     try:
+        raw_payload = record["raw_payload"]
+        if not isinstance(raw_payload, dict):
+            raise ValueError("dead letter payload must be an object")
         envelope = CollectorEnvelope(
             provider=CollectorProvider(str(record["provider"])),
             lane=CollectorLane(str(record["lane"])),
             received_at=record["received_at"],
-            payload=record["raw_payload"],
+            # The supervisor persists the expanded single item, not the NoN envelope.
+            payload={"No1": raw_payload},
         )
         await coordinator.ingest(envelope, trigger_reason="recovery")
     except Exception as exc:

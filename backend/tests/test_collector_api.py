@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.auth.router import get_current_user
@@ -98,3 +99,13 @@ def test_collector_status_rejects_role_without_permission() -> None:
         response = client.get("/api/v1/collector/status")
 
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("role", ("group_leader", "group_deputy"))
+def test_collector_status_allows_group_roles(role: str) -> None:
+    current_user = AuthUser(username=f"{role}-user", role=role, workgroup="sh")
+
+    with _client(current_user=current_user) as client:
+        response = client.get("/api/v1/collector/status")
+
+    assert response.status_code == 200
