@@ -1,0 +1,19 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "test-shanghai"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [120.8, 30.6],
+          [122.2, 30.6],
+          [122.2, 31.9],
+          [120.8, 31.9],
+          [120.8, 30.6]
+        ]]
+      }
+    }
+  ]
+}

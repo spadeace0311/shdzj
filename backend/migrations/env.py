@@ -13,6 +13,7 @@ from app.db import Base
 
 # Importing model modules registers all application tables with Base.metadata.
 from app.events import models as event_models  # noqa: F401
+from app.regions import models as region_models  # noqa: F401
 
 config = context.config
 
