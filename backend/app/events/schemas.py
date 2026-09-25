@@ -38,6 +38,8 @@ class EventIngestResponse(BaseModel):
     event_kind: str
     institutional_level: str | None = None
     service_level: int | None = None
+    lifecycle_state: str | None = None
+    t1_at: datetime | None = None
 
 
 class EventSummaryResponse(BaseModel):

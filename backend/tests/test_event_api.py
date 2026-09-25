@@ -8,12 +8,12 @@ from app.auth.router import get_current_user
 from app.auth.service import AuthUser
 from app.events.repository import (
     EventDetailRecord,
-    EventIngestOutcome,
     EventIngestResult,
     EventSummaryRecord,
 )
 from app.events.response_rules import ResponseSuggestion
 from app.events.router import get_event_service
+from app.events.service import LifecycleIngestOutcome
 from app.main import app
 
 
@@ -104,8 +104,9 @@ class FakeEventService:
         event: object,
         response_input: object | None = None,
         received_at: datetime | None = None,
-    ) -> EventIngestOutcome:
-        del received_at
+        region_context: object | None = None,
+    ) -> LifecycleIngestOutcome:
+        del received_at, region_context
         key = json.dumps(raw_payload, sort_keys=True, ensure_ascii=False)
         result = self._ingested.get(key)
         if result is None:
@@ -119,14 +120,18 @@ class FakeEventService:
             result.event_id,
             (None, None),
         )
-        return EventIngestOutcome(
+        return LifecycleIngestOutcome(
             event_id=result.event_id,
             revision_id=result.revision_id,
             revision_no=result.revision_no,
             event_kind=result.event_kind,
+            lifecycle_state="formal_triggered",
             is_current=result.is_current,
+            is_new=True,
+            triggered_assessment=True,
             institutional_level=institutional_level,
             service_level=service_level,
+            t1_at=datetime(2026, 9, 17, 2, 31, tzinfo=UTC),
         )
 
     async def list_events(self) -> list[EventSummaryRecord]:

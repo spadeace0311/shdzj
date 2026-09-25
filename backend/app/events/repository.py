@@ -12,8 +12,14 @@ from sqlalchemy import case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
-from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
 from app.events.response_rules import ResponseSuggestion
+from app.regions.domain import RegionContext
 
 _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
@@ -29,6 +35,7 @@ class EventIngestResult:
     revision_no: int
     event_kind: EventKind
     is_current: bool
+    is_new: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +127,9 @@ class EventRepository:
         payload: dict[str, object],
         event: NormalizedEvent,
         received_at: datetime,
+        *,
+        provider: str,
+        ingest_lane: str,
     ) -> RawMessage:
         received_at = _normalize_utc(received_at, "received_at")
         checksum = self.checksum(payload, event.source, event.kind.value)
@@ -134,6 +144,8 @@ class EventRepository:
             received_at=received_at,
             checksum=checksum,
             payload=payload,
+            provider=provider,
+            ingest_lane=ingest_lane,
         )
         session.add(raw)
         await session.flush()
@@ -154,6 +166,12 @@ class EventRepository:
         session: AsyncSession,
         raw: RawMessage,
         event: NormalizedEvent,
+        *,
+        semantic_fingerprint: str | None,
+        provider: str,
+        ingest_lane: str,
+        ingested_at: datetime,
+        region_context: RegionContext | None,
     ) -> EventIngestResult:
         existing_revision = await session.scalar(
             select(EarthquakeRevision).where(EarthquakeRevision.raw_message_id == raw.id)
@@ -165,11 +183,16 @@ class EventRepository:
                 revision_no=existing_revision.revision_no,
                 event_kind=EventKind(existing_revision.revision_kind),
                 is_current=existing_revision.is_current,
+                is_new=False,
             )
+
+        if event.kind in _LOGICAL_EVENT_KINDS and not semantic_fingerprint:
+            raise ValueError("semantic_fingerprint is required for CENC lifecycle events")
 
         source_id = canonical_source_id(event)
         canonical = await self._find_canonical_event(session, event, source_id)
         geom = _point_geometry(event)
+        canonical_existed = canonical is not None
 
         if canonical is None:
             canonical = EarthquakeEvent(
@@ -190,6 +213,7 @@ class EventRepository:
             await session.flush()
             revision_no = 1
             current_revision = None
+            has_reviewed_kind = False
         else:
             latest_revision_no = await session.scalar(
                 select(func.max(EarthquakeRevision.revision_no)).where(
@@ -198,8 +222,41 @@ class EventRepository:
             )
             revision_no = int(latest_revision_no or 0) + 1
             current_revision = await self._get_current_revision(session, canonical)
+            has_reviewed_kind = await session.scalar(
+                select(EarthquakeRevision.revision_kind)
+                .where(
+                    EarthquakeRevision.event_id == canonical.id,
+                    EarthquakeRevision.revision_kind.in_(
+                        tuple(kind.value for kind in _REVIEWED_EVENT_KINDS)
+                    ),
+                )
+                .limit(1)
+            ) is not None
 
-        becomes_current = _becomes_current(current_revision, event, raw.received_at)
+        if semantic_fingerprint is not None and canonical_existed:
+            duplicate_revision = await session.scalar(
+                select(EarthquakeRevision).where(
+                    EarthquakeRevision.event_id == canonical.id,
+                    EarthquakeRevision.semantic_fingerprint == semantic_fingerprint,
+                )
+            )
+            if duplicate_revision is not None:
+                return EventIngestResult(
+                    event_id=str(duplicate_revision.event_id),
+                    revision_id=str(duplicate_revision.id),
+                    revision_no=duplicate_revision.revision_no,
+                    event_kind=EventKind(duplicate_revision.revision_kind),
+                    is_current=duplicate_revision.is_current,
+                    is_new=False,
+                )
+
+        revision_kind = _resolve_revision_kind(event.kind, has_reviewed_kind)
+        becomes_current = _becomes_current(
+            current_revision,
+            event,
+            raw.received_at,
+            event_kind=revision_kind,
+        )
         if becomes_current:
             await session.execute(
                 update(EarthquakeRevision)
@@ -211,7 +268,7 @@ class EventRepository:
             event_id=canonical.id,
             raw_message_id=raw.id,
             revision_no=revision_no,
-            revision_kind=event.kind.value,
+            revision_kind=revision_kind.value,
             source_event_id=event.source_event_id,
             source_report_time=event.report_time,
             source_report_number=event.report_number,
@@ -221,6 +278,16 @@ class EventRepository:
             depth_km=event.depth_km,
             magnitude=event.magnitude,
             place=event.place,
+            semantic_fingerprint=semantic_fingerprint,
+            provider=provider,
+            ingest_lane=ingest_lane,
+            ingested_at=_normalize_utc(ingested_at, "ingested_at"),
+            inside_shanghai=region_context.inside_shanghai if region_context else None,
+            distance_to_boundary_km=(
+                region_context.distance_to_boundary_km if region_context else None
+            ),
+            region_boundary_version=region_context.boundary_version if region_context else None,
+            region_computed_at=region_context.computed_at if region_context else None,
             is_current=becomes_current,
             created_at=raw.received_at,
         )
@@ -228,16 +295,79 @@ class EventRepository:
         await session.flush()
 
         if becomes_current:
-            _apply_current_event_fields(canonical, event, revision.id, geom)
+            _apply_current_event_fields(canonical, event, revision.id, geom, revision_kind)
+            if revision_kind in _LOGICAL_EVENT_KINDS:
+                canonical.lifecycle_state = _lifecycle_state_for_kind(revision_kind)
+        if revision_kind is EventKind.FORMAL and becomes_current and canonical.t1_at is None:
+            canonical.t1_at = _normalize_utc(ingested_at, "ingested_at")
         canonical.updated_at = raw.received_at
 
         return EventIngestResult(
             event_id=str(canonical.id),
             revision_id=str(revision.id),
             revision_no=revision_no,
-            event_kind=event.kind,
+            event_kind=revision_kind,
             is_current=becomes_current,
+            is_new=True,
         )
+
+    async def enqueue_assessment(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        trigger_reason: str,
+        created_at: datetime,
+    ) -> bool:
+        event_uuid = _coerce_uuid(event_id)
+        revision_uuid = _coerce_uuid(revision_id)
+        existing = await session.scalar(
+            select(EventLifecycleOutbox.id).where(
+                EventLifecycleOutbox.event_id == event_uuid,
+                EventLifecycleOutbox.revision_id == revision_uuid,
+                EventLifecycleOutbox.trigger_type == "assessment.requested",
+            )
+        )
+        if existing is not None:
+            return False
+
+        event = await session.get(EarthquakeEvent, event_uuid, with_for_update=True)
+        if event is None:
+            raise LookupError(f"event not found: {event_uuid}")
+
+        session.add(
+            EventLifecycleOutbox(
+                event_id=event_uuid,
+                revision_id=revision_uuid,
+                trigger_type="assessment.requested",
+                trigger_reason=trigger_reason,
+                payload={
+                    "event_id": str(event_uuid),
+                    "revision_id": str(revision_uuid),
+                    "revision_no": revision_no,
+                },
+                status="pending",
+                attempt_count=0,
+                created_at=created_at,
+                available_at=created_at,
+            )
+        )
+        event.latest_trigger_revision_id = revision_uuid
+        await session.flush()
+        return True
+
+    async def get_event_lifecycle_snapshot(
+        self,
+        session: AsyncSession,
+        event_id: str,
+    ) -> tuple[str | None, datetime | None]:
+        event_uuid = _coerce_uuid(event_id)
+        event = await session.get(EarthquakeEvent, event_uuid)
+        if event is None:
+            raise LookupError(f"event not found: {event_id}")
+        return event.lifecycle_state, event.t1_at
 
     async def set_revision_suggestion(
         self,
@@ -405,12 +535,14 @@ def _becomes_current(
     current_revision: EarthquakeRevision | None,
     event: NormalizedEvent,
     received_at: datetime,
+    *,
+    event_kind: EventKind | None = None,
 ) -> bool:
     if current_revision is None:
         return True
 
     current_kind = EventKind(current_revision.revision_kind)
-    incoming_kind = event.kind
+    incoming_kind = event_kind if event_kind is not None else event.kind
     incoming_is_real = incoming_kind in _REAL_EVENT_KINDS
     current_is_real = current_kind in _REAL_EVENT_KINDS
     if incoming_is_real != current_is_real:
@@ -477,8 +609,9 @@ def _apply_current_event_fields(
     event: NormalizedEvent,
     revision_id: object,
     geom: WKTElement,
+    event_kind: EventKind,
 ) -> None:
-    canonical.event_type = event.kind.value
+    canonical.event_type = event_kind.value
     canonical.origin_time = event.origin_time
     canonical.longitude = event.longitude
     canonical.latitude = event.latitude
@@ -491,6 +624,33 @@ def _apply_current_event_fields(
     canonical.service_level = None
     canonical.response_suggestion = None
     canonical.response_rule_version = None
+
+
+def _resolve_revision_kind(
+    incoming_kind: EventKind,
+    has_reviewed_kind: bool,
+) -> EventKind:
+    if incoming_kind is EventKind.FORMAL and has_reviewed_kind:
+        return EventKind.CORRECTION
+    return incoming_kind
+
+
+def _lifecycle_state_for_kind(event_kind: EventKind) -> str:
+    if event_kind is EventKind.AUTO:
+        return "auto_pending"
+    if event_kind is EventKind.FORMAL:
+        return "formal_triggered"
+    if event_kind is EventKind.CORRECTION:
+        return "correction_triggered"
+    raise ValueError(f"unsupported lifecycle event kind: {event_kind.value}")
+
+
+def _coerce_uuid(value: object) -> object:
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        return uuid.UUID(value)
+    return value
 
 
 def _apply_suggestion_to_revision(

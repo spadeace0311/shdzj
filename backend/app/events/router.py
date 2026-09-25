@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -7,7 +9,6 @@ from app.db import SessionFactory
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.repository import (
     EventDetailRecord,
-    EventIngestOutcome,
     EventIngestResult,
     EventSummaryRecord,
 )
@@ -19,8 +20,9 @@ from app.events.schemas import (
     ManualEventRequest,
     RegionContext,
 )
-from app.events.service import EventService
+from app.events.service import EventService, LifecycleIngestOutcome
 from app.events.sources.cenc import CencAdapter
+from app.regions.domain import RegionContext as DomainRegionContext
 
 router = APIRouter(prefix="/api/v1")
 
@@ -54,11 +56,13 @@ async def ingest_formal(
 ) -> EventIngestResponse:
     event = _parse_cenc(payload, EventKind.FORMAL)
     region_context = _parse_region_context(payload)
+    domain_region_context = _to_domain_region_context(region_context)
     outcome = await _ingest_with_suggestion(
         service,
         payload,
         event,
         _response_input(event, region_context),
+        domain_region_context,
     )
     return _ingest_outcome_response(outcome)
 
@@ -74,11 +78,13 @@ async def ingest_correction(
 ) -> EventIngestResponse:
     event = _parse_cenc(payload, EventKind.CORRECTION)
     region_context = _parse_region_context(payload)
+    domain_region_context = _to_domain_region_context(region_context)
     outcome = await _ingest_with_suggestion(
         service,
         payload,
         event,
         _response_input(event, region_context),
+        domain_region_context,
     )
     return _ingest_outcome_response(outcome)
 
@@ -168,12 +174,14 @@ async def _ingest_with_suggestion(
     payload: dict[str, object],
     event: NormalizedEvent,
     response_input: ResponseInput | None,
-) -> EventIngestOutcome:
+    region_context: DomainRegionContext | None,
+) -> LifecycleIngestOutcome:
     try:
         return await service.ingest_with_response_suggestion(
             payload,
             event,
             response_input,
+            region_context=region_context,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -208,6 +216,19 @@ def _parse_region_context(payload: dict[str, object]) -> RegionContext | None:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _to_domain_region_context(
+    region_context: RegionContext | None,
+) -> DomainRegionContext | None:
+    if region_context is None:
+        return None
+    return DomainRegionContext(
+        inside_shanghai=region_context.inside_shanghai,
+        distance_to_boundary_km=region_context.distance_to_boundary_km,
+        boundary_version=None,
+        computed_at=datetime.now(UTC),
+    )
+
+
 def _ingest_response(
     result: EventIngestResult,
     suggestion: object | None,
@@ -220,10 +241,12 @@ def _ingest_response(
         event_kind=result.event_kind.value,
         institutional_level=None,
         service_level=None,
+        lifecycle_state=None,
+        t1_at=None,
     )
 
 
-def _ingest_outcome_response(outcome: EventIngestOutcome) -> EventIngestResponse:
+def _ingest_outcome_response(outcome: LifecycleIngestOutcome) -> EventIngestResponse:
     return EventIngestResponse(
         event_id=outcome.event_id,
         revision_id=outcome.revision_id,
@@ -231,6 +254,8 @@ def _ingest_outcome_response(outcome: EventIngestOutcome) -> EventIngestResponse
         event_kind=outcome.event_kind.value,
         institutional_level=outcome.institutional_level,
         service_level=outcome.service_level,
+        lifecycle_state=outcome.lifecycle_state,
+        t1_at=outcome.t1_at,
     )
 
 

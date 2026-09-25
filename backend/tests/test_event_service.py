@@ -212,6 +212,9 @@ class _RecordingRepository:
         raw_payload: dict[str, object],
         event: NormalizedEvent,
         received_at: datetime,
+        *,
+        provider: str,
+        ingest_lane: str,
     ) -> RawMessage:
         self.events.append("get_or_create_raw_message")
         self.session = session
@@ -233,6 +236,12 @@ class _RecordingRepository:
         session: _ServiceSession,
         raw: RawMessage,
         event: NormalizedEvent,
+        *,
+        semantic_fingerprint: str | None,
+        provider: str,
+        ingest_lane: str,
+        ingested_at: datetime,
+        region_context: object | None,
     ) -> EventIngestResult:
         self.events.append("append_revision")
         assert session is self.session
@@ -250,6 +259,29 @@ class _RecordingRepository:
 def _compiled(statement: Any) -> tuple[str, dict[str, object]]:
     compiled = statement.compile(dialect=postgresql.dialect())
     return str(compiled), dict(compiled.params)
+
+
+def _append_revision(
+    repository: EventRepository,
+    session: _RecordingSession,
+    raw: RawMessage,
+    event: NormalizedEvent,
+) -> EventIngestResult:
+    fingerprint = (
+        "f" * 64
+        if event.kind in {EventKind.AUTO, EventKind.FORMAL, EventKind.CORRECTION}
+        else None
+    )
+    return repository.append_revision(
+        session,
+        raw,
+        event,
+        semantic_fingerprint=fingerprint,
+        provider="api",
+        ingest_lane="http",
+        ingested_at=raw.received_at,
+        region_context=None,
+    )
 
 
 def test_checksum_is_canonical_and_order_independent() -> None:
@@ -305,6 +337,8 @@ async def test_get_or_create_raw_message_inserts_canonical_payload_and_flushes()
         payload,
         event,
         RECEIVED_AT,
+        provider="api",
+        ingest_lane="http",
     )
 
     assert raw in session.added
@@ -333,6 +367,8 @@ async def test_get_or_create_raw_message_returns_existing_without_insert() -> No
         existing.payload,
         _event(),
         RECEIVED_AT,
+        provider="api",
+        ingest_lane="http",
     )
 
     assert raw is existing
@@ -346,7 +382,7 @@ async def test_new_event_and_first_revision_use_structured_point_geometry() -> N
     raw = _raw_message()
     event = _event()
 
-    result = await repository.append_revision(session, raw, event)
+    result = await _append_revision(repository, session, raw, event)
 
     canonical = next(value for value in session.added if isinstance(value, EarthquakeEvent))
     revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
@@ -377,7 +413,7 @@ async def test_exact_source_lookup_locks_event_and_appends_current_formal_revisi
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision)
+    session = _RecordingSession(None, existing, 1, current_revision, None, None)
     raw = _raw_message()
     formal = _event(
         kind=EventKind.FORMAL,
@@ -385,7 +421,7 @@ async def test_exact_source_lookup_locks_event_and_appends_current_formal_revisi
         report_time=RECEIVED_AT + timedelta(minutes=4),
     )
 
-    result = await repository.append_revision(session, raw, formal)
+    result = await _append_revision(repository, session, raw, formal)
 
     assert result.revision_no == 2
     assert result.event_kind is EventKind.FORMAL
@@ -422,7 +458,7 @@ async def test_tolerance_lookup_uses_source_time_window_spatial_distance_and_loc
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, None, None, existing, 1, current_revision)
+    session = _RecordingSession(None, None, None, existing, 1, current_revision, None, None)
     formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -430,7 +466,7 @@ async def test_tolerance_lookup_uses_source_time_window_spatial_distance_and_loc
         report_time=RECEIVED_AT + timedelta(minutes=4),
     )
 
-    await repository.append_revision(session, _raw_message(), formal)
+    await _append_revision(repository, session, _raw_message(), formal)
 
     sql, params = _compiled(session.scalar_statements[3])
     assert "earthquake_events.source" in sql
@@ -466,7 +502,7 @@ async def test_late_auto_after_formal_merges_without_replacing_published_version
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, None, None, existing, 1, current_revision)
+    session = _RecordingSession(None, None, None, existing, 1, current_revision, None, None)
     late_auto = _event(
         source_event_id="CENC-AUTO-1",
         magnitude=Decimal("5.0"),
@@ -474,7 +510,8 @@ async def test_late_auto_after_formal_merges_without_replacing_published_version
         report_time=RECEIVED_AT + timedelta(minutes=5),
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(minutes=2)),
         late_auto,
@@ -514,7 +551,7 @@ async def test_history_source_alias_wins_before_spatial_tolerance_and_keeps_iden
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, None, existing, 2, current_revision)
+    session = _RecordingSession(None, None, existing, 2, current_revision, "formal", None)
     repeated_auto = _event(
         source_event_id="CENC-AUTO-1",
         report_time=RECEIVED_AT + timedelta(minutes=1),
@@ -522,7 +559,8 @@ async def test_history_source_alias_wins_before_spatial_tolerance_and_keeps_iden
         latitude=Decimal("32.000000"),
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(minutes=6)),
         repeated_auto,
@@ -537,7 +575,7 @@ async def test_history_source_alias_wins_before_spatial_tolerance_and_keeps_iden
     assert result.is_current is False
     assert revision.is_current is False
     assert existing.canonical_source_id == "cenc:fallback:stable"
-    assert len(session.scalar_statements) == 5
+    assert len(session.scalar_statements) == 7
 
 
 async def test_old_formal_after_newer_correction_is_saved_but_not_current() -> None:
@@ -565,7 +603,7 @@ async def test_old_formal_after_newer_correction_is_saved_but_not_current() -> N
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 3, current_revision)
+    session = _RecordingSession(None, existing, 3, current_revision, "correction", None)
     old_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -574,7 +612,8 @@ async def test_old_formal_after_newer_correction_is_saved_but_not_current() -> N
         report_number=2,
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(minutes=10)),
         old_formal,
@@ -611,14 +650,15 @@ async def test_late_formal_without_explicit_order_does_not_replace_correction() 
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 2, current_revision)
+    session = _RecordingSession(None, existing, 2, current_revision, "correction", None)
     late_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
         magnitude=Decimal("5.2"),
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
         late_formal,
@@ -654,7 +694,7 @@ async def test_formal_with_later_report_time_can_replace_correction() -> None:
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 2, current_revision)
+    session = _RecordingSession(None, existing, 2, current_revision, "correction", None)
     later_formal = _event(
         kind=EventKind.FORMAL,
         source_event_id="CENC-FORMAL-2",
@@ -662,7 +702,8 @@ async def test_formal_with_later_report_time_can_replace_correction() -> None:
         report_time=RECEIVED_AT + timedelta(minutes=5),
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(minutes=6)),
         later_formal,
@@ -672,7 +713,8 @@ async def test_formal_with_later_report_time_can_replace_correction() -> None:
     assert result.is_current is True
     assert revision.is_current is True
     assert existing.current_revision_id == revision.id
-    assert existing.event_type == EventKind.FORMAL.value
+    assert result.event_kind is EventKind.CORRECTION
+    assert existing.event_type == EventKind.CORRECTION.value
 
 
 async def test_correction_without_explicit_order_replaces_formal() -> None:
@@ -696,14 +738,14 @@ async def test_correction_without_explicit_order_replaces_formal() -> None:
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision)
+    session = _RecordingSession(None, existing, 1, current_revision, "formal", None)
     correction = _event(
         kind=EventKind.CORRECTION,
         source_event_id="CENC-FORMAL-2",
         magnitude=Decimal("5.3"),
     )
 
-    result = await repository.append_revision(session, _raw_message(), correction)
+    result = await _append_revision(repository, session, _raw_message(), correction)
 
     revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
     assert result.is_current is True
@@ -730,14 +772,14 @@ async def test_newer_auto_becomes_current_while_no_reviewed_version_exists() -> 
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision)
+    session = _RecordingSession(None, existing, 1, current_revision, None, None)
     newer_auto = _event(
         magnitude=Decimal("5.2"),
         report_time=RECEIVED_AT,
         report_number=2,
     )
 
-    result = await repository.append_revision(session, _raw_message(), newer_auto)
+    result = await _append_revision(repository, session, _raw_message(), newer_auto)
 
     revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
     assert result.revision_no == 2
@@ -778,13 +820,14 @@ async def test_auto_revisions_compare_report_number_before_received_at(
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision)
+    session = _RecordingSession(None, existing, 1, current_revision, None, None)
     incoming = _event(
         magnitude=Decimal("5.2"),
         report_number=incoming_number,
     )
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
         incoming,
@@ -813,10 +856,11 @@ async def test_auto_without_report_time_does_not_replace_newer_current_time() ->
         is_current=True,
     )
     existing.current_revision_id = current_revision.id
-    session = _RecordingSession(None, existing, 1, current_revision)
+    session = _RecordingSession(None, existing, 1, current_revision, None, None)
     incoming = _event(magnitude=Decimal("5.2"))
 
-    result = await repository.append_revision(
+    result = await _append_revision(
+        repository,
         session,
         _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
         incoming,
@@ -855,7 +899,7 @@ async def test_duplicate_raw_message_returns_existing_revision_idempotently(
     )
     session = _RecordingSession(existing_revision)
 
-    result = await repository.append_revision(session, raw, _event(kind=EventKind.CORRECTION))
+    result = await _append_revision(repository, session, raw, _event(kind=EventKind.CORRECTION))
 
     assert result == EventIngestResult(
         event_id=str(existing_revision.event_id),
@@ -863,6 +907,7 @@ async def test_duplicate_raw_message_returns_existing_revision_idempotently(
         revision_no=3,
         event_kind=EventKind.CORRECTION,
         is_current=is_current,
+        is_new=False,
     )
     assert len(session.scalar_statements) == 1
     assert session.added == []

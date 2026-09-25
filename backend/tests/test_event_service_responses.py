@@ -176,6 +176,9 @@ class _AtomicRepository:
         payload: dict[str, object],
         event: NormalizedEvent,
         received_at: datetime,
+        *,
+        provider: str,
+        ingest_lane: str,
     ) -> RawMessage:
         del session, received_at
         self.events.append("get_or_create_raw_message")
@@ -194,6 +197,12 @@ class _AtomicRepository:
         session: object,
         raw: RawMessage,
         event: NormalizedEvent,
+        *,
+        semantic_fingerprint: str | None,
+        provider: str,
+        ingest_lane: str,
+        ingested_at: datetime,
+        region_context: object | None,
     ) -> EventIngestResult:
         del session, raw
         self.events.append("append_revision")
@@ -204,6 +213,20 @@ class _AtomicRepository:
             event_kind=event.kind,
             is_current=self.append_is_current,
         )
+
+    async def enqueue_assessment(
+        self,
+        session: object,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        trigger_reason: str,
+        created_at: datetime,
+    ) -> bool:
+        del session, event_id, revision_id, revision_no, trigger_reason, created_at
+        self.events.append("enqueue_assessment")
+        return True
 
     async def set_revision_suggestion(
         self,
@@ -226,6 +249,15 @@ class _AtomicRepository:
         del session, event_id
         self.events.append("get_current_response_levels")
         return self.current_levels
+
+    async def get_event_lifecycle_snapshot(
+        self,
+        session: object,
+        event_id: str,
+    ) -> tuple[str | None, datetime | None]:
+        del session, event_id
+        self.events.append("get_event_lifecycle_snapshot")
+        return "formal_triggered", RECEIVED_AT
 
 
 def _compiled(statement: object) -> tuple[str, dict[str, object]]:
@@ -341,7 +373,9 @@ async def test_service_commits_revision_and_suggestion_in_one_transaction() -> N
         "get_or_create_raw_message",
         "append_revision",
         "set_revision_suggestion",
+        "enqueue_assessment",
         "get_current_response_levels",
+        "get_event_lifecycle_snapshot",
         "commit",
         "session:exit",
     ]
@@ -413,7 +447,8 @@ async def test_non_current_formal_with_context_keeps_current_suggestion() -> Non
         ),
     )
 
-    assert "set_revision_suggestion" in events
+    assert "set_revision_suggestion" not in events
+    assert "enqueue_assessment" not in events
     assert outcome.institutional_level == "larger"
     assert outcome.service_level == 3
 
@@ -511,10 +546,19 @@ async def test_new_current_revision_without_snapshot_clears_event_redundancy() -
         checksum="b" * 64,
         payload={"reportType": "correction"},
     )
-    session = _AppendSession(None, event, 1, current_revision)
+    session = _AppendSession(None, event, 1, current_revision, "formal", None)
     incoming = _event(EventKind.CORRECTION)
 
-    result = await EventRepository().append_revision(session, raw, incoming)
+    result = await EventRepository().append_revision(
+        session,
+        raw,
+        incoming,
+        semantic_fingerprint="f" * 64,
+        provider="api",
+        ingest_lane="http",
+        ingested_at=raw.received_at,
+        region_context=None,
+    )
 
     assert result.is_current is True
     assert event.institutional_level is None
