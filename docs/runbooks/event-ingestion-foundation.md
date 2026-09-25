@@ -64,6 +64,7 @@ React + Vite 前端
 | --- | --- | --- |
 | `GET /health` | 无 | 只检查 API 进程是否响应 |
 | `POST /api/v1/auth/login` | 无 | 表单登录并签发 Bearer token |
+| `GET /api/v1/auth/me` | Bearer token | 返回当前账号的用户名、角色和工作组，用于验证登录会话 |
 | `GET /api/v1/events` | 无 | 返回当前修订事件列表 |
 | `GET /api/v1/events/{event_id}` | 无 | 返回当前修订和当前响应建议 |
 | `POST /api/v1/ingest/auto` | 无 | 当前未实现接入 API Key |
@@ -120,7 +121,7 @@ Copy-Item .env.example .env
 | `SUPERADMIN_INITIAL_PASSWORD` | 是 | 至少 16 个字符；只在数据库中用户名不存在时用于初始化 |
 | `CENC_APP_ID` | 当前可空 | 仅保留配置位；当前代码不读取它发起请求 |
 | `CENC_API_BASE_URL` | 当前可空 | 仅保留配置位；当前代码不读取它发起请求 |
-| `RESPONSE_RULES_PATH` | 是 | Compose 中为 `/config/response_rules/shanghai-2026.yaml` |
+| `RESPONSE_RULES_PATH` | 否 | 代码默认值为 `/config/response_rules/shanghai-2026.yaml`，Compose 已挂载该路径 |
 
 安全示例只展示格式，不要照抄为实际密钥：
 
@@ -192,16 +193,18 @@ http://localhost:5173
 
 ### 3.3 任务验收用的完整重置序列
 
-无数据验收环境也可以按以下序列执行：
+以下标准验收序列用于无数据环境，并按“先迁移、后启动 API”的顺序避免新建表前启动主 API。该序列尚未在当前机器执行，因为当前环境没有 Docker 和 PostgreSQL：
 
 ```powershell
 docker compose -f infra/compose.yaml down -v
-docker compose -f infra/compose.yaml up -d --build
+docker compose -f infra/compose.yaml build
+docker compose -f infra/compose.yaml up -d postgres
 docker compose -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose -f infra/compose.yaml up -d
 docker compose -f infra/compose.yaml run --rm api pytest -v
 ```
 
-该序列启动 API 时，数据库表可能尚未创建。API 在迁移完成前可能反复启动失败；迁移完成后 Docker Compose 会使其恢复。生产或保留数据环境不要执行 `down -v`。
+生产或保留数据环境不要执行 `down -v`。
 
 停止服务：
 
@@ -516,13 +519,16 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 
 `JWT_SECRET` 用于签发和验证 Bearer token。修改并重启 API 后，旧 token 立即失效，所有用户必须重新登录。
 
+轮换 JWT 前必须先完成 7.2 的超级管理员密码轮换，并用新密码实际登录成功。若登录验证失败，不得继续轮换 JWT。
+
 操作顺序：
 
 1. 选择维护窗口，通知值守人员。
-2. 生成新的独立随机值。
-3. 修改 `.env` 中的 `JWT_SECRET`，不要把新值发到群聊、工单或截图中。
-4. 强制重建 API，使新密钥生效。
-5. 验证旧会话或旧 token 返回 `401`，再用新登录验证系统可用。
+2. 确认 7.2 的新密码登录验证已经成功。
+3. 生成新的独立随机值。
+4. 修改 `.env` 中的 `JWT_SECRET`，不要把新值发到群聊、工单或截图中。
+5. 强制重建 API，使新密钥生效。
+6. 验证旧会话或旧 token 返回 `401`，再用新登录验证系统可用。
 
 PowerShell 示例：
 
@@ -555,43 +561,96 @@ docker compose -f infra/compose.yaml up -d --force-recreate api
 
 当前系统没有修改密码 API。启动时的 `SUPERADMIN_INITIAL_PASSWORD` 只用于在 `users` 表不存在该用户名时创建账号，修改 `.env` 不会自动更新已存在账号的密码。
 
-先交互式输入新密码并生成 Argon2 哈希：
+以下流程从安全交互输入读取新密码，只通过子进程环境变量传给哈希工具，不把明文密码放到命令行参数、日志或仓库中。
+
+先输入管理员用户名和新密码，并生成 Argon2 哈希。哈希命令失败，或结果不以 `$argon2` 开头时必须停止，不得继续写数据库：
 
 ```powershell
+$adminUsername = Read-Host "超级管理员用户名"
 $newPassword = Read-Host "新的超级管理员密码" -AsSecureString
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newPassword)
 try {
   $env:NEW_SUPERADMIN_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-  $hash = (
+  $hashOutput = (
     docker compose -f infra/compose.yaml run --rm `
       -e NEW_SUPERADMIN_PASSWORD `
       api python -c "import os; from app.security import hash_password; print(hash_password(os.environ['NEW_SUPERADMIN_PASSWORD']))"
-  ).Trim()
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "生成密码哈希失败，不得更新数据库"
+  }
+  $hash = ($hashOutput | Out-String).Trim()
+  if (-not $hash.StartsWith('$argon2')) {
+    throw "密码哈希格式异常，不得更新数据库"
+  }
 } finally {
   [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
   Remove-Item Env:NEW_SUPERADMIN_PASSWORD -ErrorAction SilentlyContinue
 }
 ```
 
-更新数据库中的超级管理员密码哈希：
+更新数据库中的超级管理员密码哈希。`ON_ERROR_STOP=1` 保证 SQL 错误立即失败，`RETURNING username` 用于确认实际更新行数；必须恰好返回 1 行，否则停止：
 
 ```powershell
-docker compose -f infra/compose.yaml exec -T postgres psql `
-  -U earthquake `
-  -d earthquake `
-  -v username="superadmin" `
-  -v password_hash="$hash" `
-  -c "UPDATE users SET password_hash = :'password_hash' WHERE username = :'username';"
+$updatedRows = @(
+  docker compose -f infra/compose.yaml exec -T postgres psql `
+    -U earthquake `
+    -d earthquake `
+    -v ON_ERROR_STOP=1 `
+    -v username="$adminUsername" `
+    -v password_hash="$hash" `
+    --tuples-only `
+    --no-align `
+    -c "UPDATE users SET password_hash = :'password_hash' WHERE username = :'username' RETURNING username;"
+)
+$updatedRows = @(
+  $updatedRows |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ }
+)
+if ($LASTEXITCODE -ne 0 -or $updatedRows.Count -ne 1 -or $updatedRows[0] -ne $adminUsername) {
+  throw "超级管理员密码未恰好更新 1 行；停止轮换并检查数据库"
+}
 ```
 
-如 `.env` 修改过数据库用户名、数据库名或超级管理员用户名，请替换命令中的 `earthquake` 和 `superadmin`。
+如 `.env` 修改过数据库用户名或数据库名，请替换命令中的 `earthquake`。
 
-最后同步更新 `.env` 的 `SUPERADMIN_INITIAL_PASSWORD`，确保以后在空数据库中初始化时仍使用当前密码。该值至少 16 个字符。
+数据库更新后，用同一个安全输入的 `$newPassword` 实际登录验证。登录失败时必须停止，不得继续轮换 `JWT_SECRET`：
 
-重要安全顺序：
+```powershell
+$loginBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newPassword)
+try {
+  $env:NEW_SUPERADMIN_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($loginBstr)
+  try {
+    $loginResult = Invoke-RestMethod `
+      -Method Post `
+      -Uri "http://localhost:8000/api/v1/auth/login" `
+      -ContentType "application/x-www-form-urlencoded" `
+      -Body @{
+        username = $adminUsername
+        password = $env:NEW_SUPERADMIN_PASSWORD
+      }
+  } catch {
+    throw "新密码登录验证失败；不得继续轮换 JWT_SECRET"
+  } finally {
+    Remove-Item Env:NEW_SUPERADMIN_PASSWORD -ErrorAction SilentlyContinue
+  }
+} finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($loginBstr)
+}
+
+if (-not $loginResult.access_token) {
+  throw "登录响应缺少 token；不得继续轮换 JWT_SECRET"
+}
+```
+
+登录验证成功后，再同步更新 `.env` 的 `SUPERADMIN_INITIAL_PASSWORD`，确保以后在空数据库中初始化时仍使用当前密码。该值至少 16 个字符，修改 `.env` 时不得泄露旧密码或新密码。
+
+安全顺序：
 
 - 仅轮换超级管理员密码不会使已经签发的 JWT 失效。
-- 如果密码已经泄露或需要立即终止所有会话，应先验证新密码可用，再按 7.1 轮换 `JWT_SECRET`。
+- 如果密码已经泄露或需要立即终止所有会话，必须先用新密码实际登录成功，再按 7.1 轮换 `JWT_SECRET`。
+- 哈希生成失败、数据库更新未返回 1 行或新密码登录失败时，都不得继续轮换 JWT。
 - 轮换 JWT 后，所有用户使用新密码重新登录。
 
 ## 8. 数据库连接和迁移诊断
@@ -697,11 +756,12 @@ docker compose -f infra/compose.yaml run --rm frontend npm run build
 
 ```powershell
 docker compose -f infra/compose.yaml run --rm `
+  -e E2E_SUPERADMIN_USERNAME="<当前超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<当前超级管理员密码>" `
   frontend npm run test:e2e
 ```
 
-`E2E_SUPERADMIN_PASSWORD` 不得写入测试源码或 `.env.example`。
+若 `.env` 修改了 `SUPERADMIN_USERNAME`，必须同步传入 `E2E_SUPERADMIN_USERNAME`。`E2E_SUPERADMIN_USERNAME` 和 `E2E_SUPERADMIN_PASSWORD` 都不得写入测试源码或 `.env.example`。
 
 ## 10. 已验证状态与残余风险
 

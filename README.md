@@ -6,7 +6,6 @@
 
 - Docker Desktop（含 Docker Compose v2）
 - Git
-- CENC 测试凭据（用于本地 CENC 接入测试；不需要真实凭据也能跑单元测试）
 - 至少 8 GB 可用内存，建议 16 GB
 - 本机开放的端口：`5173`（前端）、`8000`（API，由 `API_BIND_HOST`/`API_PORT` 控制）
 
@@ -28,20 +27,16 @@ cp .env.example .env
 - `DATABASE_URL`
 - `JWT_SECRET`
 - `SUPERADMIN_INITIAL_PASSWORD`
-- `CENC_APP_ID`、`CENC_API_BASE_URL`（仅真实 CENC 联调时需要）
 
 ## 启动与停止
 
-构建并启动：
+构建镜像，先启动数据库并完成迁移，再启动全部服务：
 
 ```powershell
-docker compose -f infra/compose.yaml up -d --build
-```
-
-执行数据库迁移：
-
-```powershell
+docker compose -f infra/compose.yaml build
+docker compose -f infra/compose.yaml up -d postgres
 docker compose -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose -f infra/compose.yaml up -d
 ```
 
 启动后访问：
@@ -78,7 +73,7 @@ docker compose -f infra/compose.yaml run --rm frontend npm run typecheck
 docker compose -f infra/compose.yaml run --rm frontend npm run build
 ```
 
-单元测试不需要真实 CENC 凭据。后端测试使用假服务和内存中的响应规则；前端测试模拟 `fetch`。只有真实 CENC 联调才需要填写 `CENC_APP_ID` 和 `CENC_API_BASE_URL`。
+当前接入接口接收调用方提交的 CENC 兼容 JSON。`CENC_APP_ID` 和 `CENC_API_BASE_URL` 只是预留配置，当前代码没有读取它们发起请求，也没有外部 CENC 采集器；填写这两个变量本身不会建立真实上游联调。后端单元测试使用假服务和内存中的响应规则，前端测试模拟 `fetch`。
 
 ## 端到端测试
 
@@ -86,6 +81,7 @@ E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表�
 
 环境变量：
 
+- `E2E_SUPERADMIN_USERNAME`（可选）：超级管理员用户名，默认 `superadmin`。若 `.env` 修改了 `SUPERADMIN_USERNAME`，必须同步设置该变量。
 - `E2E_SUPERADMIN_PASSWORD`（必填）：超级管理员密码。测试代码不包含密码。
 - `E2E_BASE_URL`（可选）：前端地址，默认 `http://localhost:5173`。
 - `E2E_API_BASE_URL`（可选）：只影响 Playwright `APIRequestContext` 发出的 API 请求。留空时这些请求使用 Vite 的 `/api` 相对路径；设为绝对地址时，只有测试中的 API 请求直连该地址，页面 UI 的 `/api` 请求仍走 Vite 代理。
@@ -94,6 +90,7 @@ E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表�
 
 ```powershell
 docker compose -f infra/compose.yaml run --rm `
+  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
   frontend npm run test:e2e
 ```
@@ -102,6 +99,7 @@ docker compose -f infra/compose.yaml run --rm `
 
 ```powershell
 docker compose -f infra/compose.yaml run --rm `
+  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
   -e E2E_API_BASE_URL="http://api:8000" `
   frontend npm run test:e2e
