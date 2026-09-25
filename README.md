@@ -86,7 +86,11 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run t
 docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run build
 ```
 
-当前接入接口接收调用方提交的 CENC 兼容 JSON。`CENC_APP_ID` 和 `CENC_API_BASE_URL` 只是预留配置，当前代码没有读取它们发起请求，也没有外部 CENC 采集器；填写这两个变量本身不会建立真实上游联调。后端单元测试使用假服务和内存中的响应规则，前端测试模拟 `fetch`。
+## CENC 实时采集
+
+collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx HTTP 是常驻备用链路，FAN `auth_fail` 或连接失败时仍可继续接收正式报并进入生命周期。`FAN_APP_ID` 是规范的 FAN 客户端标识，未设置时兼容回退到 `CENC_APP_ID`；`FAN_API_KEY` 是 FAN 密钥。缺少 `FAN_APP_ID`/`CENC_APP_ID` 或 `FAN_API_KEY` 只会阻止 collector 启动，不会阻止 API、迁移或后端测试运行。
+
+部署、边界导入、运行状态核验、spool/数据库恢复、死信重放和 FAN 密钥轮换请参阅 [CENC 实时采集运行手册](docs/runbooks/cenc-realtime-collection.md)。
 
 ## 端到端测试
 
