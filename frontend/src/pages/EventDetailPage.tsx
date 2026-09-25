@@ -36,6 +36,10 @@ export function EventDetailPage() {
     void loadDetail();
   }, [loadDetail]);
 
+  const suggestion = event?.response_suggestion;
+  const causes =
+    suggestion && Array.isArray(suggestion.causes) ? suggestion.causes : [];
+
   return (
     <section className="page-section" aria-labelledby="detail-title">
       <header className="page-heading">
@@ -168,9 +172,9 @@ export function EventDetailPage() {
               <div>
                 <dt>触发原因</dt>
                 <dd>
-                  {event.response_suggestion?.causes.length ? (
+                  {causes.length > 0 ? (
                     <ul className="cause-list">
-                      {event.response_suggestion.causes.map((cause) => (
+                      {causes.map((cause) => (
                         <li key={cause}>{cause}</li>
                       ))}
                     </ul>

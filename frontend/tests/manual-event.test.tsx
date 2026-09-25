@@ -2,12 +2,16 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, expect, test, vi } from "vitest";
 
-import { createManualEvent } from "../src/api/client";
+import { ApiError, createManualEvent } from "../src/api/client";
 import { ManualEventPage } from "../src/pages/ManualEventPage";
 
-vi.mock("../src/api/client", () => ({
-  createManualEvent: vi.fn(),
-}));
+vi.mock("../src/api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/api/client")>();
+  return {
+    ...actual,
+    createManualEvent: vi.fn(),
+  };
+});
 
 const createManualEventMock = vi.mocked(createManualEvent);
 
@@ -64,5 +68,23 @@ test("shows a clear failure state when submission fails", async () => {
   fillRequiredFields();
   fireEvent.click(screen.getByRole("button", { name: "启动评估" }));
 
-  expect(await screen.findByText("提交失败，请检查输入或稍后重试")).toBeInTheDocument();
+  expect(await screen.findByText("网络连接失败，请稍后重试")).toBeInTheDocument();
+});
+
+test.each([
+  [401, "登录状态已失效，请重新登录"],
+  [403, "当前账号无权创建人工事件"],
+  [404, "事件接口不存在"],
+  [422, "输入数据不合法，请检查数值范围"],
+  [503, "事件存储服务暂不可用，请稍后重试"],
+  [408, "请求超时，请稍后重试"],
+  [0, "网络连接失败，请稍后重试"],
+] as const)("maps status %s to a clear submission error", async (status, message) => {
+  createManualEventMock.mockRejectedValue(new ApiError("backend detail", status));
+
+  renderManualPage();
+  fillRequiredFields();
+  fireEvent.click(screen.getByRole("button", { name: "启动评估" }));
+
+  expect(await screen.findByText(message)).toBeInTheDocument();
 });

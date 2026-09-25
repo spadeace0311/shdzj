@@ -311,6 +311,7 @@ def test_get_event_returns_detail() -> None:
     service = FakeEventService()
     detail = EventDetailRecord(
         event_id="event-1",
+        event_kind="formal",
         source="cenc",
         place="Shanghai Pudong",
         magnitude=Decimal("5.2"),
@@ -337,8 +338,36 @@ def test_get_event_returns_detail() -> None:
 
     assert response.status_code == 200
     assert response.json()["id"] == "event-1"
+    assert response.json()["event_kind"] == "formal"
     assert response.json()["institutional_level"] == "major"
     assert response.json()["response_rule_version"] == "2026.1"
+
+
+def test_get_event_returns_current_revision_event_kind() -> None:
+    service = FakeEventService()
+    detail = EventDetailRecord(
+        event_id="event-drill",
+        event_kind="drill",
+        source="operator",
+        place="上海浦东新区",
+        magnitude=Decimal("3.2"),
+        depth_km=Decimal("8.00"),
+        origin_time=datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC),
+        longitude=Decimal("121.540000"),
+        latitude=Decimal("31.220000"),
+        institutional_level=None,
+        service_level=None,
+        response_suggestion=None,
+        response_rule_version=None,
+        revision_no=1,
+    )
+    service.details["event-drill"] = detail
+    client = _client(service)
+
+    response = client.get("/api/v1/events/event-drill")
+
+    assert response.status_code == 200
+    assert response.json()["event_kind"] == "drill"
 
 
 def test_get_missing_event_returns_404() -> None:

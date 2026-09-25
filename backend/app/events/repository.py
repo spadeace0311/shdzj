@@ -61,6 +61,7 @@ class EventSummaryRecord:
 @dataclass(frozen=True, slots=True)
 class EventDetailRecord:
     event_id: str
+    event_kind: str
     source: str
     place: str
     magnitude: Decimal
@@ -540,6 +541,7 @@ def _event_detail_record(
 ) -> EventDetailRecord:
     return EventDetailRecord(
         event_id=str(event.id),
+        event_kind=revision.revision_kind,
         source=event.source,
         place=revision.place,
         magnitude=revision.magnitude,

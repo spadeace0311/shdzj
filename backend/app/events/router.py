@@ -254,6 +254,7 @@ def _summary_response(record: EventSummaryRecord) -> EventSummaryResponse:
 def _detail_response(record: EventDetailRecord) -> EventDetailResponse:
     return EventDetailResponse(
         id=record.event_id,
+        event_kind=record.event_kind,
         source=record.source,
         place=record.place,
         magnitude=record.magnitude,

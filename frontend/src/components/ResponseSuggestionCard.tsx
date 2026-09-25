@@ -14,6 +14,8 @@ export function ResponseSuggestionCard({
   fallbackRuleVersion,
 }: ResponseSuggestionCardProps) {
   const ruleVersion = suggestion.rule_version || fallbackRuleVersion || "-";
+  const downgraded = suggestion.downgraded === true;
+  const serviceLevel = suggestion.service_level ?? null;
 
   return (
     <div className="response-grid">
@@ -27,7 +29,7 @@ export function ResponseSuggestionCard({
         <dl className="response-facts">
           <div>
             <dt>是否降级</dt>
-            <dd>{suggestion.downgraded ? "已降级" : "未降级"}</dd>
+            <dd>{downgraded ? "已降级" : "未降级"}</dd>
           </div>
           <div>
             <dt>规则版本</dt>
@@ -40,13 +42,13 @@ export function ResponseSuggestionCard({
         <header className="panel-header">
           <span className="panel-eyebrow">中国地震局应急服务响应</span>
           <span className="response-level response-level--service">
-            {formatServiceLevel(suggestion.service_level)}
+            {formatServiceLevel(serviceLevel)}
           </span>
         </header>
         <dl className="response-facts">
           <div>
             <dt>服务级别</dt>
-            <dd>{suggestion.service_level ?? "待研判"}</dd>
+            <dd>{serviceLevel ?? "待研判"}</dd>
           </div>
           <div>
             <dt>规则版本</dt>

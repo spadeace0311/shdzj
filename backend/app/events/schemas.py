@@ -57,6 +57,7 @@ class EventSummaryResponse(BaseModel):
 
 class EventDetailResponse(BaseModel):
     id: str
+    event_kind: str
     source: str
     place: str
     magnitude: Decimal

@@ -22,11 +22,11 @@ export interface EventSummary {
 }
 
 export interface ResponseSuggestion {
-  institutional_level: string;
-  service_level: number | null;
-  downgraded: boolean;
-  causes: string[];
-  rule_version: string;
+  institutional_level?: string;
+  service_level?: number | null;
+  downgraded?: boolean;
+  causes?: string[];
+  rule_version?: string;
 }
 
 export interface EventDetail {
@@ -43,7 +43,7 @@ export interface EventDetail {
   response_suggestion: ResponseSuggestion | null;
   response_rule_version: string | null;
   revision_no: number;
-  event_kind?: string | null;
+  event_kind: string | null;
 }
 
 export interface ManualEventInput {

@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
-import { createManualEvent } from "../api/client";
+import { createManualEvent, manualEventErrorMessage } from "../api/client";
 
 const EMPTY_FORM = {
   origin_time: "",
@@ -65,8 +65,8 @@ export function ManualEventPage() {
         event_kind: form.event_kind,
       });
       setMessage({ kind: "success", text: "人工地震事件已提交并启动评估" });
-    } catch {
-      setMessage({ kind: "error", text: "提交失败，请检查输入或稍后重试" });
+    } catch (error) {
+      setMessage({ kind: "error", text: manualEventErrorMessage(error) });
     } finally {
       setSubmitting(false);
     }
