@@ -17,8 +17,9 @@ function apiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
 }
 
-async function buildIsolatedFormalFixture(
+async function buildIsolatedEventFixture(
   request: APIRequestContext,
+  runId: string,
 ): Promise<{ originTime: string; longitude: number; latitude: number }> {
   const response = await request.get(apiUrl("/api/v1/events"));
   expect(response.status()).toBe(200);
@@ -26,17 +27,21 @@ async function buildIsolatedFormalFixture(
   const existingTimes = events
     .map((event) => Date.parse(event.origin_time))
     .filter(Number.isFinite);
-  const earliestHistoricalRun = Math.min(...existingTimes);
-  const originTime = new Date(
-    Number.isFinite(earliestHistoricalRun)
-      ? earliestHistoricalRun - 180_000
-      : Date.parse("2026-09-17T02:30:05Z"),
-  );
+  const compactRunId = runId.replaceAll("-", "");
+  const timeSeed = Number.parseInt(compactRunId.slice(0, 10), 16);
+  let originTimeMs = Date.UTC(2000, 0, 1) + timeSeed;
+
+  while (existingTimes.some((time) => Math.abs(time - originTimeMs) <= 120_000)) {
+    originTimeMs += 180_000;
+  }
+
+  const longitudeSeed = Number.parseInt(compactRunId.slice(10, 18), 16);
+  const latitudeSeed = Number.parseInt(compactRunId.slice(18, 26), 16);
 
   return {
-    originTime: originTime.toISOString(),
-    longitude: 121.54,
-    latitude: 31.22,
+    originTime: new Date(originTimeMs).toISOString(),
+    longitude: 121.4 + (longitudeSeed % 400) / 1000,
+    latitude: 31 + (latitudeSeed % 600) / 1000,
   };
 }
 
@@ -73,8 +78,9 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
   await loginThroughUi(page);
 
   const runId = crypto.randomUUID();
-  const { originTime, longitude, latitude } = await buildIsolatedFormalFixture(
+  const { originTime, longitude, latitude } = await buildIsolatedEventFixture(
     page.request,
+    runId,
   );
   const place = `上海浦东新区 E2E ${runId}`;
   const response = await page.request.post(apiUrl("/api/v1/ingest/formal"), {
@@ -96,8 +102,9 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
     },
   });
 
-  expect(response.status()).toBe(201);
-  expect((await response.json()) as { event_kind?: string }).toMatchObject({
+  const responsePayload = (await response.json()) as { event_kind?: string };
+  expect(response.status(), JSON.stringify(responsePayload)).toBe(201);
+  expect(responsePayload).toMatchObject({
     event_kind: "formal",
   });
 
@@ -116,7 +123,11 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
 test("drill event keeps its identifier visible in list and detail", async ({ page, request }) => {
   await loginThroughUi(page);
 
-  const runId = Date.now().toString();
+  const runId = crypto.randomUUID();
+  const { originTime, longitude, latitude } = await buildIsolatedEventFixture(
+    request,
+    runId,
+  );
   const place = `浦东新区 E2E ${runId}`;
   const token = await getApiToken(request);
   const response = await request.post(apiUrl("/api/v1/events/manual"), {
@@ -124,9 +135,9 @@ test("drill event keeps its identifier visible in list and detail", async ({ pag
       Authorization: `Bearer ${token}`,
     },
     data: {
-      origin_time: "2026-09-17T02:30:05Z",
-      longitude: 121.54,
-      latitude: 31.22,
+      origin_time: originTime,
+      longitude,
+      latitude,
       magnitude: 3.2,
       depth_km: 8.0,
       source: "shanghai-e2e",
@@ -136,8 +147,9 @@ test("drill event keeps its identifier visible in list and detail", async ({ pag
     },
   });
 
-  expect(response.status()).toBe(201);
-  expect((await response.json()) as { event_kind?: string }).toMatchObject({
+  const responsePayload = (await response.json()) as { event_kind?: string };
+  expect(response.status(), JSON.stringify(responsePayload)).toBe(201);
+  expect(responsePayload).toMatchObject({
     event_kind: "drill",
   });
 
