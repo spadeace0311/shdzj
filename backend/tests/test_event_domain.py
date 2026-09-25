@@ -73,6 +73,33 @@ def test_domain_normalizes_origin_time_to_utc() -> None:
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
 
 
+def test_domain_quantizes_values_to_database_precision() -> None:
+    event = make_event(
+        longitude=Decimal("121.1234565"),
+        latitude=Decimal("31.9876545"),
+        depth_km=Decimal("12.345"),
+        magnitude=Decimal("5.25"),
+    )
+
+    assert event.longitude == Decimal("121.123457")
+    assert event.latitude == Decimal("31.987655")
+    assert event.depth_km == Decimal("12.35")
+    assert event.magnitude == Decimal("5.3")
+
+
+def test_domain_validates_range_after_quantization() -> None:
+    event = make_event(
+        longitude=Decimal("180.0000004"),
+        latitude=Decimal("-90.0000004"),
+    )
+
+    assert event.longitude == Decimal("180.000000")
+    assert event.latitude == Decimal("-90.000000")
+
+    with pytest.raises(ValueError, match="longitude"):
+        make_event(longitude=Decimal("180.0000005"))
+
+
 def test_domain_rejects_naive_origin_time() -> None:
     with pytest.raises(ValueError, match="timezone"):
         make_event(origin_time=datetime(2026, 9, 17, 2, 30, 5))

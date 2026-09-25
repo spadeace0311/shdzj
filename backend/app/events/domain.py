@@ -1,7 +1,7 @@
 import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 
 
@@ -41,16 +41,47 @@ class NormalizedEvent:
             raise ValueError("place must not be empty")
 
         object.__setattr__(self, "origin_time", self.origin_time.astimezone(UTC))
+        object.__setattr__(
+            self,
+            "longitude",
+            _quantize_decimal(self.longitude, "longitude", Decimal("0.000001")),
+        )
+        object.__setattr__(
+            self,
+            "latitude",
+            _quantize_decimal(self.latitude, "latitude", Decimal("0.000001")),
+        )
+        object.__setattr__(
+            self,
+            "depth_km",
+            _quantize_decimal(self.depth_km, "depth_km", Decimal("0.01")),
+        )
+        object.__setattr__(
+            self,
+            "magnitude",
+            _quantize_decimal(self.magnitude, "magnitude", Decimal("0.1")),
+        )
+
         _validate_decimal(self.longitude, "longitude", Decimal("-180"), Decimal("180"))
         _validate_decimal(self.latitude, "latitude", Decimal("-90"), Decimal("90"))
         _validate_decimal(self.depth_km, "depth_km", Decimal("0"), Decimal("1000"))
         _validate_decimal(self.magnitude, "magnitude", Decimal("-2"), Decimal("12"))
 
 
-def _validate_decimal(value: Decimal, field: str, minimum: Decimal, maximum: Decimal) -> None:
+def _quantize_decimal(value: Decimal, field: str, quantum: Decimal) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field} must be a Decimal")
-    if not value.is_finite() or value < minimum or value > maximum:
+    if not value.is_finite():
+        raise ValueError(f"{field} must be finite")
+    try:
+        quantized = value.quantize(quantum, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field} cannot be quantized") from exc
+    return Decimal(0).quantize(quantum) if quantized == 0 else quantized
+
+
+def _validate_decimal(value: Decimal, field: str, minimum: Decimal, maximum: Decimal) -> None:
+    if value < minimum or value > maximum:
         raise ValueError(f"{field} must be between {minimum} and {maximum}")
 
 
