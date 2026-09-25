@@ -310,6 +310,8 @@ def test_list_events_returns_summaries() -> None:
             institutional_level="major",
             service_level=2,
             revision_no=1,
+            lifecycle_state="formal_triggered",
+            t1_at=datetime(2026, 9, 17, 2, 31, tzinfo=UTC),
         )
     ]
     client = _client(service)
@@ -320,6 +322,8 @@ def test_list_events_returns_summaries() -> None:
     assert response.json()[0]["id"] == "event-1"
     assert response.json()[0]["institutional_level"] == "major"
     assert response.json()[0]["service_level"] == 2
+    assert response.json()[0]["lifecycle_state"] == "formal_triggered"
+    assert response.json()[0]["t1_at"] == "2026-09-17T02:31:00Z"
 
 
 def test_get_event_returns_detail() -> None:
@@ -345,6 +349,8 @@ def test_get_event_returns_detail() -> None:
         },
         response_rule_version="2026.1",
         revision_no=1,
+        lifecycle_state="formal_triggered",
+        t1_at=datetime(2026, 9, 17, 2, 31, tzinfo=UTC),
     )
     service.details["event-1"] = detail
     client = _client(service)
@@ -356,6 +362,8 @@ def test_get_event_returns_detail() -> None:
     assert response.json()["event_kind"] == "formal"
     assert response.json()["institutional_level"] == "major"
     assert response.json()["response_rule_version"] == "2026.1"
+    assert response.json()["lifecycle_state"] == "formal_triggered"
+    assert response.json()["t1_at"] == "2026-09-17T02:31:00Z"
 
 
 def test_get_event_returns_current_revision_event_kind() -> None:
@@ -375,6 +383,8 @@ def test_get_event_returns_current_revision_event_kind() -> None:
         response_suggestion=None,
         response_rule_version=None,
         revision_no=1,
+        lifecycle_state="auto_pending",
+        t1_at=None,
     )
     service.details["event-drill"] = detail
     client = _client(service)

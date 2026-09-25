@@ -7,6 +7,7 @@ import {
   formatDepth,
   formatEventKind,
   formatInstitutionalLevel,
+  formatLifecycleState,
   formatMagnitude,
   formatServiceLevel,
   isTestOrDrill,
@@ -115,6 +116,7 @@ export function EventListPage() {
                 <th>事件类型</th>
                 <th>制度响应</th>
                 <th>服务响应</th>
+                <th>生命周期</th>
                 <th>修订号</th>
               </tr>
             </thead>
@@ -138,6 +140,13 @@ export function EventListPage() {
                   </td>
                   <td>{formatInstitutionalLevel(event.institutional_level)}</td>
                   <td>{formatServiceLevel(event.service_level)}</td>
+                  <td>
+                    <span
+                      className={`lifecycle-tag lifecycle-tag--${event.lifecycle_state ?? "unentered"}`}
+                    >
+                      {formatLifecycleState(event.lifecycle_state)}
+                    </span>
+                  </td>
                   <td>R{event.revision_no}</td>
                 </tr>
               ))}

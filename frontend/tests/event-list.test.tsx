@@ -4,6 +4,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 
 import { listEvents } from "../src/api/client";
 import { EventListPage } from "../src/pages/EventListPage";
+import type { EventSummary } from "../src/types";
 
 vi.mock("../src/api/client", () => ({
   listEvents: vi.fn(),
@@ -19,7 +20,7 @@ function renderListPage() {
   );
 }
 
-const formalEvent = {
+const formalEvent: EventSummary = {
   id: "event-1",
   source: "cenc",
   event_kind: "formal",
@@ -32,6 +33,8 @@ const formalEvent = {
   institutional_level: "major",
   service_level: 2,
   revision_no: 1,
+  lifecycle_state: "formal_triggered",
+  t1_at: "2026-09-17T02:31:00Z",
 };
 
 beforeEach(() => {
@@ -46,6 +49,7 @@ test("renders dual response levels", async () => {
   expect(await screen.findByText("上海浦东新区")).toBeInTheDocument();
   expect(screen.getByText("重大响应")).toBeInTheDocument();
   expect(screen.getByText("服务响应二级")).toBeInTheDocument();
+  expect(screen.getByText("正式报已触发评估")).toBeInTheDocument();
 });
 
 test("keeps test and drill identifiers visible", async () => {

@@ -55,6 +55,8 @@ class EventSummaryResponse(BaseModel):
     institutional_level: str | None
     service_level: int | None
     revision_no: int
+    lifecycle_state: str
+    t1_at: datetime | None
 
 
 class EventDetailResponse(BaseModel):
@@ -72,3 +74,5 @@ class EventDetailResponse(BaseModel):
     response_suggestion: dict | None
     response_rule_version: str | None
     revision_no: int
+    lifecycle_state: str
+    t1_at: datetime | None

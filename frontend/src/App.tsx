@@ -2,6 +2,7 @@ import { useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
 
 import { clearAccessToken, getAccessToken } from "./api/client";
+import { CollectorStatusPage } from "./pages/CollectorStatusPage";
 import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
 import { LoginPage } from "./pages/LoginPage";
@@ -51,6 +52,12 @@ function ConsoleShell({ onLogout }: ConsoleShellProps) {
             >
               人工触发
             </NavLink>
+            <NavLink
+              to="/collector"
+              className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
+            >
+              采集状态
+            </NavLink>
           </nav>
           <div className="sidebar-note">
             <p>当前工作区</p>
@@ -63,6 +70,7 @@ function ConsoleShell({ onLogout }: ConsoleShellProps) {
             <Route path="/" element={<EventListPage />} />
             <Route path="/events/:eventId" element={<EventDetailPage />} />
             <Route path="/manual" element={<ManualEventPage />} />
+            <Route path="/collector" element={<CollectorStatusPage />} />
           </Routes>
         </main>
       </div>

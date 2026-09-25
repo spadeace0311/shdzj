@@ -33,6 +33,8 @@ const baseDetail: EventDetail = {
   response_rule_version: "2026.1",
   revision_no: 1,
   event_kind: "formal",
+  lifecycle_state: "formal_triggered",
+  t1_at: "2026-09-17T02:31:00Z",
 };
 
 function renderDetail(eventId: string) {
@@ -81,4 +83,14 @@ test("renders an old suggestion snapshot without causes", async () => {
 
   expect(await screen.findByText("暂无触发原因记录")).toBeInTheDocument();
   expect(screen.getByText("未降级")).toBeInTheDocument();
+});
+
+test("renders the event lifecycle state and immutable T1", async () => {
+  getEventMock.mockResolvedValue(baseDetail);
+
+  renderDetail("event-1");
+
+  expect(await screen.findByText("正式报已触发评估")).toBeInTheDocument();
+  expect(screen.getByText("T1")).toBeInTheDocument();
+  expect(screen.getByText("2026/09/17 10:31:00")).toBeInTheDocument();
 });

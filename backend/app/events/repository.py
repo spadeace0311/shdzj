@@ -64,6 +64,8 @@ class EventSummaryRecord:
     institutional_level: str | None
     service_level: int | None
     revision_no: int
+    lifecycle_state: str
+    t1_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +84,8 @@ class EventDetailRecord:
     response_suggestion: dict | None
     response_rule_version: str | None
     revision_no: int
+    lifecycle_state: str
+    t1_at: datetime | None
 
 
 class EventRepository:
@@ -696,6 +700,8 @@ def _event_summary_record(
         institutional_level=event.institutional_level,
         service_level=event.service_level,
         revision_no=revision.revision_no,
+        lifecycle_state=event.lifecycle_state,
+        t1_at=event.t1_at,
     )
 
 
@@ -718,6 +724,8 @@ def _event_detail_record(
         response_suggestion=event.response_suggestion,
         response_rule_version=event.response_rule_version,
         revision_no=revision.revision_no,
+        lifecycle_state=event.lifecycle_state,
+        t1_at=event.t1_at,
     )
 
 

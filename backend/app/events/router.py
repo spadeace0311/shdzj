@@ -273,6 +273,8 @@ def _summary_response(record: EventSummaryRecord) -> EventSummaryResponse:
         institutional_level=record.institutional_level,
         service_level=record.service_level,
         revision_no=record.revision_no,
+        lifecycle_state=record.lifecycle_state,
+        t1_at=record.t1_at,
     )
 
 
@@ -292,4 +294,6 @@ def _detail_response(record: EventDetailRecord) -> EventDetailResponse:
         response_suggestion=record.response_suggestion,
         response_rule_version=record.response_rule_version,
         revision_no=record.revision_no,
+        lifecycle_state=record.lifecycle_state,
+        t1_at=record.t1_at,
     )

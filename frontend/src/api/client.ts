@@ -1,4 +1,5 @@
 import type {
+  CollectorStatus,
   EventDetail,
   EventIngestResponse,
   EventSummary,
@@ -147,6 +148,18 @@ export async function listEvents(): Promise<EventSummary[]> {
 
 export async function getEvent(eventId: string): Promise<EventDetail> {
   return requestJson<EventDetail>(`/api/v1/events/${encodeURIComponent(eventId)}`);
+}
+
+export async function getCollectorStatus(): Promise<CollectorStatus> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后查看采集状态", 401);
+  }
+
+  return requestJson<CollectorStatus>("/api/v1/collector/status", {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
 }
 
 export async function createManualEvent(

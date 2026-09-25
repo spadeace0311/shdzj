@@ -9,6 +9,7 @@ import {
   formatDepth,
   formatEventKind,
   formatInstitutionalLevel,
+  formatLifecycleState,
   formatMagnitude,
   formatServiceLevel,
   isTestOrDrill,
@@ -118,6 +119,20 @@ export function EventDetailPage() {
               <div>
                 <dt>事件编号</dt>
                 <dd className="mono">{event.id}</dd>
+              </div>
+              <div>
+                <dt>生命周期状态</dt>
+                <dd>
+                  <span
+                    className={`lifecycle-tag lifecycle-tag--${event.lifecycle_state ?? "unentered"}`}
+                  >
+                    {formatLifecycleState(event.lifecycle_state)}
+                  </span>
+                </dd>
+              </div>
+              <div>
+                <dt>T1</dt>
+                <dd>{formatDateTime(event.t1_at)}</dd>
               </div>
             </dl>
           </section>

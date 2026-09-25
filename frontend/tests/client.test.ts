@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   clearAccessToken,
   createManualEvent,
+  getCollectorStatus,
   login,
   setAccessToken,
 } from "../src/api/client";
@@ -67,6 +68,29 @@ test("createManualEvent sends a JSON body with bearer authorization", async () =
   expect(JSON.parse(init.body as string)).toMatchObject({
     source: "shanghai-network",
     event_kind: "manual",
+  });
+});
+
+test("getCollectorStatus requests the restricted collector endpoint", async () => {
+  setAccessToken("test-access-token");
+  fetchMock.mockResolvedValue({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      overall_state: "healthy",
+      providers: [],
+      open_dead_letter_count: 0,
+      boundary_version: null,
+      last_ingested_event_id: null,
+    }),
+  } as Response);
+
+  await getCollectorStatus();
+
+  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(url).toBe("/api/v1/collector/status");
+  expect(init.headers).toMatchObject({
+    Authorization: "Bearer test-access-token",
   });
 });
 

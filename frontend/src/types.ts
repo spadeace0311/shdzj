@@ -6,6 +6,40 @@ export type EventKind =
   | "test"
   | "drill";
 
+export type CollectorState =
+  | "starting"
+  | "healthy"
+  | "degraded"
+  | "critical"
+  | "stopped";
+
+export interface CollectorProviderStatus {
+  provider: "fan" | "wolfx";
+  state: CollectorState;
+  connected: boolean;
+  last_http_status: number | null;
+  last_connected_at: string | null;
+  last_message_at: string | null;
+  last_success_at: string | null;
+  consecutive_failures: number;
+  reconnect_count: number;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export interface CollectorStatus {
+  overall_state: CollectorState;
+  providers: CollectorProviderStatus[];
+  open_dead_letter_count: number;
+  boundary_version: string | null;
+  last_ingested_event_id: string | null;
+}
+
+export type EventLifecycleState =
+  | "auto_pending"
+  | "formal_triggered"
+  | "correction_triggered";
+
 export interface EventSummary {
   id: string;
   source: string;
@@ -19,6 +53,8 @@ export interface EventSummary {
   institutional_level: string | null;
   service_level: number | null;
   revision_no: number;
+  lifecycle_state: EventLifecycleState;
+  t1_at: string | null;
 }
 
 export interface ResponseSuggestion {
@@ -44,6 +80,8 @@ export interface EventDetail {
   response_rule_version: string | null;
   revision_no: number;
   event_kind: string | null;
+  lifecycle_state: EventLifecycleState;
+  t1_at: string | null;
 }
 
 export interface ManualEventInput {
@@ -117,6 +155,19 @@ export function formatEventKind(kind: string | null | undefined): string {
     return "未知";
   }
   return EVENT_KIND_LABELS[kind] ?? kind;
+}
+
+export function formatLifecycleState(value: string | null | undefined): string {
+  if (value === "auto_pending") {
+    return "自动待定";
+  }
+  if (value === "formal_triggered") {
+    return "正式报已触发评估";
+  }
+  if (value === "correction_triggered") {
+    return "修订已触发评估";
+  }
+  return "未进入生命周期";
 }
 
 export function isTestOrDrill(kind: string | null | undefined): boolean {
