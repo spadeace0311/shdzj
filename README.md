@@ -109,6 +109,14 @@ docker compose -f infra/compose.yaml run --rm `
 
 页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发，代理目标当前为 `http://api:8000`。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的 API 测试请求，不会把页面 UI 的 API 基地址改成其他值。Playwright `APIRequestContext` 在浏览器上下文之外发送 HTTP 请求，因此不受浏览器 CORS 限制；页面 UI 的 `/api` 请求则依赖 Vite 代理，通常无需跨域配置。若要脱离 Compose 网络在宿主机直接运行前端，需要自行让 Vite 的代理目标指向宿主机可访问的 API 地址，并相应设置 `E2E_BASE_URL`。
 
+## 运行与交接手册
+
+事件接入基础子系统的架构边界、环境变量、事件接入、修订与原始报文核验、两级响应查看、JWT 和超级管理员密码轮换、数据库迁移诊断以及已知运行风险，统一记录在：
+
+- [地震事件接入基础子系统运行手册](docs/runbooks/event-ingestion-foundation.md)
+
+运行手册明确区分了本子系统已实现能力、预留配置和后续平台能力。涉及 CENC 定时采集、评估引擎、制图、任务协同、AI、备份自动化和每日测试调度的交接，不应把本子系统描述为已经包含这些功能。
+
 ## 本工作区验证状态
 
 本次交付在 `2026-09-25` 的工作区中验证，当前机器没有 Docker Desktop、Podman、PostgreSQL 或 `psql`，也没有安装 Playwright 浏览器。因此以下检查在本工作区没有执行：
