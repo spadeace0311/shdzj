@@ -15,4 +15,12 @@ os.environ.setdefault(
     "SUPERADMIN_INITIAL_PASSWORD",
     "test-superadmin-password-at-least-16-characters",
 )
-os.environ.setdefault("CENC_COLLECTOR_ENABLED", "false")
+_original_cenc_collector_enabled = os.environ.get("CENC_COLLECTOR_ENABLED")
+os.environ["CENC_COLLECTOR_ENABLED"] = "false"
+
+
+def pytest_unconfigure(config: object) -> None:
+    if _original_cenc_collector_enabled is None:
+        os.environ.pop("CENC_COLLECTOR_ENABLED", None)
+    else:
+        os.environ["CENC_COLLECTOR_ENABLED"] = _original_cenc_collector_enabled
