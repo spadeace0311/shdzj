@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0004_users"
-down_revision: str | None = "0003_revision_response_suggestion"
+down_revision: str | None = "0003_response_suggestion"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

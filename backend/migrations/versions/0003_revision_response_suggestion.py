@@ -6,7 +6,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0003_revision_response_suggestion"
+revision: str = "0003_response_suggestion"
 down_revision: str | None = "0002_revision_source_order"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
