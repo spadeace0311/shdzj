@@ -1,0 +1,78 @@
+import hashlib
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
+from enum import StrEnum
+
+
+class EventKind(StrEnum):
+    AUTO = "auto"
+    FORMAL = "formal"
+    CORRECTION = "correction"
+    MANUAL = "manual"
+    TEST = "test"
+    DRILL = "drill"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedEvent:
+    kind: EventKind
+    source: str
+    source_event_id: str | None
+    origin_time: datetime
+    longitude: Decimal
+    latitude: Decimal
+    depth_km: Decimal
+    magnitude: Decimal
+    place: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, EventKind):
+            raise TypeError("kind must be an EventKind")
+        if not self.source.strip():
+            raise ValueError("source must not be empty")
+        if self.source_event_id is not None and not isinstance(self.source_event_id, str):
+            raise TypeError("source_event_id must be a string or None")
+        if not isinstance(self.origin_time, datetime):
+            raise TypeError("origin_time must be a datetime")
+        if self.origin_time.tzinfo is None or self.origin_time.utcoffset() is None:
+            raise ValueError("origin_time must include timezone information")
+        if not isinstance(self.place, str) or not self.place.strip():
+            raise ValueError("place must not be empty")
+
+        object.__setattr__(self, "origin_time", self.origin_time.astimezone(UTC))
+        _validate_decimal(self.longitude, "longitude", Decimal("-180"), Decimal("180"))
+        _validate_decimal(self.latitude, "latitude", Decimal("-90"), Decimal("90"))
+        _validate_decimal(self.depth_km, "depth_km", Decimal("0"), Decimal("1000"))
+        _validate_decimal(self.magnitude, "magnitude", Decimal("-2"), Decimal("12"))
+
+
+def _validate_decimal(value: Decimal, field: str, minimum: Decimal, maximum: Decimal) -> None:
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{field} must be a Decimal")
+    if not value.is_finite() or value < minimum or value > maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+
+
+def _stable_decimal(value: Decimal, precision: int) -> str:
+    normalized = Decimal(0) if value == 0 else value
+    return f"{normalized:.{precision}f}"
+
+
+def canonical_source_id(event: NormalizedEvent) -> str:
+    if event.source_event_id:
+        return f"{event.source}:{event.source_event_id}"
+
+    origin_minute = event.origin_time.astimezone(UTC).replace(second=0, microsecond=0)
+    material = "|".join(
+        [
+            event.source,
+            origin_minute.isoformat(),
+            _stable_decimal(event.longitude, 3),
+            _stable_decimal(event.latitude, 3),
+            _stable_decimal(event.magnitude, 1),
+            _stable_decimal(event.depth_km, 1),
+        ]
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"{event.source}:fallback:{digest}"
