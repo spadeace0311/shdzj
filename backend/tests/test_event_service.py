@@ -590,6 +590,128 @@ async def test_old_formal_after_newer_correction_is_saved_but_not_current() -> N
     assert session.executed == []
 
 
+async def test_late_formal_without_explicit_order_does_not_replace_correction() -> None:
+    repository = EventRepository()
+    correction = _event(
+        kind=EventKind.CORRECTION,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.3"),
+    )
+    existing = _canonical_event(
+        event=correction,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.CORRECTION,
+        canonical_source_id="cenc:CENC-FORMAL-2",
+    )
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=2,
+        kind=EventKind.CORRECTION,
+        source_event_id="CENC-FORMAL-2",
+        is_current=True,
+    )
+    existing.current_revision_id = current_revision.id
+    session = _RecordingSession(None, existing, 2, current_revision)
+    late_formal = _event(
+        kind=EventKind.FORMAL,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.2"),
+    )
+
+    result = await repository.append_revision(
+        session,
+        _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
+        late_formal,
+    )
+
+    revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
+    assert result.is_current is False
+    assert revision.is_current is False
+    assert existing.current_revision_id == current_revision.id
+    assert existing.magnitude == Decimal("5.3")
+
+
+async def test_formal_with_later_report_time_can_replace_correction() -> None:
+    repository = EventRepository()
+    correction = _event(
+        kind=EventKind.CORRECTION,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.3"),
+        report_time=RECEIVED_AT,
+    )
+    existing = _canonical_event(
+        event=correction,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.CORRECTION,
+        canonical_source_id="cenc:CENC-FORMAL-2",
+    )
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=2,
+        kind=EventKind.CORRECTION,
+        source_event_id="CENC-FORMAL-2",
+        report_time=RECEIVED_AT,
+        is_current=True,
+    )
+    existing.current_revision_id = current_revision.id
+    session = _RecordingSession(None, existing, 2, current_revision)
+    later_formal = _event(
+        kind=EventKind.FORMAL,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.4"),
+        report_time=RECEIVED_AT + timedelta(minutes=5),
+    )
+
+    result = await repository.append_revision(
+        session,
+        _raw_message(received_at=RECEIVED_AT + timedelta(minutes=6)),
+        later_formal,
+    )
+
+    revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
+    assert result.is_current is True
+    assert revision.is_current is True
+    assert existing.current_revision_id == revision.id
+    assert existing.event_type == EventKind.FORMAL.value
+
+
+async def test_correction_without_explicit_order_replaces_formal() -> None:
+    repository = EventRepository()
+    formal = _event(
+        kind=EventKind.FORMAL,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.2"),
+    )
+    existing = _canonical_event(
+        event=formal,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.FORMAL,
+        canonical_source_id="cenc:CENC-FORMAL-2",
+    )
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=1,
+        kind=EventKind.FORMAL,
+        source_event_id="CENC-FORMAL-2",
+        is_current=True,
+    )
+    existing.current_revision_id = current_revision.id
+    session = _RecordingSession(None, existing, 1, current_revision)
+    correction = _event(
+        kind=EventKind.CORRECTION,
+        source_event_id="CENC-FORMAL-2",
+        magnitude=Decimal("5.3"),
+    )
+
+    result = await repository.append_revision(session, _raw_message(), correction)
+
+    revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
+    assert result.is_current is True
+    assert revision.is_current is True
+    assert existing.current_revision_id == revision.id
+    assert existing.event_type == EventKind.CORRECTION.value
+
+
 async def test_newer_auto_becomes_current_while_no_reviewed_version_exists() -> None:
     repository = EventRepository()
     initial = _event(report_time=RECEIVED_AT - timedelta(minutes=1))
@@ -625,6 +747,85 @@ async def test_newer_auto_becomes_current_while_no_reviewed_version_exists() -> 
     assert existing.event_type == EventKind.AUTO.value
     assert existing.magnitude == Decimal("5.2")
     assert len(session.executed) == 1
+
+
+@pytest.mark.parametrize(
+    ("current_number", "incoming_number", "expected_current"),
+    [
+        (3, 2, False),
+        (1, 2, True),
+        (2, None, False),
+    ],
+)
+async def test_auto_revisions_compare_report_number_before_received_at(
+    current_number: int,
+    incoming_number: int | None,
+    expected_current: bool,
+) -> None:
+    repository = EventRepository()
+    current_event = _event(report_number=current_number)
+    existing = _canonical_event(
+        event=current_event,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.AUTO,
+    )
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=1,
+        kind=EventKind.AUTO,
+        source_event_id="CENC-AUTO-1",
+        report_number=current_number,
+        is_current=True,
+    )
+    existing.current_revision_id = current_revision.id
+    session = _RecordingSession(None, existing, 1, current_revision)
+    incoming = _event(
+        magnitude=Decimal("5.2"),
+        report_number=incoming_number,
+    )
+
+    result = await repository.append_revision(
+        session,
+        _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
+        incoming,
+    )
+
+    revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
+    assert result.is_current is expected_current
+    assert revision.is_current is expected_current
+    assert (existing.current_revision_id == revision.id) is expected_current
+
+
+async def test_auto_without_report_time_does_not_replace_newer_current_time() -> None:
+    repository = EventRepository()
+    current_event = _event(report_time=RECEIVED_AT - timedelta(hours=1))
+    existing = _canonical_event(
+        event=current_event,
+        current_revision_id=uuid.uuid4(),
+        current_kind=EventKind.AUTO,
+    )
+    current_revision = _revision(
+        event_id=existing.id,
+        revision_no=1,
+        kind=EventKind.AUTO,
+        source_event_id="CENC-AUTO-1",
+        report_time=RECEIVED_AT - timedelta(hours=1),
+        is_current=True,
+    )
+    existing.current_revision_id = current_revision.id
+    session = _RecordingSession(None, existing, 1, current_revision)
+    incoming = _event(magnitude=Decimal("5.2"))
+
+    result = await repository.append_revision(
+        session,
+        _raw_message(received_at=RECEIVED_AT + timedelta(hours=1)),
+        incoming,
+    )
+
+    revision = next(value for value in session.added if isinstance(value, EarthquakeRevision))
+    assert result.is_current is False
+    assert revision.is_current is False
+    assert existing.current_revision_id == current_revision.id
 
 
 @pytest.mark.parametrize("is_current", [True, False])

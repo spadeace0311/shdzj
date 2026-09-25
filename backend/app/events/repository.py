@@ -15,11 +15,7 @@ from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
 _REVIEWED_EVENT_KINDS = {EventKind.FORMAL, EventKind.CORRECTION}
-_LOGICAL_KIND_RANK = {
-    EventKind.AUTO: 0,
-    EventKind.FORMAL: 1,
-    EventKind.CORRECTION: 2,
-}
+_LOGICAL_EVENT_KINDS = {EventKind.AUTO, EventKind.FORMAL, EventKind.CORRECTION}
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,45 +271,64 @@ def _becomes_current(
         return True
 
     current_kind = EventKind(current_revision.revision_kind)
-    if event.kind is EventKind.AUTO:
+    incoming_kind = event.kind
+
+    if incoming_kind not in _LOGICAL_EVENT_KINDS:
         if current_kind in _REVIEWED_EVENT_KINDS:
             return False
-        return _event_order(event, received_at) > _revision_order(current_revision)
+        return _normalize_utc(received_at, "received_at") > _normalize_utc(
+            current_revision.created_at,
+            "revision.created_at",
+        )
 
-    if event.kind in _REVIEWED_EVENT_KINDS:
-        return _event_order(event, received_at) > _revision_order(current_revision)
+    if current_kind not in _LOGICAL_EVENT_KINDS:
+        return incoming_kind in _REVIEWED_EVENT_KINDS
 
-    if current_kind in _REVIEWED_EVENT_KINDS:
+    if current_kind is EventKind.AUTO:
+        if incoming_kind in _REVIEWED_EVENT_KINDS:
+            return True
+        return _compare_explicit_order(current_revision, event) == 1
+
+    if incoming_kind is EventKind.AUTO:
         return False
-    return _normalize_utc(received_at, "received_at") > _normalize_utc(
-        current_revision.created_at,
-        "revision.created_at",
-    )
+
+    comparison = _compare_explicit_order(current_revision, event)
+    if current_kind is EventKind.FORMAL:
+        if incoming_kind is EventKind.CORRECTION:
+            return comparison != -1
+        return comparison == 1
+
+    if current_kind is EventKind.CORRECTION:
+        return comparison == 1
+    return False
 
 
-def _event_order(
-    event: NormalizedEvent,
-    received_at: datetime,
-) -> tuple[datetime, int, int, datetime]:
-    received_at = _normalize_utc(received_at, "received_at")
-    return (
-        event.report_time or received_at,
-        event.report_number if event.report_number is not None else -1,
-        _LOGICAL_KIND_RANK.get(event.kind, -1),
-        received_at,
-    )
+def _compare_explicit_order(
+    current_revision: EarthquakeRevision,
+    incoming_event: NormalizedEvent,
+) -> int | None:
+    current_number = current_revision.source_report_number
+    incoming_number = incoming_event.report_number
+    number_comparable = current_number is not None and incoming_number is not None
+    if number_comparable:
+        if incoming_number > current_number:
+            return 1
+        if incoming_number < current_number:
+            return -1
 
+    current_time = current_revision.source_report_time
+    incoming_time = incoming_event.report_time
+    time_comparable = current_time is not None and incoming_time is not None
+    if time_comparable:
+        if incoming_time > current_time:
+            return 1
+        if incoming_time < current_time:
+            return -1
+        return 0
 
-def _revision_order(
-    revision: EarthquakeRevision,
-) -> tuple[datetime, int, int, datetime]:
-    created_at = _normalize_utc(revision.created_at, "revision.created_at")
-    return (
-        revision.source_report_time or created_at,
-        (revision.source_report_number if revision.source_report_number is not None else -1),
-        _LOGICAL_KIND_RANK.get(EventKind(revision.revision_kind), -1),
-        created_at,
-    )
+    if number_comparable:
+        return 0
+    return None
 
 
 def _apply_current_event_fields(
