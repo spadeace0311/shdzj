@@ -1,8 +1,10 @@
 import hashlib
 import json
 import math
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from geoalchemy2.elements import WKTElement
@@ -11,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.events.response_rules import ResponseSuggestion
 
 _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
@@ -25,6 +28,39 @@ class EventIngestResult:
     revision_no: int
     event_kind: EventKind
     is_current: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EventSummaryRecord:
+    event_id: str
+    source: str
+    event_kind: str
+    place: str
+    magnitude: Decimal
+    depth_km: Decimal
+    origin_time: datetime
+    longitude: Decimal
+    latitude: Decimal
+    institutional_level: str | None
+    service_level: int | None
+    revision_no: int
+
+
+@dataclass(frozen=True, slots=True)
+class EventDetailRecord:
+    event_id: str
+    source: str
+    place: str
+    magnitude: Decimal
+    depth_km: Decimal
+    origin_time: datetime
+    longitude: Decimal
+    latitude: Decimal
+    institutional_level: str | None
+    service_level: int | None
+    response_suggestion: dict | None
+    response_rule_version: str | None
+    revision_no: int
 
 
 class EventRepository:
@@ -190,6 +226,61 @@ class EventRepository:
             is_current=becomes_current,
         )
 
+    async def set_response_suggestion(
+        self,
+        session: AsyncSession,
+        event_id: str,
+        suggestion: ResponseSuggestion,
+        suggestion_payload: dict,
+    ) -> None:
+        event = await session.get(
+            EarthquakeEvent,
+            uuid.UUID(event_id),
+            with_for_update=True,
+        )
+        if event is None:
+            raise LookupError(f"event not found: {event_id}")
+        event.institutional_level = suggestion.institutional_level
+        event.service_level = suggestion.service_level
+        event.response_suggestion = suggestion_payload
+        event.response_rule_version = suggestion.rule_version
+
+    async def list_current_events(
+        self,
+        session: AsyncSession,
+    ) -> list[EventSummaryRecord]:
+        rows = await session.execute(
+            select(EarthquakeEvent, EarthquakeRevision)
+            .join(
+                EarthquakeRevision,
+                EarthquakeRevision.id == EarthquakeEvent.current_revision_id,
+            )
+            .where(EarthquakeEvent.current_revision_id.is_not(None))
+            .order_by(
+                EarthquakeEvent.origin_time.desc(),
+                EarthquakeEvent.id.desc(),
+            )
+        )
+        return [_event_summary_record(event, revision) for event, revision in rows.all()]
+
+    async def get_current_event(
+        self,
+        session: AsyncSession,
+        event_id: str,
+    ) -> EventDetailRecord:
+        try:
+            event_uuid = uuid.UUID(event_id)
+        except (TypeError, ValueError) as exc:
+            raise LookupError(f"event not found: {event_id}") from exc
+
+        event = await session.get(EarthquakeEvent, event_uuid)
+        if event is None or event.current_revision_id is None:
+            raise LookupError(f"event not found: {event_id}")
+        revision = await session.get(EarthquakeRevision, event.current_revision_id)
+        if revision is None:
+            raise LookupError(f"event not found: {event_id}")
+        return _event_detail_record(event, revision)
+
     async def _find_canonical_event(
         self,
         session: AsyncSession,
@@ -346,6 +437,47 @@ def _apply_current_event_fields(
     canonical.place = event.place
     canonical.geom = geom
     canonical.current_revision_id = revision_id
+
+
+def _event_summary_record(
+    event: EarthquakeEvent,
+    revision: EarthquakeRevision,
+) -> EventSummaryRecord:
+    return EventSummaryRecord(
+        event_id=str(event.id),
+        source=event.source,
+        event_kind=revision.revision_kind,
+        place=revision.place,
+        magnitude=revision.magnitude,
+        depth_km=revision.depth_km,
+        origin_time=revision.origin_time,
+        longitude=revision.longitude,
+        latitude=revision.latitude,
+        institutional_level=event.institutional_level,
+        service_level=event.service_level,
+        revision_no=revision.revision_no,
+    )
+
+
+def _event_detail_record(
+    event: EarthquakeEvent,
+    revision: EarthquakeRevision,
+) -> EventDetailRecord:
+    return EventDetailRecord(
+        event_id=str(event.id),
+        source=event.source,
+        place=revision.place,
+        magnitude=revision.magnitude,
+        depth_km=revision.depth_km,
+        origin_time=revision.origin_time,
+        longitude=revision.longitude,
+        latitude=revision.latitude,
+        institutional_level=event.institutional_level,
+        service_level=event.service_level,
+        response_suggestion=event.response_suggestion,
+        response_rule_version=event.response_rule_version,
+        revision_no=revision.revision_no,
+    )
 
 
 def _point_geometry(event: NormalizedEvent) -> WKTElement:
