@@ -1,12 +1,22 @@
 import react from "@vitejs/plugin-react";
 import type { UserConfig } from "vite";
 
+type ProcessEnvironment = {
+  process?: {
+    env?: Record<string, string | undefined>;
+  };
+};
+
+const apiProxyTarget =
+  (globalThis as ProcessEnvironment).process?.env?.VITE_API_PROXY_TARGET ||
+  "http://api:8000";
+
 export default {
   plugins: [react()],
   server: {
     proxy: {
       "/api": {
-        target: "http://api:8000",
+        target: apiProxyTarget,
         changeOrigin: true,
       },
     },

@@ -119,6 +119,7 @@ Copy-Item .env.example .env
 | `JWT_EXPIRE_MINUTES` | 否 | 默认 `480` 分钟 |
 | `SUPERADMIN_USERNAME` | 否 | 默认 `superadmin` |
 | `SUPERADMIN_INITIAL_PASSWORD` | 是 | 至少 16 个字符；只在数据库中用户名不存在时用于初始化 |
+| `VITE_API_PROXY_TARGET` | 否 | Vite 开发服务器 `/api` 代理目标；Compose frontend 未设置时默认 `http://api:8000`，宿主机直接运行且 API 暴露在默认端口时设为 `http://127.0.0.1:8000` |
 | `CENC_APP_ID` | 当前可空 | 仅保留配置位；当前代码不读取它发起请求 |
 | `CENC_API_BASE_URL` | 当前可空 | 仅保留配置位；当前代码不读取它发起请求 |
 | `RESPONSE_RULES_PATH` | 否 | 代码默认值为 `/config/response_rules/shanghai-2026.yaml`，Compose 已挂载该路径 |
@@ -158,22 +159,22 @@ $rng.Dispose()
 以下操作会删除本地 PostgreSQL 卷和全部事件历史，只允许用于无数据测试环境：
 
 ```powershell
-docker compose -f infra/compose.yaml down -v
+docker compose --env-file .env -f infra/compose.yaml down -v
 ```
 
 先构建镜像，再启动数据库、执行迁移、启动全部服务：
 
 ```powershell
-docker compose -f infra/compose.yaml build
-docker compose -f infra/compose.yaml up -d postgres
-docker compose -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml build
+docker compose --env-file .env -f infra/compose.yaml up -d postgres
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d
 ```
 
 检查服务：
 
 ```powershell
-docker compose -f infra/compose.yaml ps
+docker compose --env-file .env -f infra/compose.yaml ps
 Invoke-RestMethod http://localhost:8000/health
 ```
 
@@ -191,17 +192,32 @@ http://localhost:5173
 
 首次登录使用 `.env` 中的 `SUPERADMIN_USERNAME` 和 `SUPERADMIN_INITIAL_PASSWORD`。
 
-### 3.3 任务验收用的完整重置序列
+### 3.3 宿主机直接运行前端
+
+Compose 模式下，frontend 容器内的 Vite 开发服务器使用默认代理目标 `http://api:8000`，无需设置 `VITE_API_PROXY_TARGET`。该默认地址只在 Compose 网络内可解析，不要在宿主机直接运行时使用。
+
+若 API 通过 Compose 暴露在宿主机默认端口 `8000`，则从仓库根目录执行：
+
+```powershell
+cd frontend
+npm install
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm run dev
+```
+
+若修改了 `API_PORT` 或 API 运行在其他主机，请把 `VITE_API_PROXY_TARGET` 改为对应的宿主机可达地址。该变量只在启动 Vite 时读取；修改后需要重启前端开发服务器。
+
+### 3.4 任务验收用的完整重置序列
 
 以下标准验收序列用于无数据环境，并按“先迁移、后启动 API”的顺序避免新建表前启动主 API。该序列尚未在当前机器执行，因为当前环境没有 Docker 和 PostgreSQL：
 
 ```powershell
-docker compose -f infra/compose.yaml down -v
-docker compose -f infra/compose.yaml build
-docker compose -f infra/compose.yaml up -d postgres
-docker compose -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose -f infra/compose.yaml up -d
-docker compose -f infra/compose.yaml run --rm api pytest -v
+docker compose --env-file .env -f infra/compose.yaml down -v
+docker compose --env-file .env -f infra/compose.yaml build
+docker compose --env-file .env -f infra/compose.yaml up -d postgres
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
 ```
 
 生产或保留数据环境不要执行 `down -v`。
@@ -209,7 +225,7 @@ docker compose -f infra/compose.yaml run --rm api pytest -v
 停止服务：
 
 ```powershell
-docker compose -f infra/compose.yaml down
+docker compose --env-file .env -f infra/compose.yaml down
 ```
 
 ## 4. 事件接入方式
@@ -419,7 +435,7 @@ Invoke-RestMethod "http://localhost:8000/api/v1/events/$eventId" | ConvertTo-Jso
 
 ```powershell
 $eventId = "<事件 id>"
-docker compose -f infra/compose.yaml exec -T postgres psql `
+docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
   -U earthquake `
   -d earthquake `
   -v event_id="$eventId" `
@@ -436,7 +452,7 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 
 ```powershell
 $eventId = "<事件 id>"
-docker compose -f infra/compose.yaml exec -T postgres psql `
+docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
   -U earthquake `
   -d earthquake `
   -v event_id="$eventId" `
@@ -493,7 +509,7 @@ $detail.response_rule_version
 
 ```powershell
 $eventId = "<事件 id>"
-docker compose -f infra/compose.yaml exec -T postgres psql `
+docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
   -U earthquake `
   -d earthquake `
   -v event_id="$eventId" `
@@ -504,7 +520,7 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 
 ```powershell
 $eventId = "<事件 id>"
-docker compose -f infra/compose.yaml exec -T postgres psql `
+docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
   -U earthquake `
   -d earthquake `
   -v event_id="$eventId" `
@@ -551,7 +567,7 @@ $content = [System.Text.RegularExpressions.Regex]::Replace(
   [System.Text.UTF8Encoding]::new($false)
 )
 
-docker compose -f infra/compose.yaml up -d --force-recreate api
+docker compose --env-file .env -f infra/compose.yaml up -d --force-recreate api
 ```
 
 当前 Compose 只有一个 API 实例。未来若扩展到多个实例，必须同时切换全部实例；混合密钥会造成部分请求间歇性返回 `401`。
@@ -571,7 +587,7 @@ $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newPassword)
 try {
   $env:NEW_SUPERADMIN_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
   $hashOutput = (
-    docker compose -f infra/compose.yaml run --rm `
+    docker compose --env-file .env -f infra/compose.yaml run --rm `
       -e NEW_SUPERADMIN_PASSWORD `
       api python -c "import os; from app.security import hash_password; print(hash_password(os.environ['NEW_SUPERADMIN_PASSWORD']))"
   )
@@ -592,7 +608,7 @@ try {
 
 ```powershell
 $updatedRows = @(
-  docker compose -f infra/compose.yaml exec -T postgres psql `
+  docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
     -U earthquake `
     -d earthquake `
     -v ON_ERROR_STOP=1 `
@@ -657,15 +673,15 @@ if (-not $loginResult.access_token) {
 ### 8.1 检查容器和网络
 
 ```powershell
-docker compose -f infra/compose.yaml ps
-docker compose -f infra/compose.yaml logs --tail 200 postgres
-docker compose -f infra/compose.yaml logs --tail 200 api
+docker compose --env-file .env -f infra/compose.yaml ps
+docker compose --env-file .env -f infra/compose.yaml logs --tail 200 postgres
+docker compose --env-file .env -f infra/compose.yaml logs --tail 200 api
 ```
 
 检查 PostgreSQL 就绪状态：
 
 ```powershell
-docker compose -f infra/compose.yaml exec postgres pg_isready `
+docker compose --env-file .env -f infra/compose.yaml exec postgres pg_isready `
   -U earthquake `
   -d earthquake
 ```
@@ -673,7 +689,7 @@ docker compose -f infra/compose.yaml exec postgres pg_isready `
 检查 PostGIS：
 
 ```powershell
-docker compose -f infra/compose.yaml exec -T postgres psql `
+docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql `
   -U earthquake `
   -d earthquake `
   -c "SELECT PostGIS_Full_Version();"
@@ -688,7 +704,7 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 | `Name or service not known`、`could not translate host name` | `DATABASE_URL` 使用了错误的数据库主机 | Compose 内主机名必须是 `postgres`，不能写 `localhost` 或 `127.0.0.1` |
 | `InvalidPasswordError`、认证失败 | `POSTGRES_PASSWORD` 与 `DATABASE_URL` 中密码不一致 | 同步修正两个变量；密码含特殊字符时做 URL 编码 |
 | API 日志出现 `Superadmin bootstrap failed; the database may be unavailable` | 数据库不可达，或 `users` 表尚未迁移 | 检查 PostgreSQL 日志并执行迁移；这通常不是登录密码错误 |
-| `psycopg`/asyncpg 连接被拒绝 | PostgreSQL 容器未就绪或已停止 | 查看 `docker compose ps` 和 `postgres` 日志 |
+| `psycopg`/asyncpg 连接被拒绝 | PostgreSQL 容器未就绪或已停止 | 查看 `docker compose --env-file .env -f infra/compose.yaml ps` 和 `postgres` 日志 |
 | 外部数据库连接失败 | 网络、防火墙或权限限制 | 从 API 容器验证网络；不要只从宿主机测试 |
 
 `GET /health` 不访问数据库。它返回 `200` 只能说明 API 进程还在运行，不能替代数据库检查。
@@ -698,15 +714,15 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 查看 Alembic 当前版本和头版本：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm api alembic current
-docker compose -f infra/compose.yaml run --rm api alembic heads
-docker compose -f infra/compose.yaml run --rm api alembic history
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic current
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic heads
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic history
 ```
 
 执行迁移：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
 ```
 
 常见迁移故障：
@@ -724,7 +740,7 @@ docker compose -f infra/compose.yaml run --rm api alembic upgrade head
 以下命令会删除 PostgreSQL 卷和全部事件历史：
 
 ```powershell
-docker compose -f infra/compose.yaml down -v
+docker compose --env-file .env -f infra/compose.yaml down -v
 ```
 
 仅用于无价值数据测试环境。正式运行环境不得使用该命令排障。
@@ -734,27 +750,27 @@ docker compose -f infra/compose.yaml down -v
 后端单元测试：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm api pytest -v
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
 ```
 
 后端静态检查：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm api ruff check app tests
+docker compose --env-file .env -f infra/compose.yaml run --rm api ruff check app tests
 ```
 
 前端单元测试、类型检查和构建：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm frontend npm test
-docker compose -f infra/compose.yaml run --rm frontend npm run typecheck
-docker compose -f infra/compose.yaml run --rm frontend npm run build
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm test
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run typecheck
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run build
 ```
 
 端到端测试：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm `
+docker compose --env-file .env -f infra/compose.yaml run --rm `
   -e E2E_SUPERADMIN_USERNAME="<当前超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<当前超级管理员密码>" `
   frontend npm run test:e2e

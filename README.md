@@ -33,10 +33,10 @@ cp .env.example .env
 构建镜像，先启动数据库并完成迁移，再启动全部服务：
 
 ```powershell
-docker compose -f infra/compose.yaml build
-docker compose -f infra/compose.yaml up -d postgres
-docker compose -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml build
+docker compose --env-file .env -f infra/compose.yaml up -d postgres
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d
 ```
 
 启动后访问：
@@ -44,16 +44,29 @@ docker compose -f infra/compose.yaml up -d
 - 前端：`http://localhost:5173`
 - API 健康检查：`http://localhost:8000/health`
 
+Compose 模式下，frontend 容器内的 Vite 开发服务器使用默认代理目标 `http://api:8000`，无需设置 `VITE_API_PROXY_TARGET`。
+
+在宿主机直接运行前端时，Vite 无法解析 Compose 服务名 `api`，需要把代理目标显式指向宿主机可访问的 API 地址：
+
+```powershell
+cd frontend
+npm install
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm run dev
+```
+
+若通过 Compose 暴露 API，默认地址为 `http://127.0.0.1:8000`；若修改了 `API_PORT` 或 API 所在主机，请同步调整该值。未设置 `VITE_API_PROXY_TARGET` 时仍默认使用容器服务地址 `http://api:8000`。
+
 停止：
 
 ```powershell
-docker compose -f infra/compose.yaml down
+docker compose --env-file .env -f infra/compose.yaml down
 ```
 
 停止并清除数据库卷（用于本地环境重置）：
 
 ```powershell
-docker compose -f infra/compose.yaml down -v
+docker compose --env-file .env -f infra/compose.yaml down -v
 ```
 
 ## 测试
@@ -61,16 +74,16 @@ docker compose -f infra/compose.yaml down -v
 后端单元测试和静态检查：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm api pytest -v
-docker compose -f infra/compose.yaml run --rm api ruff check app tests
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
+docker compose --env-file .env -f infra/compose.yaml run --rm api ruff check app tests
 ```
 
 前端单元测试、类型检查和构建：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm frontend npm test
-docker compose -f infra/compose.yaml run --rm frontend npm run typecheck
-docker compose -f infra/compose.yaml run --rm frontend npm run build
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm test
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run typecheck
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run build
 ```
 
 当前接入接口接收调用方提交的 CENC 兼容 JSON。`CENC_APP_ID` 和 `CENC_API_BASE_URL` 只是预留配置，当前代码没有读取它们发起请求，也没有外部 CENC 采集器；填写这两个变量本身不会建立真实上游联调。后端单元测试使用假服务和内存中的响应规则，前端测试模拟 `fetch`。
@@ -89,7 +102,7 @@ E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表�
 通过 Compose 运行：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm `
+docker compose --env-file .env -f infra/compose.yaml run --rm `
   -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
   frontend npm run test:e2e
@@ -98,14 +111,14 @@ docker compose -f infra/compose.yaml run --rm `
 需要让 Playwright 的 API 测试请求直连时，在 Compose 容器内应使用服务名 `http://api:8000`，不是容器内的 `localhost`：
 
 ```powershell
-docker compose -f infra/compose.yaml run --rm `
+docker compose --env-file .env -f infra/compose.yaml run --rm `
   -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
   -e E2E_API_BASE_URL="http://api:8000" `
   frontend npm run test:e2e
 ```
 
-页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发，代理目标当前为 `http://api:8000`。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的 API 测试请求，不会把页面 UI 的 API 基地址改成其他值。Playwright `APIRequestContext` 在浏览器上下文之外发送 HTTP 请求，因此不受浏览器 CORS 限制；页面 UI 的 `/api` 请求则依赖 Vite 代理，通常无需跨域配置。若要脱离 Compose 网络在宿主机直接运行前端，需要自行让 Vite 的代理目标指向宿主机可访问的 API 地址，并相应设置 `E2E_BASE_URL`。
+页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发。Compose 模式未设置 `VITE_API_PROXY_TARGET` 时默认使用 `http://api:8000`；宿主机直接运行前端时应设置为 `http://127.0.0.1:8000`（或实际可达地址）。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的 API 测试请求，不会把页面 UI 的 API 基地址改成其他值。Playwright `APIRequestContext` 在浏览器上下文之外发送 HTTP 请求，因此不受浏览器 CORS 限制；页面 UI 的 `/api` 请求则依赖 Vite 代理，通常无需跨域配置。
 
 ## 运行与交接手册
 
@@ -119,7 +132,7 @@ docker compose -f infra/compose.yaml run --rm `
 
 本次交付在 `2026-09-25` 的工作区中验证，当前机器没有 Docker Desktop、Podman、PostgreSQL 或 `psql`，也没有安装 Playwright 浏览器。因此以下检查在本工作区没有执行：
 
-- `docker compose up` 及基于真实 PostGIS 的迁移和联调
+- `docker compose --env-file .env -f infra/compose.yaml up` 及基于真实 PostGIS 的迁移和联调
 - 需要真实 PostgreSQL/PostGIS 的后端集成检查
 - 需要 Playwright 浏览器实际运行前端页面的 E2E 测试
 
