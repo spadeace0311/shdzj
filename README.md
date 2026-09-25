@@ -130,17 +130,18 @@ docker compose --env-file .env -f infra/compose.yaml run --rm `
 
 ## 本工作区验证状态
 
-本次交付在 `2026-09-25` 的工作区中验证，当前机器没有 Docker Desktop、Podman、PostgreSQL 或 `psql`，也没有安装 Playwright 浏览器。因此以下检查在本工作区没有执行：
+本次交付在 `2026-09-25` 的 Z440 工作区完成真实运行验证：
 
-- `docker compose --env-file .env -f infra/compose.yaml up` 及基于真实 PostGIS 的迁移和联调
-- 需要真实 PostgreSQL/PostGIS 的后端集成检查
-- 需要 Playwright 浏览器实际运行前端页面的 E2E 测试
+- Docker Desktop `4.92.0`、Docker Engine `29.8.0` 正常运行。
+- PostgreSQL `16`、PostGIS `3.4.3` 容器正常运行，Alembic 已迁移至 `0004_users`。
+- `docker compose --env-file .env -f infra/compose.yaml config --quiet` 通过。
+- `docker compose --env-file .env -f infra/compose.yaml build api` 通过。
+- 后端测试套件在真实 PostgreSQL/PostGIS 环境下为 `180 passed`（其中 `test_event_tables_and_postgis_exist` 直接验证建表结果和 PostGIS 扩展），Ruff 检查通过。
+- API `/health` 返回 `200`；正式报接入后返回重大响应和服务响应二级，并能从详情接口读取。
+- 前端 `npm test` 为 `23 passed`，`npm run typecheck` 和 `npm run build` 通过。
+- 宿主机 Vite 加真实 API 加 Playwright Chromium 的三条 E2E 用例全部通过。
 
-已在本工作区执行并确认通过：
+尚未完成：
 
-- `npm test`
-- `npm run typecheck`
-- `npm run build`
-- `npx playwright test --list`
-
-`npx playwright test --list` 只验证 E2E 测试发现与配置解析，不能证明端到端流程已经通过。请勿把该命令的通过当作真实 E2E 已通过。
+- 前端容器镜像构建未完成，原因是 `mcr.microsoft.com/playwright:v1.49.1-noble` 基础镜像较大且当前网络下载极慢；本轮改以宿主机 Vite 和 Playwright Chromium 完成前端与 E2E 验证。
+- 尚未连接真实 CENC 上游采集器；当前验证使用兼容 CENC JSON 的正式报接入请求。

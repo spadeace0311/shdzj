@@ -209,7 +209,7 @@ npm run dev
 
 ### 3.4 任务验收用的完整重置序列
 
-以下标准验收序列用于无数据环境，并按“先迁移、后启动 API”的顺序避免新建表前启动主 API。该序列尚未在当前机器执行，因为当前环境没有 Docker 和 PostgreSQL：
+以下标准验收序列用于无数据环境，并按“先迁移、后启动 API”的顺序避免新建表前启动主 API：
 
 ```powershell
 docker compose --env-file .env -f infra/compose.yaml down -v
@@ -221,6 +221,8 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
 ```
 
 生产或保留数据环境不要执行 `down -v`。
+
+`2026-09-25` 已在 Z440 上执行数据库和 API 部分：PostgreSQL `16`、PostGIS `3.4.3` 启动成功，迁移到 `0004_users`，API 启动并完成健康检查、正式报接入和详情读取。完整序列中的前端容器构建已尝试但未完成，原因是 Playwright 基础镜像约 `833 MB` 且下载受当前网络带宽限制；前端和三条浏览器 E2E 改由宿主机 Vite 加本机 Chromium 验证通过。
 
 停止服务：
 
@@ -780,14 +782,17 @@ docker compose --env-file .env -f infra/compose.yaml run --rm `
 
 ## 10. 已验证状态与残余风险
 
-本手册在 `2026-09-25` 的工作区完成静态核验。当前机器没有 Docker、Podman、PostgreSQL、`psql` 或 Playwright 浏览器，因此：
+本手册在 `2026-09-25` 的 Z440 工作区完成真实运行验证：
 
-- 未执行 Docker Compose 启动。
-- 未执行真实 PostgreSQL/PostGIS 迁移。
-- 未执行真实浏览器端到端流程。
-- 未执行真实 CENC 上游联调。
+- PostgreSQL `16`、PostGIS `3.4.3` 和 API 容器启动成功。
+- Alembic 迁移执行到 `0004_users`。
+- 后端测试套件在真实 PostgreSQL/PostGIS 环境下为 `180 passed`；其中 `test_event_tables_and_postgis_exist` 直接验证建表结果和 PostGIS 扩展，其他用例主要使用内存或 mock。
+- API `/health`、超级管理员初始化、正式报接入和事件详情读取通过。
+- 前端单元测试 `23 passed`，类型检查、生产构建和三条 Chromium E2E 通过。
+- 前端容器镜像构建未完成；Playwright 基础镜像下载受当前网络带宽限制，本轮改用宿主机 Vite 加本机 Chromium 完成浏览器验证。
+- 尚未执行真实 CENC 上游联调；当前只验证了兼容 CENC JSON 的接入接口。
 
-可执行的静态检查只证明文档引用的路径、接口和字段存在于当前仓库，不等同于运行时验证。
+上述结果证明当前基础事件子系统的数据库、API、前端代理和浏览器主流程可用，但不代表后续评估、制图、任务协同或 AI 模块已经实现。
 
 当前主要残余风险：
 
