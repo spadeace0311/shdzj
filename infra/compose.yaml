@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: earthquake
+      POSTGRES_USER: earthquake
+      POSTGRES_PASSWORD: earthquake
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U earthquake -d earthquake"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env.example
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

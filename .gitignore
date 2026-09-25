@@ -17,3 +17,6 @@ dist/
 coverage/
 playwright-report/
 test-results/
+*.pyc
+*.pyo
+*.log
