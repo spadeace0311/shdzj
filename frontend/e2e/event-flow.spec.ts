@@ -17,6 +17,34 @@ function apiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
 }
 
+async function findIsolatedFormalEpicenter(
+  request: APIRequestContext,
+): Promise<{ longitude: number; latitude: number }> {
+  const response = await request.get(apiUrl("/api/v1/events"));
+  expect(response.status()).toBe(200);
+  const events = (await response.json()) as Array<{
+    longitude: string;
+    latitude: string;
+  }>;
+
+  for (let longitude = 120; longitude <= 123; longitude += 0.1) {
+    for (let latitude = 29.5; latitude <= 32.5; latitude += 0.1) {
+      const isIsolated = events.every(
+        (event) =>
+          Math.hypot(
+            Number(event.longitude) - longitude,
+            Number(event.latitude) - latitude,
+          ) > 0.3,
+      );
+      if (isIsolated) {
+        return { longitude, latitude };
+      }
+    }
+  }
+
+  throw new Error("No isolated formal epicenter is available for the E2E fixture.");
+}
+
 async function loginThroughUi(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "事件控制台" })).toBeVisible();
@@ -50,10 +78,7 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
   await loginThroughUi(page);
 
   const runId = crypto.randomUUID();
-  const longitudeSeed = Number.parseInt(runId.slice(0, 8), 16);
-  const latitudeSeed = Number.parseInt(runId.slice(9, 17), 16);
-  const longitude = 120 + (longitudeSeed % 7000) / 1000;
-  const latitude = 29 + (latitudeSeed % 3000) / 1000;
+  const { longitude, latitude } = await findIsolatedFormalEpicenter(page.request);
   const place = `上海浦东新区 E2E ${runId}`;
   const response = await page.request.post(apiUrl("/api/v1/ingest/formal"), {
     data: {
