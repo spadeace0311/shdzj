@@ -102,6 +102,8 @@ class EarthquakeRevision(Base):
     revision_no: Mapped[int] = mapped_column(Integer)
     revision_kind: Mapped[str] = mapped_column(String(32), index=True)
     source_event_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    source_report_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_report_number: Mapped[int | None] = mapped_column(Integer)
     origin_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     longitude: Mapped[Decimal] = mapped_column(Numeric(10, 6))
     latitude: Mapped[Decimal] = mapped_column(Numeric(9, 6))

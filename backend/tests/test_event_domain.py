@@ -17,6 +17,8 @@ def make_event(**overrides: object) -> NormalizedEvent:
         "depth_km": Decimal("12.00"),
         "magnitude": Decimal("5.2"),
         "place": "上海浦东新区",
+        "report_time": None,
+        "report_number": None,
     }
     values.update(overrides)
     return NormalizedEvent(**values)  # type: ignore[arg-type]
@@ -71,6 +73,34 @@ def test_domain_normalizes_origin_time_to_utc() -> None:
     )
 
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+
+
+def test_domain_normalizes_report_time_to_utc() -> None:
+    event = make_event(
+        report_time=datetime(
+            2026,
+            9,
+            17,
+            10,
+            35,
+            tzinfo=timezone(timedelta(hours=8)),
+        ),
+        report_number=2,
+    )
+
+    assert event.report_time == datetime(2026, 9, 17, 2, 35, tzinfo=UTC)
+    assert event.report_number == 2
+
+
+def test_domain_rejects_naive_report_time() -> None:
+    with pytest.raises(ValueError, match="report_time.*timezone"):
+        make_event(report_time=datetime(2026, 9, 17, 2, 35))
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "2"])
+def test_domain_rejects_invalid_report_number(value: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="report_number"):
+        make_event(report_number=value)
 
 
 def test_domain_quantizes_values_to_database_precision() -> None:

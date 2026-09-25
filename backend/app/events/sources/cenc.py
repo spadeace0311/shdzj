@@ -106,6 +106,8 @@ class CencAdapter:
             depth_km=_decimal_field(payload, "depth"),
             magnitude=_decimal_field(payload, "magnitude"),
             place=_required_text(payload, "place"),
+            report_time=_optional_time_field(payload, "reportTime"),
+            report_number=_optional_non_negative_int_field(payload, "reportNum"),
         )
 
     def _parse_wolfx_eq(self, payload: dict[str, object]) -> NormalizedEvent:
@@ -126,6 +128,7 @@ class CencAdapter:
             depth_km=_decimal_field(payload, "depth"),
             magnitude=_decimal_field(payload, "magnitude"),
             place=_required_text(payload, "placeName"),
+            report_time=_optional_time_field(payload, "ReportTime"),
         )
 
     def _parse_wolfx_eew(self, payload: dict[str, object]) -> NormalizedEvent:
@@ -143,6 +146,8 @@ class CencAdapter:
             ),
             magnitude=_decimal_field(payload, "Magnitude"),
             place=_required_text(payload, "HypoCenter"),
+            report_time=_parse_origin_time(payload["ReportTime"], "ReportTime"),
+            report_number=_non_negative_int_field(payload, "ReportNum"),
         )
 
     def _parse_fan_eq(self, payload: dict[str, object]) -> NormalizedEvent:
@@ -156,6 +161,7 @@ class CencAdapter:
             depth_km=_decimal_field(payload, "depth"),
             magnitude=_decimal_field(payload, "magnitude"),
             place=_required_text(payload, "placeName"),
+            report_time=_optional_time_field(payload, "createTime"),
         )
 
     def _parse_fan_eew(self, payload: dict[str, object]) -> NormalizedEvent:
@@ -173,6 +179,11 @@ class CencAdapter:
             ),
             magnitude=_decimal_field(payload, "magnitude"),
             place=_required_text(payload, "placeName"),
+            report_time=(
+                _optional_time_field(payload, "updateTime")
+                or _optional_time_field(payload, "createTime")
+            ),
+            report_number=_non_negative_int_field(payload, "updates"),
         )
 
 
@@ -243,6 +254,8 @@ def _build_event(
     depth_km: Decimal,
     magnitude: Decimal,
     place: str,
+    report_time: datetime | None = None,
+    report_number: int | None = None,
 ) -> NormalizedEvent:
     return NormalizedEvent(
         kind=kind,
@@ -254,6 +267,8 @@ def _build_event(
         depth_km=depth_km,
         magnitude=magnitude,
         place=place,
+        report_time=report_time,
+        report_number=report_number,
     )
 
 
@@ -303,6 +318,29 @@ def _required_text(payload: dict[str, object], field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"invalid CENC {field}")
     return value.strip()
+
+
+def _optional_time_field(payload: dict[str, object], field: str) -> datetime | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    return _parse_origin_time(value, field)
+
+
+def _non_negative_int_field(payload: dict[str, object], field: str) -> int:
+    value = payload[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"invalid CENC {field}")
+    return value
+
+
+def _optional_non_negative_int_field(
+    payload: dict[str, object],
+    field: str,
+) -> int | None:
+    if field not in payload or payload[field] is None:
+        return None
+    return _non_negative_int_field(payload, field)
 
 
 def _required_any_text(payload: dict[str, object], fields: tuple[str, ...]) -> str:

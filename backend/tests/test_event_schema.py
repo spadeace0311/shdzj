@@ -23,6 +23,10 @@ def test_event_model_metadata_matches_foundation_contract() -> None:
     assert events.c.geom.type.srid == 4326
     assert _has_unique_index(events, "canonical_source_id")
     assert _has_unique_index(revisions, "raw_message_id")
+    assert revisions.c.source_report_time.type.timezone is True
+    assert revisions.c.source_report_time.nullable is True
+    assert revisions.c.source_report_number.type.python_type is int
+    assert revisions.c.source_report_number.nullable is True
     assert any(
         index.dialect_options["postgresql"].get("using") == "gist"
         for index in events.indexes

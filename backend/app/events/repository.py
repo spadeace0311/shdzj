@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
@@ -15,6 +15,11 @@ from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 _MERGE_TIME_TOLERANCE_SECONDS = 120
 _MERGE_DISTANCE_TOLERANCE_DEGREES = 0.2
 _REVIEWED_EVENT_KINDS = {EventKind.FORMAL, EventKind.CORRECTION}
+_LOGICAL_KIND_RANK = {
+    EventKind.AUTO: 0,
+    EventKind.FORMAL: 1,
+    EventKind.CORRECTION: 2,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +28,7 @@ class EventIngestResult:
     revision_id: str
     revision_no: int
     event_kind: EventKind
+    is_current: bool
 
 
 class EventRepository:
@@ -88,6 +94,16 @@ class EventRepository:
         await session.flush()
         return raw
 
+    async def acquire_ingest_lock(
+        self,
+        session: AsyncSession,
+        source: str,
+    ) -> None:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(" "hashtextextended(:lock_key, 0)" ")"),
+            {"lock_key": f"earthquake-ingest:{source}"},
+        )
+
     async def append_revision(
         self,
         session: AsyncSession,
@@ -103,6 +119,7 @@ class EventRepository:
                 revision_id=str(existing_revision.id),
                 revision_no=existing_revision.revision_no,
                 event_kind=EventKind(existing_revision.revision_kind),
+                is_current=existing_revision.is_current,
             )
 
         source_id = canonical_source_id(event)
@@ -127,6 +144,7 @@ class EventRepository:
             session.add(canonical)
             await session.flush()
             revision_no = 1
+            current_revision = None
         else:
             latest_revision_no = await session.scalar(
                 select(func.max(EarthquakeRevision.revision_no)).where(
@@ -134,9 +152,9 @@ class EventRepository:
                 )
             )
             revision_no = int(latest_revision_no or 0) + 1
-            self._promote_reviewed_source_id(canonical, event, source_id)
+            current_revision = await self._get_current_revision(session, canonical)
 
-        becomes_current = _becomes_current(canonical, event)
+        becomes_current = _becomes_current(current_revision, event, raw.received_at)
         if becomes_current:
             await session.execute(
                 update(EarthquakeRevision)
@@ -150,6 +168,8 @@ class EventRepository:
             revision_no=revision_no,
             revision_kind=event.kind.value,
             source_event_id=event.source_event_id,
+            source_report_time=event.report_time,
+            source_report_number=event.report_number,
             origin_time=event.origin_time,
             longitude=event.longitude,
             latitude=event.latitude,
@@ -171,6 +191,7 @@ class EventRepository:
             revision_id=str(revision.id),
             revision_no=revision_no,
             event_kind=event.kind,
+            is_current=becomes_current,
         )
 
     async def _find_canonical_event(
@@ -186,6 +207,27 @@ class EventRepository:
         )
         if canonical is not None:
             return canonical
+
+        if event.source_event_id:
+            historical_alias = await session.scalar(
+                select(EarthquakeEvent)
+                .join(
+                    EarthquakeRevision,
+                    EarthquakeRevision.event_id == EarthquakeEvent.id,
+                )
+                .where(
+                    EarthquakeRevision.source_event_id == event.source_event_id,
+                    EarthquakeEvent.source == event.source,
+                )
+                .order_by(
+                    EarthquakeRevision.created_at.desc(),
+                    EarthquakeRevision.revision_no.desc(),
+                )
+                .limit(1)
+                .with_for_update(of=EarthquakeEvent)
+            )
+            if historical_alias is not None:
+                return historical_alias
 
         point = _point_geometry(event)
         return await session.scalar(
@@ -212,24 +254,66 @@ class EventRepository:
             .with_for_update()
         )
 
-    @staticmethod
-    def _promote_reviewed_source_id(
+    async def _get_current_revision(
+        self,
+        session: AsyncSession,
         canonical: EarthquakeEvent,
-        event: NormalizedEvent,
-        source_id: str,
-    ) -> None:
-        if event.kind in _REVIEWED_EVENT_KINDS and event.source_event_id:
-            canonical.canonical_source_id = source_id
+    ) -> EarthquakeRevision | None:
+        if canonical.current_revision_id is None:
+            return None
+        return await session.scalar(
+            select(EarthquakeRevision).where(EarthquakeRevision.id == canonical.current_revision_id)
+        )
 
 
-def _becomes_current(canonical: EarthquakeEvent, event: NormalizedEvent) -> bool:
+def _becomes_current(
+    current_revision: EarthquakeRevision | None,
+    event: NormalizedEvent,
+    received_at: datetime,
+) -> bool:
+    if current_revision is None:
+        return True
+
+    current_kind = EventKind(current_revision.revision_kind)
+    if event.kind is EventKind.AUTO:
+        if current_kind in _REVIEWED_EVENT_KINDS:
+            return False
+        return _event_order(event, received_at) > _revision_order(current_revision)
+
     if event.kind in _REVIEWED_EVENT_KINDS:
-        return True
-    if canonical.current_revision_id is None:
-        return True
-    if canonical.event_type in {kind.value for kind in _REVIEWED_EVENT_KINDS}:
+        return _event_order(event, received_at) > _revision_order(current_revision)
+
+    if current_kind in _REVIEWED_EVENT_KINDS:
         return False
-    return event.kind is not EventKind.AUTO
+    return _normalize_utc(received_at, "received_at") > _normalize_utc(
+        current_revision.created_at,
+        "revision.created_at",
+    )
+
+
+def _event_order(
+    event: NormalizedEvent,
+    received_at: datetime,
+) -> tuple[datetime, int, int, datetime]:
+    received_at = _normalize_utc(received_at, "received_at")
+    return (
+        event.report_time or received_at,
+        event.report_number if event.report_number is not None else -1,
+        _LOGICAL_KIND_RANK.get(event.kind, -1),
+        received_at,
+    )
+
+
+def _revision_order(
+    revision: EarthquakeRevision,
+) -> tuple[datetime, int, int, datetime]:
+    created_at = _normalize_utc(revision.created_at, "revision.created_at")
+    return (
+        revision.source_report_time or created_at,
+        (revision.source_report_number if revision.source_report_number is not None else -1),
+        _LOGICAL_KIND_RANK.get(EventKind(revision.revision_kind), -1),
+        created_at,
+    )
 
 
 def _apply_current_event_fields(

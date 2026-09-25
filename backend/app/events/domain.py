@@ -25,6 +25,8 @@ class NormalizedEvent:
     depth_km: Decimal
     magnitude: Decimal
     place: str
+    report_time: datetime | None = None
+    report_number: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, EventKind):
@@ -39,8 +41,20 @@ class NormalizedEvent:
             raise ValueError("origin_time must include timezone information")
         if not isinstance(self.place, str) or not self.place.strip():
             raise ValueError("place must not be empty")
+        if self.report_time is not None:
+            if not isinstance(self.report_time, datetime):
+                raise TypeError("report_time must be a datetime or None")
+            if self.report_time.tzinfo is None or self.report_time.utcoffset() is None:
+                raise ValueError("report_time must include timezone information")
+        if self.report_number is not None:
+            if isinstance(self.report_number, bool) or not isinstance(self.report_number, int):
+                raise TypeError("report_number must be a non-negative integer or None")
+            if self.report_number < 0:
+                raise ValueError("report_number must be a non-negative integer or None")
 
         object.__setattr__(self, "origin_time", self.origin_time.astimezone(UTC))
+        if self.report_time is not None:
+            object.__setattr__(self, "report_time", self.report_time.astimezone(UTC))
         object.__setattr__(
             self,
             "longitude",

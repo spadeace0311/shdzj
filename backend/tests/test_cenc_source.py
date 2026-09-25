@@ -32,6 +32,19 @@ def test_parse_formal_cenc_message() -> None:
     assert event.depth_km == Decimal("12.0")
     assert event.magnitude == Decimal("5.2")
     assert event.place == "上海浦东新区"
+    assert event.report_time is None
+    assert event.report_number is None
+
+
+def test_parse_internal_optional_report_order_fields() -> None:
+    payload = formal_payload()
+    payload["reportTime"] = "2026-09-17 10:35:00"
+    payload["reportNum"] = 2
+
+    event = CencAdapter().parse(payload)
+
+    assert event.report_time == datetime(2026, 9, 17, 2, 35, tzinfo=UTC)
+    assert event.report_number == 2
 
 
 def test_parse_normalizes_offset_time_to_utc() -> None:
@@ -124,6 +137,8 @@ def test_parse_wolfx_cenc_automatic_eqlist_contract() -> None:
     assert event.kind is EventKind.AUTO
     assert event.source_event_id == "WOLFX-AUTO-2026091701"
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time == datetime(2026, 9, 17, 2, 31, tzinfo=UTC)
+    assert event.report_number is None
     assert event.place == "华东某地"
 
 
@@ -146,6 +161,7 @@ def test_parse_wolfx_cenc_reviewed_eqlist_contract() -> None:
 
     assert event.kind is EventKind.FORMAL
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time == datetime(2026, 9, 17, 2, 35, tzinfo=UTC)
 
 
 def test_parse_rejects_reviewed_wolfx_report_without_depth() -> None:
@@ -185,6 +201,8 @@ def test_parse_wolfx_cenc_eew_with_null_depth_uses_placeholder() -> None:
     assert event.kind is EventKind.AUTO
     assert event.source_event_id == "WOLFX-EEW-2026091701"
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time == datetime(2026, 9, 17, 2, 30, 20, tzinfo=UTC)
+    assert event.report_number == 1
     assert event.depth_km == Decimal("10.00")
     assert event.place == "华东某地"
 
@@ -207,6 +225,7 @@ def test_parse_fan_cenc_determination_formal_contract(info_type: str) -> None:
     assert event.kind is EventKind.FORMAL
     assert event.source_event_id == "FAN-FORMAL-2026091701"
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time is None
 
 
 @pytest.mark.parametrize(
@@ -237,6 +256,7 @@ def test_parse_realtime_fan_cenc_determination_without_updates(
     assert event.kind is expected_kind
     assert event.source_event_id == "FAN-REALTIME-2026091701"
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time == datetime(2026, 9, 17, 2, 35, tzinfo=UTC)
 
 
 def test_parse_fan_cenc_eew_contract() -> None:
@@ -244,6 +264,8 @@ def test_parse_fan_cenc_eew_contract() -> None:
         {
             "eventId": "FAN-EEW-2026091701",
             "shockTime": "2026-09-17 10:30:05",
+            "createTime": "2026-09-17 10:35:00",
+            "updateTime": "2026-09-17 10:36:00",
             "placeName": "华东某地",
             "updates": 3,
             "latitude": 31.22,
@@ -256,6 +278,8 @@ def test_parse_fan_cenc_eew_contract() -> None:
     assert event.kind is EventKind.AUTO
     assert event.source_event_id == "FAN-EEW-2026091701"
     assert event.origin_time == datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
+    assert event.report_time == datetime(2026, 9, 17, 2, 36, tzinfo=UTC)
+    assert event.report_number == 3
 
 
 @pytest.mark.parametrize(

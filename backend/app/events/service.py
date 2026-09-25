@@ -28,6 +28,7 @@ class EventService:
 
         async with self._session_factory() as session:
             async with session.begin():
+                await self._repository.acquire_ingest_lock(session, event.source)
                 raw = await self._repository.get_or_create_raw_message(
                     session,
                     raw_payload,
