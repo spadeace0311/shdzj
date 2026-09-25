@@ -517,18 +517,17 @@ docker compose -f infra/compose.yaml exec -T postgres psql `
 
 ### 7.1 轮换 JWT_SECRET
 
-`JWT_SECRET` 用于签发和验证 Bearer token。修改并重启 API 后，旧 token 立即失效，所有用户必须重新登录。
+`JWT_SECRET` 用于签发和验证 Bearer token，与超级管理员账号密码是相互独立的凭据。轮换 `JWT_SECRET` 不需要先轮换超级管理员密码，也不依赖 7.2 的密码验证结果。
 
-轮换 JWT 前必须先完成 7.2 的超级管理员密码轮换，并用新密码实际登录成功。若登录验证失败，不得继续轮换 JWT。
+修改并重启 API 后，新的 `JWT_SECRET` 会立即使所有现有 token 失效，所有用户必须重新登录。如已确认或高度怀疑 JWT 泄露，应立即按本节轮换，不应等待无关的密码轮换完成。
 
 操作顺序：
 
-1. 选择维护窗口，通知值守人员。
-2. 确认 7.2 的新密码登录验证已经成功。
-3. 生成新的独立随机值。
-4. 修改 `.env` 中的 `JWT_SECRET`，不要把新值发到群聊、工单或截图中。
-5. 强制重建 API，使新密钥生效。
-6. 验证旧会话或旧 token 返回 `401`，再用新登录验证系统可用。
+1. 非紧急轮换可选择维护窗口并通知值守人员；发生 JWT 泄露时应立即轮换，通知和复盘可在遏制风险后完成。
+2. 生成新的独立随机值。
+3. 修改 `.env` 中的 `JWT_SECRET`，不要把新值发到群聊、工单或截图中。
+4. 强制重建 API，使新密钥生效。
+5. 验证旧会话或旧 token 返回 `401`，再验证用户重新登录后系统可用。
 
 PowerShell 示例：
 
@@ -615,7 +614,7 @@ if ($LASTEXITCODE -ne 0 -or $updatedRows.Count -ne 1 -or $updatedRows[0] -ne $ad
 
 如 `.env` 修改过数据库用户名或数据库名，请替换命令中的 `earthquake`。
 
-数据库更新后，用同一个安全输入的 `$newPassword` 实际登录验证。登录失败时必须停止，不得继续轮换 `JWT_SECRET`：
+数据库更新后，用同一个安全输入的 `$newPassword` 实际登录验证。登录失败时，本次密码轮换不得标记为完成，必须排查并修正后重新验证。该失败不阻止因 JWT 独立泄露而按 7.1 立即处置：
 
 ```powershell
 $loginBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($newPassword)
@@ -631,7 +630,7 @@ try {
         password = $env:NEW_SUPERADMIN_PASSWORD
       }
   } catch {
-    throw "新密码登录验证失败；不得继续轮换 JWT_SECRET"
+    throw "新密码登录验证失败；本次密码轮换不得标记为完成"
   } finally {
     Remove-Item Env:NEW_SUPERADMIN_PASSWORD -ErrorAction SilentlyContinue
   }
@@ -640,7 +639,7 @@ try {
 }
 
 if (-not $loginResult.access_token) {
-  throw "登录响应缺少 token；不得继续轮换 JWT_SECRET"
+  throw "登录响应缺少 token；本次密码轮换不得标记为完成"
 }
 ```
 
@@ -649,9 +648,9 @@ if (-not $loginResult.access_token) {
 安全顺序：
 
 - 仅轮换超级管理员密码不会使已经签发的 JWT 失效。
-- 如果密码已经泄露或需要立即终止所有会话，必须先用新密码实际登录成功，再按 7.1 轮换 `JWT_SECRET`。
-- 哈希生成失败、数据库更新未返回 1 行或新密码登录失败时，都不得继续轮换 JWT。
-- 轮换 JWT 后，所有用户使用新密码重新登录。
+- 如果超级管理员密码已经泄露，建议在确认新密码实际登录可用后尽快按 7.1 轮换 `JWT_SECRET`，以终止旧会话；这是密码泄露场景的推荐顺序，不是所有 JWT 轮换的通用前置条件。
+- 哈希生成失败、数据库更新未返回 1 行或新密码登录失败时，本次密码轮换不得标记为完成；如果同时存在 JWT 泄露风险或需要终止会话，仍应按 7.1 独立轮换 `JWT_SECRET`。
+- 轮换 JWT 后，所有用户必须重新登录；完成密码轮换的场景使用已验证的新密码，其他场景使用当前有效密码。
 
 ## 8. 数据库连接和迁移诊断
 
