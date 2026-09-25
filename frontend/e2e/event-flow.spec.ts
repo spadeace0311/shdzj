@@ -17,32 +17,27 @@ function apiUrl(path: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
 }
 
-async function findIsolatedFormalEpicenter(
+async function buildIsolatedFormalFixture(
   request: APIRequestContext,
-): Promise<{ longitude: number; latitude: number }> {
+): Promise<{ originTime: string; longitude: number; latitude: number }> {
   const response = await request.get(apiUrl("/api/v1/events"));
   expect(response.status()).toBe(200);
-  const events = (await response.json()) as Array<{
-    longitude: string;
-    latitude: string;
-  }>;
+  const events = (await response.json()) as Array<{ origin_time: string }>;
+  const existingTimes = events
+    .map((event) => Date.parse(event.origin_time))
+    .filter(Number.isFinite);
+  const earliestHistoricalRun = Math.min(...existingTimes);
+  const originTime = new Date(
+    Number.isFinite(earliestHistoricalRun)
+      ? earliestHistoricalRun - 180_000
+      : Date.parse("2026-09-17T02:30:05Z"),
+  );
 
-  for (let longitude = 120; longitude <= 123; longitude += 0.1) {
-    for (let latitude = 29.5; latitude <= 32.5; latitude += 0.1) {
-      const isIsolated = events.every(
-        (event) =>
-          Math.hypot(
-            Number(event.longitude) - longitude,
-            Number(event.latitude) - latitude,
-          ) > 0.3,
-      );
-      if (isIsolated) {
-        return { longitude, latitude };
-      }
-    }
-  }
-
-  throw new Error("No isolated formal epicenter is available for the E2E fixture.");
+  return {
+    originTime: originTime.toISOString(),
+    longitude: 121.54,
+    latitude: 31.22,
+  };
 }
 
 async function loginThroughUi(page: Page): Promise<void> {
@@ -78,13 +73,15 @@ test("formal CENC event exposes dual response suggestions", async ({ page }) => 
   await loginThroughUi(page);
 
   const runId = crypto.randomUUID();
-  const { longitude, latitude } = await findIsolatedFormalEpicenter(page.request);
+  const { originTime, longitude, latitude } = await buildIsolatedFormalFixture(
+    page.request,
+  );
   const place = `上海浦东新区 E2E ${runId}`;
   const response = await page.request.post(apiUrl("/api/v1/ingest/formal"), {
     data: {
       eventId: `CENC-E2E-${runId}`,
       reportType: "formal",
-      originTime: "2026-09-17T02:30:05Z",
+      originTime,
       longitude,
       latitude,
       magnitude: 5.2,
