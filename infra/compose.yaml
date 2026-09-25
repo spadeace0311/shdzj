@@ -39,6 +39,32 @@ services:
       postgres:
         condition: service_healthy
 
+  collector:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      CENC_COLLECTOR_ENABLED: "true"
+      FAN_API_KEY: "${FAN_API_KEY:-}"
+      FAN_APP_ID: "${FAN_APP_ID:-}"
+      CENC_APP_ID: "${CENC_APP_ID:-}"
+      COLLECTOR_SPOOL_DIR: "/var/lib/collector-spool"
+    command: ["python", "-m", "app.collector.main"]
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - collector-spool:/var/lib/collector-spool
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   frontend:
     build:
       context: ../frontend
@@ -54,3 +80,4 @@ services:
 volumes:
   postgres_data:
   frontend_node_modules:
+  collector-spool:

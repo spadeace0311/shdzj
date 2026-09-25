@@ -754,3 +754,11 @@ def _validate_json_value(value: Any, path: str) -> None:
             _validate_json_value(item, f"{path}.{key}")
         return
     raise TypeError(f"{path} must contain only JSON-compatible values, got {type(value).__name__}")
+
+
+def __getattr__(name: str):
+    if name == "LifecycleIngestOutcome":
+        from app.events.service import LifecycleIngestOutcome
+
+        return LifecycleIngestOutcome
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
