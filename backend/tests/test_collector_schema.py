@@ -1,5 +1,8 @@
+from pathlib import Path
 from typing import Any
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -7,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.config import settings
 
 
+BACKEND_DIR = Path(__file__).parents[1]
 EXPECTED_TABLES = {"collector_runtime_state", "collector_dead_letters"}
 
 
@@ -37,13 +41,17 @@ def _inspect_collector_schema(sync_connection: Connection) -> dict[str, Any]:
 
 
 async def test_collector_schema_contract() -> None:
+    alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    expected_migration_version = ScriptDirectory.from_config(alembic_config).get_current_head()
+
     engine = create_async_engine(settings.database_url)
     async with engine.connect() as connection:
         schema = await connection.run_sync(_inspect_collector_schema)
         migration_version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
     await engine.dispose()
 
-    assert migration_version == "0006_collector_runtime"
+    assert migration_version == expected_migration_version
     assert EXPECTED_TABLES <= schema["tables"]
 
     runtime_columns = schema["columns"]["collector_runtime_state"]
