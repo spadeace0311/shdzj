@@ -2,14 +2,16 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, expect, test, vi } from "vitest";
 
-import { getEvent } from "../src/api/client";
+import { getCurrentAssessment, getEvent } from "../src/api/client";
 import { EventDetailPage } from "../src/pages/EventDetailPage";
 import type { EventDetail } from "../src/types";
 
 vi.mock("../src/api/client", () => ({
+  getCurrentAssessment: vi.fn(),
   getEvent: vi.fn(),
 }));
 
+const getCurrentAssessmentMock = vi.mocked(getCurrentAssessment);
 const getEventMock = vi.mocked(getEvent);
 
 const baseDetail: EventDetail = {
@@ -48,6 +50,8 @@ function renderDetail(eventId: string) {
 }
 
 beforeEach(() => {
+  getCurrentAssessmentMock.mockReset();
+  getCurrentAssessmentMock.mockResolvedValue(null);
   getEventMock.mockReset();
 });
 

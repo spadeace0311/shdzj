@@ -834,7 +834,7 @@ export interface AssessmentRunStatus {
 }
 ```
 
-- [ ] **Step 1: 写组件失败测试**
+- [x] **Step 1: 写组件失败测试**
 
 测试断言：
 
@@ -850,7 +850,7 @@ expect(screen.getByText("距 T1 +5 分钟截止")).toBeInTheDocument();
 expect(screen.queryByText("评估编排")).not.toBeInTheDocument();
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run:
 
@@ -861,7 +861,7 @@ npm test -- --run tests/assessment-progress.test.tsx
 
 Expected: FAIL，原因是组件和类型尚不存在。
 
-- [ ] **Step 3: 实现卡片和事件详情接入**
+- [x] **Step 3: 实现卡片和事件详情接入**
 
 卡片以紧凑的运营界面展示：
 
@@ -873,7 +873,7 @@ Expected: FAIL，原因是组件和类型尚不存在。
 
 不使用大标题、渐变或装饰性卡片嵌套。
 
-- [ ] **Step 4: 运行前端测试并提交**
+- [x] **Step 4: 运行前端测试并提交**
 
 Run:
 

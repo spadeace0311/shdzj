@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { getEvent } from "../api/client";
+import { getCurrentAssessment, getEvent } from "../api/client";
+import { AssessmentProgressCard } from "../components/AssessmentProgressCard";
 import { ResponseSuggestionCard } from "../components/ResponseSuggestionCard";
 import {
   formatCoordinate,
@@ -13,6 +14,7 @@ import {
   formatMagnitude,
   formatServiceLevel,
   isTestOrDrill,
+  type AssessmentRunStatus,
   type EventDetail,
 } from "../types";
 
@@ -21,6 +23,7 @@ type DetailStatus = "loading" | "ready" | "error";
 export function EventDetailPage() {
   const { eventId = "" } = useParams();
   const [event, setEvent] = useState<EventDetail | null>(null);
+  const [assessment, setAssessment] = useState<AssessmentRunStatus | null>(null);
   const [status, setStatus] = useState<DetailStatus>("loading");
 
   const loadDetail = useCallback(async () => {
@@ -36,6 +39,25 @@ export function EventDetailPage() {
   useEffect(() => {
     void loadDetail();
   }, [loadDetail]);
+
+  useEffect(() => {
+    let active = true;
+    setAssessment(null);
+    void getCurrentAssessment(eventId)
+      .then((result) => {
+        if (active) {
+          setAssessment(result);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAssessment(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [eventId]);
 
   const suggestion = event?.response_suggestion;
   const causes =
@@ -136,6 +158,8 @@ export function EventDetailPage() {
               </div>
             </dl>
           </section>
+
+          <AssessmentProgressCard run={assessment} />
 
           <section className="detail-block">
             <header className="section-header">

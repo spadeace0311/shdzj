@@ -1,4 +1,5 @@
 import type {
+  AssessmentRunStatus,
   CollectorStatus,
   EventDetail,
   EventIngestResponse,
@@ -148,6 +149,29 @@ export async function listEvents(): Promise<EventSummary[]> {
 
 export async function getEvent(eventId: string): Promise<EventDetail> {
   return requestJson<EventDetail>(`/api/v1/events/${encodeURIComponent(eventId)}`);
+}
+
+export async function getCurrentAssessment(
+  eventId: string,
+): Promise<AssessmentRunStatus | null> {
+  if (!accessToken) {
+    return null;
+  }
+  try {
+    return await requestJson<AssessmentRunStatus>(
+      `/api/v1/assessments/events/${encodeURIComponent(eventId)}/current`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      },
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export async function getCollectorStatus(): Promise<CollectorStatus> {

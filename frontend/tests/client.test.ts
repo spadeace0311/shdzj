@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   clearAccessToken,
   createManualEvent,
+  getCurrentAssessment,
   getCollectorStatus,
   login,
   setAccessToken,
@@ -92,6 +93,46 @@ test("getCollectorStatus requests the restricted collector endpoint", async () =
   expect(init.headers).toMatchObject({
     Authorization: "Bearer test-access-token",
   });
+});
+
+test("getCurrentAssessment requests the event's latest run with bearer authorization", async () => {
+  setAccessToken("test-access-token");
+  fetchMock.mockResolvedValue({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      run_id: "run-1",
+      event_id: "event-1",
+      revision_id: "revision-1",
+      run_no: 1,
+      status: "pending",
+      t1_at: "2026-09-26T01:00:00Z",
+      deadline_at: "2026-09-26T01:05:00Z",
+      completed_task_count: 0,
+      failed_task_count: 0,
+      total_task_count: 9,
+      tasks: [],
+    }),
+  } as Response);
+
+  await getCurrentAssessment("event-1");
+
+  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(url).toBe("/api/v1/assessments/events/event-1/current");
+  expect(init.headers).toMatchObject({
+    Authorization: "Bearer test-access-token",
+  });
+});
+
+test("getCurrentAssessment returns null when the event has no run", async () => {
+  setAccessToken("test-access-token");
+  fetchMock.mockResolvedValue({
+    ok: false,
+    status: 404,
+    json: async () => ({ detail: "assessment_run_not_found" }),
+  } as Response);
+
+  await expect(getCurrentAssessment("event-1")).resolves.toBeNull();
 });
 
 test("createManualEvent parses FastAPI validation array detail", async () => {

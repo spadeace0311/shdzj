@@ -504,6 +504,134 @@ a:hover {
   grid-template-columns: 180px minmax(0, 1fr);
 }
 
+.assessment-progress {
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--teal);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 18px 20px 20px;
+  box-shadow: var(--shadow);
+}
+
+.assessment-progress__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.assessment-progress__header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.assessment-progress__badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.assessment-run-status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.assessment-run-status--pending {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.assessment-run-status--running {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.assessment-run-status--completed {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.assessment-run-status--failed,
+.assessment-run-status--canceled {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.assessment-progress__facts {
+  display: grid;
+  grid-template-columns: 160px minmax(210px, 1fr) minmax(210px, 1fr) 190px;
+  gap: 1px;
+  overflow: hidden;
+  margin: 16px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--line);
+}
+
+.assessment-progress__facts > div {
+  min-height: 66px;
+  background: var(--surface-muted);
+  padding: 11px 13px;
+}
+
+.assessment-progress__facts dt,
+.assessment-task-progress__header {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.assessment-progress__facts dd {
+  margin: 7px 0 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.assessment-task-progress {
+  margin-top: 16px;
+}
+
+.assessment-task-progress__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.assessment-task-strip {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(36px, 1fr));
+  gap: 8px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.assessment-task-dot {
+  height: 10px;
+  border-radius: 2px;
+  background: #c8d1d9;
+}
+
+.assessment-task-dot--succeeded {
+  background: var(--green);
+}
+
+.assessment-task-dot--running {
+  background: var(--blue);
+}
+
+.assessment-task-dot--failed,
+.assessment-task-dot--canceled {
+  background: var(--red);
+}
+
+.assessment-task-dot--skipped {
+  background: var(--amber);
+}
+
 .cause-list {
   margin: 0;
   padding-left: 18px;

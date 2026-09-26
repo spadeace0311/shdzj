@@ -113,6 +113,51 @@ export interface TokenResponse {
   token_type?: string;
 }
 
+export type AssessmentRunStatusValue =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export type AssessmentTaskStatusValue =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "canceled";
+
+export interface AssessmentTaskStatus {
+  id: string;
+  task_key: string;
+  task_type: string;
+  component: string;
+  priority: number;
+  sequence: number;
+  status: AssessmentTaskStatusValue;
+  deadline_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  attempt_count: number;
+  max_attempts: number;
+  last_error: string | null;
+}
+
+export interface AssessmentRunStatus {
+  run_id: string;
+  event_id: string;
+  revision_id: string;
+  run_no: number;
+  status: AssessmentRunStatusValue;
+  t1_at: string;
+  deadline_at: string;
+  completed_task_count: number;
+  failed_task_count: number;
+  total_task_count: number;
+  tasks: AssessmentTaskStatus[];
+}
+
 const INSTITUTIONAL_LEVEL_LABELS: Record<string, string> = {
   special_major: "特别重大响应",
   major: "重大响应",
