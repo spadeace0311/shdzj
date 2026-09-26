@@ -914,7 +914,7 @@ git commit -m "feat: show assessment orchestration progress"
   - Workflow history and task status inspection.
   - Worker restart and database recovery.
 
-- [ ] **Step 1: 编写运行手册**
+- [x] **Step 1: 编写运行手册**
 
 手册必须包含以下可执行 SQL：
 
@@ -935,7 +935,7 @@ ORDER BY created_at DESC
 LIMIT 20;
 ```
 
-- [ ] **Step 2: 更新 README 的能力边界**
+- [x] **Step 2: 更新 README 的能力边界**
 
 README 必须明确：
 
@@ -943,7 +943,7 @@ README 必须明确：
 - 烈度、损失、制图和报告算法仍未实现。
 - Temporal 不可用时会阻塞 Outbox 发布，不会影响已接收事件。
 
-- [ ] **Step 3: 运行全量验证**
+- [x] **Step 3: 运行全量验证**
 
 Run:
 
@@ -964,7 +964,7 @@ Expected:
 - Ruff 无错误。
 - 前端全部测试、类型检查和构建通过。
 
-- [ ] **Step 4: 验证真实本地 Temporal 回路**
+- [x] **Step 4: 验证真实本地 Temporal 回路**
 
 启动 Compose 后：
 
@@ -982,7 +982,7 @@ docker compose --env-file .env -f infra/compose.yaml up -d api assessment-dispat
 4. `assessment_tasks` 有 9 条记录。
 5. 前端事件详情显示 `0 / 9` 或实际完成进度。
 
-- [ ] **Step 5: 最终提交**
+- [x] **Step 5: 最终提交**
 
 ```bash
 git add docs/runbooks/assessment-orchestration.md README.md

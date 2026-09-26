@@ -1,6 +1,6 @@
 # 上海市地震应急辅助决策系统
 
-本仓库实现地震事件接入与响应研判控制台。后端接收 CENC 报文并生成制度响应、服务响应建议；前端提供登录、事件列表、事件详情和人工事件录入。
+本仓库实现地震事件接入、响应研判与评估编排基础。后端接收 CENC 报文并生成制度响应、服务响应建议；前端提供登录、事件列表、事件详情和人工事件录入。正式报与更正报可经 Outbox 和 Temporal 建立评估运行及 9 个任务骨架。
 
 ## 前置条件
 
@@ -8,6 +8,7 @@
 - Git
 - 至少 8 GB 可用内存，建议 16 GB
 - 本机开放的端口：`5173`（前端）、`8000`（API，由 `API_BIND_HOST`/`API_PORT` 控制）
+- Temporal UI 默认绑定 `127.0.0.1:8088`
 
 ## 首次配置
 
@@ -43,6 +44,7 @@ docker compose --env-file .env -f infra/compose.yaml up -d
 
 - 前端：`http://localhost:5173`
 - API 健康检查：`http://localhost:8000/health`
+- Temporal UI：`http://127.0.0.1:8088`
 
 Compose 模式下，frontend 容器内的 Vite 开发服务器使用默认代理目标 `http://api:8000`，无需设置 `VITE_API_PROXY_TARGET`。
 
@@ -91,6 +93,21 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run b
 collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx HTTP 是常驻备用链路，FAN `auth_fail` 或连接失败时仍可继续接收正式报并进入生命周期。`FAN_APP_ID` 是规范的 FAN 客户端标识，未设置时兼容回退到 `CENC_APP_ID`；`FAN_API_KEY` 是 FAN 密钥。缺少 `FAN_APP_ID`/`CENC_APP_ID` 或 `FAN_API_KEY` 只会阻止 collector 启动，不会阻止 API、迁移或后端测试运行。
 
 部署、边界导入、运行状态核验、spool/数据库恢复、死信重放和 FAN 密钥轮换请参阅 [CENC 实时采集运行手册](docs/runbooks/cenc-realtime-collection.md)。
+
+## 评估编排基础
+
+正式报和更正报首次入库时创建评估 Outbox。独立的 `assessment-dispatcher` 消费 Outbox，以稳定 Workflow ID 启动 Temporal Workflow；`temporal-worker` 执行幂等 Activity，并在 PostgreSQL 中建立 `assessment_runs` 和 `assessment_tasks`。API 服务不运行 Dispatcher。
+
+当前每个正式报或更正报修订建立 9 个任务：
+
+- 模型烈度、仪器烈度、融合烈度。
+- 受灾人口、人员伤亡、房屋破坏、经济损失。
+- 快速评估报告。
+- 工作组响应任务。
+
+当前只实现评估运行和任务骨架。烈度、损失、制图、报告算法、成果流转和 AI 问答仍未实现。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+
+评估编排的启动、健康检查、Outbox 查询、死信安全重放、Workflow 核验和 Worker 恢复请参阅 [评估编排运行手册](docs/runbooks/assessment-orchestration.md)。
 
 ## 端到端测试
 
