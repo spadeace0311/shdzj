@@ -652,7 +652,7 @@ async def run_dispatcher(stop_event: asyncio.Event | None = None) -> None: ...
 async def run_worker(stop_event: asyncio.Event | None = None) -> None: ...
 ```
 
-- [ ] **Step 1: 写进程工厂失败测试**
+- [x] **Step 1: 写进程工厂失败测试**
 
 使用假的 Temporal client、session factory 和 sleep 函数，断言：
 
@@ -662,7 +662,7 @@ assert dispatcher.max_attempts == configured.assessment_outbox_max_attempts
 assert worker_task_queue == configured.temporal_task_queue
 ```
 
-- [ ] **Step 2: 实现连接工厂和独立进程**
+- [x] **Step 2: 实现连接工厂和独立进程**
 
 Dispatcher 循环：
 
@@ -689,7 +689,7 @@ worker = Worker(
 await worker.run()
 ```
 
-- [ ] **Step 3: 在 Compose 中增加独立服务**
+- [x] **Step 3: 在 Compose 中增加独立服务**
 
 新增：
 
@@ -700,7 +700,7 @@ await worker.run()
 
 API 服务默认 `ASSESSMENT_DISPATCHER_ENABLED=false`；仅 dispatcher 容器显式设为 `true`。
 
-- [ ] **Step 4: 运行配置和进程测试**
+- [x] **Step 4: 运行配置和进程测试**
 
 Run:
 
@@ -712,7 +712,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add backend/app/assessment/worker.py backend/app/assessment/dispatcher.py \

@@ -23,6 +23,7 @@ services:
     environment:
       JWT_SECRET: "${JWT_SECRET:?JWT_SECRET is required}"
       SUPERADMIN_INITIAL_PASSWORD: "${SUPERADMIN_INITIAL_PASSWORD:?SUPERADMIN_INITIAL_PASSWORD is required}"
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
     command:
       - uvicorn
       - app.main:app
@@ -38,6 +39,85 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  temporal-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: temporal
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+    volumes:
+      - temporal_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PWD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGRES_SEEDS: temporal-postgres
+    expose:
+      - "7233"
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: "http://localhost:${TEMPORAL_UI_PORT:-8088}"
+    ports:
+      - "${TEMPORAL_UI_BIND_HOST:-127.0.0.1}:${TEMPORAL_UI_PORT:-8088}:8080"
+    depends_on:
+      temporal:
+        condition: service_started
+
+  assessment-dispatcher:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "true"
+      TEMPORAL_ADDRESS: temporal:7233
+    command: ["python", "-m", "app.assessment.worker", "dispatcher"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  temporal-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+    command: ["python", "-m", "app.assessment.worker", "worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
 
   collector:
     build:
@@ -79,5 +159,6 @@ services:
 
 volumes:
   postgres_data:
+  temporal_postgres_data:
   frontend_node_modules:
   collector-spool:

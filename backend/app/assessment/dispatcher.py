@@ -50,6 +50,14 @@ class AssessmentDispatcher:
         self._lease_seconds = lease_seconds
         self._now = now
 
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    @property
+    def max_attempts(self) -> int:
+        return self._max_attempts
+
     async def dispatch_once(self) -> int:
         claimed = await self._claim_pending()
         published = 0

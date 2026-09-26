@@ -4,9 +4,18 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import delete, select
+from temporalio.common import WorkflowIDConflictPolicy
 
 from app.assessment.dispatcher import AssessmentDispatcher
 from app.assessment.models import AssessmentRun, AssessmentTask
+from app.assessment.temporal import AssessmentWorkflow, AssessmentWorkflowInput
+from app.assessment.worker import (
+    TemporalAssessmentStarter,
+    build_dispatcher,
+    build_worker,
+    run_dispatcher,
+)
+from app.config import Settings
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
@@ -82,6 +91,162 @@ class BlockingFailureStarter(BlockingStarter):
         self.started.set()
         await self.release.wait()
         raise RuntimeError("stale worker failed")
+
+
+class RecordingTemporalClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def start_workflow(
+        self,
+        workflow: object,
+        arg: object,
+        *,
+        id: str,
+        task_queue: str,
+        execution_timeout: object,
+        id_conflict_policy: object,
+    ) -> None:
+        self.calls.append(
+            {
+                "workflow": workflow,
+                "arg": arg,
+                "id": id,
+                "task_queue": task_queue,
+                "execution_timeout": execution_timeout,
+                "id_conflict_policy": id_conflict_policy,
+            }
+        )
+
+
+class RecordingDispatcher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def dispatch_once(self) -> int:
+        self.calls += 1
+        return 0
+
+
+class RecordingWorker:
+    def __init__(
+        self,
+        client: object,
+        *,
+        task_queue: str,
+        workflows: list[object],
+        activities: list[object],
+        graceful_shutdown_timeout: object,
+    ) -> None:
+        self.client = client
+        self.task_queue = task_queue
+        self.workflows = workflows
+        self.activities = activities
+        self.graceful_shutdown_timeout = graceful_shutdown_timeout
+
+
+def _configured_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://earthquake:earthquake@localhost:5432/earthquake",
+        jwt_secret="test-jwt-secret-at-least-16-characters",
+        superadmin_initial_password="test-superadmin-password-at-least-16-characters",
+        temporal_address="temporal-test:7233",
+        temporal_namespace="test-namespace",
+        temporal_task_queue="assessment-test",
+        assessment_dispatcher_enabled=True,
+        assessment_outbox_poll_seconds=0.25,
+        assessment_outbox_batch_size=7,
+        assessment_outbox_max_attempts=4,
+        assessment_outbox_lease_seconds=12,
+        assessment_workflow_deadline_seconds=180,
+    )
+
+
+def test_dispatcher_process_factory_uses_configured_limits(session_factory) -> None:
+    configured = _configured_settings()
+    dispatcher = build_dispatcher(
+        client=RecordingTemporalClient(),
+        session_factory=session_factory,
+        configured=configured,
+    )
+
+    assert dispatcher.batch_size == configured.assessment_outbox_batch_size
+    assert dispatcher.max_attempts == configured.assessment_outbox_max_attempts
+
+
+def test_worker_process_factory_uses_configured_task_queue(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configured_settings()
+    monkeypatch.setattr("app.assessment.worker.Worker", RecordingWorker)
+    worker = build_worker(
+        client=RecordingTemporalClient(),
+        session_factory=session_factory,
+        configured=configured,
+    )
+
+    assert worker.task_queue == configured.temporal_task_queue
+
+
+async def test_temporal_starter_maps_outbox_payload_to_workflow_input() -> None:
+    client = RecordingTemporalClient()
+    starter = TemporalAssessmentStarter(
+        client,
+        task_queue="assessment-test",
+        execution_timeout=timedelta(seconds=180),
+    )
+
+    await starter.start_assessment(
+        workflow_id="assessment:event-1:revision-1",
+        payload={
+            "event_id": "event-1",
+            "revision_id": "revision-1",
+            "outbox_id": "outbox-1",
+        },
+    )
+
+    assert client.calls == [
+        {
+            "workflow": AssessmentWorkflow.run,
+            "arg": AssessmentWorkflowInput(
+                event_id="event-1",
+                revision_id="revision-1",
+                outbox_id="outbox-1",
+            ),
+            "id": "assessment:event-1:revision-1",
+            "task_queue": "assessment-test",
+            "execution_timeout": timedelta(seconds=180),
+            "id_conflict_policy": WorkflowIDConflictPolicy.USE_EXISTING,
+        }
+    ]
+
+
+async def test_run_dispatcher_polls_when_no_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured = _configured_settings()
+    dispatcher = RecordingDispatcher()
+    sleeps: list[float] = []
+    stop_event = asyncio.Event()
+
+    monkeypatch.setattr(
+        "app.assessment.worker.build_dispatcher",
+        lambda **_kwargs: dispatcher,
+    )
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        stop_event.set()
+
+    await run_dispatcher(
+        stop_event,
+        client=RecordingTemporalClient(),
+        configured=configured,
+        sleep=sleep,
+    )
+
+    assert dispatcher.calls == 1
+    assert sleeps == [configured.assessment_outbox_poll_seconds]
 
 
 async def _create_outbox(session_factory) -> EventLifecycleOutbox:
