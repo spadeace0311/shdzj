@@ -1,4 +1,5 @@
 from datetime import timedelta
+from uuid import UUID
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,6 +95,48 @@ class AssessmentRepository:
             )
         await session.flush()
         return run
+
+    async def ensure_run_from_outbox(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: str,
+        revision_id: str,
+        outbox_id: str,
+    ) -> AssessmentRun:
+        try:
+            event_uuid = UUID(event_id)
+            revision_uuid = UUID(revision_id)
+            outbox_uuid = UUID(outbox_id)
+        except ValueError as exc:
+            raise ValueError("assessment trigger identifiers must be UUIDs") from exc
+
+        outbox = await session.get(
+            EventLifecycleOutbox,
+            outbox_uuid,
+            with_for_update=True,
+        )
+        event = await session.get(EarthquakeEvent, event_uuid)
+        revision = await session.get(EarthquakeRevision, revision_uuid)
+        if outbox is None or event is None or revision is None:
+            raise LookupError("assessment trigger not found")
+        if outbox.event_id != event_uuid or outbox.revision_id != revision_uuid:
+            raise ValueError("assessment trigger identifiers do not match")
+
+        return await self.ensure_run_and_tasks(
+            session,
+            event=event,
+            revision=revision,
+            outbox=outbox,
+        )
+
+    async def count_tasks(self, session: AsyncSession, run_id: object) -> int:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(AssessmentTask)
+            .where(AssessmentTask.run_id == run_id)
+        )
+        return int(count or 0)
 
 
 def _validate_trigger_identity(

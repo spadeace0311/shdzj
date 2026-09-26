@@ -549,7 +549,7 @@ class AssessmentActivities:
     ) -> AssessmentWorkflowResult: ...
 ```
 
-- [ ] **Step 1: 写 Temporal 测试失败用例**
+- [x] **Step 1: 写 Temporal 测试失败用例**
 
 使用 `WorkflowEnvironment.start_time_skipping()`：
 
@@ -571,7 +571,7 @@ async with await WorkflowEnvironment.start_time_skipping() as env:
 assert result.task_count == 9
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run:
 
@@ -582,7 +582,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: FAIL，原因是 `temporalio` 和 workflow 尚不存在。
 
-- [ ] **Step 3: 增加固定依赖**
+- [x] **Step 3: 增加固定依赖**
 
 在 `backend/pyproject.toml` 增加：
 
@@ -592,7 +592,7 @@ Expected: FAIL，原因是 `temporalio` 和 workflow 尚不存在。
 
 更新 lock 文件或镜像依赖安装方式后重建 API 镜像。
 
-- [ ] **Step 4: 实现 Workflow、Activity 和失败重试策略**
+- [x] **Step 4: 实现 Workflow、Activity 和失败重试策略**
 
 Activity 使用：
 
@@ -616,7 +616,7 @@ async def prepare_assessment(
 
 RetryPolicy 固定为最多 3 次、初始间隔 1 秒、最大间隔 10 秒。
 
-- [ ] **Step 5: 运行测试并提交**
+- [x] **Step 5: 运行测试并提交**
 
 Run:
 
