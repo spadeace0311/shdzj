@@ -82,6 +82,28 @@ class RecordingCoordinator:
         return None
 
 
+class StalenessAdvancingCoordinator(RecordingCoordinator):
+    def __init__(
+        self,
+        *,
+        started_at: datetime,
+        clock: dict[str, datetime],
+        stop_event: asyncio.Event,
+    ) -> None:
+        super().__init__()
+        self._started_at = started_at
+        self._clock = clock
+        self._stop_event = stop_event
+
+    async def ingest(self, envelope: CollectorEnvelope, trigger_reason: str = "live"):
+        result = await super().ingest(envelope, trigger_reason)
+        if len(self.calls) == 1:
+            self._clock["now"] = self._started_at + timedelta(seconds=61)
+        elif len(self.calls) == 2:
+            self._stop_event.set()
+        return result
+
+
 class RecoveryCoordinator(RecordingCoordinator):
     def __init__(self, remaining_failures: dict[str, int]) -> None:
         super().__init__()
@@ -99,6 +121,20 @@ class RecoveryCoordinator(RecordingCoordinator):
         if event_id == "C":
             self.c_ingested.set()
         return None
+
+
+class ConcurrentSpoolCoordinator(RecoveryCoordinator):
+    def __init__(self) -> None:
+        super().__init__(remaining_failures={"A": 4})
+        self.replay_started = asyncio.Event()
+        self.replay_release = asyncio.Event()
+
+    async def ingest(self, envelope: CollectorEnvelope, trigger_reason: str = "live"):
+        event_id = str(envelope.payload["No1"]["EventID"])
+        if event_id == "A" and trigger_reason == "recovery":
+            self.replay_started.set()
+            await self.replay_release.wait()
+        return await super().ingest(envelope, trigger_reason)
 
 
 class SuccessfulCoordinator(RecordingCoordinator):
@@ -175,6 +211,11 @@ class NoopWolfxCollector:
         return None
 
 
+class FailingCollector:
+    async def run(self, **kwargs) -> None:
+        raise RuntimeError("collector task failed")
+
+
 class PushFanCollector:
     def __init__(self, envelopes: list[CollectorEnvelope]) -> None:
         self.envelopes = envelopes
@@ -186,6 +227,35 @@ class PushFanCollector:
         for envelope in self.envelopes:
             await on_envelope(envelope)
         await stop_event.wait()
+
+
+class HealthyPushFanCollector(PushFanCollector):
+    def __init__(
+        self,
+        envelopes: list[CollectorEnvelope],
+        healthy_at: datetime,
+    ) -> None:
+        super().__init__(envelopes)
+        self._healthy_at = healthy_at
+
+    async def run(self, **kwargs) -> None:
+        await kwargs["on_health"](
+            ProviderHealthUpdate(
+                provider=CollectorProvider.FAN,
+                state="healthy",
+                connected=True,
+                last_http_status=200,
+                last_connected_at=self._healthy_at,
+                last_message_at=self._healthy_at,
+                last_success_at=self._healthy_at,
+                last_transport_at=self._healthy_at,
+                consecutive_failures=0,
+                reconnect_count=0,
+                last_error=None,
+                updated_at=self._healthy_at,
+            )
+        )
+        await super().run(**kwargs)
 
 
 class RecoveryBoundSpy:
@@ -494,6 +564,71 @@ async def test_live_spooled_item_is_replayed_before_newer_live_item() -> None:
     assert list(spool.pending) == []
 
 
+async def test_spool_append_during_replay_is_drained_before_newer_live_item() -> None:
+    service = RecordingCollectorService()
+    spool = RecordingSpool()
+    coordinator = ConcurrentSpoolCoordinator()
+    stop_event = asyncio.Event()
+    received_at = datetime(2026, 9, 25, 1, 5, tzinfo=UTC)
+    a = CollectorEnvelope(
+        provider=CollectorProvider.WOLFX,
+        lane=CollectorLane.HTTP,
+        received_at=received_at,
+        payload={
+            "No1": {
+                **reviewed_wolfx_event(),
+                "EventID": "A",
+                "ReportTime": "2026-09-25T01:04:00Z",
+            }
+        },
+    )
+    b = CollectorEnvelope(
+        provider=CollectorProvider.WOLFX,
+        lane=CollectorLane.HTTP,
+        received_at=received_at + timedelta(seconds=1),
+        payload={
+            "No1": {
+                **reviewed_wolfx_event(),
+                "EventID": "B",
+                "ReportTime": "2026-09-25T01:05:00Z",
+            }
+        },
+    )
+    c = CollectorEnvelope(
+        provider=CollectorProvider.WOLFX,
+        lane=CollectorLane.HTTP,
+        received_at=received_at + timedelta(seconds=2),
+        payload={
+            "No1": {
+                **reviewed_wolfx_event(),
+                "EventID": "C",
+                "ReportTime": "2026-09-25T01:06:00Z",
+            }
+        },
+    )
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=spool,
+        fan_collector=PushFanCollector([a, c]),
+        wolfx_collector=NoopWolfxCollector(),
+        sleep=fake_sleep,
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(coordinator.replay_started.wait(), timeout=1)
+    supervisor._spool_envelope(b)
+    coordinator.replay_release.set()
+    await asyncio.wait_for(coordinator.c_ingested.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert coordinator.ingested_order == ["A", "B", "C"]
+    assert list(spool.pending) == []
+
+
 async def test_replay_keeps_spool_file_when_dead_letter_persistence_fails() -> None:
     service = RecordingCollectorService(fail_dead_letter=True)
     spool = RecordingSpool()
@@ -570,6 +705,32 @@ async def test_runtime_spool_drain_failure_stops_before_newer_live_item() -> Non
     assert coordinator.ingested_order == []
     assert len(list(spool.pending)) == 1
     assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+
+
+async def test_collector_task_failure_marks_critical_and_stops() -> None:
+    service = RecordingCollectorService()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(),
+        spool=RecordingSpool(),
+        fan_collector=FailingCollector(),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=1)
+    finally:
+        if not task.done():
+            stop_event.set()
+            await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+
+    assert supervisor.provider_states == {"fan": "critical", "wolfx": "critical"}
+    assert service.health_updates[-1].state == "critical"
 
 
 async def test_spool_remove_commit_failure_keeps_pending_without_success(
@@ -818,7 +979,7 @@ async def test_supervisor_honors_envelope_provenance_and_clears_after_completion
     assert fan_collector.recovery_since is None
 
 
-async def test_active_recovery_bound_drops_old_live_frame_before_completion() -> None:
+async def test_active_recovery_bound_does_not_drop_old_live_frame() -> None:
     bound = datetime(2026, 9, 25, 1, 0, tzinfo=UTC)
     service = RecordingCollectorService(
         watermarks={"fan": bound, "wolfx": bound}
@@ -865,7 +1026,7 @@ async def test_active_recovery_bound_drops_old_live_frame_before_completion() ->
     stop_event.set()
     await asyncio.wait_for(task, timeout=1)
 
-    assert coordinator.calls == [completion]
+    assert coordinator.calls == [old_live, completion]
     assert fan_collector.recovery_since is None
 
 
@@ -1049,6 +1210,40 @@ async def test_connected_provider_degrades_after_no_recent_message() -> None:
     assert degraded_update.connected is True
     assert degraded_update.last_error == "no recent messages"
     assert fan_updates[-1].state == "stopped"
+
+
+async def test_connected_provider_degrades_while_queue_remains_busy() -> None:
+    started_at = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+    clock = {"now": started_at}
+    service = RecordingCollectorService()
+    stop_event = asyncio.Event()
+    coordinator = StalenessAdvancingCoordinator(
+        started_at=started_at,
+        clock=clock,
+        stop_event=stop_event,
+    )
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=coordinator,
+        spool=RecordingSpool(),
+        fan_collector=HealthyPushFanCollector(
+            [envelope(), envelope()],
+            healthy_at=started_at,
+        ),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: clock["now"],
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(task, timeout=1)
+
+    fan_updates = [
+        update
+        for update in service.health_updates
+        if update.provider is CollectorProvider.FAN
+    ]
+    assert any(update.state == "degraded" for update in fan_updates)
 
 
 async def test_recent_transport_activity_keeps_provider_healthy_despite_stale_message() -> None:

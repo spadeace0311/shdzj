@@ -62,6 +62,7 @@ class CollectorSupervisor:
             CollectorProvider.WOLFX: None,
         }
         self._pending_spool = False
+        self._spool_generation = 0
 
     @property
     def provider_states(self) -> dict[str, str]:
@@ -104,45 +105,59 @@ class CollectorSupervisor:
             return
         self._pending_spool = False
 
-        tasks = [
-            asyncio.create_task(
+        tasks = {
+            CollectorProvider.FAN: asyncio.create_task(
                 self._fan_collector.run(
                     on_envelope=self._enqueue_envelope,
                     on_health=self._on_health,
                     stop_event=stop_event,
                 )
             ),
-            asyncio.create_task(
+            CollectorProvider.WOLFX: asyncio.create_task(
                 self._wolfx_collector.run(
                     on_envelope=self._enqueue_envelope,
                     on_health=self._on_health,
                     stop_event=stop_event,
                 )
             ),
-        ]
+        }
 
         try:
             while not stop_event.is_set():
+                task_failure = self._collector_task_failure(tasks)
+                if task_failure is not None:
+                    provider, error = task_failure
+                    logger.error(
+                        "collector task failed provider=%s",
+                        provider.value,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                    await self._mark_critical_and_stop()
+                    break
+                await self._enforce_message_staleness()
                 if self._pending_spool:
+                    spool_generation = self._spool_generation
                     if not await self._replay_spool():
                         await self._mark_critical_and_stop()
                         break
-                    self._pending_spool = False
+                    if self._spool_generation == spool_generation:
+                        self._pending_spool = False
+                    else:
+                        continue
                 try:
                     envelope = await asyncio.wait_for(
                         self._queue.get(),
                         timeout=0.5,
                     )
                 except asyncio.TimeoutError:
-                    await self._enforce_message_staleness()
                     continue
                 await self._process_live(envelope)
         except asyncio.CancelledError:
             raise
         finally:
-            for task in tasks:
+            for task in tasks.values():
                 task.cancel()
-            for task in tasks:
+            for task in tasks.values():
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -150,6 +165,18 @@ class CollectorSupervisor:
             for provider in (CollectorProvider.FAN, CollectorProvider.WOLFX):
                 if self._health.get(provider) != "critical":
                     await self._set_provider_state(provider, "stopped")
+
+    @staticmethod
+    def _collector_task_failure(
+        tasks: dict[CollectorProvider, asyncio.Task[None]],
+    ) -> tuple[CollectorProvider, Exception] | None:
+        for provider, task in tasks.items():
+            if not task.done() or task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                return provider, error
+        return None
 
     async def process_envelopes(
         self,
@@ -312,6 +339,7 @@ class CollectorSupervisor:
 
     def _spool_envelope(self, envelope: CollectorEnvelope) -> str:
         self._spool.append(envelope)
+        self._spool_generation += 1
         self._pending_spool = True
         return "spooled"
 
@@ -328,7 +356,8 @@ class CollectorSupervisor:
             bound = self._recovery_bounds[item.provider]
             source_time = self._source_time(item)
             if (
-                bound is not None
+                item.trigger_reason == _RECOVERY
+                and bound is not None
                 and source_time is not None
                 and source_time < bound
             ):

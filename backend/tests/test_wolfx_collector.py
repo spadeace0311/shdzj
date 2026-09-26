@@ -1,7 +1,10 @@
 import asyncio
 import json
 import random
+import threading
+import time
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -48,6 +51,26 @@ def invalid_json_handler(request: httpx.Request) -> httpx.Response:
 
 def non_object_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=["not", "an", "object"])
+
+
+class LocalWolfxHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        request_index = len(self.server.requests)
+        self.server.requests.append(self.path)
+        if request_index == 0:
+            time.sleep(10.2)
+        body = json.dumps(FIXTURE).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, format: str, *args: object) -> None:
+        return None
 
 
 def test_wolfx_parser_emits_only_cenc_automatic_and_reviewed() -> None:
@@ -281,6 +304,64 @@ async def test_run_polls_immediately_then_waits_interval() -> None:
         "healthy",
         "stopped",
     ]
+
+
+async def test_run_recovers_after_loopback_http_timeout() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), LocalWolfxHandler)
+    server.daemon_threads = True
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = httpx.AsyncClient()
+    stop_event = asyncio.Event()
+    envelopes = []
+    envelopes_ready = asyncio.Event()
+    sleep_calls: list[float] = []
+
+    async def sleep_after_recovery(delay: float) -> None:
+        sleep_calls.append(delay)
+        if len(sleep_calls) > 1:
+            await stop_event.wait()
+
+    async def on_envelope(envelope) -> None:
+        envelopes.append(envelope)
+        if len(envelopes) == 2:
+            envelopes_ready.set()
+
+    collector = WolfxCollector(
+        url=f"http://127.0.0.1:{server.server_port}/cenc_eqlist.json",
+        poll_interval_seconds=10,
+        client=client,
+        now=fixed_now,
+        sleep=sleep_after_recovery,
+    )
+    health = HealthRecorder()
+    task = asyncio.create_task(
+        collector.run(on_envelope, health, stop_event)
+    )
+
+    try:
+        await asyncio.wait_for(envelopes_ready.wait(), timeout=15)
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1)
+        await client.aclose()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    assert server.requests == [
+        "/cenc_eqlist.json",
+        "/cenc_eqlist.json",
+    ]
+    assert [update.state for update in health.updates] == [
+        "starting",
+        "degraded",
+        "healthy",
+        "stopped",
+    ]
+    assert len(envelopes) == 2
+    assert sleep_calls[0] >= 1.0
 
 
 async def test_run_applies_recovery_bound_only_until_supervisor_clears_it() -> None:

@@ -181,7 +181,7 @@ docker compose --env-file .env -f infra/compose.yaml up -d --force-recreate coll
 | 现象 | 检查 | 处置 |
 | --- | --- | --- |
 | FAN `auth_fail` | `collector_runtime_state.fan.last_error`、`FAN_APP_ID`/`CENC_APP_ID` 和 `FAN_API_KEY` | 校正受控 `.env`，强制重建 collector；不得输出密钥 |
-| WebSocket 消息停滞 | FAN 的 `last_message_at`、`stale_after`、`reconnect_count`、collector 日志 | 检查 FAN 服务和外网；Wolfx 应继续提供备用可用性 |
+| WebSocket 传输停滞 | FAN 的 `state`、`stale_after`、`reconnect_count`、collector 日志；`last_message_at` 只表示业务报文时间，传输活跃时间当前仅保存在进程内 | 检查 FAN 服务和外网；Wolfx 应继续提供备用可用性 |
 | Wolfx HTTP 故障 | Wolfx 的 `last_http_status`、`last_error`、连续失败和重连次数 | 检查 `WOLFX_CENC_URL`、DNS、代理、证书和上游 HTTP 状态 |
 | 数据库故障 | PostgreSQL 状态、API/collector 日志、spool 文件 | 恢复数据库；重启 collector，确认 spool 排空 |
 | 双链路严重 | 两个 provider 均为 `degraded`/`critical`、spool 数量和健康端点 | 优先恢复至少一个 provider；若 spool 写入失败，不得继续运行 |

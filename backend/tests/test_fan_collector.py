@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from websockets.asyncio.server import serve as serve_websocket
 
 from app.collector.domain import CollectorLane, CollectorProvider
 from app.collector.fan import FanCollector, FanMessageParser
@@ -283,6 +284,73 @@ async def test_fan_collector_rotates_urls_after_connection_failure() -> None:
         await collector.run(on_envelope=AsyncMock(), on_health=AsyncMock())
 
     assert attempts == ["wss://primary", "wss://backup"]
+
+
+async def test_fan_collector_reconnects_to_backup_loopback_server() -> None:
+    primary_messages: list[dict[str, object]] = []
+    backup_messages: list[dict[str, object]] = []
+    backup_event = asyncio.Event()
+
+    async def primary_handler(websocket) -> None:
+        primary_messages.append(json.loads(await websocket.recv()))
+        primary_messages.append(json.loads(await websocket.recv()))
+        await websocket.close(code=1012, reason="restart")
+
+    async def backup_handler(websocket) -> None:
+        backup_messages.append(json.loads(await websocket.recv()))
+        backup_messages.append(json.loads(await websocket.recv()))
+        await websocket.send(json.dumps({"type": "auth_success"}))
+        await websocket.send(json.dumps(FIXTURE["query_response"]))
+        backup_event.set()
+        await websocket.wait_closed()
+
+    async with (
+        serve_websocket(primary_handler, "127.0.0.1", 0) as primary_server,
+        serve_websocket(backup_handler, "127.0.0.1", 0) as backup_server,
+    ):
+        primary_port = primary_server.sockets[0].getsockname()[1]
+        backup_port = backup_server.sockets[0].getsockname()[1]
+        collector = FanCollector(
+            app_id="app-id",
+            api_key="secret",
+            urls=(
+                f"ws://127.0.0.1:{primary_port}",
+                f"ws://127.0.0.1:{backup_port}",
+            ),
+            query_interval_seconds=60,
+            sleep=fake_sleep,
+            now=fixed_now,
+        )
+        envelopes = EnvelopeRecorder()
+        health = HealthRecorder()
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            collector.run(envelopes, health, stop_event)
+        )
+
+        await asyncio.wait_for(backup_event.wait(), timeout=1)
+        await asyncio.wait_for(websocket_drained(envelopes), timeout=1)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    assert primary_messages == [
+        {"type": "auth", "appId": "app-id", "key": "secret"},
+        {"type": "cenclist"},
+    ]
+    assert backup_messages == primary_messages
+    assert [update.state for update in health.updates] == [
+        "starting",
+        "degraded",
+        "healthy",
+        "healthy",
+        "stopped",
+    ]
+    assert len(envelopes.envelopes) == 1
+
+
+async def websocket_drained(envelopes: EnvelopeRecorder) -> None:
+    while not envelopes.envelopes:
+        await asyncio.sleep(0)
 
 
 async def test_authenticated_business_envelope_emits_healthy() -> None:
