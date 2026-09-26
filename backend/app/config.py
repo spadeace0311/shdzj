@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     assessment_outbox_poll_seconds: float = 1.0
     assessment_outbox_batch_size: int = 20
     assessment_outbox_max_attempts: int = 10
+    assessment_outbox_lease_seconds: int = 60
     assessment_workflow_deadline_seconds: int = 300
 
     @property
@@ -89,6 +90,8 @@ class Settings(BaseSettings):
             raise ValueError("ASSESSMENT_OUTBOX_BATCH_SIZE must be between 1 and 1000")
         if not 1 <= self.assessment_outbox_max_attempts <= 100:
             raise ValueError("ASSESSMENT_OUTBOX_MAX_ATTEMPTS must be between 1 and 100")
+        if self.assessment_outbox_lease_seconds <= 0:
+            raise ValueError("ASSESSMENT_OUTBOX_LEASE_SECONDS must be positive")
         if self.assessment_workflow_deadline_seconds <= 0:
             raise ValueError("ASSESSMENT_WORKFLOW_DEADLINE_SECONDS must be positive")
         return self

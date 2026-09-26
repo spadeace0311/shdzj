@@ -26,6 +26,7 @@ def test_assessment_settings_defaults() -> None:
     assert configured.assessment_outbox_poll_seconds == 1.0
     assert configured.assessment_outbox_batch_size == 20
     assert configured.assessment_outbox_max_attempts == 10
+    assert configured.assessment_outbox_lease_seconds == 60
     assert configured.assessment_workflow_deadline_seconds == 300
 
 
@@ -39,6 +40,7 @@ def test_assessment_settings_validate_bounded_values() -> None:
         {"assessment_outbox_batch_size": 1_001},
         {"assessment_outbox_max_attempts": 0},
         {"assessment_outbox_max_attempts": 101},
+        {"assessment_outbox_lease_seconds": 0},
         {"assessment_workflow_deadline_seconds": 0},
     )
 

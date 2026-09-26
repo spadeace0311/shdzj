@@ -443,7 +443,7 @@ class AssessmentDispatcher:
     async def dispatch_once(self) -> int: ...
 ```
 
-- [ ] **Step 1: 写认领、成功发布和重试失败测试**
+- [x] **Step 1: 写认领、成功发布和重试失败测试**
 
 必须证明：
 
@@ -463,11 +463,11 @@ assert outbox.available_at == now() + timedelta(seconds=2)
 assert "RuntimeError" in outbox.last_error
 ```
 
-- [ ] **Step 2: 写并发认领测试**
+- [x] **Step 2: 写并发认领测试**
 
 两个 dispatcher 并发处理同一批时，只允许一个实例认领每条 Outbox；另一个返回 `0`。测试使用真实 PostgreSQL 事务和 `FOR UPDATE SKIP LOCKED`。
 
-- [ ] **Step 3: 运行测试确认失败**
+- [x] **Step 3: 运行测试确认失败**
 
 Run:
 
@@ -478,7 +478,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: FAIL，原因是 dispatcher 尚不存在。
 
-- [ ] **Step 4: 实现调度器**
+- [x] **Step 4: 实现调度器**
 
 Workflow ID 固定为：
 
@@ -494,7 +494,7 @@ delay_seconds = min(2 ** max(outbox.attempt_count - 1, 0), 300)
 
 达到 `max_attempts` 时状态改为 `dead_letter`，保留 `last_error`，不再自动发布。
 
-- [ ] **Step 5: 运行聚焦测试并提交**
+- [x] **Step 5: 运行聚焦测试并提交**
 
 Run:
 
