@@ -301,7 +301,7 @@ class AssessmentRepository:
     ) -> AssessmentRun | None: ...
 ```
 
-- [ ] **Step 1: 写确定性计划失败测试**
+- [x] **Step 1: 写确定性计划失败测试**
 
 首批任务必须为：
 
@@ -327,7 +327,7 @@ assert [task.priority for task in plan[:3]] == [100, 99, 98]
 assert plan[-1].priority == 10
 ```
 
-- [ ] **Step 2: 写幂等仓储失败测试**
+- [x] **Step 2: 写幂等仓储失败测试**
 
 同一 Outbox 连续执行两次 `ensure_run_and_tasks()`：
 
@@ -339,7 +339,7 @@ assert first.id == second.id
 assert await count_tasks(session, first.id) == 9
 ```
 
-- [ ] **Step 3: 运行测试确认失败**
+- [x] **Step 3: 运行测试确认失败**
 
 Run:
 
@@ -350,7 +350,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: FAIL，原因是计划和仓储尚不存在。
 
-- [ ] **Step 4: 实现计划构建器**
+- [x] **Step 4: 实现计划构建器**
 
 本任务固定输出 9 个任务。`deadline_offset_seconds` 分别为：
 
@@ -368,7 +368,7 @@ Expected: FAIL，原因是计划和仓储尚不存在。
 }
 ```
 
-- [ ] **Step 5: 实现仓储幂等写入**
+- [x] **Step 5: 实现仓储幂等写入**
 
 在同一事务中：
 
@@ -392,7 +392,7 @@ Expected: FAIL，原因是计划和仓储尚不存在。
 }
 ```
 
-- [ ] **Step 6: 运行测试并提交**
+- [x] **Step 6: 运行测试并提交**
 
 Run:
 
