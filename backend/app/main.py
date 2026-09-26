@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.assessment.router import router as assessment_router
 from app.auth.router import router as auth_router
 from app.auth.service import AuthService
 from app.collector.router import router as collector_router
@@ -23,6 +24,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Shanghai Earthquake Emergency API", lifespan=lifespan)
+app.include_router(assessment_router)
 app.include_router(auth_router)
 app.include_router(events_router)
 app.include_router(collector_router)

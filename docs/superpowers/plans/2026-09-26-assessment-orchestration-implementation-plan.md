@@ -756,7 +756,7 @@ Response:
 }
 ```
 
-- [ ] **Step 1: 写 API 失败测试**
+- [x] **Step 1: 写 API 失败测试**
 
 覆盖：
 
@@ -771,7 +771,7 @@ assert response.json()["total_task_count"] == 9
 
 再覆盖无运行返回 `404 assessment_run_not_found` 和非法 UUID 返回 `422`。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run:
 
@@ -782,11 +782,11 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: FAIL，原因是路由尚不存在。
 
-- [ ] **Step 3: 实现只读仓储查询和认证路由**
+- [x] **Step 3: 实现只读仓储查询和认证路由**
 
 沿用现有 `require_role`，允许 `superadmin`、`group_leader`、`group_deputy`、普通组员和只读用户。未知角色沿用项目现有拒绝策略。
 
-- [ ] **Step 4: 运行测试并提交**
+- [x] **Step 4: 运行测试并提交**
 
 Run:
 

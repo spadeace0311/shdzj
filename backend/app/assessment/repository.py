@@ -138,6 +138,39 @@ class AssessmentRepository:
         )
         return int(count or 0)
 
+    async def get_current_run(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: str,
+    ) -> AssessmentRun | None:
+        try:
+            event_uuid = UUID(event_id)
+        except ValueError as exc:
+            raise ValueError("event_id must be a UUID") from exc
+        return await session.scalar(
+            select(AssessmentRun)
+            .where(AssessmentRun.event_id == event_uuid)
+            .order_by(
+                AssessmentRun.run_no.desc(),
+                AssessmentRun.created_at.desc(),
+                AssessmentRun.id.desc(),
+            )
+            .limit(1)
+        )
+
+    async def list_tasks(
+        self,
+        session: AsyncSession,
+        run_id: object,
+    ) -> list[AssessmentTask]:
+        tasks = await session.scalars(
+            select(AssessmentTask)
+            .where(AssessmentTask.run_id == run_id)
+            .order_by(AssessmentTask.sequence, AssessmentTask.id)
+        )
+        return list(tasks.all())
+
 
 def _validate_trigger_identity(
     event: EarthquakeEvent,
