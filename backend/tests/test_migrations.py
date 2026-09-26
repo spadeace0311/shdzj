@@ -9,10 +9,13 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.config import settings
+
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0009_non_cenc_lifecycle"
+LATEST_REVISION = "0010_assessment_orchestration"
+NON_CENC_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"
 MIGRATION_TEST_VERSION = "migration-test-0008"
@@ -362,11 +365,38 @@ def test_migration_identifiers_fit_alembic_version_column() -> None:
     assert oversized == []
 
 
-def test_migration_head_includes_non_cenc_lifecycle_fix() -> None:
+def test_migration_head_includes_assessment_orchestration() -> None:
     alembic_config = Config(str(BACKEND_DIR / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
 
     assert ScriptDirectory.from_config(alembic_config).get_current_head() == LATEST_REVISION
+
+
+async def _assessment_orchestration_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    async with engine.connect() as connection:
+        table_names = await connection.run_sync(
+            lambda sync: set(inspect(sync).get_table_names())
+        )
+    await engine.dispose()
+    return {"assessment_runs", "assessment_tasks"} <= table_names
+
+
+async def test_0010_assessment_orchestration_is_reversible() -> None:
+    _set_revision(NON_CENC_REVISION)
+    assert await _assessment_orchestration_tables_exist() is False
+
+    try:
+        _set_revision(LATEST_REVISION)
+        assert await _assessment_orchestration_tables_exist() is True
+
+        _set_revision(NON_CENC_REVISION)
+        assert await _assessment_orchestration_tables_exist() is False
+
+        _set_revision(LATEST_REVISION)
+        assert await _assessment_orchestration_tables_exist() is True
+    finally:
+        _set_revision(LATEST_REVISION)
 
 
 async def test_0008_backfills_old_rows_and_downgrade_upgrade_is_reversible() -> None:

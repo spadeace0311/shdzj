@@ -99,7 +99,7 @@
   - `Settings.assessment_outbox_max_attempts: int`
   - `Settings.assessment_workflow_deadline_seconds: int`
 
-- [ ] **Step 1: 写配置和 ORM 契约失败测试**
+- [x] **Step 1: 写配置和 ORM 契约失败测试**
 
 ```python
 def test_assessment_settings_defaults() -> None:
@@ -148,7 +148,7 @@ def test_assessment_orm_metadata_contract() -> None:
     } <= set(tasks.c.keys())
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run:
 
@@ -159,7 +159,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: FAIL，原因是 `app.assessment`、`AssessmentRun` 和新增配置尚不存在。
 
-- [ ] **Step 3: 实现领域枚举和 SQLAlchemy 模型**
+- [x] **Step 3: 实现领域枚举和 SQLAlchemy 模型**
 
 `AssessmentRun` 的关键约束：
 
@@ -224,11 +224,11 @@ created_at: datetime
 updated_at: datetime
 ```
 
-- [ ] **Step 4: 增加迁移与模型注册**
+- [x] **Step 4: 增加迁移与模型注册**
 
 迁移 `0010_assessment_orchestration.py` 创建两张表、外键和索引；`downgrade()` 按依赖逆序删除。`migrations/env.py` 导入 `app.assessment.models`。
 
-- [ ] **Step 5: 运行聚焦测试和迁移往返测试**
+- [x] **Step 5: 运行聚焦测试和迁移往返测试**
 
 Run:
 
@@ -239,7 +239,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api `
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add backend/app/assessment backend/migrations/versions/0010_assessment_orchestration.py \

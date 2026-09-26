@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.auth import models as auth_models  # noqa: F401
+from app.assessment import models as assessment_models  # noqa: F401
 from app.collector import models as collector_models  # noqa: F401
 from app.config import settings
 from app.db import Base

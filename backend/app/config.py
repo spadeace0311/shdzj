@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     collector_spool_dir: str = "/var/lib/collector-spool"
     collector_max_spool_bytes: int = 1_073_741_824
     response_rules_path: str = "/config/response_rules/shanghai-2026.yaml"
+    temporal_address: str = "temporal:7233"
+    temporal_namespace: str = "default"
+    temporal_task_queue: str = "assessment"
+    assessment_dispatcher_enabled: bool = False
+    assessment_outbox_poll_seconds: float = 1.0
+    assessment_outbox_batch_size: int = 20
+    assessment_outbox_max_attempts: int = 10
+    assessment_workflow_deadline_seconds: int = 300
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -69,6 +77,20 @@ class Settings(BaseSettings):
             raise ValueError("COLLECTOR_SPOOL_DIR must not be empty")
         if self.collector_max_spool_bytes < 1:
             raise ValueError("COLLECTOR_MAX_SPOOL_BYTES must be positive")
+        if not self.temporal_address.strip():
+            raise ValueError("TEMPORAL_ADDRESS must not be empty")
+        if not self.temporal_namespace.strip():
+            raise ValueError("TEMPORAL_NAMESPACE must not be empty")
+        if not self.temporal_task_queue.strip():
+            raise ValueError("TEMPORAL_TASK_QUEUE must not be empty")
+        if self.assessment_outbox_poll_seconds <= 0:
+            raise ValueError("ASSESSMENT_OUTBOX_POLL_SECONDS must be positive")
+        if not 1 <= self.assessment_outbox_batch_size <= 1_000:
+            raise ValueError("ASSESSMENT_OUTBOX_BATCH_SIZE must be between 1 and 1000")
+        if not 1 <= self.assessment_outbox_max_attempts <= 100:
+            raise ValueError("ASSESSMENT_OUTBOX_MAX_ATTEMPTS must be between 1 and 100")
+        if self.assessment_workflow_deadline_seconds <= 0:
+            raise ValueError("ASSESSMENT_WORKFLOW_DEADLINE_SECONDS must be positive")
         return self
 
 
