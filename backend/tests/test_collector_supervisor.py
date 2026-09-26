@@ -232,9 +232,11 @@ class HealthPulseCollector:
         self,
         provider: CollectorProvider,
         health_time: datetime,
+        last_transport_at: datetime | None = None,
     ) -> None:
         self._provider = provider
         self._health_time = health_time
+        self._last_transport_at = last_transport_at
         self.recovery_since = None
 
     async def run(self, **kwargs) -> None:
@@ -247,6 +249,7 @@ class HealthPulseCollector:
                 last_connected_at=self._health_time,
                 last_message_at=self._health_time,
                 last_success_at=self._health_time,
+                last_transport_at=self._last_transport_at,
                 consecutive_failures=0,
                 reconnect_count=0,
                 last_error=None,
@@ -1046,6 +1049,44 @@ async def test_connected_provider_degrades_after_no_recent_message() -> None:
     assert degraded_update.connected is True
     assert degraded_update.last_error == "no recent messages"
     assert fan_updates[-1].state == "stopped"
+
+
+async def test_recent_transport_activity_keeps_provider_healthy_despite_stale_message() -> None:
+    started_at = datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
+    service = RecordingCollectorService()
+    stop_event = asyncio.Event()
+    supervisor = CollectorSupervisor(
+        settings=collector_settings(),
+        service=service,
+        coordinator=RecordingCoordinator(),
+        spool=RecordingSpool(),
+        fan_collector=HealthPulseCollector(
+            CollectorProvider.FAN,
+            started_at - timedelta(minutes=2),
+            last_transport_at=started_at,
+        ),
+        wolfx_collector=NoopWolfxCollector(),
+        now=lambda: started_at,
+    )
+
+    task = asyncio.create_task(supervisor.run(stop_event))
+    for _ in range(100):
+        if any(
+            update.provider is CollectorProvider.FAN and update.state == "healthy"
+            for update in service.health_updates
+        ):
+            break
+        await asyncio.sleep(0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    fan_updates = [
+        update
+        for update in service.health_updates
+        if update.provider is CollectorProvider.FAN
+    ]
+    assert [update.state for update in fan_updates] == ["starting", "healthy", "stopped"]
+    assert fan_updates[1].last_transport_at == started_at
 
 
 async def test_update_after_success_advances_watermark_and_health_does_not_overwrite_ingest_time(

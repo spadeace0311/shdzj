@@ -34,6 +34,7 @@ class FanParseResult:
     error_text: str | None = None
     history_frame: bool = False
     recovery_complete: bool = False
+    transport_active: bool = False
 
 
 class FanMessageParser:
@@ -50,21 +51,24 @@ class FanMessageParser:
 
         message_type = message.get("type")
         if message_type == "auth_success":
-            return FanParseResult(auth_state="success")
+            return FanParseResult(auth_state="success", transport_active=True)
         if message_type == "auth_fail":
             return FanParseResult(
                 auth_state="failed",
                 error_text="authentication failed",
             )
         if message_type in {"pong", "heartbeat"}:
-            return FanParseResult(heartbeat=True)
+            return FanParseResult(heartbeat=True, transport_active=True)
 
         if message_type in {"initial_all", "query_response"}:
             data = _nested_data(message, "cenc", "Data")
             if isinstance(data, dict) and data:
                 data = _filter_history_payload(data, recovery_since)
                 if not data:
-                    return FanParseResult(history_frame=True)
+                    return FanParseResult(
+                        history_frame=True,
+                        transport_active=True,
+                    )
                 return FanParseResult(
                     envelope=self._envelope(
                         data,
@@ -74,8 +78,9 @@ class FanMessageParser:
                         ),
                     ),
                     history_frame=True,
+                    transport_active=True,
                 )
-            return FanParseResult(history_frame=True)
+            return FanParseResult(history_frame=True, transport_active=True)
 
         if message_type == "cenclist_response":
             history = message.get("Data")
@@ -92,6 +97,7 @@ class FanMessageParser:
                 return FanParseResult(
                     history_frame=True,
                     recovery_complete=complete and recovery_since is not None,
+                    transport_active=True,
                 )
             items.sort(key=_history_sort_key)
             normalized = {f"No{index}": item for index, item in enumerate(items, start=1)}
@@ -106,6 +112,7 @@ class FanMessageParser:
                 ),
                 history_frame=True,
                 recovery_complete=complete and recovery_since is not None,
+                transport_active=True,
             )
 
         if message_type == "update":
@@ -118,7 +125,8 @@ class FanMessageParser:
                         {"No1": data},
                         received_at,
                         trigger_reason="live",
-                    )
+                    ),
+                    transport_active=True,
                 )
 
         return FanParseResult()
@@ -255,6 +263,7 @@ class FanCollector:
         self._last_connected_at: datetime | None = None
         self._last_message_at: datetime | None = None
         self._last_success_at: datetime | None = None
+        self._last_transport_at: datetime | None = None
         self._consecutive_failures = 0
         self._reconnect_count = 0
         self._last_error: str | None = None
@@ -364,11 +373,14 @@ class FanCollector:
                 self._authenticated = True
                 self._last_error = None
                 self._consecutive_failures = 0
+                await self._record_transport_activity(on_health, self._now())
                 continue
             if parsed.auth_state == "failed":
                 self._authenticated = False
                 raise _AuthenticationFailed
             if parsed.heartbeat:
+                if self._authenticated:
+                    await self._record_transport_activity(on_health, self._now())
                 continue
             envelope = parsed.envelope
             if envelope is None and parsed.recovery_complete:
@@ -381,11 +393,14 @@ class FanCollector:
                     recovery_complete=True,
                 )
             if envelope is None:
+                if self._authenticated and parsed.transport_active:
+                    await self._record_transport_activity(on_health, self._now())
                 continue
 
             try:
                 if self._authenticated:
                     self._last_http_status = None
+                    self._last_transport_at = envelope.received_at
                     if envelope.payload:
                         self._last_message_at = envelope.received_at
                     self._last_success_at = envelope.received_at
@@ -396,6 +411,16 @@ class FanCollector:
                     await self._emit_health(on_health, "healthy")
             except Exception as exc:
                 raise _CallbackFailure(exc) from exc
+
+    async def _record_transport_activity(
+        self,
+        on_health: HealthCallback,
+        received_at: datetime,
+    ) -> None:
+        self._last_transport_at = received_at
+        self._consecutive_failures = 0
+        self._last_error = None
+        await self._emit_health(on_health, "healthy")
 
     async def _heartbeat_loop(self, websocket: Any, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -491,6 +516,7 @@ class FanCollector:
             last_connected_at=self._last_connected_at,
             last_message_at=self._last_message_at,
             last_success_at=self._last_success_at,
+            last_transport_at=self._last_transport_at,
             consecutive_failures=self._consecutive_failures,
             reconnect_count=self._reconnect_count,
             last_error=self._last_error,

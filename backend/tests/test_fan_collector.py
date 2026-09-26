@@ -1,7 +1,7 @@
 import asyncio
 import json
 import random
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -196,6 +196,17 @@ def fixed_now() -> datetime:
     return datetime(2026, 9, 25, 1, 6, tzinfo=UTC)
 
 
+class IncrementingClock:
+    def __init__(self, start: datetime, step: timedelta = timedelta(seconds=1)) -> None:
+        self._current = start
+        self._step = step
+
+    def __call__(self) -> datetime:
+        value = self._current
+        self._current += self._step
+        return value
+
+
 class FakeWebSocket:
     def __init__(self, frames: tuple[object, ...] = ()) -> None:
         self._frames = list(frames)
@@ -306,9 +317,10 @@ async def test_authenticated_business_envelope_emits_healthy() -> None:
     assert [update.state for update in health.updates] == [
         "starting",
         "healthy",
+        "healthy",
         "stopped",
     ]
-    healthy = health.updates[1]
+    healthy = health.updates[2]
     assert healthy.connected is True
     assert healthy.last_http_status is None
     assert healthy.last_connected_at == fixed_now()
@@ -316,6 +328,90 @@ async def test_authenticated_business_envelope_emits_healthy() -> None:
     assert healthy.last_success_at == fixed_now()
     assert healthy.consecutive_failures == 0
     assert len(envelopes.envelopes) == 1
+
+
+async def test_authenticated_heartbeat_advances_transport_activity() -> None:
+    websocket = FakeWebSocket(
+        (
+            json.dumps({"type": "auth_success"}),
+            json.dumps({"type": "pong"}),
+        )
+    )
+
+    async def connect(url: str):
+        return websocket
+
+    collector = FanCollector(
+        app_id="app-id",
+        api_key="secret",
+        urls=("wss://primary",),
+        query_interval_seconds=60,
+        connect=connect,
+        sleep=never_sleep,
+        now=IncrementingClock(fixed_now()),
+    )
+    health = HealthRecorder()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        collector.run(on_envelope=AsyncMock(), on_health=health, stop_event=stop_event)
+    )
+
+    await asyncio.wait_for(websocket.drained.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    healthy_updates = [update for update in health.updates if update.state == "healthy"]
+    assert len(healthy_updates) == 2
+    assert healthy_updates[0].last_transport_at is not None
+    assert healthy_updates[1].last_transport_at is not None
+    assert (
+        healthy_updates[1].last_transport_at
+        > healthy_updates[0].last_transport_at
+    )
+    assert healthy_updates[-1].last_message_at is None
+    assert healthy_updates[-1].last_success_at is None
+
+
+async def test_authenticated_empty_query_response_advances_transport_activity() -> None:
+    websocket = FakeWebSocket(
+        (
+            json.dumps({"type": "auth_success"}),
+            json.dumps({"type": "query_response", "cenc": {"Data": None}}),
+        )
+    )
+
+    async def connect(url: str):
+        return websocket
+
+    collector = FanCollector(
+        app_id="app-id",
+        api_key="secret",
+        urls=("wss://primary",),
+        query_interval_seconds=60,
+        connect=connect,
+        sleep=never_sleep,
+        now=IncrementingClock(fixed_now()),
+    )
+    health = HealthRecorder()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        collector.run(on_envelope=AsyncMock(), on_health=health, stop_event=stop_event)
+    )
+
+    await asyncio.wait_for(websocket.drained.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    healthy_updates = [update for update in health.updates if update.state == "healthy"]
+    assert len(healthy_updates) == 2
+    assert healthy_updates[0].last_transport_at is not None
+    assert healthy_updates[1].last_transport_at is not None
+    assert (
+        healthy_updates[1].last_transport_at
+        > healthy_updates[0].last_transport_at
+    )
+    assert healthy_updates[-1].last_message_at is None
+    assert healthy_updates[-1].last_success_at is None
 
 
 async def test_business_envelope_before_auth_does_not_emit_healthy() -> None:
@@ -563,7 +659,7 @@ async def test_callback_exception_propagates_without_reconnect() -> None:
         await asyncio.wait_for(task, timeout=1)
 
     assert connect_count == 1
-    assert [update.state for update in health.updates] == ["starting"]
+    assert [update.state for update in health.updates] == ["starting", "healthy"]
     assert websocket.closed is True
 
 

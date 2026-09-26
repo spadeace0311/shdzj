@@ -447,7 +447,9 @@ class CollectorSupervisor:
                 self._healthy_since.pop(update.provider, None)
             return update
 
-        if update.last_message_at is not None:
+        if update.last_transport_at is not None:
+            self._healthy_since[update.provider] = update.last_transport_at
+        elif update.last_message_at is not None:
             self._healthy_since[update.provider] = update.last_message_at
         else:
             self._healthy_since.setdefault(update.provider, self._now())
@@ -477,6 +479,7 @@ class CollectorSupervisor:
             last_connected_at=None,
             last_message_at=None,
             last_success_at=None,
+            last_transport_at=None,
             consecutive_failures=0,
             reconnect_count=0,
             last_error=None,

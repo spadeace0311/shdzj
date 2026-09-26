@@ -46,6 +46,7 @@ class ProviderHealthUpdate:
     reconnect_count: int
     last_error: str | None
     updated_at: datetime
+    last_transport_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.state not in {"starting", "healthy", "degraded", "critical", "stopped"}:

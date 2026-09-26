@@ -135,6 +135,7 @@ class WolfxCollector:
         self._last_connected_at: datetime | None = None
         self._last_message_at: datetime | None = None
         self._last_success_at: datetime | None = None
+        self._last_transport_at: datetime | None = None
         self._consecutive_failures = 0
         self._reconnect_count = 0
         self._last_error: str | None = None
@@ -221,6 +222,7 @@ class WolfxCollector:
         self._last_http_status = status
         self._last_connected_at = received_at
         self._last_success_at = received_at
+        self._last_transport_at = received_at
         if any(envelope.payload for envelope in envelopes):
             self._last_message_at = received_at
         self._consecutive_failures = 0
@@ -278,6 +280,7 @@ class WolfxCollector:
             last_connected_at=self._last_connected_at,
             last_message_at=self._last_message_at,
             last_success_at=self._last_success_at,
+            last_transport_at=self._last_transport_at,
             consecutive_failures=self._consecutive_failures,
             reconnect_count=self._reconnect_count,
             last_error=self._last_error,

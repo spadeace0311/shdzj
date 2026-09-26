@@ -412,6 +412,8 @@ async def test_run_emits_healthy_on_empty_response() -> None:
     assert healthy.connected is True
     assert healthy.last_http_status == 200
     assert healthy.last_connected_at == fixed_now()
+    assert healthy.last_transport_at == fixed_now()
+    assert healthy.last_message_at is None
     assert healthy.consecutive_failures == 0
     assert healthy.reconnect_count == 0
 
