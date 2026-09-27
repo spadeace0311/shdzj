@@ -138,7 +138,15 @@ async def test_product_and_raster_round_trip(session_factory) -> None:
     assert product["product_type"] == "model"
     assert bands[0][0, 0] == pytest.approx(4.0)
     assert metadata["grid_definition_version"] == "grid-1"
-    assert metadata["bands"] == [{"number": 1, "name": "value"}]
+    assert [band["number"] for band in metadata["bands"]] == [1]
+    assert [band["name"] for band in metadata["bands"]] == ["value"]
+    assert {
+        "type",
+        "unit",
+        "nodata",
+        "scale",
+        "checksum",
+    } <= set(metadata["bands"][0])
     assert metadata["crs"] == "EPSG:32651"
     assert metadata["origin_x"] == 500000.0
     assert metadata["origin_y"] == 3500000.0
@@ -215,7 +223,20 @@ async def test_multi_band_round_trip_preserves_order_metadata_and_exact_values(
     np.testing.assert_array_equal(bands[0], values)
     np.testing.assert_array_equal(bands[1], sigma)
     assert metadata["grid_definition_version"] == "grid-multi"
-    assert metadata["bands"] == expected_manifest
+    assert [(band["number"], band["name"]) for band in metadata["bands"]] == [
+        (band["number"], band["name"]) for band in expected_manifest
+    ]
+    assert all(
+        {
+            "type",
+            "unit",
+            "nodata",
+            "scale",
+            "checksum",
+        }
+        <= set(band)
+        for band in metadata["bands"]
+    )
     assert metadata["crs"] == "EPSG:32651"
     assert metadata["srid"] == 32651
     assert metadata["origin_x"] == 600000.0
@@ -413,18 +434,18 @@ async def test_checksum_verification_failure_rolls_back(
     run_id, task_id = await _seed_run(session_factory)
     repository = IntensityRepository()
     definition = GridDefinition("grid-1", "EPSG:32651", 1000, 500000, 3500000, 1, 1)
-    original_encode = RasterCodec.encode
+    original_checksum = RasterCodec.content_checksum
     calls = 0
 
-    def mismatched_encode(definition, bands, band_manifest):
+    def mismatched_checksum(definition, bands, band_manifest):
         nonlocal calls
         calls += 1
-        payload = original_encode(definition, bands, band_manifest)
+        checksum = original_checksum(definition, bands, band_manifest)
         if calls == 2:
-            return payload + b"\x00"
-        return payload
+            return "0" * 64
+        return checksum
 
-    monkeypatch.setattr(RasterCodec, "encode", mismatched_encode)
+    monkeypatch.setattr(RasterCodec, "content_checksum", mismatched_checksum)
     write = IntensityProductWrite(
         run_id=run_id,
         task_id=task_id,

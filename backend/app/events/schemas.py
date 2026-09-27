@@ -10,6 +10,7 @@ class RegionContext(BaseModel):
 
     inside_shanghai: bool | None = None
     distance_to_boundary_km: Decimal | None = Field(default=None, ge=0)
+    boundary_version: str | None = Field(default=None, max_length=64)
     deaths: int | None = Field(default=None, ge=0)
     max_intensity: Decimal | None = Field(default=None, ge=0, le=12)
 

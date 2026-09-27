@@ -159,7 +159,6 @@ def _configured_settings() -> Settings:
         assessment_outbox_batch_size=7,
         assessment_outbox_max_attempts=4,
         assessment_outbox_lease_seconds=12,
-        assessment_workflow_deadline_seconds=180,
     )
 
 

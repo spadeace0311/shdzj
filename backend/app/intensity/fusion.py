@@ -65,6 +65,13 @@ def fuse(
             candidate_weights,
             0.0,
         )
+        weighted_cells = instrument_weight > 0
+        if not np.all(np.isfinite(instrument.values[weighted_cells])):
+            raise ValueError("weighted instrument values must be finite")
+        if not np.all(np.isfinite(instrument.sigma[weighted_cells])):
+            raise ValueError("weighted instrument sigma must be finite")
+        if np.any(instrument.sigma[weighted_cells] < 0):
+            raise ValueError("weighted instrument sigma must not be negative")
         total_weight = model_weight + instrument_weight
         fused_candidate = (
             model_weight * model_values + instrument_weight * instrument.values

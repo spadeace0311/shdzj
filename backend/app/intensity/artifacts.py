@@ -95,9 +95,61 @@ class RasterCodec:
     def checksum(payload: bytes) -> str:
         return hashlib.sha256(payload).hexdigest()
 
+    @staticmethod
+    def content_checksum(
+        definition: GridDefinition,
+        bands: Sequence[BandInput],
+        band_manifest: dict,
+    ) -> str:
+        digest = hashlib.sha256(b"intensity-raster-content-v1\0")
+        digest.update(
+            json.dumps(
+                _json_canonical(
+                    {
+                        "grid": {
+                            "version": definition.version,
+                            "crs": definition.crs,
+                            "resolution_m": definition.resolution_m,
+                            "origin_x": definition.origin_x,
+                            "origin_y": definition.origin_y,
+                            "width": definition.width,
+                            "height": definition.height,
+                        },
+                        "manifest": band_manifest,
+                    }
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for index, band in enumerate(bands, start=1):
+            if isinstance(band, tuple):
+                name, values = band
+            else:
+                values = band
+                name = _band_name(band_manifest, index)
+            values = np.ascontiguousarray(values, dtype=np.float64)
+            digest.update(str(name).encode("utf-8"))
+            digest.update(len(str(name).encode("utf-8")).to_bytes(4, "little"))
+            digest.update(
+                str((values.shape[0], values.shape[1])).encode("ascii")
+            )
+            digest.update(values.tobytes(order="C"))
+        return digest.hexdigest()
+
 
 def _band_name(manifest: dict, number: int) -> str:
     for band in manifest.get("bands", []):
         if band.get("number") == number:
             return str(band["name"])
     return f"band_{number}"
+
+
+def _json_canonical(value):
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {str(key): _json_canonical(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_canonical(item) for item in value]
+    return value

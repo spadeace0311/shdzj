@@ -5,7 +5,7 @@ import asyncio
 import logging
 import signal
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy
@@ -94,6 +94,8 @@ def build_worker(
             activities.run_intensity_instrument,
             activities.run_intensity_fusion,
             activities.mark_deadline_exceeded,
+            activities.observe_task_deadlines,
+            activities.reconcile_assessment_timeouts,
             activities.finalize_assessment,
         ],
         graceful_shutdown_timeout=timedelta(seconds=10),
@@ -120,6 +122,10 @@ async def run_dispatcher(
     )
     while not stop_event.is_set():
         dispatched = await dispatcher.dispatch_once()
+        await _reconcile_assessment_timeouts(
+            session_factory,
+            configured,
+        )
         if dispatched == 0:
             await sleep(configured.assessment_outbox_poll_seconds)
 
@@ -148,6 +154,29 @@ async def _connect_temporal(configured: Settings) -> Client:
         configured.temporal_address,
         namespace=configured.temporal_namespace,
     )
+
+
+async def _reconcile_assessment_timeouts(
+    session_factory: object,
+    configured: Settings,
+) -> list[str]:
+    from app.assessment.repository import AssessmentRepository
+
+    repository = AssessmentRepository()
+    observed_at = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            failed_ids = await repository.reconcile_timeouts(
+                session,
+                safety_timeout_seconds=configured.assessment_workflow_safety_timeout_seconds,
+                observed_at=observed_at,
+            )
+    for run_id in failed_ids:
+        logger.error(
+            "assessment workflow safety timeout run_id=%s",
+            run_id,
+        )
+    return [str(run_id) for run_id in failed_ids]
 
 
 async def _run_until_stopped(

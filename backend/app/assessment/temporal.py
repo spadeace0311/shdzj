@@ -29,6 +29,7 @@ class PreparedAssessment:
     run_id: str
     task_count: int
     deadline_at: datetime
+    task_deadlines: tuple[datetime, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,12 @@ class AssessmentRunActivityInput:
 class FinalizeAssessmentInput:
     run_id: str
     outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssessmentTimeoutInput:
+    safety_timeout_seconds: int
+    observed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +77,9 @@ class AssessmentWorkflow:
         )
         prepared = _as_prepared_assessment(prepared_payload)
         deadline_task = asyncio.create_task(self._mark_deadline_when_due(prepared))
+        task_deadline_task = asyncio.create_task(
+            self._observe_task_deadlines_when_due(prepared)
+        )
         try:
             model_handle = workflow.start_activity(
                 "run_intensity_model",
@@ -110,6 +120,12 @@ class AssessmentWorkflow:
             if not deadline_task.done():
                 deadline_task.cancel()
                 await asyncio.gather(deadline_task, return_exceptions=True)
+            if not task_deadline_task.done():
+                task_deadline_task.cancel()
+                await asyncio.gather(
+                    task_deadline_task,
+                    return_exceptions=True,
+                )
 
     async def _mark_deadline_when_due(
         self,
@@ -124,6 +140,23 @@ class AssessmentWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=_retry_policy(),
         )
+
+    async def _observe_task_deadlines_when_due(
+        self,
+        prepared: PreparedAssessment,
+    ) -> None:
+        current_time = workflow.now()
+        for deadline in sorted(set(prepared.task_deadlines)):
+            delay = deadline - current_time
+            if delay.total_seconds() > 0:
+                await workflow.sleep(delay)
+            await workflow.execute_activity(
+                "observe_task_deadlines",
+                AssessmentRunActivityInput(prepared.run_id),
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=_retry_policy(),
+            )
+            current_time = max(current_time, deadline)
 
     async def _finalize(
         self,
@@ -158,7 +191,19 @@ def _as_prepared_assessment(value: object) -> PreparedAssessment:
         run_id=str(value["run_id"]),
         task_count=int(value["task_count"]),
         deadline_at=deadline,
+        task_deadlines=tuple(
+            _as_datetime(item)
+            for item in value.get("task_deadlines", [])
+        ),
     )
+
+
+def _as_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise TypeError("prepared assessment task deadline must be a timestamp")
 
 
 def _retry_policy() -> RetryPolicy:
@@ -210,10 +255,15 @@ class AssessmentActivities:
                 )
                 await repository.start_run(session, run.id)
                 task_count = await repository.count_tasks(session, run.id)
+                task_deadlines = await repository.list_task_deadlines(
+                    session,
+                    run.id,
+                )
         return PreparedAssessment(
             run_id=str(run.id),
             task_count=task_count,
             deadline_at=run.deadline_at,
+            task_deadlines=tuple(task_deadlines),
         )
 
     @activity.defn(name="run_intensity_model")
@@ -263,6 +313,51 @@ class AssessmentActivities:
                 request.run_id,
             )
         return marked
+
+    @activity.defn(name="observe_task_deadlines")
+    async def observe_task_deadlines(
+        self,
+        request: AssessmentRunActivityInput,
+    ):
+        from app.assessment.repository import AssessmentRepository
+
+        repository = AssessmentRepository()
+        async with self._session_factory() as session:
+            async with session.begin():
+                warned = await repository.observe_task_deadlines(
+                    session,
+                    request.run_id,
+                    datetime.now(UTC),
+                )
+        for task_key in warned:
+            logger.warning(
+                "assessment task deadline exceeded run_id=%s task_key=%s",
+                request.run_id,
+                task_key,
+            )
+        return warned
+
+    @activity.defn(name="reconcile_assessment_timeouts")
+    async def reconcile_assessment_timeouts(
+        self,
+        request: AssessmentTimeoutInput,
+    ):
+        from app.assessment.repository import AssessmentRepository
+
+        repository = AssessmentRepository()
+        async with self._session_factory() as session:
+            async with session.begin():
+                failed_ids = await repository.reconcile_timeouts(
+                    session,
+                    safety_timeout_seconds=request.safety_timeout_seconds,
+                    observed_at=request.observed_at,
+                )
+        for run_id in failed_ids:
+            logger.error(
+                "assessment workflow safety timeout run_id=%s",
+                run_id,
+            )
+        return failed_ids
 
     @activity.defn(name="finalize_assessment")
     async def finalize_assessment(self, request: FinalizeAssessmentInput):

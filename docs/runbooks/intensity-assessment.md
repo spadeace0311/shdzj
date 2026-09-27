@@ -23,7 +23,6 @@
 
 - `INTENSITY_PARAMETERS_PATH`，默认 `/config/intensity/shanghai-2019.yaml`。
 - `INTENSITY_REGION_PROFILE_PATH`，默认 `/config/intensity/shanghai-region.yaml`。
-- `ASSESSMENT_WORKFLOW_DEADLINE_SECONDS`，默认 `300`。
 - `ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS`，默认 `1800`。
 
 默认网格使用 `EPSG:32651`、`1000 m` 分辨率。距离计算使用 WGS 84 球面测地距离，连续值以双精度存储，展示时四舍五入到 `0.1` 烈度度。

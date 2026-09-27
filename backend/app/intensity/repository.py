@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -42,6 +43,7 @@ class IntensityProductWrite:
     source_product_id: str | None
     observed_at: datetime | None
     bands: list[tuple[str, np.ndarray]]
+    band_metadata: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +158,8 @@ class IntensityRepository:
         session: AsyncSession,
         write: IntensityProductWrite,
     ) -> UUID:
+        normalized_bands = _normalized_bands(write)
+        _validate_product_write(write, normalized_bands)
         existing = await session.scalar(
             select(IntensityFieldProduct).where(
                 IntensityFieldProduct.run_id == write.run_id,
@@ -181,13 +185,13 @@ class IntensityRepository:
                 ):
                     raise ValueError("existing intensity product is incomplete")
             elif existing.completed_at is None:
-                existing.completed_at = now
-            if existing.status != write.status.value:
-                raise ValueError("published product status cannot be overwritten")
-            if existing.algorithm_version != write.algorithm_version:
-                raise ValueError("published product algorithm version cannot be overwritten")
-            if existing.input_fingerprint != write.input_fingerprint:
-                raise ValueError("published product fingerprint cannot be overwritten")
+                raise ValueError("existing intensity product is incomplete")
+            _validate_existing_product(write, existing)
+            if raster_required:
+                await _load_and_verify_raster(
+                    session,
+                    existing.id,
+                )
             return existing.id
 
         if not write.bands and write.status in {
@@ -224,24 +228,22 @@ class IntensityRepository:
         session.add(product)
         await session.flush()
 
-        if write.bands:
-            manifest = {
-                "bands": [
-                    {"number": index, "name": name}
-                    for index, (name, _) in enumerate(write.bands, start=1)
-                ]
-            }
-            payload = RasterCodec.encode(
+        if normalized_bands:
+            manifest = _build_band_manifest(
                 write.grid_definition,
-                write.bands,
+                normalized_bands,
+                write.band_metadata,
+            )
+            checksum = RasterCodec.content_checksum(
+                write.grid_definition,
+                normalized_bands,
                 manifest,
             )
-            checksum = RasterCodec.checksum(payload)
             srid = CRS.from_user_input(write.grid_definition.crs).to_epsg()
             if srid is None:
                 raise ValueError("grid CRS must map to an EPSG code")
 
-            raster_expression = _raster_expression(len(write.bands))
+            raster_expression = _raster_expression(len(normalized_bands))
             bindings = {
                 "id": uuid4(),
                 "product_id": product_id,
@@ -256,7 +258,7 @@ class IntensityRepository:
                 "srid": srid,
                 "created_at": now,
             }
-            for index, (_, values) in enumerate(write.bands, start=1):
+            for index, (_, values) in enumerate(normalized_bands, start=1):
                 bindings[f"values_{index}"] = np.asarray(
                     values,
                     dtype=np.float64,
@@ -291,22 +293,13 @@ class IntensityRepository:
                 ),
                 bindings,
             )
-            persisted_values = await _dump_band_values(
+            await _load_and_verify_raster(
                 session,
                 product_id,
-                expected_count=len(write.bands),
+                expected_definition=write.grid_definition,
+                expected_bands=normalized_bands,
+                expected_checksum=checksum,
             )
-            persisted_bands = [
-                (name, values)
-                for (name, _), values in zip(write.bands, persisted_values)
-            ]
-            reconstructed_payload = RasterCodec.encode(
-                write.grid_definition,
-                persisted_bands,
-                manifest,
-            )
-            if RasterCodec.checksum(reconstructed_payload) != checksum:
-                raise RuntimeError("intensity raster checksum verification failed")
 
             await session.execute(
                 text(
@@ -388,6 +381,7 @@ class IntensityRepository:
                 "source_product_id": product.source_product_id,
                 "observed_at": product.observed_at,
                 "completed_at": product.completed_at,
+                "published_at": product.published_at,
                 "statistics": dict(product.statistics),
             }
             for product in products
@@ -401,70 +395,337 @@ class IntensityRepository:
         product = await session.get(IntensityFieldProduct, product_id)
         if product is None:
             raise LookupError("intensity product not found")
+        bands, metadata = await _load_and_verify_raster(
+            session,
+            product_id,
+        )
+        if product.output_checksum != metadata["checksum"]:
+            raise RuntimeError("persisted raster checksum does not match product")
+        return bands, metadata
 
-        raster_metadata = (
-            await session.execute(
-                text(
-                    """
-                    SELECT
-                        ST_Width(rast),
-                        ST_Height(rast),
-                        ST_SRID(rast),
-                        ST_ScaleX(rast),
-                        ST_ScaleY(rast),
-                        ST_UpperLeftX(rast),
-                        ST_UpperLeftY(rast)
-                    FROM intensity_rasters
-                    WHERE product_id = :product_id
-                    """
-                ),
-                {"product_id": product_id},
+
+def _normalized_bands(
+    write: IntensityProductWrite,
+) -> list[tuple[str, np.ndarray]]:
+    normalized: list[tuple[str, np.ndarray]] = []
+    expected = (
+        write.grid_definition.height,
+        write.grid_definition.width,
+    )
+    for name, values in write.bands:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("raster band names must not be empty")
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != expected:
+            raise ValueError("raster band shape does not match grid definition")
+        normalized.append((name, np.ascontiguousarray(array)))
+    if len({name for name, _ in normalized}) != len(normalized):
+        raise ValueError("raster band names must be unique")
+    return normalized
+
+
+def _validate_existing_product(
+    write: IntensityProductWrite,
+    existing: IntensityFieldProduct,
+) -> None:
+    immutable_values = {
+        "status": existing.status,
+        "algorithm_version": existing.algorithm_version,
+        "parameter_version": existing.parameter_version,
+        "strategy_version": existing.strategy_version,
+        "grid_definition_version": existing.grid_definition_version,
+        "region_profile_version": existing.region_profile_version,
+        "input_fingerprint": existing.input_fingerprint,
+        "input_checksum": existing.input_checksum,
+        "quality_grade": existing.quality_grade,
+        "coverage_ratio": float(existing.coverage_ratio),
+        "source_product_id": existing.source_product_id,
+        "observed_at": existing.observed_at,
+        "statistics": dict(existing.statistics),
+    }
+    incoming_values = {
+        "status": write.status.value,
+        "algorithm_version": write.algorithm_version,
+        "parameter_version": write.parameter_version,
+        "strategy_version": write.strategy_version,
+        "grid_definition_version": write.grid_definition.version,
+        "region_profile_version": write.region_profile_version,
+        "input_fingerprint": write.input_fingerprint,
+        "input_checksum": write.input_checksum,
+        "quality_grade": write.quality_grade,
+        "coverage_ratio": float(write.coverage_ratio),
+        "source_product_id": write.source_product_id,
+        "observed_at": write.observed_at,
+        "statistics": write.statistics,
+    }
+    for key in immutable_values:
+        if immutable_values[key] != incoming_values[key]:
+            raise ValueError(f"published intensity product {key} cannot be overwritten")
+
+
+def _validate_product_write(
+    write: IntensityProductWrite,
+    normalized_bands: list[tuple[str, np.ndarray]],
+) -> None:
+    if not math.isfinite(float(write.coverage_ratio)) or not 0.0 <= float(
+        write.coverage_ratio
+    ) <= 1.0:
+        raise ValueError("intensity product coverage ratio must be between zero and one")
+    if (
+        write.status in {ProductStatus.AVAILABLE, ProductStatus.PARTIAL}
+        and not normalized_bands
+    ):
+        raise ValueError("available or partial intensity product requires raster bands")
+    if (
+        write.status not in {ProductStatus.AVAILABLE, ProductStatus.PARTIAL}
+        and normalized_bands
+    ):
+        raise ValueError("terminal intensity product must not persist raster bands")
+    _validate_json_numbers(write.statistics)
+
+
+def _validate_json_numbers(value: object) -> None:
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_json_numbers(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_json_numbers(item)
+        return
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            raise ValueError("intensity product metadata must contain finite numbers")
+
+
+def _build_band_manifest(
+    definition: GridDefinition,
+    bands: list[tuple[str, np.ndarray]],
+    band_metadata: dict[str, dict],
+) -> dict:
+    entries = []
+    for index, (name, values) in enumerate(bands, start=1):
+        metadata = dict(band_metadata.get(name, {}))
+        band_type = metadata.get("type", "float64")
+        if not isinstance(band_type, str) or not band_type:
+            raise ValueError(f"raster band {name} type must not be empty")
+        unit = metadata.get("unit")
+        if unit is not None and not isinstance(unit, str):
+            raise ValueError(f"raster band {name} unit must be a string or null")
+        nodata = metadata.get("nodata")
+        if nodata is not None:
+            nodata = _finite_float_value(
+                nodata,
+                f"raster band {name} nodata",
             )
-        ).one_or_none()
-        if raster_metadata is None:
-            raise LookupError("intensity raster not found")
+        scale = _finite_float_value(
+            metadata.get("scale", 1.0),
+            f"raster band {name} scale",
+        )
+        if scale == 0:
+            raise ValueError(f"raster band {name} scale must not be zero")
+        entries.append(
+            {
+                "number": index,
+                "name": name,
+                "type": band_type,
+                "unit": unit,
+                "nodata": nodata,
+                "scale": scale,
+                "checksum": _array_checksum(values),
+            }
+        )
+    return {
+        "grid": {
+            "version": definition.version,
+            "crs": definition.crs,
+            "resolution_m": definition.resolution_m,
+            "origin_x": definition.origin_x,
+            "origin_y": definition.origin_y,
+            "width": definition.width,
+            "height": definition.height,
+        },
+        "bands": entries,
+    }
 
-        (
-            width,
-            height,
-            srid,
-            scale_x,
-            scale_y,
-            origin_x,
-            origin_y,
-        ) = raster_metadata
-        raw_bands = await _dump_band_values(session, product_id)
-        if not raw_bands:
-            raise LookupError("intensity raster has no bands")
 
-        bands = [
-            np.asarray(values, dtype=np.float64)
-            for values in raw_bands
-        ]
-        metadata = {
-            "crs": CRS.from_epsg(srid).to_string() if srid else None,
-            "width": int(width),
-            "height": int(height),
-            "srid": int(srid),
-            "resolution_m": abs(float(scale_x)),
-            "origin_x": float(origin_x),
-            "origin_y": float(origin_y),
-            "grid_definition_version": product.grid_definition_version,
-        }
+def _finite_float_value(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite number")
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError(f"{field} must be finite")
+    return converted
 
-        manifest = await session.scalar(
+
+def _array_checksum(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values, dtype=np.float64)
+    digest = hashlib.sha256(b"intensity-band-v1\0")
+    digest.update(str((array.shape[0], array.shape[1])).encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _grid_definition_from_manifest(manifest: dict) -> GridDefinition:
+    grid = manifest.get("grid")
+    if not isinstance(grid, dict):
+        raise RuntimeError("persisted raster manifest is missing grid metadata")
+    try:
+        return GridDefinition(
+            version=str(grid["version"]),
+            crs=str(grid["crs"]),
+            resolution_m=int(grid["resolution_m"]),
+            origin_x=float(grid["origin_x"]),
+            origin_y=float(grid["origin_y"]),
+            width=int(grid["width"]),
+            height=int(grid["height"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("persisted raster grid metadata is invalid") from exc
+
+
+def _manifest_bands(manifest: dict) -> list[dict]:
+    bands = manifest.get("bands")
+    if not isinstance(bands, list) or not bands:
+        raise RuntimeError("persisted raster manifest has no bands")
+    for band in bands:
+        if not isinstance(band, dict) or {"number", "name"} - set(band):
+            raise RuntimeError("persisted raster band manifest is invalid")
+    return bands
+
+
+def _expected_grid_srid(definition: GridDefinition) -> int:
+    srid = CRS.from_user_input(definition.crs).to_epsg()
+    if srid is None:
+        raise ValueError("grid CRS must map to an EPSG code")
+    return srid
+
+
+def _check_float_equal(
+    actual: object,
+    expected: float,
+    field_name: str,
+) -> None:
+    if not math.isclose(float(actual), expected, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError(f"persisted raster {field_name} verification failed")
+
+
+async def _load_and_verify_raster(
+    session: AsyncSession,
+    product_id: UUID,
+    *,
+    expected_definition: GridDefinition | None = None,
+    expected_bands: list[tuple[str, np.ndarray]] | None = None,
+    expected_checksum: str | None = None,
+) -> tuple[list[np.ndarray], dict]:
+    row = (
+        await session.execute(
             text(
                 """
-                SELECT band_manifest
+                SELECT
+                    ST_Width(rast) AS actual_width,
+                    ST_Height(rast) AS actual_height,
+                    ST_SRID(rast) AS actual_srid,
+                    ST_ScaleX(rast) AS scale_x,
+                    ST_ScaleY(rast) AS scale_y,
+                    ST_UpperLeftX(rast) AS origin_x,
+                    ST_UpperLeftY(rast) AS origin_y,
+                    band_manifest,
+                    checksum,
+                    width AS stored_width,
+                    height AS stored_height,
+                    srid AS stored_srid
                 FROM intensity_rasters
                 WHERE product_id = :product_id
                 """
             ),
             {"product_id": product_id},
         )
-        if manifest is not None:
-            metadata["bands"] = manifest["bands"]
-        return bands, metadata
+    ).mappings().one_or_none()
+    if row is None:
+        raise LookupError("intensity raster not found")
+
+    manifest = row["band_manifest"]
+    if not isinstance(manifest, dict):
+        raise RuntimeError("persisted raster manifest is not a mapping")
+    manifest = dict(manifest)
+    definition = expected_definition or _grid_definition_from_manifest(manifest)
+    if expected_definition is None:
+        expected_bands = None
+    if expected_definition is None and expected_checksum is None:
+        expected_checksum = None
+
+    decoded_bands = await _dump_band_values(session, product_id)
+    manifest_bands = _manifest_bands(manifest)
+    actual_width = int(row["actual_width"])
+    actual_height = int(row["actual_height"])
+    actual_srid = int(row["actual_srid"])
+    stored_width = int(row["stored_width"])
+    stored_height = int(row["stored_height"])
+    stored_srid = int(row["stored_srid"])
+    scale_x = float(row["scale_x"])
+    scale_y = float(row["scale_y"])
+    origin_x = float(row["origin_x"])
+    origin_y = float(row["origin_y"])
+
+    if actual_width != definition.width or actual_height != definition.height:
+        raise RuntimeError("persisted raster dimensions verification failed")
+    if stored_width != actual_width or stored_height != actual_height:
+        raise RuntimeError("persisted raster dimension metadata verification failed")
+    expected_srid = _expected_grid_srid(definition)
+    if actual_srid != expected_srid or stored_srid != actual_srid:
+        raise RuntimeError("persisted raster SRID verification failed")
+    _check_float_equal(scale_x, float(definition.resolution_m), "scale x")
+    _check_float_equal(scale_y, -float(definition.resolution_m), "scale y")
+    _check_float_equal(origin_x, float(definition.origin_x), "origin x")
+    _check_float_equal(origin_y, float(definition.origin_y), "origin y")
+    if str(manifest["grid"]["version"]) != definition.version:
+        raise RuntimeError("persisted raster grid version verification failed")
+    if len(decoded_bands) != len(manifest_bands):
+        raise RuntimeError("persisted raster band count verification failed")
+
+    for index, (band_meta, values) in enumerate(
+        zip(manifest_bands, decoded_bands, strict=True),
+        start=1,
+    ):
+        if int(band_meta["number"]) != index:
+            raise RuntimeError("persisted raster band numbering verification failed")
+        if "checksum" not in band_meta:
+            raise RuntimeError("persisted raster band checksum is missing")
+        if _array_checksum(values) != band_meta["checksum"]:
+            raise RuntimeError("persisted raster band checksum verification failed")
+        if expected_bands is not None:
+            expected_name, expected_values = expected_bands[index - 1]
+            if band_meta["name"] != expected_name:
+                raise RuntimeError("persisted raster band name verification failed")
+            if not np.array_equal(values, expected_values, equal_nan=True):
+                raise RuntimeError("persisted raster value verification failed")
+
+    checksum = str(row["checksum"])
+    computed = RasterCodec.content_checksum(definition, decoded_bands, manifest)
+    if expected_checksum is not None and checksum != expected_checksum:
+        raise RuntimeError("persisted raster checksum verification failed")
+    if checksum != computed:
+        raise RuntimeError("persisted raster checksum verification failed")
+
+    product = await session.get(IntensityFieldProduct, product_id)
+    if product is None:
+        raise LookupError("intensity product not found")
+    if product.output_checksum is not None and product.output_checksum != checksum:
+        raise RuntimeError("persisted product checksum verification failed")
+
+    return decoded_bands, {
+        "crs": CRS.from_epsg(actual_srid).to_string() if actual_srid else None,
+        "width": actual_width,
+        "height": actual_height,
+        "srid": actual_srid,
+        "resolution_m": abs(scale_x),
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "grid_definition_version": definition.version,
+        "bands": manifest_bands,
+        "checksum": checksum,
+    }
 
 
 async def _dump_band_values(
@@ -490,8 +751,10 @@ async def _dump_band_values(
             {"product_id": product_id},
         )
     ).all()
+    if not values:
+        raise RuntimeError("persisted raster has no bands")
     if expected_count is not None and len(values) != expected_count:
-        raise RuntimeError("intensity raster band count verification failed")
+        raise RuntimeError("persisted raster band count verification failed")
     return [np.asarray(value, dtype=np.float64) for value in values]
 
 

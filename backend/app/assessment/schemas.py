@@ -36,6 +36,7 @@ class IntensityProductSummary(BaseModel):
     source_product_id: str | None
     observed_at: datetime | None
     completed_at: datetime | None
+    published_at: datetime | None
     statistics: dict
 
 

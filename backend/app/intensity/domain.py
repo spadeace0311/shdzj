@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+import math
 
 import numpy as np
 
@@ -29,6 +30,20 @@ def _optional_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return _require_utc(value)
+
+
+def _finite_array(value: np.ndarray, field: str) -> np.ndarray:
+    array = np.asarray(value)
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{field} must contain only finite values")
+    return array
+
+
+def _array_shape(value: np.ndarray, field: str, expected: tuple[int, ...]) -> np.ndarray:
+    array = np.asarray(value)
+    if array.shape != expected:
+        raise ValueError(f"{field} shape must match the field grid")
+    return array
 
 
 class ProductType(StrEnum):
@@ -84,6 +99,13 @@ class IntensityEventSnapshot:
     report_ingested_at: datetime
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("magnitude", self.magnitude),
+            ("longitude", self.longitude),
+            ("latitude", self.latitude),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
         object.__setattr__(
             self,
             "report_ingested_at",
@@ -106,6 +128,10 @@ class GridDefinition:
             raise ValueError("grid dimensions and resolution must be positive")
         if not self.version.strip() or not self.crs.strip():
             raise ValueError("grid version and crs must not be empty")
+        if not math.isfinite(float(self.origin_x)) or not math.isfinite(
+            float(self.origin_y)
+        ):
+            raise ValueError("grid origin must be finite")
 
     @property
     def cell_count(self) -> int:
@@ -161,10 +187,27 @@ class ModelField:
     sigma: np.ndarray
     extrapolated: bool
     direction: DirectionDecision
+    model_weight: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", _readonly_array(self.values))
-        object.__setattr__(self, "sigma", _readonly_array(self.sigma))
+        values = _finite_array(self.values, "model values")
+        sigma = _finite_array(self.sigma, "model sigma")
+        sigma = _array_shape(sigma, "model sigma", values.shape)
+        if np.any(np.asarray(sigma) < 0):
+            raise ValueError("model sigma must not be negative")
+        model_weight = None
+        if self.model_weight is not None:
+            model_weight = _finite_array(self.model_weight, "model weight")
+            model_weight = _array_shape(model_weight, "model weight", values.shape)
+            if np.any(np.asarray(model_weight) < 0):
+                raise ValueError("model weight must not be negative")
+        object.__setattr__(self, "values", _readonly_array(values))
+        object.__setattr__(self, "sigma", _readonly_array(sigma))
+        object.__setattr__(
+            self,
+            "model_weight",
+            _readonly_optional_array(model_weight),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +265,7 @@ class FusionField:
     coverage_ratio: float
 
     def __post_init__(self) -> None:
+        arrays = {}
         for name in (
             "values",
             "sigma",
@@ -231,4 +275,33 @@ class FusionField:
             "instrument_weight",
             "quality_codes",
         ):
-            object.__setattr__(self, name, _readonly_array(getattr(self, name)))
+            arrays[name] = np.asarray(getattr(self, name))
+        expected = arrays["values"].shape
+        for name in arrays:
+            if arrays[name].shape != expected:
+                raise ValueError(f"{name} shape must match the field grid")
+        for name in (
+            "values",
+            "sigma",
+            "p10",
+            "p90",
+            "model_weight",
+            "instrument_weight",
+        ):
+            arrays[name] = _finite_array(arrays[name], name)
+        if np.any(arrays["sigma"] < 0):
+            raise ValueError("fusion sigma must not be negative")
+        if np.any(arrays["model_weight"] < 0) or np.any(
+            arrays["instrument_weight"] < 0
+        ):
+            raise ValueError("fusion weights must not be negative")
+        if np.any(arrays["p10"] > arrays["values"]) or np.any(
+            arrays["values"] > arrays["p90"]
+        ):
+            raise ValueError("fusion interval bounds must contain the center value")
+        if not math.isfinite(float(self.coverage_ratio)) or not 0.0 <= float(
+            self.coverage_ratio
+        ) <= 1.0:
+            raise ValueError("fusion coverage ratio must be between zero and one")
+        for name in arrays:
+            object.__setattr__(self, name, _readonly_array(arrays[name]))

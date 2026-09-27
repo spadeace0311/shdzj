@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
@@ -203,26 +203,74 @@ class IntensityService:
                 f"{type(audit_exc).__name__}: {audit_exc}"
             )
 
+    async def _existing_task_outcome(
+        self,
+        session: AsyncSession,
+        run: AssessmentRun,
+        task,
+    ) -> IntensityTaskOutcome:
+        product_type = ProductType(task.task_key.removeprefix("intensity."))
+        product = await self.intensity_repository.get_product(
+            session,
+            run_id=run.id,
+            product_type=product_type,
+        )
+        if product is None:
+            raise LookupError(
+                f"completed {task.task_key} task has no persisted intensity product"
+            )
+        return IntensityTaskOutcome(
+            run_id=str(run.id),
+            task_key=task.task_key,
+            status="succeeded",
+            product_id=str(product["id"]),
+            output_checksum=product["output_checksum"],
+        )
+
     async def run_model(self, run_id: str) -> IntensityTaskOutcome:
         try:
             async with self.session_factory() as session:
                 async with session.begin():
                     run, revision = await self._load_context(session, run_id)
                     definition = await self._ensure_grid(session, run)
-                    task = await self.assessment_repository.start_task(
-                        session,
-                        run.id,
-                        "intensity.model",
-                        self.MODEL_ALGORITHM_VERSION,
-                        _fingerprint(self, run, revision, definition),
-                    )
-                    assert task.input_fingerprint is not None
                     samples = sample_grid(
                         definition,
                         epicenter_longitude=float(revision.longitude),
                         epicenter_latitude=float(revision.latitude),
                     )
                     direction = await self._direction(session, revision)
+                    task = await self.assessment_repository.start_task(
+                        session,
+                        run.id,
+                        "intensity.model",
+                        self.MODEL_ALGORITHM_VERSION,
+                        _fingerprint(
+                            self,
+                            run,
+                            revision,
+                            definition,
+                            extra={
+                                "direction": {
+                                    "status": direction.status.value,
+                                    "source": direction.source,
+                                    "strike_deg": direction.strike_deg,
+                                    "candidate_fault_id": (
+                                        direction.candidate_fault_id
+                                    ),
+                                    "candidate_distance_km": (
+                                        direction.candidate_distance_km
+                                    ),
+                                }
+                            },
+                        ),
+                    )
+                    if task.status == "succeeded":
+                        return await self._existing_task_outcome(
+                            session,
+                            run,
+                            task,
+                        )
+                    assert task.input_fingerprint is not None
                     model = evaluate_model(
                         IntensityEventSnapshot(
                             event_id=str(run.event_id),
@@ -236,6 +284,14 @@ class IntensityService:
                         direction,
                         self.parameters.model,
                     )
+                    model_weight = (
+                        self.parameters.fusion.model_quality_weight
+                        / (
+                            np.asarray(model.sigma, dtype=np.float64) ** 2
+                            + self.parameters.fusion.epsilon
+                        )
+                    )
+                    model = replace(model, model_weight=model_weight)
                     model_values = np.asarray(model.values, dtype=np.float64).reshape(
                         definition.height,
                         definition.width,
@@ -244,6 +300,10 @@ class IntensityService:
                         definition.height,
                         definition.width,
                     )
+                    model_weight = np.asarray(
+                        model.model_weight,
+                        dtype=np.float64,
+                    ).reshape(definition.height, definition.width)
                     product_id = await self.intensity_repository.save_product(
                         session,
                         IntensityProductWrite(
@@ -269,7 +329,16 @@ class IntensityService:
                             },
                             source_product_id=None,
                             observed_at=revision.ingested_at,
-                            bands=[("value", model_values), ("sigma", model_sigma)],
+                            bands=[
+                                ("value", model_values),
+                                ("sigma", model_sigma),
+                                ("model_weight", model_weight),
+                            ],
+                            band_metadata={
+                                "value": _band_metadata("intensity_degree"),
+                                "sigma": _band_metadata("intensity_degree"),
+                                "model_weight": _band_metadata("weight"),
+                            },
                         ),
                     )
                     product = await self.intensity_repository.get_product(
@@ -318,6 +387,12 @@ class IntensityService:
                         self.INSTRUMENT_ALGORITHM_VERSION,
                         _fingerprint(self, run, revision, definition),
                     )
+                    if task.status == "succeeded":
+                        return await self._existing_task_outcome(
+                            session,
+                            run,
+                            task,
+                        )
                     assert task.input_fingerprint is not None
                     request = InstrumentRequest(
                         event_id=str(run.event_id),
@@ -363,6 +438,7 @@ class IntensityService:
                         )
 
                     bands = []
+                    band_metadata = {}
                     if product.status in {
                         ProductStatus.AVAILABLE,
                         ProductStatus.PARTIAL,
@@ -393,6 +469,11 @@ class IntensityService:
                                 ),
                             ),
                         ]
+                        band_metadata = {
+                            "value": _band_metadata("intensity_degree"),
+                            "sigma": _band_metadata("intensity_degree"),
+                            "quality_code": _band_metadata("quality_code"),
+                        }
 
                     product_id = await self.intensity_repository.save_product(
                         session,
@@ -414,6 +495,7 @@ class IntensityService:
                             source_product_id=product.product_id,
                             observed_at=product.observed_at,
                             bands=bands,
+                            band_metadata=band_metadata,
                         ),
                     )
                     stored_product = await self.intensity_repository.get_product(
@@ -504,6 +586,12 @@ class IntensityService:
                             },
                         ),
                     )
+                    if fusion_task.status == "succeeded":
+                        return await self._existing_task_outcome(
+                            session,
+                            run,
+                            fusion_task,
+                        )
                     assert fusion_task.input_fingerprint is not None
                     if model_arrays is None:
                         raise LookupError(
@@ -579,6 +667,19 @@ class IntensityService:
                             source_product_id=None,
                             observed_at=revision.ingested_at,
                             bands=bands,
+                            band_metadata={
+                                "value": _band_metadata("intensity_degree"),
+                                "sigma": _band_metadata("intensity_degree"),
+                                "p10": _band_metadata("intensity_degree"),
+                                "p90": _band_metadata("intensity_degree"),
+                                "model_weight": _band_metadata("weight"),
+                                "instrument_weight": _band_metadata("weight"),
+                                "quality_code": _band_metadata("quality_code"),
+                                "model_value": _band_metadata("intensity_degree"),
+                                "instrument_value": _band_metadata(
+                                    "intensity_degree"
+                                ),
+                            },
                         ),
                     )
                     stored_product = await self.intensity_repository.get_product(
@@ -666,12 +767,28 @@ def _safe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:2000]
 
 
+def _band_metadata(unit: str | None) -> dict:
+    return {
+        "type": "float64",
+        "unit": unit,
+        "nodata": None,
+        "scale": 1.0,
+    }
+
+
 def _statistics(values) -> dict:
     array = np.asarray(values, dtype=np.float64)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("intensity statistics require finite values")
     return {
         "minimum": float(np.min(array)),
         "maximum": float(np.max(array)),
         "mean": float(np.mean(array)),
+        "count": int(array.size),
+        "std": float(np.std(array)),
+        "p10": float(np.percentile(array, 10, method="linear")),
+        "p50": float(np.percentile(array, 50, method="linear")),
+        "p90": float(np.percentile(array, 90, method="linear")),
     }
 
 

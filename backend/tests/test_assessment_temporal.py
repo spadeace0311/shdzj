@@ -162,6 +162,7 @@ async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> No
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
                 activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
                 activities.finalize_assessment,
             ],
         ):
@@ -207,6 +208,7 @@ async def test_intensity_workflow_executes_three_tasks_and_skips_deferred(
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
                 activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
                 activities.finalize_assessment,
             ],
         ):
@@ -260,6 +262,7 @@ async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
                 activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
                 failing_finalize.finalize_assessment,
             ],
         ):
@@ -330,6 +333,7 @@ async def test_deadline_marker_persists_without_canceling_workflow(
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
                 activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
                 activities.finalize_assessment,
             ],
         ):
@@ -370,6 +374,7 @@ async def test_instrument_failure_still_completes_model_only(
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
                 activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
                 activities.finalize_assessment,
             ],
         ):

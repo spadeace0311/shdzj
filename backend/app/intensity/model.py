@@ -77,11 +77,14 @@ def axis_intensity(
     axis: AxisParameters,
 ) -> np.ndarray:
     distance = _validated_distance(distance_km)
-    return (
+    values = (
         axis.intercept
         + axis.magnitude_coefficient * magnitude
         - axis.decay_coefficient * np.log(distance + axis.distance_offset_km)
     )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("axis intensity output must be finite")
+    return values
 
 
 def _axis_radius(
@@ -269,7 +272,7 @@ def _field_residual(
     equivalent_distance = math.sqrt(
         x_km**2 + (long_radius / short_radius * y_km) ** 2
     )
-    return float(
+    value = float(
         axis_intensity(
             magnitude,
             np.asarray([equivalent_distance], dtype=np.float64),
@@ -277,6 +280,9 @@ def _field_residual(
         )[0]
         - intensity
     )
+    if not math.isfinite(value):
+        raise ValueError("model field residual must be finite")
+    return value
 
 
 def _normalize_strike(value: float) -> float:

@@ -1,14 +1,14 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.assessment.plan import AssessmentPlanBuilder
 from app.events.domain import EventKind
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox
-from app.intensity.models import AssessmentTaskAttempt
+from app.intensity.models import AssessmentTaskAttempt, IntensityFieldProduct
 
 
 class AssessmentRepository:
@@ -24,22 +24,24 @@ class AssessmentRepository:
         outbox: EventLifecycleOutbox,
     ) -> AssessmentRun:
         _validate_trigger_identity(event, revision, outbox)
+        canonical = await session.get(EarthquakeEvent, event.id, with_for_update=True)
+        if canonical is None:
+            raise LookupError(f"event not found: {event.id}")
+        if canonical.t1_at is None:
+            raise ValueError("event T1 is required before assessment orchestration")
+
         await session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
             {"lock_key": f"assessment-outbox:{outbox.id}"},
         )
 
         existing = await session.scalar(
-            select(AssessmentRun).where(AssessmentRun.outbox_id == outbox.id)
+            select(AssessmentRun)
+            .where(AssessmentRun.outbox_id == outbox.id)
+            .with_for_update()
         )
         if existing is not None:
             return existing
-
-        canonical = await session.get(EarthquakeEvent, event.id, with_for_update=True)
-        if canonical is None:
-            raise LookupError(f"event not found: {event.id}")
-        if canonical.t1_at is None:
-            raise ValueError("event T1 is required before assessment orchestration")
 
         latest_run_no = await session.scalar(
             select(func.max(AssessmentRun.run_no)).where(
@@ -79,19 +81,29 @@ class AssessmentRepository:
         )
         session.add(run)
         await session.flush()
-        canonical.latest_assessment_run_id = run.id
-        await session.execute(
-            update(AssessmentRun)
-            .where(
-                AssessmentRun.event_id == canonical.id,
-                AssessmentRun.id != run.id,
-                AssessmentRun.superseded_at.is_(None),
-            )
-            .values(
-                superseded_by_run_id=run.id,
-                superseded_at=outbox.created_at,
-            )
-        )
+
+        # The event's current revision is authoritative. A delayed outbox for
+        # a revision that is no longer current creates an historical run only.
+        if canonical.current_revision_id == revision.id:
+            canonical.latest_assessment_run_id = run.id
+            previous_runs = (
+                await session.scalars(
+                    select(AssessmentRun)
+                    .where(
+                        AssessmentRun.event_id == canonical.id,
+                        AssessmentRun.id != run.id,
+                        AssessmentRun.superseded_at.is_(None),
+                    )
+                    .order_by(AssessmentRun.id)
+                    .with_for_update()
+                )
+            ).all()
+            for previous_run in previous_runs:
+                previous_run.superseded_by_run_id = run.id
+                previous_run.superseded_at = datetime.now(UTC)
+        elif canonical.latest_assessment_run_id is not None:
+            run.superseded_by_run_id = canonical.latest_assessment_run_id
+            run.superseded_at = datetime.now(UTC)
 
         for task in plan:
             session.add(
@@ -129,11 +141,7 @@ class AssessmentRepository:
         except ValueError as exc:
             raise ValueError("assessment trigger identifiers must be UUIDs") from exc
 
-        outbox = await session.get(
-            EventLifecycleOutbox,
-            outbox_uuid,
-            with_for_update=True,
-        )
+        outbox = await session.get(EventLifecycleOutbox, outbox_uuid)
         event = await session.get(EarthquakeEvent, event_uuid)
         revision = await session.get(EarthquakeRevision, revision_uuid)
         if outbox is None or event is None or revision is None:
@@ -156,6 +164,18 @@ class AssessmentRepository:
         algorithm_version: str,
         input_fingerprint: str,
     ) -> AssessmentTask:
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
+        if run is None:
+            raise LookupError("assessment run not found")
         task = await session.scalar(
             select(AssessmentTask)
             .where(
@@ -220,9 +240,16 @@ class AssessmentRepository:
         if task.status != "running":
             raise ValueError("task must be running before it can complete")
         now = datetime.now(UTC)
+        deadline_evidence = (
+            dict(task.result or {}).get("deadline_exceeded_at")
+            if task.status != "succeeded"
+            else None
+        )
         task.status = "succeeded"
         task.output_checksum = output_checksum
-        task.result = result
+        task.result = dict(result)
+        if deadline_evidence is not None:
+            task.result["deadline_exceeded_at"] = deadline_evidence
         task.completed_at = now
         task.last_error = None
         attempt = await session.scalar(
@@ -356,7 +383,16 @@ class AssessmentRepository:
             identifier = run_id if isinstance(run_id, UUID) else UUID(run_id)
         except ValueError as exc:
             raise ValueError("run_id must be a UUID") from exc
-        run = await session.get(AssessmentRun, identifier, with_for_update=True)
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == identifier)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            identifier,
+        )
         if run is None:
             raise LookupError("assessment run not found")
         if run.deadline_exceeded_at is not None:
@@ -394,10 +430,19 @@ class AssessmentRepository:
         session: AsyncSession,
         run_id: UUID,
     ) -> AssessmentRun:
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
         if run is None:
             raise LookupError("assessment run not found")
-        if run.status == "running":
+        if run.status in {"completed", "running"}:
             return run
         if run.status != "pending":
             raise ValueError("run must be pending before it can start")
@@ -412,20 +457,23 @@ class AssessmentRepository:
         run_id: UUID,
         algorithm_bundle_version: str,
     ) -> AssessmentRun:
-        # Lock the event before the run so run mutation and event-run creation use
-        # the same event-first lock order.
         run_event_id = await session.scalar(
             select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
         )
         if run_event_id is None:
             raise LookupError("assessment run not found")
-        event = await session.get(EarthquakeEvent, run_event_id, with_for_update=True)
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        event, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
         if run is None:
             raise LookupError("assessment run not found")
         if run.status == "completed":
             if run.algorithm_bundle_version != algorithm_bundle_version:
                 raise ValueError("run algorithm bundle version changed")
+            if event is not None and event.latest_assessment_run_id == run.id:
+                await self._publish_products(session, run.id)
             return run
         if run.status != "running":
             raise ValueError("run must be running before it can complete")
@@ -454,6 +502,7 @@ class AssessmentRepository:
         run.algorithm_bundle_version = algorithm_bundle_version
         if event is not None and event.latest_assessment_run_id == run.id:
             event.effective_assessment_run_id = run.id
+            await self._publish_products(session, run.id)
         return run
 
     async def fail_run(
@@ -462,7 +511,16 @@ class AssessmentRepository:
         run_id: UUID,
         error_summary: str,
     ) -> AssessmentRun:
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
         if run is None:
             raise LookupError("assessment run not found")
         if run.status in {"completed", "failed"}:
@@ -480,7 +538,16 @@ class AssessmentRepository:
         run_id: UUID,
         error_summary: str,
     ) -> AssessmentRun | None:
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            return None
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
         if run is None:
             return None
         if run.status in {"completed", "failed"}:
@@ -496,7 +563,16 @@ class AssessmentRepository:
         run_id: UUID,
         successor_run_id: UUID,
     ) -> None:
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
         if run is None:
             raise LookupError("assessment run not found")
         run.superseded_by_run_id = successor_run_id
@@ -520,16 +596,10 @@ class AssessmentRepository:
             event_uuid = UUID(event_id)
         except ValueError as exc:
             raise ValueError("event_id must be a UUID") from exc
-        return await session.scalar(
-            select(AssessmentRun)
-            .where(AssessmentRun.event_id == event_uuid)
-            .order_by(
-                AssessmentRun.run_no.desc(),
-                AssessmentRun.created_at.desc(),
-                AssessmentRun.id.desc(),
-            )
-            .limit(1)
-        )
+        event = await session.get(EarthquakeEvent, event_uuid)
+        if event is None or event.latest_assessment_run_id is None:
+            return None
+        return await session.get(AssessmentRun, event.latest_assessment_run_id)
 
     async def list_tasks(
         self,
@@ -542,6 +612,179 @@ class AssessmentRepository:
             .order_by(AssessmentTask.sequence, AssessmentTask.id)
         )
         return list(tasks.all())
+
+    async def list_task_deadlines(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> list[datetime]:
+        deadlines = (
+            await session.scalars(
+                select(AssessmentTask.deadline_at)
+                .where(AssessmentTask.run_id == run_id)
+                .distinct()
+                .order_by(AssessmentTask.deadline_at)
+            )
+        ).all()
+        return list(deadlines)
+
+    async def observe_task_deadlines(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        observed_at: datetime,
+    ) -> list[str]:
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        run = await session.get(AssessmentRun, run_id)
+        if run is None:
+            raise LookupError("assessment run not found")
+
+        tasks = (
+            await session.scalars(
+                select(AssessmentTask)
+                .where(
+                    AssessmentTask.run_id == run.id,
+                    AssessmentTask.status.in_(("pending", "running")),
+                    AssessmentTask.deadline_at <= observed_at,
+                )
+                .order_by(AssessmentTask.sequence, AssessmentTask.id)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        warned: list[str] = []
+        for task in tasks:
+            existing_result = dict(task.result or {})
+            if "deadline_exceeded_at" in existing_result:
+                continue
+            existing_result["deadline_exceeded_at"] = observed_at.isoformat()
+            task.result = existing_result
+            warned.append(task.task_key)
+        return warned
+
+    async def reconcile_timeouts(
+        self,
+        session: AsyncSession,
+        *,
+        safety_timeout_seconds: int,
+        observed_at: datetime,
+    ) -> list[UUID]:
+        if safety_timeout_seconds <= 0:
+            raise ValueError("safety_timeout_seconds must be positive")
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        cutoff = observed_at - timedelta(seconds=safety_timeout_seconds)
+        run_ids = (
+            await session.scalars(
+                select(AssessmentRun.id)
+                .where(
+                    AssessmentRun.status == "running",
+                    or_(
+                        AssessmentRun.started_at <= cutoff,
+                        and_(
+                            AssessmentRun.started_at.is_(None),
+                            AssessmentRun.created_at <= cutoff,
+                        ),
+                    ),
+                )
+                .order_by(AssessmentRun.id)
+            )
+        ).all()
+        failed_ids: list[UUID] = []
+        for run_id in run_ids:
+            run_event_id = await session.scalar(
+                select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+            )
+            if run_event_id is None:
+                continue
+            _, run = await self._lock_event_then_run(
+                session,
+                run_event_id,
+                run_id,
+            )
+            if (
+                run is None
+                or run.status != "running"
+            ):
+                continue
+            effective_started_at = run.started_at or run.created_at
+            if effective_started_at > cutoff:
+                continue
+            self._apply_timeout_failure(
+                run,
+                observed_at,
+                safety_timeout_seconds,
+            )
+            tasks = (
+                await session.scalars(
+                    select(AssessmentTask)
+                    .where(
+                        AssessmentTask.run_id == run.id,
+                        AssessmentTask.status.in_(("pending", "running")),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            for task in tasks:
+                task.status = "failed"
+                task.completed_at = observed_at
+                task.last_error = run.last_error
+            failed_ids.append(run_id)
+        return failed_ids
+
+    async def _lock_event_then_run(
+        self,
+        session: AsyncSession,
+        event_id: object,
+        run_id: object | None = None,
+    ) -> tuple[EarthquakeEvent, AssessmentRun | None]:
+        event = await session.get(
+            EarthquakeEvent,
+            event_id,
+            with_for_update=True,
+        )
+        if event is None:
+            raise LookupError("assessment event not found")
+        if run_id is None:
+            return event, None
+        run = await session.get(
+            AssessmentRun,
+            run_id,
+            with_for_update=True,
+        )
+        return event, run
+
+    async def _publish_products(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> None:
+        now = datetime.now(UTC)
+        products = (
+            await session.scalars(
+                select(IntensityFieldProduct).where(
+                    IntensityFieldProduct.run_id == run_id
+                )
+            )
+        ).all()
+        for product in products:
+            if product.published_at is None:
+                product.published_at = now
+
+    @staticmethod
+    def _apply_timeout_failure(
+        run: AssessmentRun,
+        observed_at: datetime,
+        safety_timeout_seconds: int,
+    ) -> None:
+        if run.deadline_exceeded_at is None and observed_at > run.deadline_at:
+            run.deadline_exceeded_at = observed_at
+        started_at = run.started_at or run.created_at
+        run.status = "failed"
+        run.completed_at = observed_at
+        run.duration_ms = int((observed_at - started_at).total_seconds() * 1000)
+        run.last_error = (
+            "assessment workflow safety timeout exceeded after "
+            f"{safety_timeout_seconds} seconds"
+        )
 
 
 def _validate_trigger_identity(
@@ -557,3 +800,9 @@ def _validate_trigger_identity(
         raise ValueError("outbox does not belong to revision")
     if outbox.trigger_type != "assessment.requested":
         raise ValueError("outbox is not an assessment request")
+
+
+def _normalize_utc(value: datetime, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must include timezone information")
+    return value.astimezone(UTC)

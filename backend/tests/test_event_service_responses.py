@@ -151,6 +151,16 @@ class _AtomicSessionFactory:
         return self.session
 
 
+class _AtomicRegionRepository:
+    async def get_active(self, session: object):
+        del session
+        return type(
+            "_ActiveBoundary",
+            (),
+            {"version": "atomic-boundary-v1"},
+        )()
+
+
 class _AtomicRepository:
     def __init__(
         self,
@@ -352,7 +362,11 @@ async def test_repository_keeps_previous_revision_snapshot_after_recalculation()
 async def test_service_commits_revision_and_suggestion_in_one_transaction() -> None:
     events: list[str] = []
     repository = _AtomicRepository(events)
-    service = EventService(_AtomicSessionFactory(events), repository=repository)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+    )
 
     outcome = await service.ingest_with_response_suggestion(
         _payload(),
@@ -388,7 +402,11 @@ async def test_service_commits_revision_and_suggestion_in_one_transaction() -> N
 async def test_service_rolls_back_revision_when_suggestion_persist_fails() -> None:
     events: list[str] = []
     repository = _AtomicRepository(events, suggestion_error=True)
-    service = EventService(_AtomicSessionFactory(events), repository=repository)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+    )
 
     with pytest.raises(RuntimeError, match="suggestion failure"):
         await service.ingest_with_response_suggestion(
@@ -414,7 +432,11 @@ async def test_service_rolls_back_revision_when_suggestion_persist_fails() -> No
 async def test_service_without_context_returns_existing_current_suggestion() -> None:
     events: list[str] = []
     repository = _AtomicRepository(events, current_levels=("larger", 3))
-    service = EventService(_AtomicSessionFactory(events), repository=repository)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+    )
 
     outcome = await service.ingest_with_response_suggestion(
         _payload(),
@@ -430,7 +452,11 @@ async def test_service_without_context_returns_existing_current_suggestion() -> 
 async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
     events: list[str] = []
     repository = _AtomicRepository(events, enqueue_result=False)
-    service = EventService(_AtomicSessionFactory(events), repository=repository)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+    )
 
     outcome = await service.ingest_with_response_suggestion(
         _payload(),
@@ -449,7 +475,11 @@ async def test_non_current_formal_with_context_keeps_current_suggestion() -> Non
         current_levels=("larger", 3),
         append_is_current=False,
     )
-    service = EventService(_AtomicSessionFactory(events), repository=repository)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+    )
 
     outcome = await service.ingest_with_response_suggestion(
         _payload(),

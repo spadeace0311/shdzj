@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -17,6 +17,7 @@ from app.events.response_rules import (
     ResponseRuleEngine,
 )
 from app.regions.domain import RegionContext
+from app.regions.repository import RegionRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,9 +50,11 @@ class EventService:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         repository: EventRepository | None = None,
+        region_repository: RegionRepository | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._repository = repository or EventRepository(session_factory)
+        self._region_repository = region_repository or RegionRepository(session_factory)
 
     async def ingest(
         self,
@@ -133,6 +136,11 @@ class EventService:
         async with self._session_factory() as session:
             async with session.begin():
                 await self._repository.acquire_ingest_lock(session, event.source)
+                region_context = await self._resolve_assessment_boundary(
+                    session,
+                    event,
+                    region_context,
+                )
                 raw = await self._repository.get_or_create_raw_message(
                     session,
                     raw_payload,
@@ -203,6 +211,31 @@ class EventService:
             service_level=service_level,
             t1_at=t1_at,
         )
+
+    async def _resolve_assessment_boundary(
+        self,
+        session: AsyncSession,
+        event: NormalizedEvent,
+        region_context: RegionContext | None,
+    ) -> RegionContext | None:
+        if event.kind not in {EventKind.FORMAL, EventKind.CORRECTION}:
+            return region_context
+        if region_context is not None and region_context.boundary_version:
+            return region_context
+        active = await self._region_repository.get_active(session)
+        if active is None:
+            raise ValueError(
+                "active region boundary is required for formal and correction "
+                "assessment ingestion"
+            )
+        if region_context is None:
+            return RegionContext(
+                inside_shanghai=None,
+                distance_to_boundary_km=None,
+                boundary_version=active.version,
+                computed_at=datetime.now(UTC),
+            )
+        return replace(region_context, boundary_version=active.version)
 
     async def list_events(self) -> list[EventSummaryRecord]:
         async with self._session_factory() as session:

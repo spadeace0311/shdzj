@@ -226,7 +226,7 @@ def _to_domain_region_context(
     return DomainRegionContext(
         inside_shanghai=region_context.inside_shanghai,
         distance_to_boundary_km=region_context.distance_to_boundary_km,
-        boundary_version=None,
+        boundary_version=region_context.boundary_version,
         computed_at=datetime.now(UTC),
     )
 

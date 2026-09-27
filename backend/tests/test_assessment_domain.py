@@ -27,7 +27,7 @@ def test_assessment_settings_defaults() -> None:
     assert configured.assessment_outbox_batch_size == 20
     assert configured.assessment_outbox_max_attempts == 10
     assert configured.assessment_outbox_lease_seconds == 60
-    assert configured.assessment_workflow_deadline_seconds == 300
+    assert not hasattr(configured, "assessment_workflow_deadline_seconds")
     assert configured.intensity_parameters_path.endswith("shanghai-2019.yaml")
     assert configured.intensity_region_profile_path.endswith("shanghai-region.yaml")
     assert configured.assessment_workflow_safety_timeout_seconds == 1800
@@ -44,7 +44,6 @@ def test_assessment_settings_validate_bounded_values() -> None:
         {"assessment_outbox_max_attempts": 0},
         {"assessment_outbox_max_attempts": 101},
         {"assessment_outbox_lease_seconds": 0},
-        {"assessment_workflow_deadline_seconds": 0},
         {"intensity_parameters_path": " "},
         {"intensity_region_profile_path": ""},
         {"assessment_workflow_safety_timeout_seconds": 0},
