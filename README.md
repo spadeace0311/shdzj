@@ -105,7 +105,9 @@ collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx 
 - 快速评估报告。
 - 工作组响应任务。
 
-当前只实现评估运行和任务骨架。烈度、损失、制图、报告算法、成果流转和 AI 问答仍未实现。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+当前已实现 `intensity.model`、`intensity.instrument` 和 `intensity.fusion`。模型和融合完成是运行成功的必要条件；仪器缺失或失败会保存 `unavailable`/`invalid` 产品，并由融合回退到 `model_only`/`F3`，不会导致运行失败。损失、制图、报告文件、成果流转和 AI 问答仍不在本阶段范围内，对应任务保持 `skipped`。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+
+烈度评估的启动、正式报核验、产品检查、更正语义、超时处理、仪器降级和栅格备份请参阅 [烈度评估运行手册](docs/runbooks/intensity-assessment.md)。
 
 评估编排的启动、健康检查、Outbox 查询、死信安全重放、Workflow 核验和 Worker 恢复请参阅 [评估编排运行手册](docs/runbooks/assessment-orchestration.md)。
 
