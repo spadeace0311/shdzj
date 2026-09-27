@@ -66,11 +66,22 @@ def fuse(
             0.0,
         )
         total_weight = model_weight + instrument_weight
-        fused_values = (
+        fused_candidate = (
             model_weight * model_values + instrument_weight * instrument.values
         ) / total_weight
-        fused_sigma = np.sqrt(1.0 / total_weight)
-        coverage = float(valid.sum() / model_values.size)
+        fused_values = np.where(
+            instrument_weight > 0,
+            fused_candidate,
+            model_values,
+        )
+        fused_sigma = np.where(
+            instrument_weight > 0,
+            np.sqrt(1.0 / total_weight),
+            model_sigma,
+        )
+        coverage = float(
+            np.count_nonzero(valid & (q > 0)) / model_values.size
+        )
         if bool(instrument_weight.any()):
             mode = FusionMode.FULL
 
@@ -96,15 +107,20 @@ def _quality_codes(
     shape: tuple[int, ...],
     source_codes: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    flat_codes = source_codes.reshape(-1)
     valid = np.asarray(
         [
             str(code) in _VALID_INSTRUMENT_QUALITY
-            for code in source_codes.reshape(-1)
+            for code in flat_codes
         ],
         dtype=bool,
     ).reshape(shape)
     quality_codes = np.full(shape, InstrumentQuality.Q0.value, dtype=object)
-    quality_codes[valid] = np.asarray(source_codes, dtype=object)[valid]
+    valid_indices = np.flatnonzero(valid)
+    quality_codes.flat[valid_indices] = [
+        InstrumentQuality(str(flat_codes[index])).value
+        for index in valid_indices
+    ]
     return quality_codes, valid
 
 
