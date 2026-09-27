@@ -5,7 +5,6 @@ from geoalchemy2 import Geometry, Raster
 from sqlalchemy import (
     DateTime,
     ForeignKey,
-    Index,
     Integer,
     Numeric,
     String,
@@ -36,7 +35,6 @@ class AssessmentTaskAttempt(Base):
     )
     task_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("assessment_tasks.id", ondelete="CASCADE"),
-        index=True,
     )
     attempt_number: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), index=True)
@@ -56,7 +54,6 @@ class IntensityFieldProduct(Base):
     __tablename__ = "intensity_field_products"
     __table_args__ = (
         UniqueConstraint("run_id", "product_type", name="uq_intensity_product_run_type"),
-        Index("ix_intensity_products_run_type", "run_id", "product_type"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -66,7 +63,6 @@ class IntensityFieldProduct(Base):
     )
     run_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("assessment_runs.id", ondelete="CASCADE"),
-        index=True,
     )
     task_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("assessment_tasks.id", ondelete="CASCADE"),
@@ -84,7 +80,7 @@ class IntensityFieldProduct(Base):
     output_checksum: Mapped[str | None] = mapped_column(String(64))
     quality_grade: Mapped[str | None] = mapped_column(String(16), index=True)
     coverage_ratio: Mapped[float] = mapped_column(Numeric(8, 6), default=0)
-    spatial_extent = mapped_column(
+    spatial_extent: Mapped[object | None] = mapped_column(
         Geometry(geometry_type="POLYGON", srid=4326),
         nullable=True,
     )
@@ -110,7 +106,6 @@ class IntensityRaster(Base):
     product_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("intensity_field_products.id", ondelete="CASCADE"),
         unique=True,
-        index=True,
     )
     rast: Mapped[object] = mapped_column(Raster)
     band_manifest: Mapped[dict] = mapped_column(JSONB)

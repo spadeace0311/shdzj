@@ -397,6 +397,195 @@ async def _intensity_tables_exist() -> bool:
     } <= names
 
 
+async def _intensity_schema_state() -> dict[str, object]:
+    tables = (
+        "assessment_runs",
+        "assessment_tasks",
+        "earthquake_events",
+        "assessment_task_attempts",
+        "intensity_field_products",
+        "intensity_rasters",
+    )
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync: {
+                    table: {column["name"] for column in inspect(sync).get_columns(table)}
+                    for table in tables
+                    if table in inspect(sync).get_table_names()
+                }
+            )
+            foreign_key_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT
+                                conrelid::regclass::text AS table_name,
+                                pg_get_constraintdef(oid) AS definition
+                            FROM pg_constraint
+                            WHERE contype = 'f'
+                            """
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            unique_constraint_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT
+                                conname,
+                                conrelid::regclass::text AS table_name,
+                                pg_get_constraintdef(oid) AS definition
+                            FROM pg_constraint
+                            WHERE contype = 'u'
+                            """
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            index_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT indexname
+                            FROM pg_indexes
+                            WHERE schemaname = current_schema()
+                            """
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+        return {
+            "columns": columns,
+            "foreign_keys": {
+                (row["table_name"], row["definition"])
+                for row in foreign_key_rows
+                if row["table_name"] in tables
+            },
+            "unique_constraints": {
+                (row["table_name"], row["conname"], row["definition"])
+                for row in unique_constraint_rows
+                if row["table_name"] in tables
+            },
+            "indexes": {
+                row["indexname"]
+                for row in index_rows
+            },
+        }
+    finally:
+        await engine.dispose()
+
+
+def _intensity_added_columns(state: dict[str, object]) -> set[tuple[str, str]]:
+    columns = state["columns"]
+    expected = {
+        ("assessment_runs", "report_ingested_at"),
+        ("assessment_runs", "deadline_basis_at"),
+        ("assessment_runs", "deadline_exceeded_at"),
+        ("assessment_runs", "duration_ms"),
+        ("assessment_runs", "algorithm_bundle_version"),
+        ("assessment_runs", "superseded_by_run_id"),
+        ("assessment_runs", "superseded_at"),
+        ("assessment_tasks", "input_fingerprint"),
+        ("assessment_tasks", "output_checksum"),
+        ("assessment_tasks", "algorithm_version"),
+        ("earthquake_events", "latest_assessment_run_id"),
+        ("earthquake_events", "effective_assessment_run_id"),
+    }
+    return {
+        (table, column)
+        for table, column in expected
+        if column in columns.get(table, set())
+    }
+
+
+def _intensity_added_foreign_keys(state: dict[str, object]) -> set[tuple[str, str]]:
+    expected = {
+        (
+            "assessment_runs",
+            "FOREIGN KEY (superseded_by_run_id) REFERENCES assessment_runs(id) ON DELETE SET NULL",
+        ),
+        (
+            "earthquake_events",
+            "FOREIGN KEY (latest_assessment_run_id) REFERENCES assessment_runs(id) ON DELETE SET NULL",
+        ),
+        (
+            "earthquake_events",
+            "FOREIGN KEY (effective_assessment_run_id) REFERENCES assessment_runs(id) ON DELETE SET NULL",
+        ),
+        (
+            "assessment_task_attempts",
+            "FOREIGN KEY (task_id) REFERENCES assessment_tasks(id) ON DELETE CASCADE",
+        ),
+        (
+            "intensity_field_products",
+            "FOREIGN KEY (run_id) REFERENCES assessment_runs(id) ON DELETE CASCADE",
+        ),
+        (
+            "intensity_field_products",
+            "FOREIGN KEY (task_id) REFERENCES assessment_tasks(id) ON DELETE CASCADE",
+        ),
+        (
+            "intensity_rasters",
+            "FOREIGN KEY (product_id) REFERENCES intensity_field_products(id) ON DELETE CASCADE",
+        ),
+    }
+    return state["foreign_keys"] & expected
+
+
+def _intensity_added_unique_constraints(
+    state: dict[str, object],
+) -> set[tuple[str, str, str]]:
+    expected = {
+        (
+            "assessment_task_attempts",
+            "uq_assessment_task_attempts_number",
+            "UNIQUE (task_id, attempt_number)",
+        ),
+        (
+            "intensity_field_products",
+            "uq_intensity_product_run_type",
+            "UNIQUE (run_id, product_type)",
+        ),
+        (
+            "intensity_rasters",
+            "intensity_rasters_product_id_key",
+            "UNIQUE (product_id)",
+        ),
+    }
+    return state["unique_constraints"] & expected
+
+
+def _intensity_added_indexes(state: dict[str, object]) -> set[str]:
+    expected = {
+        "ix_assessment_runs_report_ingested_at",
+        "ix_assessment_runs_deadline_basis_at",
+        "ix_assessment_runs_superseded_by_run_id",
+        "ix_assessment_tasks_input_fingerprint",
+        "ix_assessment_task_attempts_status",
+        "ix_intensity_products_task_id",
+        "ix_intensity_products_product_type",
+        "ix_intensity_products_status",
+        "ix_intensity_products_quality_grade",
+        "ix_intensity_products_source_product_id",
+        "ix_earthquake_events_latest_assessment_run_id",
+        "ix_earthquake_events_effective_assessment_run_id",
+    }
+    return state["indexes"] & expected
+
+
 async def test_0010_assessment_orchestration_is_reversible() -> None:
     _set_revision(NON_CENC_REVISION)
     assert await _assessment_orchestration_tables_exist() is False
@@ -417,11 +606,26 @@ async def test_0010_assessment_orchestration_is_reversible() -> None:
 async def test_0011_intensity_assessment_is_reversible() -> None:
     _set_revision(INTENSITY_PREVIOUS_REVISION)
     assert await _intensity_tables_exist() is False
+    previous_state = await _intensity_schema_state()
+    assert _intensity_added_columns(previous_state) == set()
+    assert _intensity_added_foreign_keys(previous_state) == set()
+    assert _intensity_added_unique_constraints(previous_state) == set()
+    assert _intensity_added_indexes(previous_state) == set()
     try:
         _set_revision(LATEST_REVISION)
         assert await _intensity_tables_exist() is True
+        head_state = await _intensity_schema_state()
+        assert len(_intensity_added_columns(head_state)) == 12
+        assert len(_intensity_added_foreign_keys(head_state)) == 7
+        assert len(_intensity_added_unique_constraints(head_state)) == 3
+        assert len(_intensity_added_indexes(head_state)) == 12
         _set_revision(INTENSITY_PREVIOUS_REVISION)
         assert await _intensity_tables_exist() is False
+        downgraded_state = await _intensity_schema_state()
+        assert _intensity_added_columns(downgraded_state) == set()
+        assert _intensity_added_foreign_keys(downgraded_state) == set()
+        assert _intensity_added_unique_constraints(downgraded_state) == set()
+        assert _intensity_added_indexes(downgraded_state) == set()
         _set_revision(LATEST_REVISION)
     finally:
         _set_revision(LATEST_REVISION)

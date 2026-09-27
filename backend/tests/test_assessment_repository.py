@@ -130,6 +130,8 @@ async def test_repository_creates_run_and_nine_tasks_idempotently(session_factor
     assert first.run_no == 1
     assert first.t1_at == datetime(2026, 9, 26, 1, 3, tzinfo=UTC)
     assert first.deadline_at == datetime(2026, 9, 26, 1, 8, tzinfo=UTC)
+    assert first.report_ingested_at == first.t1_at
+    assert first.deadline_basis_at == first.t1_at
     assert first.snapshot == {
         "event_id": str(event.id),
         "revision_id": str(revision.id),

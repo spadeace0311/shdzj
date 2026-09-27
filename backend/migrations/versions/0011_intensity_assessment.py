@@ -122,11 +122,6 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
-        "ix_assessment_task_attempts_task_id",
-        "assessment_task_attempts",
-        ["task_id"],
-    )
-    op.create_index(
         "ix_assessment_task_attempts_status",
         "assessment_task_attempts",
         ["status"],
@@ -183,13 +178,11 @@ def upgrade() -> None:
         ),
     )
     for name, columns in (
-        ("ix_intensity_products_run_id", ["run_id"]),
         ("ix_intensity_products_task_id", ["task_id"]),
         ("ix_intensity_products_product_type", ["product_type"]),
         ("ix_intensity_products_status", ["status"]),
         ("ix_intensity_products_quality_grade", ["quality_grade"]),
         ("ix_intensity_products_source_product_id", ["source_product_id"]),
-        ("ix_intensity_products_run_type", ["run_id", "product_type"]),
     ):
         op.create_index(name, "intensity_field_products", columns)
 
@@ -217,12 +210,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("product_id"),
     )
-    op.create_index(
-        "ix_intensity_rasters_product_id",
-        "intensity_rasters",
-        ["product_id"],
-    )
-
     op.add_column(
         "earthquake_events",
         sa.Column(
@@ -289,26 +276,19 @@ def downgrade() -> None:
     op.drop_column("earthquake_events", "effective_assessment_run_id")
     op.drop_column("earthquake_events", "latest_assessment_run_id")
 
-    op.drop_index("ix_intensity_rasters_product_id", table_name="intensity_rasters")
     op.drop_table("intensity_rasters")
     for name in (
-        "ix_intensity_products_run_type",
         "ix_intensity_products_source_product_id",
         "ix_intensity_products_quality_grade",
         "ix_intensity_products_status",
         "ix_intensity_products_product_type",
         "ix_intensity_products_task_id",
-        "ix_intensity_products_run_id",
     ):
         op.drop_index(name, table_name="intensity_field_products")
     op.drop_table("intensity_field_products")
 
     op.drop_index(
         "ix_assessment_task_attempts_status",
-        table_name="assessment_task_attempts",
-    )
-    op.drop_index(
-        "ix_assessment_task_attempts_task_id",
         table_name="assessment_task_attempts",
     )
     op.drop_table("assessment_task_attempts")

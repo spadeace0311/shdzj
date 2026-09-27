@@ -60,6 +60,8 @@ class AssessmentRepository:
             status="pending",
             priority=max(task.priority for task in plan),
             t1_at=canonical.t1_at,
+            report_ingested_at=canonical.t1_at,
+            deadline_basis_at=canonical.t1_at,
             deadline_at=canonical.t1_at + timedelta(seconds=deadline_seconds),
             snapshot={
                 "event_id": str(canonical.id),
