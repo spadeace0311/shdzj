@@ -31,6 +31,13 @@ def test_assessment_orm_metadata_contract() -> None:
         "completed_at",
         "snapshot",
         "last_error",
+        "report_ingested_at",
+        "deadline_basis_at",
+        "deadline_exceeded_at",
+        "duration_ms",
+        "algorithm_bundle_version",
+        "superseded_by_run_id",
+        "superseded_at",
         "created_at",
         "updated_at",
     } <= set(runs.c.keys())
@@ -50,6 +57,9 @@ def test_assessment_orm_metadata_contract() -> None:
         "max_attempts",
         "result",
         "last_error",
+        "input_fingerprint",
+        "output_checksum",
+        "algorithm_version",
         "created_at",
         "updated_at",
     } <= set(tasks.c.keys())
@@ -58,6 +68,7 @@ def test_assessment_orm_metadata_contract() -> None:
         "earthquake_events.id",
         "earthquake_revisions.id",
         "event_lifecycle_outbox.id",
+        "assessment_runs.id",
     } == {foreign_key.target_fullname for foreign_key in runs.foreign_keys}
     assert {"assessment_runs.id"} == {
         foreign_key.target_fullname for foreign_key in tasks.foreign_keys
@@ -135,6 +146,13 @@ async def test_assessment_orchestration_schema_contract() -> None:
         "t1_at",
         "deadline_at",
         "snapshot",
+        "report_ingested_at",
+        "deadline_basis_at",
+        "deadline_exceeded_at",
+        "duration_ms",
+        "algorithm_bundle_version",
+        "superseded_by_run_id",
+        "superseded_at",
     } <= schema["columns"]["assessment_runs"]
     assert {
         "run_id",
@@ -147,4 +165,7 @@ async def test_assessment_orchestration_schema_contract() -> None:
         "deadline_at",
         "attempt_count",
         "max_attempts",
+        "input_fingerprint",
+        "output_checksum",
+        "algorithm_version",
     } <= schema["columns"]["assessment_tasks"]

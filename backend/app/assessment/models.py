@@ -58,6 +58,16 @@ class AssessmentRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     snapshot: Mapped[dict] = mapped_column(JSONB)
     last_error: Mapped[str | None] = mapped_column(Text)
+    report_ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    deadline_basis_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    deadline_exceeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    algorithm_bundle_version: Mapped[str | None] = mapped_column(String(128))
+    superseded_by_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessment_runs.id", ondelete="SET NULL", use_alter=True),
+        index=True,
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
@@ -115,6 +125,9 @@ class AssessmentTask(Base):
     )
     result: Mapped[dict | None] = mapped_column(JSONB)
     last_error: Mapped[str | None] = mapped_column(Text)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    output_checksum: Mapped[str | None] = mapped_column(String(64))
+    algorithm_version: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),

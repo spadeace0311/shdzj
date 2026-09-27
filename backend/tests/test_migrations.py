@@ -14,7 +14,8 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0010_assessment_orchestration"
+LATEST_REVISION = "0011_intensity_assessment"
+INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 NON_CENC_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"
@@ -382,6 +383,20 @@ async def _assessment_orchestration_tables_exist() -> bool:
     return {"assessment_runs", "assessment_tasks"} <= table_names
 
 
+async def _intensity_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    async with engine.connect() as connection:
+        names = await connection.run_sync(
+            lambda sync: set(inspect(sync).get_table_names())
+        )
+    await engine.dispose()
+    return {
+        "assessment_task_attempts",
+        "intensity_field_products",
+        "intensity_rasters",
+    } <= names
+
+
 async def test_0010_assessment_orchestration_is_reversible() -> None:
     _set_revision(NON_CENC_REVISION)
     assert await _assessment_orchestration_tables_exist() is False
@@ -395,6 +410,19 @@ async def test_0010_assessment_orchestration_is_reversible() -> None:
 
         _set_revision(LATEST_REVISION)
         assert await _assessment_orchestration_tables_exist() is True
+    finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0011_intensity_assessment_is_reversible() -> None:
+    _set_revision(INTENSITY_PREVIOUS_REVISION)
+    assert await _intensity_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        assert await _intensity_tables_exist() is True
+        _set_revision(INTENSITY_PREVIOUS_REVISION)
+        assert await _intensity_tables_exist() is False
+        _set_revision(LATEST_REVISION)
     finally:
         _set_revision(LATEST_REVISION)
 

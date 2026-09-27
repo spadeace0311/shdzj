@@ -72,6 +72,14 @@ class EarthquakeEvent(Base):
         index=True,
     )
     latest_trigger_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    latest_assessment_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessment_runs.id", ondelete="SET NULL", use_alter=True),
+        index=True,
+    )
+    effective_assessment_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("assessment_runs.id", ondelete="SET NULL", use_alter=True),
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
