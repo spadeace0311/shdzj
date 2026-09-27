@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,7 +8,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 from pyproj import CRS
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.intensity.artifacts import RasterCodec
@@ -16,7 +17,10 @@ from app.intensity.domain import (
     ProductStatus,
     ProductType,
 )
+from app.intensity.grid import grid_definition_from_bounds
 from app.intensity.models import IntensityFieldProduct, IntensityRaster
+from app.intensity.region import RegionProfile
+from app.regions.models import RegionBoundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +44,113 @@ class IntensityProductWrite:
     bands: list[tuple[str, np.ndarray]]
 
 
+@dataclass(frozen=True, slots=True)
+class ProductArrays:
+    product_id: UUID
+    product_type: str
+    status: str
+    bands: dict[str, np.ndarray]
+    statistics: dict
+
+
 class IntensityRepository:
+    async def resolve_grid_definition(
+        self,
+        session: AsyncSession,
+        profile: RegionProfile,
+        boundary_version: str,
+    ) -> GridDefinition:
+        boundary = await session.scalar(
+            select(RegionBoundary).where(RegionBoundary.version == boundary_version)
+        )
+        if boundary is None:
+            raise LookupError("region boundary version not found")
+        target_srid = CRS.from_user_input(profile.grid_crs).to_epsg()
+        if target_srid is None:
+            raise ValueError("region profile grid CRS must map to an EPSG code")
+        transformed = func.ST_Transform(RegionBoundary.geom, target_srid)
+        buffered = func.ST_Buffer(transformed, profile.grid_buffer_km * 1000)
+        envelope = func.ST_Envelope(buffered)
+        row = (
+            await session.execute(
+                select(
+                    func.ST_XMin(envelope).label("min_x"),
+                    func.ST_YMin(envelope).label("min_y"),
+                    func.ST_XMax(envelope).label("max_x"),
+                    func.ST_YMax(envelope).label("max_y"),
+                ).where(RegionBoundary.id == boundary.id)
+            )
+        ).one()
+        provisional = grid_definition_from_bounds(
+            min_x=float(row.min_x),
+            min_y=float(row.min_y),
+            max_x=float(row.max_x),
+            max_y=float(row.max_y),
+            resolution_m=profile.grid_resolution_m,
+            crs=profile.grid_crs,
+            version="pending",
+        )
+        identity = {
+            "region_profile_version": profile.version,
+            "boundary_version": boundary_version,
+            "min_x": provisional.origin_x,
+            "min_y": provisional.origin_y - provisional.height * provisional.resolution_m,
+            "max_x": provisional.origin_x + provisional.width * provisional.resolution_m,
+            "max_y": provisional.origin_y,
+            "resolution_m": provisional.resolution_m,
+            "crs": provisional.crs,
+        }
+        checksum = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return GridDefinition(
+            version=f"{profile.version}:{boundary.version}:{checksum[:16]}",
+            crs=provisional.crs,
+            resolution_m=provisional.resolution_m,
+            origin_x=provisional.origin_x,
+            origin_y=provisional.origin_y,
+            width=provisional.width,
+            height=provisional.height,
+        )
+
+    async def load_product_arrays(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+        product_type: ProductType,
+    ) -> ProductArrays | None:
+        product = await session.scalar(
+            select(IntensityFieldProduct).where(
+                IntensityFieldProduct.run_id == run_id,
+                IntensityFieldProduct.product_type == product_type.value,
+            )
+        )
+        if product is None:
+            return None
+        if product.status not in {
+            ProductStatus.AVAILABLE.value,
+            ProductStatus.PARTIAL.value,
+        }:
+            return ProductArrays(
+                product_id=product.id,
+                product_type=product.product_type,
+                status=product.status,
+                bands={},
+                statistics=dict(product.statistics),
+            )
+        raster_bands, manifest = await self.load_raster(session, product.id)
+        names = [item["name"] for item in manifest.get("bands", [])]
+        if len(names) != len(raster_bands):
+            raise ValueError("raster band manifest does not match raster")
+        return ProductArrays(
+            product_id=product.id,
+            product_type=product.product_type,
+            status=product.status,
+            bands=dict(zip(names, raster_bands, strict=True)),
+            statistics=dict(product.statistics),
+        )
+
     async def save_product(
         self,
         session: AsyncSession,

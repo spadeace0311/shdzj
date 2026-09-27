@@ -324,6 +324,25 @@ class AssessmentRepository:
             attempt.completed_at = now
         return task
 
+    async def mark_deadline_exceeded(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        observed_at: datetime,
+    ) -> bool:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            raise LookupError("assessment run not found")
+        if run.deadline_exceeded_at is not None:
+            return False
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        observed_at = observed_at.astimezone(UTC)
+        if observed_at <= run.deadline_at:
+            return False
+        run.deadline_exceeded_at = observed_at
+        return True
+
     async def start_run(
         self,
         session: AsyncSession,
