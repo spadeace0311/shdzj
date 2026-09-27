@@ -36,6 +36,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "performance: integration benchmarks that use the full configured grid",
+]
 
 [tool.ruff]
 line-length = 100
