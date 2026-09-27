@@ -31,3 +31,12 @@ def test_raster_codec_round_trip_preserves_values_and_georeference() -> None:
     assert metadata["crs"] == "EPSG:32651"
     assert metadata["width"] == 2
     assert metadata["height"] == 2
+    assert metadata["grid_definition_version"] == "grid-1"
+    assert metadata["origin_x"] == 500000.0
+    assert metadata["origin_y"] == 3500000.0
+    assert metadata["resolution_m"] == 1000.0
+    assert metadata["srid"] == 32651
+    assert metadata["bands"] == [
+        {"number": 1, "name": "value"},
+        {"number": 2, "name": "sigma"},
+    ]

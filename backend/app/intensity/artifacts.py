@@ -75,13 +75,19 @@ class RasterCodec:
                     dataset.read(index)
                     for index in range(1, dataset.count + 1)
                 ]
+                tags = dataset.tags()
+                band_manifest = json.loads(tags["band_manifest"]) if "band_manifest" in tags else {}
+                transform = dataset.transform
                 metadata = {
                     "crs": dataset.crs.to_string(),
                     "width": dataset.width,
                     "height": dataset.height,
-                    "grid_definition_version": dataset.tags().get(
-                        "grid_definition_version"
-                    ),
+                    "srid": dataset.crs.to_epsg(),
+                    "origin_x": float(transform.c),
+                    "origin_y": float(transform.f),
+                    "resolution_m": float(transform.a),
+                    "grid_definition_version": tags.get("grid_definition_version"),
+                    "bands": band_manifest.get("bands"),
                 }
         return bands, metadata
 

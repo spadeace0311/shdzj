@@ -16,7 +16,7 @@ from app.intensity.domain import (
     ProductStatus,
     ProductType,
 )
-from app.intensity.models import IntensityFieldProduct
+from app.intensity.models import IntensityFieldProduct, IntensityRaster
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +56,24 @@ class IntensityRepository:
         if existing is not None:
             if existing.input_fingerprint != write.input_fingerprint:
                 raise ValueError("published product fingerprint cannot be overwritten")
+            raster_id = await session.scalar(
+                select(IntensityRaster.id)
+                .where(IntensityRaster.product_id == existing.id)
+                .limit(1)
+            )
+            if (
+                existing.completed_at is None
+                or existing.output_checksum is None
+                or raster_id is None
+            ):
+                raise ValueError("existing intensity product is incomplete")
             return existing.id
+
+        if not write.bands and write.status in {
+            ProductStatus.AVAILABLE,
+            ProductStatus.PARTIAL,
+        }:
+            raise ValueError("available or partial intensity product requires raster bands")
 
         product_id = uuid4()
         product = IntensityFieldProduct(
@@ -153,6 +170,23 @@ class IntensityRepository:
                 ),
                 bindings,
             )
+            persisted_values = await _dump_band_values(
+                session,
+                product_id,
+                expected_count=len(write.bands),
+            )
+            persisted_bands = [
+                (name, values)
+                for (name, _), values in zip(write.bands, persisted_values)
+            ]
+            reconstructed_payload = RasterCodec.encode(
+                write.grid_definition,
+                persisted_bands,
+                manifest,
+            )
+            if RasterCodec.checksum(reconstructed_payload) != checksum:
+                raise RuntimeError("intensity raster checksum verification failed")
+
             await session.execute(
                 text(
                     """
@@ -174,8 +208,6 @@ class IntensityRepository:
                 },
             )
             product.output_checksum = checksum
-            product.completed_at = now
-        else:
             product.completed_at = now
 
         return product_id
@@ -245,23 +277,7 @@ class IntensityRepository:
             origin_x,
             origin_y,
         ) = raster_metadata
-        raw_bands = (
-            await session.scalars(
-                text(
-                    """
-                    SELECT ST_DumpValues(rast, band_number, false)
-                    FROM intensity_rasters
-                    CROSS JOIN LATERAL generate_series(
-                        1,
-                        ST_NumBands(rast)
-                    ) AS band_number
-                    WHERE product_id = :product_id
-                    ORDER BY band_number
-                    """
-                ),
-                {"product_id": product_id},
-            )
-        ).all()
+        raw_bands = await _dump_band_values(session, product_id)
         if not raw_bands:
             raise LookupError("intensity raster has no bands")
 
@@ -273,6 +289,7 @@ class IntensityRepository:
             "crs": CRS.from_epsg(srid).to_string() if srid else None,
             "width": int(width),
             "height": int(height),
+            "srid": int(srid),
             "resolution_m": abs(float(scale_x)),
             "origin_x": float(origin_x),
             "origin_y": float(origin_y),
@@ -292,6 +309,34 @@ class IntensityRepository:
         if manifest is not None:
             metadata["bands"] = manifest["bands"]
         return bands, metadata
+
+
+async def _dump_band_values(
+    session: AsyncSession,
+    product_id: UUID,
+    *,
+    expected_count: int | None = None,
+) -> list[np.ndarray]:
+    values = (
+        await session.scalars(
+            text(
+                """
+                SELECT ST_DumpValues(rast, band_number, false)
+                FROM intensity_rasters
+                CROSS JOIN LATERAL generate_series(
+                    1,
+                    ST_NumBands(rast)
+                ) AS band_number
+                WHERE product_id = :product_id
+                ORDER BY band_number
+                """
+            ),
+            {"product_id": product_id},
+        )
+    ).all()
+    if expected_count is not None and len(values) != expected_count:
+        raise RuntimeError("intensity raster band count verification failed")
+    return [np.asarray(value, dtype=np.float64) for value in values]
 
 
 def _raster_expression(band_count: int) -> str:
