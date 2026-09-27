@@ -164,17 +164,26 @@ class IntensityRepository:
         )
         now = datetime.now(UTC)
         if existing is not None:
-            raster_id = await session.scalar(
-                select(IntensityRaster.id)
-                .where(IntensityRaster.product_id == existing.id)
-                .limit(1)
-            )
-            if (
-                existing.completed_at is None
-                or existing.output_checksum is None
-                or raster_id is None
-            ):
-                raise ValueError("existing intensity product is incomplete")
+            raster_required = write.status in {
+                ProductStatus.AVAILABLE,
+                ProductStatus.PARTIAL,
+            }
+            if raster_required:
+                raster_id = await session.scalar(
+                    select(IntensityRaster.id)
+                    .where(IntensityRaster.product_id == existing.id)
+                    .limit(1)
+                )
+                if (
+                    existing.completed_at is None
+                    or existing.output_checksum is None
+                    or raster_id is None
+                ):
+                    raise ValueError("existing intensity product is incomplete")
+            elif existing.completed_at is None:
+                existing.completed_at = now
+            if existing.status != write.status.value:
+                raise ValueError("published product status cannot be overwritten")
             if existing.algorithm_version != write.algorithm_version:
                 raise ValueError("published product algorithm version cannot be overwritten")
             if existing.input_fingerprint != write.input_fingerprint:
@@ -320,6 +329,8 @@ class IntensityRepository:
                 },
             )
             product.output_checksum = checksum
+            product.completed_at = now
+        else:
             product.completed_at = now
 
         return product_id

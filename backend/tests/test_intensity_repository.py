@@ -314,7 +314,7 @@ async def test_available_product_without_bands_is_rejected(session_factory) -> N
     assert count == 0
 
 
-async def test_unavailable_product_without_bands_remains_incomplete_and_not_loadable(
+async def test_terminal_product_without_bands_is_complete_and_not_loadable(
     session_factory,
 ) -> None:
     run_id, task_id = await _seed_run(session_factory)
@@ -346,7 +346,7 @@ async def test_unavailable_product_without_bands_remains_incomplete_and_not_load
     async with session_factory() as session:
         product = await session.get(IntensityFieldProduct, product_id)
         assert product is not None
-        assert product.completed_at is None
+        assert product.completed_at is not None
         assert product.output_checksum is None
         with pytest.raises(LookupError, match="raster not found"):
             await repository.load_raster(session, product_id)

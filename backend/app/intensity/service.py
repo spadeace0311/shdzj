@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -19,6 +20,7 @@ from app.intensity.domain import (
     DirectionStatus,
     GridDefinition,
     InstrumentProduct,
+    InstrumentProductFormat,
     IntensityEventSnapshot,
     ModelField,
     ProductStatus,
@@ -36,6 +38,9 @@ from app.intensity.model import FaultCandidate, evaluate_model, resolve_directio
 from app.intensity.parameters import ParameterBundle
 from app.intensity.region import RegionProfile, load_region_profile
 from app.intensity.repository import IntensityProductWrite, IntensityRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +184,25 @@ class IntensityService:
                     _safe_error(exc),
                 )
 
+    async def _record_task_failure_safely(
+        self,
+        run_id: str,
+        task_key: str,
+        exc: Exception,
+    ) -> None:
+        try:
+            await self._record_task_failure(run_id, task_key, exc)
+        except Exception as audit_exc:
+            logger.exception(
+                "intensity task failure audit write failed for run=%s task=%s",
+                run_id,
+                task_key,
+            )
+            exc.add_note(
+                "intensity task failure audit write failed: "
+                f"{type(audit_exc).__name__}: {audit_exc}"
+            )
+
     async def run_model(self, run_id: str) -> IntensityTaskOutcome:
         try:
             async with self.session_factory() as session:
@@ -278,10 +302,7 @@ class IntensityService:
                         output_checksum=output_checksum,
                     )
         except Exception as exc:
-            try:
-                await self._record_task_failure(run_id, "intensity.model", exc)
-            except Exception:
-                pass
+            await self._record_task_failure_safely(run_id, "intensity.model", exc)
             raise
 
     async def run_instrument(self, run_id: str) -> IntensityTaskOutcome:
@@ -427,10 +448,11 @@ class IntensityService:
                         output_checksum=output_checksum,
                     )
         except Exception as exc:
-            try:
-                await self._record_task_failure(run_id, "intensity.instrument", exc)
-            except Exception:
-                pass
+            await self._record_task_failure_safely(
+                run_id,
+                "intensity.instrument",
+                exc,
+            )
             raise
 
     async def run_fusion(self, run_id: str) -> IntensityTaskOutcome:
@@ -591,10 +613,7 @@ class IntensityService:
                         output_checksum=output_checksum,
                     )
         except Exception as exc:
-            try:
-                await self._record_task_failure(run_id, "intensity.fusion", exc)
-            except Exception:
-                pass
+            await self._record_task_failure_safely(run_id, "intensity.fusion", exc)
             raise
 
     async def record_task_failure(
@@ -673,8 +692,8 @@ def _instrument_from_arrays(arrays):
         product_version=arrays.statistics.get("product_version"),
         observed_at=_parse_optional_datetime(arrays.statistics.get("observed_at")),
         source=arrays.statistics.get("source", "instrument"),
-        format=None,
-        source_verified=False,
+        format=_parse_instrument_format(arrays.statistics.get("format")),
+        source_verified=bool(arrays.statistics.get("source_verified", False)),
         grid_version=arrays.statistics.get("grid_definition_version"),
         values=values,
         sigma=sigma,
@@ -697,6 +716,14 @@ def _parse_optional_datetime(value) -> datetime | None:
     return datetime.fromisoformat(str(value))
 
 
+def _parse_instrument_format(value) -> InstrumentProductFormat | None:
+    if value is None or isinstance(value, InstrumentProductFormat):
+        return value
+    return InstrumentProductFormat(str(value))
+
+
+# PostGIS rasters are persisted as float64, so quality codes are encoded
+# deterministically as Q0=0, Q1=1, Q2=2, Q3=3 and decoded back when reloaded.
 _QUALITY_CODE_VALUES = {
     "Q0": 0.0,
     "Q1": 1.0,
@@ -735,6 +762,8 @@ def _instrument_statistics(
         "generated_at": _isoformat_optional(product.generated_at),
         "grid_definition_version": definition.version,
         "coverage_ratio": float(product.coverage_ratio),
+        "format": product.format.value if product.format is not None else None,
+        "source_verified": product.source_verified,
         "raw_checksum": product.raw_checksum,
         "normalized_checksum": product.normalized_checksum,
         "crs": product.crs,
