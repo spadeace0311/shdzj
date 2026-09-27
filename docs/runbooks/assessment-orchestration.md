@@ -341,4 +341,8 @@ docker compose --env-file .env -f infra/compose.yaml logs --tail 200 temporal-wo
 - 当前未验证生产级 Temporal 高可用、TLS、鉴权或多节点 Worker 部署。
 - 修改 Workflow 代码或 Task Queue 前必须评估运行中 Workflow 的兼容性。
 - `intensity_rasters` 是 PostgreSQL/PostGIS 内的 raster 数据，备份策略必须包含该表，不能只备份普通业务表。
+- 真实联调中观察到 `intensity.instrument` 首次尝试在 `assessment_runs` 的
+  `FOR UPDATE` 上发生一次瞬态 `DBAPIError` 死锁，并由 Temporal 按
+  `maximum_attempts=3` 重试成功；作为操作风险监控重复死锁或三次尝试均失败的情况，
+  检查 `assessment_task_attempts.error_category` 和 Postgres/Temporal 日志。
 - 正式接入内网数据、生产数据库或上级系统前，需要单独完成安全、网络和灾备评审。

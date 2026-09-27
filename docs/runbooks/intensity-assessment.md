@@ -87,9 +87,17 @@ ORDER BY run_no DESC;
 
 - `intensity.model` 为 `succeeded`。
 - `intensity.fusion` 为 `succeeded`。
-- `intensity.instrument` 为 `succeeded`，即使其产品状态是 `unavailable`。
 - 后六个损失、报告和协同任务为 `skipped`，原因 `out_of_phase_scope`。
 - 运行状态为 `completed`，`algorithm_bundle_version` 为 `intensity-v1`。
+
+仪器任务有两种正确结果：
+
+- 正常降级路径：`intensity.instrument` 为 `succeeded`，产品状态是
+  `unavailable` 或 `invalid`，融合回退到 `model_only`/`F3`。
+- 意外 Activity 异常路径：`intensity.instrument` 为 `failed`，但运行仍可
+  `completed`，因为完成运行只强制要求模型和融合成功。此时融合同样回退到
+  `model_only`/`F3`；必须查看任务尝试和 `last_error`，不能把失败任务误当成
+  正常降级。
 
 ## Inspecting Model, Instrument, and Fusion Products
 
@@ -203,6 +211,25 @@ WHERE run_id = '<run-id>'
 
 如需接入或禁用仪器 provider，修改 `config/intensity/shanghai-region.yaml` 的 `instrument_provider` 并重启 Worker。禁止把未验证产品标为 `available`。
 
+### Instrument Activity Transient Deadlock
+
+真实联调中观察到 `intensity.instrument` 首次尝试在 `assessment_runs` 的
+`FOR UPDATE` 上触发 `DBAPIError`/`DeadlockDetectedError`。Temporal 重试策略为
+`maximum_attempts=3`、初始间隔 `2s`、最大间隔 `8s`、退避系数 `4.0`，第二次尝试
+成功。按操作风险监控：
+
+```sql
+SELECT t.task_key, a.attempt_number, a.status, a.error_category, a.error_summary
+FROM assessment_tasks t
+LEFT JOIN assessment_task_attempts a ON a.task_id = t.id
+WHERE t.run_id = '<run-id>'
+ORDER BY t.sequence, a.attempt_number;
+```
+
+偶发一次并成功重试不改变正常完成语义。若重复出现或三次尝试均失败，应作为模型
+与仪器 Activity 的锁顺序并发问题处理，并检查 Postgres 日志与 Temporal 历史；
+不得把 `dead_letter` 或运行状态手工改为成功来掩盖失败。
+
 ## Database and Raster Checks
 
 烈度栅格保存在 PostgreSQL/PostGIS 的 `intensity_rasters` 中，不是外部文件。核验 PostGIS raster 扩展：
@@ -260,7 +287,9 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run b
 - Compose 配置退出码 `0`，无输出。
 - 迁移头：`0011_intensity_assessment (head)`。
 - 后端全量测试：`453 passed, 70 warnings in 208.08s (0:03:28)`。
-- 全网格性能：`1 passed, 6 warnings in 5.87s`；补充 `-s` 输出为 `model=0.874s instrument=0.617s fusion=2.044s`。
+- 全网格性能：验收上限 `model<=60s`、`instrument<=60s`、`fusion<=90s`；
+  `1 passed, 6 warnings in 5.87s`，补充 `-s` 实测为
+  `model=0.874s instrument=0.617s fusion=2.044s`。
 - Ruff：`All checks passed!`。
 - 前端测试：`Test Files 8 passed (8)`，`Tests 34 passed (34)`，`Duration 3.60s`。
 - 前端类型检查：退出码 `0`，无错误输出。
