@@ -96,6 +96,12 @@ class GridDefinition:
     width: int
     height: int
 
+    def __post_init__(self) -> None:
+        if self.resolution_m <= 0 or self.width <= 0 or self.height <= 0:
+            raise ValueError("grid dimensions and resolution must be positive")
+        if not self.version.strip() or not self.crs.strip():
+            raise ValueError("grid version and crs must not be empty")
+
     @property
     def cell_count(self) -> int:
         return self.width * self.height
