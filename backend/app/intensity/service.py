@@ -121,3 +121,52 @@ class IntensityService:
             finite_fault_deg=inputs.finite_fault_deg,
             candidates=inputs.candidates,
         )
+
+    async def record_task_failure(
+        self,
+        run_id: str,
+        task_key: str,
+        exc: Exception,
+    ) -> None:
+        try:
+            try:
+                run_uuid = UUID(run_id)
+            except ValueError:
+                pass
+            else:
+                async with self.session_factory() as session:
+                    async with session.begin():
+                        await self.assessment_repository.record_task_failure_audit(
+                            session,
+                            run_uuid,
+                            task_key,
+                            type(exc).__name__,
+                            _safe_error(exc),
+                        )
+        finally:
+            raise exc
+
+    async def record_run_failure(
+        self,
+        run_id: str,
+        exc: Exception,
+    ) -> None:
+        try:
+            try:
+                run_uuid = UUID(run_id)
+            except ValueError:
+                pass
+            else:
+                async with self.session_factory() as session:
+                    async with session.begin():
+                        await self.assessment_repository.record_run_failure_audit(
+                            session,
+                            run_uuid,
+                            _safe_error(exc),
+                        )
+        finally:
+            raise exc
+
+
+def _safe_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:2000]

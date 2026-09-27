@@ -54,8 +54,6 @@ class IntensityRepository:
         )
         now = datetime.now(UTC)
         if existing is not None:
-            if existing.input_fingerprint != write.input_fingerprint:
-                raise ValueError("published product fingerprint cannot be overwritten")
             raster_id = await session.scalar(
                 select(IntensityRaster.id)
                 .where(IntensityRaster.product_id == existing.id)
@@ -67,6 +65,10 @@ class IntensityRepository:
                 or raster_id is None
             ):
                 raise ValueError("existing intensity product is incomplete")
+            if existing.algorithm_version != write.algorithm_version:
+                raise ValueError("published product algorithm version cannot be overwritten")
+            if existing.input_fingerprint != write.input_fingerprint:
+                raise ValueError("published product fingerprint cannot be overwritten")
             return existing.id
 
         if not write.bands and write.status in {

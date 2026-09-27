@@ -223,6 +223,62 @@ async def test_multi_band_round_trip_preserves_order_metadata_and_exact_values(
     assert metadata["resolution_m"] == 250.0
 
 
+async def test_completed_product_idempotency_rejects_changed_algorithm(
+    session_factory,
+) -> None:
+    run_id, task_id = await _seed_run(session_factory)
+    repository = IntensityRepository()
+    grid = GridDefinition("grid-1", "EPSG:32651", 1000, 500000, 3500000, 1, 1)
+    fingerprint = "7" * 64
+    write = IntensityProductWrite(
+        run_id=run_id,
+        task_id=task_id,
+        product_type=ProductType.MODEL,
+        status=ProductStatus.AVAILABLE,
+        algorithm_version="model-v1",
+        parameter_version="parameters-v1",
+        strategy_version=None,
+        grid_definition=grid,
+        region_profile_version="shanghai-v1",
+        input_fingerprint=fingerprint,
+        input_checksum="8" * 64,
+        quality_grade=None,
+        coverage_ratio=0.0,
+        statistics={"minimum": 4.0, "maximum": 4.0},
+        source_product_id=None,
+        observed_at=None,
+        bands=[("value", np.array([[4.0]]))],
+    )
+    changed_algorithm = IntensityProductWrite(
+        run_id=run_id,
+        task_id=task_id,
+        product_type=ProductType.MODEL,
+        status=ProductStatus.AVAILABLE,
+        algorithm_version="model-v2",
+        parameter_version="parameters-v1",
+        strategy_version=None,
+        grid_definition=grid,
+        region_profile_version="shanghai-v1",
+        input_fingerprint=fingerprint,
+        input_checksum="8" * 64,
+        quality_grade=None,
+        coverage_ratio=0.0,
+        statistics={"minimum": 4.0, "maximum": 4.0},
+        source_product_id=None,
+        observed_at=None,
+        bands=[("value", np.array([[4.0]]))],
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await repository.save_product(session, write)
+
+    with pytest.raises(ValueError, match="algorithm"):
+        async with session_factory() as session:
+            async with session.begin():
+                await repository.save_product(session, changed_algorithm)
+
+
 async def test_available_product_without_bands_is_rejected(session_factory) -> None:
     run_id, task_id = await _seed_run(session_factory)
     repository = IntensityRepository()

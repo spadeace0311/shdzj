@@ -65,7 +65,7 @@ class AssessmentRepository:
             report_ingested_at=basis_at,
             deadline_basis_at=basis_at,
             deadline_at=deadline_at,
-            started_at=outbox.created_at,
+            started_at=None,
             snapshot={
                 "event_id": str(canonical.id),
                 "revision_id": str(revision.id),
@@ -153,6 +153,7 @@ class AssessmentRepository:
         session: AsyncSession,
         run_id: UUID,
         task_key: str,
+        algorithm_version: str,
         input_fingerprint: str,
     ) -> AssessmentTask:
         task = await session.scalar(
@@ -166,15 +167,30 @@ class AssessmentRepository:
         if task is None:
             raise LookupError("assessment task not found")
         if task.status == "succeeded":
+            if task.algorithm_version != algorithm_version:
+                raise ValueError("task algorithm version changed")
+            if task.input_fingerprint != input_fingerprint:
+                raise ValueError("task input fingerprint changed")
             return task
+        if task.status == "running":
+            if task.algorithm_version != algorithm_version:
+                raise ValueError("task algorithm version changed")
+            if task.input_fingerprint != input_fingerprint:
+                raise ValueError("task input fingerprint changed")
+            return task
+        if task.status not in {"pending", "failed"}:
+            raise ValueError("terminal task cannot be restarted")
+        if task.algorithm_version not in {None, algorithm_version}:
+            raise ValueError("task algorithm version changed")
         if task.input_fingerprint not in {None, input_fingerprint}:
             raise ValueError("task input fingerprint changed")
-        if task.status == "running":
-            return task
 
         task.status = "running"
+        task.algorithm_version = algorithm_version
         task.input_fingerprint = input_fingerprint
         task.started_at = task.started_at or datetime.now(UTC)
+        task.completed_at = None
+        task.last_error = None
         task.attempt_count += 1
         session.add(
             AssessmentTaskAttempt(
@@ -197,6 +213,12 @@ class AssessmentRepository:
         task = await session.get(AssessmentTask, task_id, with_for_update=True)
         if task is None:
             raise LookupError("assessment task not found")
+        if task.status == "succeeded":
+            if task.output_checksum != output_checksum:
+                raise ValueError("task output checksum changed")
+            return task
+        if task.status != "running":
+            raise ValueError("task must be running before it can complete")
         now = datetime.now(UTC)
         task.status = "succeeded"
         task.output_checksum = output_checksum
@@ -225,6 +247,10 @@ class AssessmentRepository:
         task = await session.get(AssessmentTask, task_id, with_for_update=True)
         if task is None:
             raise LookupError("assessment task not found")
+        if task.status in {"succeeded", "failed"}:
+            raise ValueError("terminal task cannot be overwritten")
+        if task.status != "running":
+            raise ValueError("task must be running before it can fail")
         now = datetime.now(UTC)
         task.status = "failed"
         task.completed_at = now
@@ -242,15 +268,105 @@ class AssessmentRepository:
             attempt.completed_at = now
         return task
 
+    async def record_task_failure_audit(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        task_key: str,
+        error_category: str,
+        error_summary: str,
+    ) -> AssessmentTask | None:
+        task = await session.scalar(
+            select(AssessmentTask)
+            .where(
+                AssessmentTask.run_id == run_id,
+                AssessmentTask.task_key == task_key,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return None
+        if task.status in {"succeeded", "failed"}:
+            return task
+
+        now = datetime.now(UTC)
+        bounded_summary = error_summary[:2000]
+        task.status = "failed"
+        task.completed_at = now
+        task.last_error = bounded_summary
+
+        if task.attempt_count == 0:
+            task.attempt_count = 1
+            session.add(
+                AssessmentTaskAttempt(
+                    task_id=task.id,
+                    attempt_number=1,
+                    status="failed",
+                    started_at=now,
+                    completed_at=now,
+                    input_fingerprint=task.input_fingerprint,
+                    error_category=error_category,
+                    error_summary=bounded_summary,
+                )
+            )
+            return task
+
+        attempt = await session.scalar(
+            select(AssessmentTaskAttempt).where(
+                AssessmentTaskAttempt.task_id == task.id,
+                AssessmentTaskAttempt.attempt_number == task.attempt_count,
+            )
+        )
+        if attempt is not None:
+            attempt.status = "failed"
+            attempt.error_category = error_category
+            attempt.error_summary = bounded_summary
+            attempt.completed_at = now
+        return task
+
+    async def start_run(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> AssessmentRun:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            raise LookupError("assessment run not found")
+        if run.status == "running":
+            return run
+        if run.status != "pending":
+            raise ValueError("run must be pending before it can start")
+        run.status = "running"
+        run.started_at = datetime.now(UTC)
+        run.last_error = None
+        return run
+
     async def complete_run(
         self,
         session: AsyncSession,
         run_id: UUID,
         algorithm_bundle_version: str,
     ) -> AssessmentRun:
+        # Lock the event before the run so run mutation and event-run creation use
+        # the same event-first lock order.
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        event = await session.get(EarthquakeEvent, run_event_id, with_for_update=True)
         run = await session.get(AssessmentRun, run_id, with_for_update=True)
         if run is None:
             raise LookupError("assessment run not found")
+        if run.status == "completed":
+            if run.algorithm_bundle_version != algorithm_bundle_version:
+                raise ValueError("run algorithm bundle version changed")
+            return run
+        if run.status != "running":
+            raise ValueError("run must be running before it can complete")
+        # Phase-specific policy: model and fusion are required; instrument is
+        # deliberately optional because a degraded or unavailable instrument can
+        # still produce a valid model-only fusion.
         required_tasks = (
             await session.scalars(
                 select(AssessmentTask).where(
@@ -271,7 +387,6 @@ class AssessmentRepository:
         started_at = run.started_at or run.created_at
         run.duration_ms = int((now - started_at).total_seconds() * 1000)
         run.algorithm_bundle_version = algorithm_bundle_version
-        event = await session.get(EarthquakeEvent, run.event_id, with_for_update=True)
         if event is not None and event.latest_assessment_run_id == run.id:
             event.effective_assessment_run_id = run.id
         return run
@@ -285,6 +400,26 @@ class AssessmentRepository:
         run = await session.get(AssessmentRun, run_id, with_for_update=True)
         if run is None:
             raise LookupError("assessment run not found")
+        if run.status in {"completed", "failed"}:
+            raise ValueError("terminal run cannot be overwritten")
+        if run.status != "running":
+            raise ValueError("run must be running before it can fail")
+        run.status = "failed"
+        run.completed_at = datetime.now(UTC)
+        run.last_error = error_summary[:2000]
+        return run
+
+    async def record_run_failure_audit(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        error_summary: str,
+    ) -> AssessmentRun | None:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            return None
+        if run.status in {"completed", "failed"}:
+            return run
         run.status = "failed"
         run.completed_at = datetime.now(UTC)
         run.last_error = error_summary[:2000]
