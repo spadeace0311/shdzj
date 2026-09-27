@@ -89,6 +89,7 @@ services:
     environment:
       ASSESSMENT_DISPATCHER_ENABLED: "true"
       TEMPORAL_ADDRESS: temporal:7233
+      ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS: "${ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS:-1800}"
     command: ["python", "-m", "app.assessment.worker", "dispatcher"]
     restart: unless-stopped
     volumes:

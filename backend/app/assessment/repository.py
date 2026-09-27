@@ -324,13 +324,28 @@ class AssessmentRepository:
             attempt.completed_at = now
         return task
 
+    async def get_run(
+        self,
+        session: AsyncSession,
+        run_id: str | UUID,
+    ) -> AssessmentRun | None:
+        try:
+            identifier = run_id if isinstance(run_id, UUID) else UUID(run_id)
+        except ValueError as exc:
+            raise ValueError("run_id must be a UUID") from exc
+        return await session.get(AssessmentRun, identifier)
+
     async def mark_deadline_exceeded(
         self,
         session: AsyncSession,
-        run_id: UUID,
+        run_id: str | UUID,
         observed_at: datetime,
     ) -> bool:
-        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        try:
+            identifier = run_id if isinstance(run_id, UUID) else UUID(run_id)
+        except ValueError as exc:
+            raise ValueError("run_id must be a UUID") from exc
+        run = await session.get(AssessmentRun, identifier, with_for_update=True)
         if run is None:
             raise LookupError("assessment run not found")
         if run.deadline_exceeded_at is not None:
@@ -342,6 +357,26 @@ class AssessmentRepository:
             return False
         run.deadline_exceeded_at = observed_at
         return True
+
+    async def skip_deferred_tasks(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> None:
+        tasks = (
+            await session.scalars(
+                select(AssessmentTask)
+                .where(
+                    AssessmentTask.run_id == run_id,
+                    AssessmentTask.status == "pending",
+                )
+                .with_for_update()
+            )
+        ).all()
+        for task in tasks:
+            task.status = "skipped"
+            task.completed_at = datetime.now(UTC)
+            task.result = {"reason": "out_of_phase_scope"}
 
     async def start_run(
         self,

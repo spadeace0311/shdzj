@@ -68,7 +68,7 @@ def build_dispatcher(
             client,
             task_queue=configured.temporal_task_queue,
             execution_timeout=timedelta(
-                seconds=configured.assessment_workflow_deadline_seconds
+                seconds=configured.assessment_workflow_safety_timeout_seconds
             ),
         ),
         batch_size=configured.assessment_outbox_batch_size,
@@ -88,7 +88,14 @@ def build_worker(
         client,
         task_queue=configured.temporal_task_queue,
         workflows=[AssessmentWorkflow],
-        activities=[activities.prepare_assessment],
+        activities=[
+            activities.prepare_assessment,
+            activities.run_intensity_model,
+            activities.run_intensity_instrument,
+            activities.run_intensity_fusion,
+            activities.mark_deadline_exceeded,
+            activities.finalize_assessment,
+        ],
         graceful_shutdown_timeout=timedelta(seconds=10),
     )
 
