@@ -126,6 +126,79 @@ async def _seed_product(session_factory) -> UUID:
             return run.id
 
 
+async def _seed_superseding_run(session_factory) -> UUID:
+    event = NormalizedEvent(
+        EventKind.CORRECTION,
+        "cenc",
+        "API-INTENSITY-1",
+        datetime(2026, 9, 27, 1, 0, tzinfo=UTC),
+        Decimal("121.5"),
+        Decimal("31.2"),
+        Decimal("10"),
+        Decimal("5.3"),
+        "test",
+        datetime(2026, 9, 27, 1, 4, tzinfo=UTC),
+    )
+    received = datetime(2026, 9, 27, 1, 5, tzinfo=UTC)
+    outcome = await EventService(session_factory).ingest_collected(
+        raw_payload={"EventID": "API-INTENSITY-1", "type": "reviewed"},
+        event=event,
+        provider="fan",
+        lane="websocket",
+        received_at=received,
+        response_input=ResponseInput(
+            event.magnitude,
+            event.depth_km,
+            True,
+            0,
+            None,
+            None,
+        ),
+        region_context=RegionContext(True, 0, "grid-test", received),
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            outbox = await session.scalar(
+                select(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                )
+            )
+            run = await AssessmentRepository().ensure_run_from_outbox(
+                session,
+                event_id=outcome.event_id,
+                revision_id=outcome.revision_id,
+                outbox_id=str(outbox.id),
+            )
+            return run.id
+
+
+async def _complete_required_tasks(session, run_id) -> None:
+    repository = AssessmentRepository()
+    for task_key, algorithm_version, fingerprint in (
+        ("intensity.model", "model-axis-ratio-v1", "a" * 64),
+        ("intensity.fusion", "fusion-inverse-variance-v1", "b" * 64),
+    ):
+        task = await session.scalar(
+            select(AssessmentTask).where(
+                AssessmentTask.run_id == run_id,
+                AssessmentTask.task_key == task_key,
+            )
+        )
+        await repository.start_task(
+            session,
+            run_id,
+            task_key,
+            algorithm_version,
+            fingerprint,
+        )
+        await repository.complete_task(
+            session,
+            task.id,
+            fingerprint,
+            {"product_id": task_key},
+        )
+
+
 async def test_get_intensity_result_summary(session_factory) -> None:
     run_id = await _seed_product(session_factory)
     previous = app.dependency_overrides.get(get_current_user)
@@ -156,3 +229,52 @@ async def test_get_intensity_result_summary(session_factory) -> None:
     assert body["products"][0]["product_type"] == "model"
     assert body["products"][0]["product_id"]
     assert body["products"][0]["algorithm_version"] == "model-axis-ratio-v1"
+
+
+async def test_get_intensity_result_for_superseded_run(session_factory) -> None:
+    first_run_id = await _seed_product(session_factory)
+    repository = AssessmentRepository()
+
+    async with session_factory() as session:
+        async with session.begin():
+            first = await session.get(AssessmentRun, first_run_id)
+            event_id = first.event_id
+            first_revision_id = first.revision_id
+            await repository.start_run(session, first_run_id)
+            await _complete_required_tasks(session, first_run_id)
+            await repository.complete_run(session, first_run_id, "bundle-1")
+
+    second_run_id = await _seed_superseding_run(session_factory)
+
+    previous = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        username="operator",
+        role="group_member",
+        workgroup="震害评估组",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                f"/api/v1/assessments/runs/{first_run_id}/intensity"
+            )
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == str(first_run_id)
+    assert body["event_id"] == str(event_id)
+    assert body["revision_id"] == str(first_revision_id)
+    assert body["run_status"] == "completed"
+    assert body["superseded_by_run_id"] == str(second_run_id)
+    assert body["effective_run_id"] == str(first_run_id)
+    assert body["effective_revision_id"] == str(first_revision_id)
+    assert body["is_latest_revision"] is False
+    assert body["is_fallback"] is False
+    assert body["products"][0]["product_type"] == "model"

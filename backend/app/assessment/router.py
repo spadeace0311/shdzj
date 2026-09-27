@@ -47,6 +47,8 @@ async def get_intensity_result(
                 if run is None:
                     raise LookupError("assessment_run_not_found")
                 event = await session.get(EarthquakeEvent, run.event_id)
+                if event is None:
+                    raise LookupError("assessment_event_not_found")
                 effective = await assessment_repository.get_effective_run(
                     session,
                     event_id=str(run.event_id),
@@ -57,6 +59,8 @@ async def get_intensity_result(
                 )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="assessment storage is unavailable") from exc
     return IntensityResultResponse(
         run_id=str(run.id),
         event_id=str(run.event_id),
