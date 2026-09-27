@@ -1,13 +1,14 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.assessment.plan import AssessmentPlanBuilder
 from app.events.domain import EventKind
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox
+from app.intensity.models import AssessmentTaskAttempt
 
 
 class AssessmentRepository:
@@ -50,7 +51,8 @@ class AssessmentRepository:
             institutional_level=revision.institutional_level,
             service_level=revision.service_level,
         )
-        deadline_seconds = max(task.deadline_offset_seconds for task in plan)
+        basis_at = revision.ingested_at or canonical.t1_at
+        deadline_at = basis_at + timedelta(seconds=300)
         run = AssessmentRun(
             event_id=canonical.id,
             revision_id=revision.id,
@@ -60,9 +62,10 @@ class AssessmentRepository:
             status="pending",
             priority=max(task.priority for task in plan),
             t1_at=canonical.t1_at,
-            report_ingested_at=canonical.t1_at,
-            deadline_basis_at=canonical.t1_at,
-            deadline_at=canonical.t1_at + timedelta(seconds=deadline_seconds),
+            report_ingested_at=basis_at,
+            deadline_basis_at=basis_at,
+            deadline_at=deadline_at,
+            started_at=outbox.created_at,
             snapshot={
                 "event_id": str(canonical.id),
                 "revision_id": str(revision.id),
@@ -76,6 +79,19 @@ class AssessmentRepository:
         )
         session.add(run)
         await session.flush()
+        canonical.latest_assessment_run_id = run.id
+        await session.execute(
+            update(AssessmentRun)
+            .where(
+                AssessmentRun.event_id == canonical.id,
+                AssessmentRun.id != run.id,
+                AssessmentRun.superseded_at.is_(None),
+            )
+            .values(
+                superseded_by_run_id=run.id,
+                superseded_at=outbox.created_at,
+            )
+        )
 
         for task in plan:
             session.add(
@@ -87,7 +103,7 @@ class AssessmentRepository:
                     priority=task.priority,
                     sequence=task.sequence,
                     status="pending",
-                    deadline_at=canonical.t1_at
+                    deadline_at=basis_at
                     + timedelta(seconds=task.deadline_offset_seconds),
                     attempt_count=0,
                     max_attempts=task.max_attempts,
@@ -131,6 +147,160 @@ class AssessmentRepository:
             revision=revision,
             outbox=outbox,
         )
+
+    async def start_task(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        task_key: str,
+        input_fingerprint: str,
+    ) -> AssessmentTask:
+        task = await session.scalar(
+            select(AssessmentTask)
+            .where(
+                AssessmentTask.run_id == run_id,
+                AssessmentTask.task_key == task_key,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            raise LookupError("assessment task not found")
+        if task.status == "succeeded":
+            return task
+        if task.input_fingerprint not in {None, input_fingerprint}:
+            raise ValueError("task input fingerprint changed")
+        if task.status == "running":
+            return task
+
+        task.status = "running"
+        task.input_fingerprint = input_fingerprint
+        task.started_at = task.started_at or datetime.now(UTC)
+        task.attempt_count += 1
+        session.add(
+            AssessmentTaskAttempt(
+                task_id=task.id,
+                attempt_number=task.attempt_count,
+                status="running",
+                started_at=datetime.now(UTC),
+                input_fingerprint=input_fingerprint,
+            )
+        )
+        return task
+
+    async def complete_task(
+        self,
+        session: AsyncSession,
+        task_id: UUID,
+        output_checksum: str | None,
+        result: dict,
+    ) -> AssessmentTask:
+        task = await session.get(AssessmentTask, task_id, with_for_update=True)
+        if task is None:
+            raise LookupError("assessment task not found")
+        now = datetime.now(UTC)
+        task.status = "succeeded"
+        task.output_checksum = output_checksum
+        task.result = result
+        task.completed_at = now
+        task.last_error = None
+        attempt = await session.scalar(
+            select(AssessmentTaskAttempt).where(
+                AssessmentTaskAttempt.task_id == task.id,
+                AssessmentTaskAttempt.attempt_number == task.attempt_count,
+            )
+        )
+        if attempt is not None:
+            attempt.status = "succeeded"
+            attempt.output_checksum = output_checksum
+            attempt.completed_at = now
+        return task
+
+    async def fail_task(
+        self,
+        session: AsyncSession,
+        task_id: UUID,
+        error_category: str,
+        error_summary: str,
+    ) -> AssessmentTask:
+        task = await session.get(AssessmentTask, task_id, with_for_update=True)
+        if task is None:
+            raise LookupError("assessment task not found")
+        now = datetime.now(UTC)
+        task.status = "failed"
+        task.completed_at = now
+        task.last_error = error_summary[:2000]
+        attempt = await session.scalar(
+            select(AssessmentTaskAttempt).where(
+                AssessmentTaskAttempt.task_id == task.id,
+                AssessmentTaskAttempt.attempt_number == task.attempt_count,
+            )
+        )
+        if attempt is not None:
+            attempt.status = "failed"
+            attempt.error_category = error_category
+            attempt.error_summary = error_summary[:2000]
+            attempt.completed_at = now
+        return task
+
+    async def complete_run(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        algorithm_bundle_version: str,
+    ) -> AssessmentRun:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            raise LookupError("assessment run not found")
+        required_tasks = (
+            await session.scalars(
+                select(AssessmentTask).where(
+                    AssessmentTask.run_id == run.id,
+                    AssessmentTask.task_key.in_(
+                        ("intensity.model", "intensity.fusion")
+                    ),
+                )
+            )
+        ).all()
+        if {
+            task.task_key for task in required_tasks if task.status == "succeeded"
+        } != {"intensity.model", "intensity.fusion"}:
+            raise ValueError("required intensity tasks have not succeeded")
+        now = datetime.now(UTC)
+        run.status = "completed"
+        run.completed_at = now
+        started_at = run.started_at or run.created_at
+        run.duration_ms = int((now - started_at).total_seconds() * 1000)
+        run.algorithm_bundle_version = algorithm_bundle_version
+        event = await session.get(EarthquakeEvent, run.event_id, with_for_update=True)
+        if event is not None and event.latest_assessment_run_id == run.id:
+            event.effective_assessment_run_id = run.id
+        return run
+
+    async def fail_run(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        error_summary: str,
+    ) -> AssessmentRun:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            raise LookupError("assessment run not found")
+        run.status = "failed"
+        run.completed_at = datetime.now(UTC)
+        run.last_error = error_summary[:2000]
+        return run
+
+    async def mark_superseded(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        successor_run_id: UUID,
+    ) -> None:
+        run = await session.get(AssessmentRun, run_id, with_for_update=True)
+        if run is None:
+            raise LookupError("assessment run not found")
+        run.superseded_by_run_id = successor_run_id
+        run.superseded_at = datetime.now(UTC)
 
     async def count_tasks(self, session: AsyncSession, run_id: object) -> int:
         count = await session.scalar(
