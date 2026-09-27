@@ -1,16 +1,20 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import delete, func, select
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.assessment.models import AssessmentRun, AssessmentTask
+from app.assessment.repository import AssessmentRepository
 from app.assessment.temporal import (
     AssessmentActivities,
     AssessmentWorkflow,
     AssessmentWorkflowInput,
+    FinalizeAssessmentInput,
 )
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
@@ -112,6 +116,34 @@ def _test_intensity_service(session_factory):
     )
 
 
+class _FailingFinalizeActivity:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @activity.defn(name="finalize_assessment")
+    async def finalize_assessment(self, request: FinalizeAssessmentInput):
+        self.calls.append(request.outcome)
+        raise ApplicationError(
+            "finalize failed",
+            type="FinalizeFailure",
+            non_retryable=True,
+        )
+
+
+class _DegradedInstrumentService:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    async def run_model(self, run_id: str):
+        return await self._delegate.run_model(run_id)
+
+    async def run_instrument(self, run_id: str):
+        raise RuntimeError("instrument unavailable")
+
+    async def run_fusion(self, run_id: str):
+        return await self._delegate.run_fusion(run_id)
+
+
 async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> None:
     request = await _create_workflow_input(session_factory)
     activities = AssessmentActivities(
@@ -205,3 +237,161 @@ async def test_intensity_workflow_executes_three_tasks_and_skips_deferred(
     assert statuses["intensity.fusion"] == "succeeded"
     assert statuses["loss.population"] == "skipped"
     assert statuses["workgroup.response_tasks"] == "skipped"
+
+
+async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _test_intensity_service(session_factory),
+    )
+    failing_finalize = _FailingFinalizeActivity()
+
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="assessment-finalize-failure-test",
+            workflows=[AssessmentWorkflow],
+            activities=[
+                activities.prepare_assessment,
+                activities.run_intensity_model,
+                activities.run_intensity_instrument,
+                activities.run_intensity_fusion,
+                activities.mark_deadline_exceeded,
+                failing_finalize.finalize_assessment,
+            ],
+        ):
+            with pytest.raises(Exception):
+                await environment.client.execute_workflow(
+                    AssessmentWorkflow.run,
+                    request,
+                    id=f"assessment-finalize-failure:{request.event_id}",
+                    task_queue="assessment-finalize-failure-test",
+                )
+
+    assert failing_finalize.calls == ["completed"]
+
+
+async def test_finalize_failed_is_idempotent_for_already_failed_run(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(session_factory)
+    prepared = await activities.prepare_assessment(request)
+
+    async with session_factory() as session:
+        async with session.begin():
+            run = await session.get(AssessmentRun, prepared.run_id)
+            await AssessmentRepository().fail_run(
+                session,
+                run.id,
+                "already failed",
+            )
+
+    await activities.finalize_assessment(
+        FinalizeAssessmentInput(prepared.run_id, "failed")
+    )
+
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, prepared.run_id)
+    assert run.status == "failed"
+
+
+async def test_deadline_marker_persists_without_canceling_workflow(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    async with session_factory() as session:
+        async with session.begin():
+            repository = AssessmentRepository()
+            run = await repository.ensure_run_from_outbox(
+                session,
+                event_id=request.event_id,
+                revision_id=request.revision_id,
+                outbox_id=request.outbox_id,
+            )
+            run.deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _test_intensity_service(session_factory),
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="assessment-deadline-test",
+            workflows=[AssessmentWorkflow],
+            activities=[
+                activities.prepare_assessment,
+                activities.run_intensity_model,
+                activities.run_intensity_instrument,
+                activities.run_intensity_fusion,
+                activities.mark_deadline_exceeded,
+                activities.finalize_assessment,
+            ],
+        ):
+            result = await environment.client.execute_workflow(
+                AssessmentWorkflow.run,
+                request,
+                id=f"assessment-deadline:{request.event_id}",
+                task_queue="assessment-deadline-test",
+            )
+
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, result.run_id)
+
+    assert run.status == "completed"
+    assert run.completed_at is not None
+    assert run.deadline_exceeded_at is not None
+
+
+async def test_instrument_failure_still_completes_model_only(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _DegradedInstrumentService(
+            _test_intensity_service(session_factory)
+        ),
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="assessment-instrument-failure-test",
+            workflows=[AssessmentWorkflow],
+            activities=[
+                activities.prepare_assessment,
+                activities.run_intensity_model,
+                activities.run_intensity_instrument,
+                activities.run_intensity_fusion,
+                activities.mark_deadline_exceeded,
+                activities.finalize_assessment,
+            ],
+        ):
+            result = await environment.client.execute_workflow(
+                AssessmentWorkflow.run,
+                request,
+                id=f"assessment-instrument-failure:{request.event_id}",
+                task_queue="assessment-instrument-failure-test",
+            )
+
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, result.run_id)
+        tasks = (
+            await session.scalars(
+                select(AssessmentTask)
+                .where(AssessmentTask.run_id == result.run_id)
+                .order_by(AssessmentTask.sequence)
+            )
+        ).all()
+
+    assert run.status == "completed"
+    statuses = {task.task_key: task.status for task in tasks}
+    assert statuses["intensity.model"] == "succeeded"
+    assert statuses["intensity.instrument"] == "skipped"
+    assert statuses["intensity.fusion"] == "succeeded"

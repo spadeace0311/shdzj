@@ -95,6 +95,7 @@ class AssessmentWorkflow:
                     outcome="failed",
                 )
 
+            outcome = "completed"
             try:
                 await workflow.execute_activity(
                     "run_intensity_fusion",
@@ -103,8 +104,8 @@ class AssessmentWorkflow:
                     retry_policy=_retry_policy(),
                 )
             except ActivityError:
-                return await self._finalize(prepared, outcome="failed")
-            return await self._finalize(prepared, outcome="completed")
+                outcome = "failed"
+            return await self._finalize(prepared, outcome=outcome)
         finally:
             if not deadline_task.done():
                 deadline_task.cancel()
@@ -286,9 +287,10 @@ class AssessmentActivities:
                         algorithm_bundle_version="intensity-v1",
                     )
                     return None
-                await repository.fail_run(
-                    session,
-                    run.id,
-                    "assessment intensity chain failed",
-                )
+                if run.status not in {"completed", "failed"}:
+                    await repository.fail_run(
+                        session,
+                        run.id,
+                        "assessment intensity chain failed",
+                    )
                 return None
