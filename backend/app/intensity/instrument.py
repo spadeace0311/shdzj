@@ -10,9 +10,12 @@ import numpy as np
 from app.intensity.domain import (
     GridDefinition,
     InstrumentProduct,
+    InstrumentProductFormat,
     InstrumentQuality,
     ProductStatus,
 )
+
+_NORMALIZED_CHECKSUM_SCHEMA = b"instrument-normalized-v1\0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,8 @@ class UnavailableInstrumentProvider:
             product_version=None,
             observed_at=None,
             source="not_connected",
+            format=None,
+            source_verified=False,
             grid_version=request.definition.version,
             values=None,
             sigma=None,
@@ -53,6 +58,11 @@ def validate_instrument_product(
         and product.status is not ProductStatus.PARTIAL
     ):
         return product
+    if (
+        product.format is not InstrumentProductFormat.GRID
+        or not product.source_verified
+    ):
+        raise ValueError("instrument product must be a verified GRID product")
     expected_shape = (definition.height, definition.width)
     if product.grid_version != definition.version:
         raise ValueError("instrument product grid version does not match")
@@ -88,16 +98,25 @@ def validate_instrument_product(
     )
     coverage = float(valid.sum() / definition.cell_count)
     status = ProductStatus.AVAILABLE if coverage == 1.0 else ProductStatus.PARTIAL
+    code_bytes = "".join(normalized_codes.tolist()).encode("ascii")
     normalized_checksum = hashlib.sha256()
-    normalized_checksum.update(np.asarray(product.values, dtype=np.float64).tobytes())
-    normalized_checksum.update(np.asarray(product.sigma, dtype=np.float64).tobytes())
-    normalized_checksum.update("".join(normalized_codes.tolist()).encode("ascii"))
+    normalized_checksum.update(_NORMALIZED_CHECKSUM_SCHEMA)
+    normalized_checksum.update(
+        np.ascontiguousarray(product.values, dtype="<f8").tobytes(order="C")
+    )
+    normalized_checksum.update(
+        np.ascontiguousarray(product.sigma, dtype="<f8").tobytes(order="C")
+    )
+    normalized_checksum.update(len(code_bytes).to_bytes(4, byteorder="little"))
+    normalized_checksum.update(code_bytes)
     return InstrumentProduct(
         status=status,
         product_id=product.product_id,
         product_version=product.product_version,
         observed_at=product.observed_at,
         source=product.source,
+        format=product.format,
+        source_verified=product.source_verified,
         grid_version=product.grid_version,
         values=np.asarray(product.values, dtype=np.float64).reshape(-1),
         sigma=np.asarray(product.sigma, dtype=np.float64).reshape(-1),

@@ -45,6 +45,11 @@ class ProductStatus(StrEnum):
     STALE = "stale"
 
 
+class InstrumentProductFormat(StrEnum):
+    GRID = "grid"
+    STATION = "station"
+
+
 class InstrumentQuality(StrEnum):
     Q1 = "Q1"
     Q2 = "Q2"
@@ -169,6 +174,8 @@ class InstrumentProduct:
     product_version: str | None
     observed_at: datetime | None
     source: str
+    format: InstrumentProductFormat | None
+    source_verified: bool
     grid_version: str | None
     values: np.ndarray | None
     sigma: np.ndarray | None
