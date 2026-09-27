@@ -139,6 +139,11 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
         "report.rapid_assessment",
         "workgroup.response_tasks",
     ]
+    assert body["intensity"]["run_id"] == str(run_id)
+    assert body["intensity"]["event_id"] == str(event_id)
+    assert body["intensity"]["run_status"] == "pending"
+    assert body["intensity"]["effective_run_id"] is None
+    assert body["intensity"]["products"] == []
 
 
 async def test_get_current_assessment_returns_404_when_run_does_not_exist() -> None:

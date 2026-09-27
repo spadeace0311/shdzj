@@ -335,6 +335,17 @@ class AssessmentRepository:
             raise ValueError("run_id must be a UUID") from exc
         return await session.get(AssessmentRun, identifier)
 
+    async def get_effective_run(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: str,
+    ) -> AssessmentRun | None:
+        event = await session.get(EarthquakeEvent, UUID(event_id))
+        if event is None or event.effective_assessment_run_id is None:
+            return None
+        return await session.get(AssessmentRun, event.effective_assessment_run_id)
+
     async def mark_deadline_exceeded(
         self,
         session: AsyncSession,

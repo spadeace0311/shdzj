@@ -360,6 +360,39 @@ class IntensityRepository:
             "statistics": dict(row.statistics),
         }
 
+    async def list_products(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> list[dict]:
+        products = (
+            await session.scalars(
+                select(IntensityFieldProduct)
+                .where(IntensityFieldProduct.run_id == run_id)
+                .order_by(IntensityFieldProduct.product_type)
+            )
+        ).all()
+        return [
+            {
+                "product_id": str(product.id),
+                "product_type": product.product_type,
+                "status": product.status,
+                "algorithm_version": product.algorithm_version,
+                "parameter_version": product.parameter_version,
+                "strategy_version": product.strategy_version,
+                "grid_definition_version": product.grid_definition_version,
+                "region_profile_version": product.region_profile_version,
+                "quality_grade": product.quality_grade,
+                "coverage_ratio": float(product.coverage_ratio),
+                "output_checksum": product.output_checksum,
+                "source_product_id": product.source_product_id,
+                "observed_at": product.observed_at,
+                "completed_at": product.completed_at,
+                "statistics": dict(product.statistics),
+            }
+            for product in products
+        ]
+
     async def load_raster(
         self,
         session: AsyncSession,
