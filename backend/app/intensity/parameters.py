@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 import yaml
 
@@ -34,13 +36,20 @@ class ModelParameters:
 @dataclass(frozen=True, slots=True)
 class FusionParameters:
     model_quality_weight: float
-    quality_weights: dict[InstrumentQuality, float]
+    quality_weights: Mapping[InstrumentQuality, float]
     epsilon: float
     interval_z: float
     f1_min_coverage: float
     f1_max_sigma_p95: float
     f2_min_coverage: float
     f2_max_sigma_p95: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "quality_weights",
+            MappingProxyType(dict(self.quality_weights)),
+        )
 
 
 @dataclass(frozen=True, slots=True)

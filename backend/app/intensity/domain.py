@@ -1,10 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 import numpy as np
+
+
+def _readonly_array(value: np.ndarray) -> np.ndarray:
+    frozen = np.array(value, copy=True)
+    frozen.setflags(write=False)
+    return frozen
+
+
+def _readonly_optional_array(value: np.ndarray | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    return _readonly_array(value)
+
+
+def _require_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _optional_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return _require_utc(value)
 
 
 class ProductType(StrEnum):
@@ -54,6 +78,13 @@ class IntensityEventSnapshot:
     latitude: float
     report_ingested_at: datetime
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "report_ingested_at",
+            _require_utc(self.report_ingested_at),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class GridDefinition:
@@ -90,6 +121,19 @@ class GridSamples:
     distance_km: np.ndarray
     azimuth_deg: np.ndarray
 
+    def __post_init__(self) -> None:
+        for name in (
+            "rows",
+            "columns",
+            "x_km",
+            "y_km",
+            "longitude",
+            "latitude",
+            "distance_km",
+            "azimuth_deg",
+        ):
+            object.__setattr__(self, name, _readonly_array(getattr(self, name)))
+
 
 @dataclass(frozen=True, slots=True)
 class DirectionDecision:
@@ -106,6 +150,10 @@ class ModelField:
     sigma: np.ndarray
     extrapolated: bool
     direction: DirectionDecision
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", _readonly_array(self.values))
+        object.__setattr__(self, "sigma", _readonly_array(self.sigma))
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +175,25 @@ class InstrumentProduct:
     raw_checksum: str | None = None
     normalized_checksum: str | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _optional_utc(self.observed_at))
+        object.__setattr__(self, "generated_at", _optional_utc(self.generated_at))
+        object.__setattr__(
+            self,
+            "values",
+            _readonly_optional_array(self.values),
+        )
+        object.__setattr__(
+            self,
+            "sigma",
+            _readonly_optional_array(self.sigma),
+        )
+        object.__setattr__(
+            self,
+            "quality_codes",
+            _readonly_optional_array(self.quality_codes),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class FusionField:
@@ -140,3 +207,15 @@ class FusionField:
     mode: FusionMode
     quality: FusionQuality
     coverage_ratio: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "values",
+            "sigma",
+            "p10",
+            "p90",
+            "model_weight",
+            "instrument_weight",
+            "quality_codes",
+        ):
+            object.__setattr__(self, name, _readonly_array(getattr(self, name)))

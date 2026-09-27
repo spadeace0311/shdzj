@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from app.intensity.domain import InstrumentQuality
-from app.intensity.parameters import load_parameter_bundle, parameter_bundle_checksum
+from app.intensity.parameters import (
+    FusionParameters,
+    load_parameter_bundle,
+    parameter_bundle_checksum,
+)
 
 
 PARAMETERS = Path("/config/intensity/shanghai-2019.yaml")
@@ -33,3 +37,27 @@ def test_parameter_checksum_is_stable_and_content_sensitive(tmp_path: Path) -> N
 
     assert parameter_bundle_checksum(first) == parameter_bundle_checksum(PARAMETERS)
     assert parameter_bundle_checksum(second) != parameter_bundle_checksum(PARAMETERS)
+
+
+def test_fusion_quality_weights_are_immutable_and_do_not_alias_inputs() -> None:
+    source = {
+        InstrumentQuality.Q1: 1.0,
+        InstrumentQuality.Q2: 0.5,
+        InstrumentQuality.Q3: 0.25,
+        InstrumentQuality.Q0: 0.0,
+    }
+    parameters = FusionParameters(
+        model_quality_weight=1.0,
+        quality_weights=source,
+        epsilon=0.000001,
+        interval_z=1.2816,
+        f1_min_coverage=0.90,
+        f1_max_sigma_p95=0.75,
+        f2_min_coverage=0.50,
+        f2_max_sigma_p95=1.25,
+    )
+
+    source[InstrumentQuality.Q1] = 0.0
+    assert parameters.quality_weights[InstrumentQuality.Q1] == 1.0
+    with pytest.raises(TypeError):
+        parameters.quality_weights[InstrumentQuality.Q1] = 0.0
