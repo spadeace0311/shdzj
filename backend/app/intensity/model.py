@@ -62,14 +62,21 @@ def resolve_direction(
     return DirectionDecision(DirectionStatus.UNCERTAIN, None, None)
 
 
+def _validated_distance(distance_km: np.ndarray) -> np.ndarray:
+    distance = np.asarray(distance_km, dtype=np.float64)
+    if np.any(distance < 0):
+        raise ValueError("distance_km must not be negative")
+    if not np.all(np.isfinite(distance)):
+        raise ValueError("distance_km must be finite")
+    return distance
+
+
 def axis_intensity(
     magnitude: float,
     distance_km: np.ndarray,
     axis: AxisParameters,
 ) -> np.ndarray:
-    distance = np.asarray(distance_km, dtype=np.float64)
-    if np.any(distance < 0):
-        raise ValueError("distance_km must not be negative")
+    distance = _validated_distance(distance_km)
     return (
         axis.intercept
         + axis.magnitude_coefficient * magnitude
@@ -100,6 +107,7 @@ def evaluate_model(
     magnitude = float(snapshot.magnitude)
     if not math.isfinite(magnitude):
         raise ValueError("magnitude must be finite")
+    _validated_distance(samples.distance_km)
     if direction.status is DirectionStatus.UNCERTAIN:
         long_values = axis_intensity(
             magnitude,
@@ -145,8 +153,8 @@ def _axis_ratio_field(
     parameters: ModelParameters,
 ) -> tuple[np.ndarray, np.ndarray]:
     delta = np.deg2rad(samples.azimuth_deg - strike_deg)
-    x = samples.distance_km * np.sin(delta)
-    y = samples.distance_km * np.cos(delta)
+    x = samples.distance_km * np.cos(delta)
+    y = samples.distance_km * np.sin(delta)
     values = np.empty_like(x)
     sigma = np.empty_like(x)
 
@@ -164,17 +172,42 @@ def _axis_ratio_field(
             parameters.short_axis,
         )[0]
     )
-    high_bound = min(
+    field_high_bound = min(
         parameters.solver_intensity_max,
         center_intensity_long - 1e-6,
         center_intensity_short - 1e-6,
     )
-    if high_bound <= parameters.solver_intensity_min:
+    if field_high_bound <= parameters.solver_intensity_min:
         raise ModelFieldConvergenceError("model field has no valid intensity bracket")
 
     for index, (x_value, y_value, delta_value) in enumerate(zip(x, y, delta, strict=True)):
+        distance = float(samples.distance_km[index])
+        axis_epsilon = max(distance, 1.0) * 1e-12
+
+        if abs(y_value) <= axis_epsilon:
+            values[index] = float(
+                axis_intensity(
+                    magnitude,
+                    np.asarray([abs(x_value)], dtype=np.float64),
+                    parameters.long_axis,
+                )[0]
+            )
+            sigma[index] = parameters.long_axis.sigma
+            continue
+
+        if abs(x_value) <= axis_epsilon:
+            values[index] = float(
+                axis_intensity(
+                    magnitude,
+                    np.asarray([abs(y_value)], dtype=np.float64),
+                    parameters.short_axis,
+                )[0]
+            )
+            sigma[index] = parameters.short_axis.sigma
+            continue
+
         low = parameters.solver_intensity_min
-        high = high_bound
+        high = field_high_bound
         low_value = _field_residual(
             low,
             magnitude,
@@ -215,8 +248,8 @@ def _axis_ratio_field(
             raise ModelFieldConvergenceError("model field bisection exceeded max iterations")
 
         values[index] = (low + high) / 2.0
-        wa = math.sin(delta_value) ** 2
-        wb = math.cos(delta_value) ** 2
+        wa = math.cos(delta_value) ** 2
+        wb = math.sin(delta_value) ** 2
         sigma[index] = math.sqrt(
             wa * parameters.long_axis.sigma**2
             + wb * parameters.short_axis.sigma**2
