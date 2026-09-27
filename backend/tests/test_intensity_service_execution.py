@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -470,6 +470,101 @@ async def test_audit_write_failure_is_logged_and_annotated(
     assert excinfo.value.__notes__
     assert any("audit store unavailable" in note for note in excinfo.value.__notes__)
     assert "audit store unavailable" in caplog.text
+
+
+async def _make_deadline_already_due(session_factory, run_id: str) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            run = await session.get(AssessmentRun, run_id)
+            assert run is not None
+            run.deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+
+
+async def test_late_model_completion_still_persists_deadline_flag(
+    session_factory,
+) -> None:
+    run_id = await _seed_run(session_factory)
+    service = IntensityService(
+        session_factory=session_factory,
+        parameters=load_parameter_bundle("/config/intensity/shanghai-2019.yaml"),
+        fixed_grid_definition=GridDefinition(
+            "grid-late-model",
+            "EPSG:32651",
+            1000,
+            0,
+            2000,
+            2,
+            2,
+        ),
+    )
+    await _make_deadline_already_due(session_factory, run_id)
+
+    outcome = await service.run_model(run_id)
+
+    assert outcome.status == "succeeded"
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, run_id)
+    assert run is not None
+    assert run.deadline_exceeded_at is not None
+
+
+async def test_late_instrument_completion_still_persists_deadline_flag(
+    session_factory,
+) -> None:
+    run_id = await _seed_run(session_factory)
+    service = IntensityService(
+        session_factory=session_factory,
+        parameters=load_parameter_bundle("/config/intensity/shanghai-2019.yaml"),
+        fixed_grid_definition=GridDefinition(
+            "grid-late-instrument",
+            "EPSG:32651",
+            1000,
+            0,
+            2000,
+            2,
+            2,
+        ),
+        instrument_provider=UnavailableProvider(),
+    )
+    await _make_deadline_already_due(session_factory, run_id)
+
+    outcome = await service.run_instrument(run_id)
+
+    assert outcome.status == "succeeded"
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, run_id)
+    assert run is not None
+    assert run.deadline_exceeded_at is not None
+
+
+async def test_late_fusion_completion_still_persists_deadline_flag(
+    session_factory,
+) -> None:
+    run_id = await _seed_run(session_factory)
+    service = IntensityService(
+        session_factory=session_factory,
+        parameters=load_parameter_bundle("/config/intensity/shanghai-2019.yaml"),
+        fixed_grid_definition=GridDefinition(
+            "grid-late-fusion",
+            "EPSG:32651",
+            1000,
+            0,
+            2000,
+            2,
+            2,
+        ),
+        instrument_provider=UnavailableProvider(),
+    )
+    assert (await service.run_model(run_id)).status == "succeeded"
+    await _make_deadline_already_due(session_factory, run_id)
+
+    outcome = await service.run_fusion(run_id)
+
+    assert outcome.status == "succeeded"
+    async with session_factory() as session:
+        run = await session.get(AssessmentRun, run_id)
+    assert run is not None
+    assert run.deadline_exceeded_at is not None
 
 
 async def test_unavailable_instrument_rerun_is_idempotent(session_factory) -> None:

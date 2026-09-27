@@ -289,6 +289,11 @@ class IntensityService:
                             "grid_definition_version": definition.version,
                         },
                     )
+                    await self.assessment_repository.mark_deadline_exceeded(
+                        session,
+                        run.id,
+                        datetime.now(UTC),
+                    )
                     return IntensityTaskOutcome(
                         run_id=str(run.id),
                         task_key=task.task_key,
@@ -429,6 +434,11 @@ class IntensityService:
                             "product_id": str(product_id),
                             "grid_definition_version": definition.version,
                         },
+                    )
+                    await self.assessment_repository.mark_deadline_exceeded(
+                        session,
+                        run.id,
+                        datetime.now(UTC),
                     )
                     return IntensityTaskOutcome(
                         run_id=str(run.id),
@@ -589,6 +599,11 @@ class IntensityService:
                             "product_id": str(product_id),
                             "grid_definition_version": definition.version,
                         },
+                    )
+                    await self.assessment_repository.mark_deadline_exceeded(
+                        session,
+                        run.id,
+                        datetime.now(UTC),
                     )
                     return IntensityTaskOutcome(
                         run_id=str(run.id),
