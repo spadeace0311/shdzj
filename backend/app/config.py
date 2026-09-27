@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     assessment_outbox_max_attempts: int = 10
     assessment_outbox_lease_seconds: int = 60
     assessment_workflow_deadline_seconds: int = 300
+    intensity_parameters_path: str = "/config/intensity/shanghai-2019.yaml"
+    intensity_region_profile_path: str = "/config/intensity/shanghai-region.yaml"
+    assessment_workflow_safety_timeout_seconds: int = 1800
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -94,6 +97,12 @@ class Settings(BaseSettings):
             raise ValueError("ASSESSMENT_OUTBOX_LEASE_SECONDS must be positive")
         if self.assessment_workflow_deadline_seconds <= 0:
             raise ValueError("ASSESSMENT_WORKFLOW_DEADLINE_SECONDS must be positive")
+        if not self.intensity_parameters_path.strip():
+            raise ValueError("INTENSITY_PARAMETERS_PATH must not be empty")
+        if not self.intensity_region_profile_path.strip():
+            raise ValueError("INTENSITY_REGION_PROFILE_PATH must not be empty")
+        if self.assessment_workflow_safety_timeout_seconds <= 0:
+            raise ValueError("ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS must be positive")
         return self
 
 
