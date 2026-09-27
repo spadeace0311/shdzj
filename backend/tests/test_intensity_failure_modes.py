@@ -5,8 +5,9 @@ from sqlalchemy import select
 
 from app.assessment.models import AssessmentTask
 from app.db import engine
-from app.intensity.domain import GridDefinition
+from app.intensity.domain import GridDefinition, ProductStatus, ProductType
 from app.intensity.instrument import UnavailableInstrumentProvider
+from app.intensity.models import IntensityFieldProduct
 from app.intensity.model import ModelFieldConvergenceError
 from app.intensity.parameters import load_parameter_bundle
 from app.intensity.service import DirectionInputs, IntensityService
@@ -53,16 +54,28 @@ async def test_instrument_failure_does_not_fail_model_fusion_chain(
         instrument_provider=FailingInstrumentProvider(),
     )
 
+    instrument_product = None
     try:
         model = await service.run_model(run_id)
         instrument = await service.run_instrument(run_id)
         fusion = await service.run_fusion(run_id)
+        async with session_factory() as session:
+            instrument_product = await session.scalar(
+                select(IntensityFieldProduct).where(
+                    IntensityFieldProduct.run_id == run_id,
+                    IntensityFieldProduct.product_type == ProductType.INSTRUMENT.value,
+                )
+            )
     finally:
         await cleanup_intensity_fixture(session_factory)
 
     assert model.status == "succeeded"
     assert instrument.status == "succeeded"
     assert fusion.status == "succeeded"
+    assert instrument_product is not None
+    assert instrument_product.status == ProductStatus.UNAVAILABLE.value
+    assert instrument_product.statistics["source"] == "provider_error"
+    assert instrument_product.statistics["reason"] == "provider_error:RuntimeError"
 
 
 async def test_duplicate_model_run_keeps_one_product(
