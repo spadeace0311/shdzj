@@ -5,6 +5,7 @@ services:
       POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB is required}"
       POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGIS_GDAL_ENABLED_DRIVERS: "ENABLE_ALL"
     expose:
       - "5432"
     ports:
