@@ -82,11 +82,32 @@ def _bounds_match(left_wkt: str, right_wkt: str) -> bool:
     )
 
 
+async def _raster_payload_checksum(
+    session: AsyncSession,
+    raster_id: UUID,
+) -> tuple[bytes, str]:
+    payload = (
+        await session.execute(
+            text(
+                """
+                SELECT ST_AsGDALRaster(rast, 'GTiff')
+                FROM data_asset_rasters
+                WHERE id = :id
+                """
+            ),
+            {"id": raster_id},
+        )
+    ).scalar_one()
+    if payload is None:
+        raise RuntimeError("data asset raster payload is null")
+    payload_bytes = bytes(payload)
+    return payload_bytes, hashlib.sha256(payload_bytes).hexdigest()
+
+
 async def _verify_saved_raster(
     session: AsyncSession,
     raster_id: UUID,
     descriptor: NormalizedRasterData,
-    checksum: str,
 ) -> None:
     expected_manifest = _band_manifest(descriptor)
     row = (
@@ -142,6 +163,7 @@ async def _verify_saved_raster(
     persisted_band_count = int(metadata[9])
     persisted_resolution_x = hypot(persisted_scale_x, persisted_skew_y)
     persisted_resolution_y = hypot(persisted_skew_x, persisted_scale_y)
+    _, exported_checksum = await _raster_payload_checksum(session, raster_id)
 
     if (
         persisted_width != descriptor.width
@@ -163,7 +185,7 @@ async def _verify_saved_raster(
             rel_tol=1e-6,
             abs_tol=1e-6,
         )
-        or stored_checksum != checksum
+        or stored_checksum != exported_checksum
         or dict(stored_manifest) != expected_manifest
         or not _bounds_match(actual_extent, expected_extent)
         or not _bounds_match(stored_extent, expected_extent)
@@ -254,7 +276,18 @@ async def save_raster_version(
             "created_at": datetime.now(UTC),
         },
     )
-    await _verify_saved_raster(session, raster_id, descriptor, checksum)
+    _, canonical_checksum = await _raster_payload_checksum(session, raster_id)
+    await session.execute(
+        text(
+            """
+            UPDATE data_asset_rasters
+            SET checksum = :checksum
+            WHERE id = :id
+            """
+        ),
+        {"id": raster_id, "checksum": canonical_checksum},
+    )
+    await _verify_saved_raster(session, raster_id, descriptor)
     return raster_id
 
 

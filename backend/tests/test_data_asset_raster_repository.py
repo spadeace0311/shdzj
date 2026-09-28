@@ -24,6 +24,94 @@ async def _dispose_engine_between_tests():
     await engine.dispose()
 
 
+@pytest.fixture
+async def seeded_compressed_imported_version(session_factory, tmp_path):
+    from datetime import UTC, datetime
+
+    import numpy as np
+    import rasterio
+    from rasterio.transform import Affine
+    from sqlalchemy import select
+
+    from app.data_assets.models import DataAsset, DataAssetVersion
+    from tests.data_asset_helpers import (
+        FIXTURE_ACTOR,
+        SeededImportedVersion,
+        _asset_contract,
+        _cleanup_fixture_data,
+        _definition,
+    )
+
+    source_path = tmp_path / "compressed.tif"
+    transform = Affine(0.01, 0, 121.0, 0, -0.01, 31.5)
+    with rasterio.open(
+        source_path,
+        "w",
+        driver="GTiff",
+        width=16,
+        height=16,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:4326",
+        nodata=0,
+        transform=transform,
+        compress="DEFLATE",
+        tiled=True,
+        blockxsize=16,
+        blockysize=16,
+    ) as target:
+        target.write(np.arange(256, dtype="uint8").reshape(16, 16), 1)
+
+    definition = _definition("shanghai.gdp.raster")
+    source_checksum = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            asset = await session.scalar(
+                select(DataAsset).where(
+                    DataAsset.asset_key == definition.asset_key,
+                    DataAsset.region_id == definition.region_id,
+                )
+            )
+            if asset is None:
+                asset = DataAsset(
+                    asset_key=definition.asset_key,
+                    region_id=definition.region_id,
+                    name=definition.name,
+                    data_type=definition.data_type.value,
+                    spatial_granularity=definition.spatial_granularity,
+                    responsibility_unit=definition.responsibility_unit,
+                    update_interval_days=definition.update_interval_days,
+                    is_core=definition.is_core,
+                    contract=_asset_contract(definition),
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(asset)
+                await session.flush()
+            version = DataAssetVersion(
+                asset_id=asset.id,
+                version=f"compressed-raster-{uuid4()}",
+                status="imported",
+                source_uri="https://example.gov.invalid/compressed.tif",
+                schema_summary={},
+                record_count=0,
+                spatial_extent=None,
+                source_crs="EPSG:4326",
+                checksum=source_checksum,
+                managed_path=None,
+                imported_by=FIXTURE_ACTOR,
+                imported_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(version)
+            await session.flush()
+            version_id = version.id
+    yield SeededImportedVersion(version_id, source_path, definition)
+    await _cleanup_fixture_data(session_factory)
+
+
 def _manifest(descriptor):
     return {
         "band_count": descriptor.band_count,
@@ -104,7 +192,6 @@ async def test_save_raster_version_rejects_persisted_metadata_mismatch(
         source.source_path,
         source.definition,
     )
-    checksum = hashlib.sha256(source.source_path.read_bytes()).hexdigest()
     async with session_factory() as session:
         async with session.begin():
             raster_id = await save_raster_version(
@@ -122,7 +209,6 @@ async def test_save_raster_version_rejects_persisted_metadata_mismatch(
                     session,
                     raster_id,
                     descriptor,
-                    checksum,
                 )
 
 
@@ -147,8 +233,58 @@ async def test_load_raster_version_round_trips_payload_and_manifest(
                 session,
                 source.version_id,
             )
-    assert payload == source.source_path.read_bytes()
+            stored_checksum = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT checksum
+                        FROM data_asset_rasters
+                        WHERE version_id = :version_id
+                        """
+                    ),
+                    {"version_id": source.version_id},
+                )
+            ).scalar_one()
+    assert hashlib.sha256(payload).hexdigest() == stored_checksum
     assert manifest == _manifest(descriptor)
+
+
+async def test_load_raster_version_accepts_reencoded_compressed_geotiff(
+    session_factory,
+    seeded_compressed_imported_version,
+) -> None:
+    source = seeded_compressed_imported_version
+    descriptor = GeoTiffAssetImporter().load(
+        source.source_path,
+        source.definition,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await save_raster_version(
+                session,
+                source.version_id,
+                source.source_path,
+                descriptor,
+            )
+            stored_checksum = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT checksum
+                        FROM data_asset_rasters
+                        WHERE version_id = :version_id
+                        """
+                    ),
+                    {"version_id": source.version_id},
+                )
+            ).scalar_one()
+            payload, manifest = await load_raster_version(
+                session,
+                source.version_id,
+            )
+    assert hashlib.sha256(payload).hexdigest() == stored_checksum
+    assert manifest == _manifest(descriptor)
+    assert payload != source.source_path.read_bytes()
 
 
 async def test_load_raster_version_rejects_not_found(session_factory) -> None:
