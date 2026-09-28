@@ -40,6 +40,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "performance: integration benchmarks that use the full configured grid",
+  "windows_mdb: read-only Microsoft Access ODBC integration tests",
 ]
 
 [tool.ruff]
