@@ -7,6 +7,7 @@ from app.assessment.router import router as assessment_router
 from app.auth.router import router as auth_router
 from app.auth.service import AuthService
 from app.collector.router import router as collector_router
+from app.data_assets.router import router as data_assets_router
 from app.db import SessionFactory
 from app.events.router import router as events_router
 
@@ -28,6 +29,7 @@ app.include_router(assessment_router)
 app.include_router(auth_router)
 app.include_router(events_router)
 app.include_router(collector_router)
+app.include_router(data_assets_router)
 
 
 @app.get("/health")
