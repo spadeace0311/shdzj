@@ -18,9 +18,11 @@ class GeoTiffAssetImporter:
         with rasterio.open(path) as dataset:
             if dataset.crs is None:
                 raise ValueError("GeoTIFF CRS is required")
-            epsg = CRS.from_user_input(dataset.crs).to_epsg()
-            if epsg is None:
-                raise ValueError("GeoTIFF CRS must map to an EPSG code")
+            srid = _resolve_srid(CRS.from_user_input(dataset.crs))
+            if srid is None:
+                raise ValueError(
+                    "GeoTIFF CRS must map to a numeric EPSG or ESRI code"
+                )
             if dataset.width <= 0 or dataset.height <= 0 or dataset.count <= 0:
                 raise ValueError("GeoTIFF dimensions and band count must be positive")
             transform = dataset.transform
@@ -54,7 +56,7 @@ class GeoTiffAssetImporter:
             return NormalizedRasterData(
                 width=dataset.width,
                 height=dataset.height,
-                srid=epsg,
+                srid=srid,
                 band_count=dataset.count,
                 dtype=dataset.dtypes[0],
                 nodata=dataset.nodata,
@@ -62,3 +64,16 @@ class GeoTiffAssetImporter:
                 resolution_y=resolution_y,
                 spatial_extent=tuple(dataset.bounds),
             )
+
+
+def _resolve_srid(crs: CRS) -> int | None:
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return epsg
+    authority = crs.to_authority()
+    if authority is None:
+        return None
+    auth_name, auth_code = authority
+    if auth_name.upper() not in {"EPSG", "ESRI"} or not auth_code.isdigit():
+        return None
+    return int(auth_code)

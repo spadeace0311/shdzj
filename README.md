@@ -111,6 +111,20 @@ collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx 
 
 评估编排的启动、健康检查、Outbox 查询、死信安全重放、Workflow 核验和 Worker 恢复请参阅 [评估编排运行手册](docs/runbooks/assessment-orchestration.md)。
 
+## 数据资产中心
+
+数据资产中心已实现上海区域数据资产的版本化接入、校验、发布、停用、回滚和评估快照。导入格式包括 GeoJSON、Windows Access MDB、GeoTIFF 和 YAML/JSON 参数文件；MDB 因 ODBC 驱动边界必须在 Windows 宿主机运行，其他格式由 `data-asset-worker` 在 Linux 容器中处理。
+
+角色权限：
+
+- `data_maintainer`：导入和校验。
+- `data_publisher`：导入、校验、发布、停用和回滚。
+- `superadmin`：拥有全部数据资产操作。
+
+评估运行创建时会冻结已发布资产版本、校验和以及 required/optional 角色到 `data_asset_snapshots`。当前阶段只捕获快照，受灾人口、人员伤亡、房屋破坏和经济损失等损失公式仍属于后续工作，尚未消费这些快照。
+
+数据资产的部署、导入、发布、故障排查、快照核验、更新逾期和备份恢复请参阅 [数据资产中心运行手册](docs/runbooks/data-asset-center.md)。
+
 ## 端到端测试
 
 E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表和详情页能独立显示制度响应与服务响应。测试不读取或写入浏览器存储，登录 token 仅保存在 React 内存中。

@@ -70,6 +70,31 @@ def test_geotiff_importer_reads_metadata(tmp_path: Path) -> None:
     assert descriptor.resolution_x == pytest.approx(0.01)
 
 
+def test_geotiff_importer_accepts_numeric_esri_authority(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "gdp-albers.tif"
+    with rasterio.open(
+        source,
+        "w",
+        driver="GTiff",
+        width=1,
+        height=1,
+        count=1,
+        dtype="float32",
+        crs="ESRI:102025",
+        transform=Affine(1000, 0, 0, 0, -1000, 0),
+    ) as dataset:
+        dataset.write(np.ones((1, 1, 1), dtype=np.float32))
+
+    descriptor = GeoTiffAssetImporter().load(
+        source,
+        get_asset_definition("shanghai.gdp.raster"),
+    )
+
+    assert descriptor.srid == 102025
+
+
 def test_geotiff_importer_rejects_unknown_crs(tmp_path: Path) -> None:
     source = tmp_path / "bad.tif"
     with rasterio.open(

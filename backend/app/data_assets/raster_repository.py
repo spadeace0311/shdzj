@@ -35,6 +35,40 @@ def _band_manifest(descriptor: NormalizedRasterData) -> dict:
     }
 
 
+def _manifest_matches(stored: dict, expected: dict) -> bool:
+    if set(stored) != set(expected):
+        return False
+    if (
+        int(stored.get("band_count", 0)) != expected["band_count"]
+        or str(stored.get("dtype")) != expected["dtype"]
+    ):
+        return False
+    for field_name in ("resolution_x", "resolution_y"):
+        try:
+            if not isclose(
+                float(stored[field_name]),
+                float(expected[field_name]),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            ):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    stored_nodata = stored.get("nodata")
+    expected_nodata = expected.get("nodata")
+    if stored_nodata is None or expected_nodata is None:
+        return stored_nodata is None and expected_nodata is None
+    try:
+        return isclose(
+            float(stored_nodata),
+            float(expected_nodata),
+            rel_tol=1e-9,
+            abs_tol=0.0,
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _validate_descriptor(descriptor: NormalizedRasterData) -> None:
     if descriptor.width <= 0 or descriptor.height <= 0 or descriptor.band_count <= 0:
         raise ValueError("raster dimensions and band count must be positive")
@@ -186,7 +220,7 @@ async def _verify_saved_raster(
             abs_tol=1e-6,
         )
         or stored_checksum != exported_checksum
-        or dict(stored_manifest) != expected_manifest
+        or not _manifest_matches(dict(stored_manifest), expected_manifest)
         or not _bounds_match(actual_extent, expected_extent)
         or not _bounds_match(stored_extent, expected_extent)
     ):
@@ -245,7 +279,10 @@ async def save_raster_version(
             WITH source AS (
                 SELECT CAST(:id AS uuid) AS id,
                        CAST(:version_id AS uuid) AS version_id,
-                       ST_FromGDALRaster(:payload) AS rast
+                       ST_SetSRID(
+                           ST_FromGDALRaster(:payload),
+                           :srid
+                       ) AS rast
             )
             INSERT INTO data_asset_rasters (
                 id, version_id, rast, band_manifest, checksum,

@@ -158,6 +158,64 @@ async def test_save_raster_version_can_read_postgis_metadata(
     assert len(row[3]) == 64
 
 
+async def test_save_raster_version_sets_numeric_esri_authority(
+    session_factory,
+    seeded_imported_version,
+) -> None:
+    source = seeded_imported_version
+    import numpy as np
+    import rasterio
+    from rasterio.transform import Affine
+
+    with rasterio.open(
+        source.source_path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=5,
+        count=1,
+        dtype="float32",
+        crs="ESRI:102025",
+        nodata=-3.4028230607370965e38,
+        transform=Affine(1000, 0, 0, 0, -1000, 0),
+    ) as dataset:
+        dataset.write(np.ones((5, 4), dtype="float32"), 1)
+    checksum = hashlib.sha256(source.source_path.read_bytes()).hexdigest()
+    descriptor = GeoTiffAssetImporter().load(
+        source.source_path,
+        source.definition,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(DataAssetVersion)
+                .where(DataAssetVersion.id == source.version_id)
+                .values(checksum=checksum)
+            )
+            raster_id = await save_raster_version(
+                session,
+                source.version_id,
+                source.source_path,
+                descriptor,
+            )
+            stored_srid = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT ST_SRID(rast)
+                        FROM data_asset_rasters
+                        WHERE id = :raster_id
+                        """
+                    ),
+                    {"raster_id": raster_id},
+                )
+            ).scalar_one()
+
+    assert descriptor.srid == 102025
+    assert stored_srid == 102025
+
+
 async def test_save_raster_version_rejects_version_checksum_mismatch(
     session_factory,
     seeded_imported_version,

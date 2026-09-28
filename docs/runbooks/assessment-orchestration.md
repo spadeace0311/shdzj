@@ -151,7 +151,8 @@ ORDER BY available_at;
 SELECT id, event_id, revision_id, run_no, status,
        report_ingested_at, deadline_basis_at, deadline_at,
        deadline_exceeded_at, algorithm_bundle_version,
-       superseded_by_run_id, last_error
+       superseded_by_run_id, data_asset_snapshot_fingerprint,
+       data_asset_snapshot_result, last_error
 FROM assessment_runs
 ORDER BY created_at DESC
 LIMIT 20;
@@ -163,7 +164,8 @@ LIMIT 20;
 SELECT id, revision_id, run_no, status, t1_at,
        report_ingested_at, deadline_basis_at, deadline_at,
        deadline_exceeded_at, algorithm_bundle_version,
-       superseded_by_run_id, created_at, completed_at
+       superseded_by_run_id, data_asset_snapshot_fingerprint,
+       data_asset_snapshot_result, created_at, completed_at
 FROM assessment_runs
 WHERE event_id = '<事件 UUID>'
 ORDER BY run_no DESC
@@ -179,6 +181,37 @@ FROM assessment_tasks
 WHERE run_id = '<运行 UUID>'
 ORDER BY sequence;
 ```
+
+查看该运行冻结的数据资产快照：
+
+```sql
+SELECT r.id AS run_id,
+       r.data_asset_snapshot_fingerprint,
+       r.data_asset_snapshot_result,
+       das.asset_key,
+       das.version,
+       das.checksum,
+       das.role,
+       das.required
+FROM assessment_runs r
+LEFT JOIN data_asset_snapshots das ON das.run_id = r.id
+WHERE r.id = '<运行 UUID>'
+ORDER BY das.asset_key;
+```
+
+评估状态 API 返回的 `intensity` 和顶层响应中都包含以下字段：
+
+```json
+{
+  "data_asset_snapshot_fingerprint": "<sha256>",
+  "data_asset_snapshot": {
+    "snapshot_count": 2,
+    "missing_required": ["shanghai.loss.parameters"]
+  }
+}
+```
+
+创建评估运行时会捕获所有已发布的 required/optional 资产。缺少 required 资产会记录在 `missing_required` 中，但当前阶段只做记录，不使评估运行失败；损失实现启用后，该缺失将变成损失任务失败。
 
 查看该运行的烈度产品：
 

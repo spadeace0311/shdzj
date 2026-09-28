@@ -18,7 +18,7 @@ from shapely.geometry import (
 )
 from shapely.geometry.base import BaseGeometry
 from shapely.geometry.polygon import orient
-from shapely.validation import explain_validity
+from shapely.validation import explain_validity, make_valid
 from shapely import wkt as shapely_wkt
 
 from app.config import settings
@@ -137,7 +137,8 @@ class MdbAssetImporter:
             field = contract_lookup.get(str(column).upper())
             field_type = field.python_type if field is not None else None
             converted = _json_safe(value, field_type)
-            properties[str(column)] = _coerce_contract_value(
+            property_key = field.name if field is not None else str(column)
+            properties[property_key] = _coerce_contract_value(
                 converted,
                 field_type,
             )
@@ -481,14 +482,31 @@ def _group_polygon_rings(rings: list[LinearRing]) -> list[Polygon]:
                 polygon_holes.append(hole)
                 assigned_holes.add(index)
         polygon = Polygon(exterior.coords, [hole.coords for hole in polygon_holes])
-        if not polygon.is_valid:
-            raise ValueError(
-                f"invalid ESRI polygon ring: {explain_validity(polygon)}"
-            )
-        polygons.append(orient(polygon, sign=1.0))
+        polygons.extend(_repair_polygon(polygon))
     if len(assigned_holes) != len(holes):
         raise ValueError("ESRI polygon has a hole outside every exterior ring")
     return polygons
+
+
+def _repair_polygon(polygon: Polygon) -> list[Polygon]:
+    if polygon.is_valid:
+        return [orient(polygon, sign=1.0)]
+    repaired = make_valid(polygon)
+    if repaired.geom_type == "Polygon":
+        return [orient(repaired, sign=1.0)]
+    if repaired.geom_type == "MultiPolygon":
+        return [orient(part, sign=1.0) for part in repaired.geoms]
+    if repaired.geom_type == "GeometryCollection":
+        polygons = [
+            orient(part, sign=1.0)
+            for part in repaired.geoms
+            if part.geom_type == "Polygon"
+        ]
+        if polygons:
+            return polygons
+    raise ValueError(
+        f"invalid ESRI polygon ring: {explain_validity(polygon)}"
+    )
 
 
 def _json_safe(value: object, field_type: str | None) -> object:
@@ -547,7 +565,9 @@ def _business_key(
         column = column_lookup.get(field.upper())
         if column is None:
             raise ValueError(f"business key field is missing from MDB row: {field}")
-        value = properties.get(column)
+        value = properties.get(field)
+        if value is None:
+            value = properties.get(column)
         text = "" if value is None else str(value).strip()
         if not text:
             raise ValueError("business key fields are required")

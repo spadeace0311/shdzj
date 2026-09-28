@@ -182,6 +182,50 @@ def test_mdb_importer_normalizes_table_and_geometry(tmp_path: Path) -> None:
     assert result.records[0].geometry_wkt.startswith("MULTILINESTRING")
 
 
+def test_mdb_importer_canonicalizes_contract_field_names(tmp_path: Path) -> None:
+    source = tmp_path / "base.mdb"
+    source.write_bytes(b"not-opened-by-fake")
+
+    class CanonicalCursor:
+        description = [("id",), ("name",), ("SHAPE",)]
+        rows = [
+            (
+                "T001",
+                "测试镇",
+                _polygon_shape(
+                    ((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 0.0))
+                ),
+            )
+        ]
+
+        def execute(self, statement: str) -> None:
+            assert statement == "SELECT * FROM [TOWN_CODE]"
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self) -> None:
+            return None
+
+    class CanonicalConnection:
+        def cursor(self) -> CanonicalCursor:
+            return CanonicalCursor()
+
+        def close(self) -> None:
+            return None
+
+    class CanonicalFactory:
+        def connect(self, _path):
+            return CanonicalConnection()
+
+    importer = MdbAssetImporter(connection_factory=CanonicalFactory())
+    result = importer.load(source, get_asset_definition("shanghai.admin.town"))
+
+    assert result.records[0].properties["ID"] == "T001"
+    assert result.records[0].properties["NAME"] == "测试镇"
+    assert "id" not in result.records[0].properties
+
+
 def test_parse_esri_polygon_shape() -> None:
     ring = ((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 0.0))
 
@@ -258,6 +302,25 @@ def test_parse_esri_rejects_invalid_polygon_ring() -> None:
 
     with pytest.raises(ValueError, match="closed"):
         parse_esri_shape(_polygon_shape(ring))
+
+
+def test_parse_esri_repairs_self_intersecting_polygon_ring() -> None:
+    ring = (
+        (0.0, 0.0),
+        (2.0, 0.0),
+        (1.0, 1.0),
+        (2.0, 2.0),
+        (0.0, 2.0),
+        (1.0, 1.0),
+        (0.0, 0.0),
+    )
+
+    geometry = parse_esri_shape(_polygon_shape(ring))
+
+    assert geometry.geom_type == "MultiPolygon"
+    assert geometry.is_valid
+    assert len(geometry.geoms) == 2
+    assert geometry.area == pytest.approx(2.0)
 
 
 def test_parse_esri_rejects_malformed_part_indices() -> None:

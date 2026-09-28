@@ -191,7 +191,12 @@ FIRST_PARTY_ASSETS = (
                 _field("id", "string"),
                 _field("name", "string"),
                 _field("TOTAL_AREA", "number", nonnegative=True),
-                _field("HIGH_RISE", "number", nonnegative=True),
+                _field(
+                    "HIGH_RISE",
+                    "number",
+                    required=False,
+                    nonnegative=True,
+                ),
                 _field("RCFRAME", "number", nonnegative=True),
                 _field("BRICK_STRUCTURE", "number", nonnegative=True),
                 _field("SINGLE_AREA", "number", nonnegative=True),
