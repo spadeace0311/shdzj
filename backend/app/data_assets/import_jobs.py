@@ -223,8 +223,13 @@ def sanitize_error(error: Exception) -> str:
     if not message:
         return type(error).__name__
     patterns = (
-        r"(?i)\b(?:driver|dbq|database|password|pwd|user|uid)=([^;]+)",
-        r"(?i)\b(?:postgres(?:ql)?(?:\+asyncpg)?|mysql|mssql|odbc)://\S+",
+        r"(?i)\b(?:driver|dbq|database|user|uid|token|api[_-]?key|apikey|"
+        r"password|passwd|pwd|secret|access[_-]?token)\b\s*[:=]\s*[^\s,;]+",
+        r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/]+:[^\s@/]+@\S+",
+        (
+            r"(?i)\b(?:postgres(?:ql)?(?:\+asyncpg)?|mysql|mssql|odbc|redis|"
+            r"rediss|mongodb(?:\+srv)?|amqp|amqps|oracle|sqlite)://\S+"
+        ),
         r"(?i)\b[A-Za-z]:\\[^\s;]+",
     )
     for pattern in patterns:

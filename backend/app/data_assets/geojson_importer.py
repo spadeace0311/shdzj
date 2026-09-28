@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pyproj import Transformer
 from shapely import wkt as shapely_wkt
-from shapely.geometry import MultiPolygon, shape
+from shapely.geometry import MultiLineString, MultiPolygon, shape
 from shapely.ops import transform
 from shapely.validation import explain_validity
 
@@ -49,9 +49,17 @@ class GeoJsonAssetImporter:
                     raise ValueError(f"invalid geometry at row {row_number}: {explain_validity(geometry)}")
                 if transformer is not None:
                     geometry = transform(transformer, geometry)
-                if geometry.geom_type == "Polygon":
-                    geometry = MultiPolygon([geometry])
+                geometry = self._normalize_geometry(
+                    geometry,
+                    contract.geometry_type,
+                    row_number,
+                )
                 geometry_wkt = geometry.wkt
+            elif contract.geometry_type is not None:
+                raise ValueError(
+                    f"geometry type mismatch at row {row_number}: "
+                    f"expected {contract.geometry_type}, got None"
+                )
             records.append(
                 NormalizedRecord(
                     row_number=row_number,
@@ -92,6 +100,29 @@ class GeoJsonAssetImporter:
         if document.get("type") == "Feature":
             return [document]
         raise ValueError("GeoJSON must be a Feature or FeatureCollection")
+
+    @staticmethod
+    def _normalize_geometry(geometry, expected: str | None, row_number: int):
+        if expected is None:
+            return geometry
+        expected = expected.upper()
+        geometry_type = geometry.geom_type.upper()
+        if expected == "MULTIPOLYGON":
+            if geometry_type == "POLYGON":
+                return MultiPolygon([geometry])
+            if geometry_type == "MULTIPOLYGON":
+                return geometry
+        elif expected == "MULTILINESTRING":
+            if geometry_type == "LINESTRING":
+                return MultiLineString([geometry])
+            if geometry_type == "MULTILINESTRING":
+                return geometry
+        elif geometry_type == expected:
+            return geometry
+        raise ValueError(
+            f"geometry type mismatch at row {row_number}: "
+            f"expected {expected}, got {geometry_type}"
+        )
 
     @staticmethod
     def _business_key(properties: dict, fields: tuple[str, ...]) -> str:

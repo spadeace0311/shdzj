@@ -62,3 +62,43 @@ def test_geojson_importer_rejects_duplicate_business_key(tmp_path: Path) -> None
             source,
             get_asset_definition("shanghai.admin.town"),
         )
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        None,
+        {"type": "Point", "coordinates": [121.5, 31.2]},
+        {
+            "type": "LineString",
+            "coordinates": [[121.5, 31.2], [121.51, 31.21]],
+        },
+    ],
+    ids=["null", "point", "linestring"],
+)
+def test_geojson_importer_enforces_contract_geometry_type(
+    tmp_path: Path,
+    geometry: object,
+) -> None:
+    source = tmp_path / "wrong-geometry.geojson"
+    source.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"ID": "310115001", "NAME": "wrong geometry"},
+                        "geometry": geometry,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="geometry type"):
+        GeoJsonAssetImporter().load(
+            source,
+            get_asset_definition("shanghai.admin.town"),
+        )
