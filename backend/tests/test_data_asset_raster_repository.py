@@ -13,6 +13,7 @@ from app.data_assets.raster_repository import (
     load_raster_version,
     save_raster_version,
 )
+from app.data_assets.service import DataAssetService
 
 
 @pytest.fixture(autouse=True)
@@ -119,6 +120,7 @@ def _manifest(descriptor):
         "nodata": descriptor.nodata,
         "resolution_x": descriptor.resolution_x,
         "resolution_y": descriptor.resolution_y,
+        "native_bounds": list(descriptor.native_spatial_extent),
     }
 
 
@@ -214,6 +216,92 @@ async def test_save_raster_version_sets_numeric_esri_authority(
 
     assert descriptor.srid == 102025
     assert stored_srid == 102025
+
+
+async def test_populate_projected_raster_persists_wgs84_extent_and_source_crs(
+    session_factory,
+    seeded_imported_version,
+) -> None:
+    source = seeded_imported_version
+    import numpy as np
+    import rasterio
+    from rasterio.transform import Affine
+
+    with rasterio.open(
+        source.source_path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=3,
+        count=1,
+        dtype="float32",
+        crs="EPSG:32651",
+        transform=Affine(1000, 0, 500_000, 0, -1000, 3_453_000),
+    ) as dataset:
+        dataset.write(np.ones((3, 4), dtype="float32"), 1)
+    checksum = hashlib.sha256(source.source_path.read_bytes()).hexdigest()
+    descriptor = GeoTiffAssetImporter().load(
+        source.source_path,
+        source.definition,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(DataAssetVersion)
+                .where(DataAssetVersion.id == source.version_id)
+                .values(checksum=checksum)
+            )
+            version = await DataAssetService().populate_candidate_version(
+                session,
+                source.version_id,
+                descriptor,
+                {
+                    "file_format": "geotiff",
+                    "source_crs": descriptor.source_crs,
+                },
+                source_path=source.source_path,
+            )
+            version_id = version.id
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT v.source_crs,
+                           ST_SRID(v.spatial_extent),
+                           ST_XMin(v.spatial_extent),
+                           ST_YMin(v.spatial_extent),
+                           ST_XMax(v.spatial_extent),
+                           ST_YMax(v.spatial_extent),
+                           r.srid,
+                           ST_SRID(r.spatial_extent),
+                           ST_XMin(r.spatial_extent),
+                           ST_YMin(r.spatial_extent),
+                           ST_XMax(r.spatial_extent),
+                           ST_YMax(r.spatial_extent)
+                    FROM data_asset_versions v
+                    JOIN data_asset_rasters r ON r.version_id = v.id
+                    WHERE v.id = :version_id
+                    """
+                ),
+                {"version_id": version_id},
+            )
+        ).one()
+
+    assert row[0] == "EPSG:32651"
+    assert row[1] == 4326
+    assert tuple(float(value) for value in row[2:6]) == pytest.approx(
+        descriptor.spatial_extent,
+        abs=1e-6,
+    )
+    assert row[6] == 32651
+    assert row[7] == 4326
+    assert tuple(float(value) for value in row[8:12]) == pytest.approx(
+        descriptor.spatial_extent,
+        abs=1e-6,
+    )
 
 
 async def test_save_raster_version_rejects_version_checksum_mismatch(

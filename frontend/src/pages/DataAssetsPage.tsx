@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import {
   ApiError,
+  getDataAssetImportJob,
   importDataAsset,
   listDataAssetVersions,
   listDataAssets,
@@ -12,6 +13,7 @@ import {
 } from "../api/client";
 import {
   formatDateTime,
+  type DataAssetImportJob,
   type DataAssetSummary,
   type DataAssetVersion,
   type ValidationIssue,
@@ -104,6 +106,7 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
   >("idle");
   const [importMessage, setImportMessage] = useState("");
   const [importError, setImportError] = useState("");
+  const [importJob, setImportJob] = useState<DataAssetImportJob | null>(null);
 
   const [dialog, setDialog] = useState<{
     action: LifecycleAction;
@@ -141,6 +144,7 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
     setSelectedVersionId(null);
     setValidationReport(null);
     setValidationMessage("");
+    setImportJob(null);
     try {
       const versionList = await listDataAssetVersions(assetKey);
       setVersions(versionList);
@@ -151,13 +155,45 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
     }
   }
 
-  async function loadVersionsForAsset(assetKey: string) {
-    try {
-      const versionList = await listDataAssetVersions(assetKey);
-      setVersions(versionList);
-      setSelectedVersionId(versionList[0]?.id ?? null);
-    } catch {
-      // Keep the existing table so a failed refresh does not discard known state.
+  async function refreshAssetState(
+    assetKey: string,
+    preferredVersionId?: string,
+  ) {
+    const [assetList, versionList] = await Promise.all([
+      listDataAssets(),
+      listDataAssetVersions(assetKey),
+    ]);
+    setAssets(assetList);
+    setSelectedKey(assetKey);
+    setVersions(versionList);
+    setSelectedVersionId(
+      preferredVersionId &&
+        versionList.some((version) => version.id === preferredVersionId)
+        ? preferredVersionId
+        : (versionList[0]?.id ?? null),
+    );
+  }
+
+  async function pollImportJob(jobId: string, assetKey: string) {
+    while (true) {
+      const job = await getDataAssetImportJob(jobId);
+      setImportJob(job);
+      if (["completed", "rejected", "failed"].includes(job.status)) {
+        setImportState("idle");
+        if (job.status === "completed") {
+          setImportMessage("导入完成");
+        } else {
+          setImportMessage(
+            job.status === "rejected" ? "导入校验未通过" : "导入处理失败",
+          );
+        }
+        await refreshAssetState(assetKey, job.version_id);
+        return;
+      }
+      setImportMessage(
+        job.status === "queued" ? "导入任务已进入队列" : "正在导入数据",
+      );
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 2_000));
     }
   }
 
@@ -173,7 +209,7 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
     setImportMessage("");
     setImportState("submitting");
     try {
-      await importDataAsset(selectedAsset.asset_key, {
+      const accepted = await importDataAsset(selectedAsset.asset_key, {
         version: importVersion.trim(),
         source_uri: sourceUri.trim(),
         ...(licenseName.trim() ? { license_name: licenseName.trim() } : {}),
@@ -182,7 +218,13 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
       });
       setImportState("queued");
       setImportMessage("导入任务已进入队列");
-      void loadVersionsForAsset(selectedAsset.asset_key);
+      setImportJob(null);
+      void pollImportJob(accepted.job_id, selectedAsset.asset_key).catch(
+        (caught) => {
+          setImportState("idle");
+          setImportError(errorMessage(caught));
+        },
+      );
     } catch (caught) {
       setImportState("idle");
       setImportError(errorMessage(caught));
@@ -229,10 +271,9 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
         updated = await rollbackDataAssetVersion(dialog.version.id, reason);
       }
 
-      setVersions((current) =>
-        current.map((version) => (version.id === updated.id ? updated : version)),
-      );
-      setSelectedVersionId(updated.id);
+      if (selectedAsset) {
+        await refreshAssetState(selectedAsset.asset_key, updated.id);
+      }
       setDialog(null);
     } catch (caught) {
       setDialogError(errorMessage(caught));
@@ -442,6 +483,30 @@ export function DataAssetsPage({ userRole }: { userRole: string }) {
                     <p className="form-success" role="status">
                       {importMessage}
                     </p>
+                  ) : null}
+                  {importJob ? (
+                    <div className="data-asset-findings">
+                      <p>
+                        任务状态：
+                        <span className="mono">{importJob.status}</span>
+                      </p>
+                      {importJob.error_summary ? (
+                        <p className="form-error" role="alert">
+                          {importJob.error_summary}
+                        </p>
+                      ) : null}
+                      <IssueList
+                        title="导入错误"
+                        issues={importJob.validation_errors}
+                      />
+                      <IssueList
+                        title="导入警告"
+                        issues={importJob.validation_warnings}
+                      />
+                      {Object.keys(importJob.statistics).length > 0 ? (
+                        <pre>{JSON.stringify(importJob.statistics, null, 2)}</pre>
+                      ) : null}
+                    </div>
                   ) : null}
 
                   <div className="form-actions">

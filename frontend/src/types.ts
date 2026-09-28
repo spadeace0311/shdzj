@@ -158,6 +158,7 @@ export interface DataAssetVersion {
   version: string;
   status: DataAssetVersionStatus;
   source_uri: string;
+  source_crs: string;
   license_name: string | null;
   acquired_at: string | null;
   valid_from: string | null;
@@ -175,6 +176,7 @@ export interface DataAssetVersion {
   retired_at: string | null;
   validation_errors: ValidationIssue[];
   validation_warnings: ValidationIssue[];
+  statistics: Record<string, unknown>;
 }
 
 export interface DataAssetImportInput {
@@ -191,6 +193,21 @@ export interface DataAssetImportAccepted {
   asset_key: string;
   version: string;
   status: "queued" | "running" | "completed" | "rejected" | "failed";
+}
+
+export interface DataAssetImportJob {
+  job_id: string;
+  asset_key: string;
+  version: string;
+  version_id: string;
+  status: "queued" | "running" | "completed" | "rejected" | "failed";
+  error_summary: string | null;
+  validation_errors: ValidationIssue[];
+  validation_warnings: ValidationIssue[];
+  statistics: Record<string, unknown>;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }
 
 export interface ValidationReport {

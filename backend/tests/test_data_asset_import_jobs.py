@@ -85,9 +85,23 @@ async def test_complete_import_job_sets_terminal_status_and_timestamp(
             job_id = job.id
             version_id = job.asset_version_id
 
+    report = ValidationReport(
+        version_id=str(version_id),
+        status=AssetVersionStatus.VALIDATED,
+        errors=(),
+        warnings=(
+            ValidationIssue(
+                severity="warning",
+                code="record_count_outside_expected",
+                message="record count differs",
+            ),
+        ),
+        statistics={"record_count": 1},
+        checked_at=datetime.now(UTC),
+    )
     async with session_factory() as session:
         async with session.begin():
-            await complete_import_job(session, job_id, version_id)
+            await complete_import_job(session, job_id, version_id, report)
 
     async with session_factory() as session:
         stored = await session.get(DataAssetImportJob, job_id)
@@ -96,6 +110,8 @@ async def test_complete_import_job_sets_terminal_status_and_timestamp(
     assert stored.asset_version_id == version_id
     assert stored.completed_at is not None
     assert stored.completed_at.tzinfo is not None
+    assert stored.validation_warnings[0]["code"] == "record_count_outside_expected"
+    assert stored.statistics == {"record_count": 1}
 
 
 async def test_reject_import_job_records_validation_and_audit(

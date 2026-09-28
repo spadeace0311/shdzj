@@ -10,7 +10,6 @@ from app.auth.router import require_role
 from app.config import settings
 from app.data_assets.domain import (
     AssetDataType,
-    AssetVersionStatus,
     ImportJobStatus,
     SourceFormat,
     ValidationReport,
@@ -23,6 +22,7 @@ from app.data_assets.schemas import (
     AssetSummaryResponse,
     AssetVersionResponse,
     ImportAcceptedResponse,
+    ImportJobResponse,
     LifecycleActionRequest,
     ValidationReportResponse,
 )
@@ -231,6 +231,26 @@ async def get_data_asset_version(
     return map_asset_version_detail_response(view)
 
 
+@router.get(
+    "/data-asset-import-jobs/{job_id}",
+    response_model=ImportJobResponse,
+)
+async def get_data_asset_import_job(
+    job_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    service: DataAssetService = Depends(get_data_asset_service),
+    _current_user: object = Depends(require_role(*_DATA_READ_ROLES)),
+) -> ImportJobResponse:
+    try:
+        view = await service.get_import_job(session, job_id)
+    except (KeyError, LookupError, PermissionError, ValueError, SQLAlchemyError) as exc:
+        raise _map_data_asset_error(exc) from exc
+    payload = asdict(view)
+    payload["job_id"] = str(payload["job_id"])
+    payload["version_id"] = str(payload["version_id"])
+    return ImportJobResponse.model_validate(payload)
+
+
 @router.post(
     "/data-asset-versions/{version_id}/validate",
     response_model=ValidationReportResponse,
@@ -272,7 +292,8 @@ async def publish_data_asset_version(
                 current_user.username,
                 request.reason,
             )
-            return await _version_response_for_model(session, version)
+            detail = await service.get_version_detail(session, version.id)
+            return map_asset_version_detail_response(detail)
     except (KeyError, LookupError, PermissionError, ValueError, SQLAlchemyError) as exc:
         raise _map_data_asset_error(exc) from exc
 
@@ -296,7 +317,8 @@ async def retire_data_asset_version(
                 current_user.username,
                 request.reason,
             )
-            return await _version_response_for_model(session, version)
+            detail = await service.get_version_detail(session, version.id)
+            return map_asset_version_detail_response(detail)
     except (KeyError, LookupError, PermissionError, ValueError, SQLAlchemyError) as exc:
         raise _map_data_asset_error(exc) from exc
 
@@ -320,41 +342,7 @@ async def rollback_data_asset_version(
                 current_user.username,
                 request.reason,
             )
-            return await _version_response_for_model(session, version)
+            detail = await service.get_version_detail(session, version.id)
+            return map_asset_version_detail_response(detail)
     except (KeyError, LookupError, PermissionError, ValueError, SQLAlchemyError) as exc:
         raise _map_data_asset_error(exc) from exc
-
-
-async def _version_response_for_model(session, version) -> AssetVersionResponse:
-    from app.data_assets.models import DataAsset
-
-    asset = await session.get(DataAsset, version.asset_id)
-    if asset is None:
-        raise LookupError("data asset version references a missing asset")
-    return map_asset_version_response(
-        AssetVersionView(
-            version_id=version.id,
-            asset_key=asset.asset_key,
-            region_id=asset.region_id,
-            version=version.version,
-            status=AssetVersionStatus(version.status),
-            source_uri=version.source_uri,
-            license_name=version.license_name,
-            acquired_at=version.acquired_at,
-            valid_from=version.valid_from,
-            valid_to=version.valid_to,
-            quality_grade=version.quality_grade,
-            change_note=version.change_note,
-            schema_summary=dict(version.schema_summary),
-            record_count=version.record_count,
-            checksum=version.checksum or "",
-            imported_by=version.imported_by or "",
-            reviewed_by=version.reviewed_by,
-            imported_at=version.imported_at or version.created_at,
-            validated_at=version.validated_at,
-            published_at=version.published_at,
-            retired_at=version.retired_at,
-            validation_errors=(),
-            validation_warnings=(),
-        )
-    )

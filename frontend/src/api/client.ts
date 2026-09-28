@@ -4,6 +4,7 @@ import type {
   CurrentUser,
   DataAssetImportAccepted,
   DataAssetImportInput,
+  DataAssetImportJob,
   DataAssetSummary,
   DataAssetVersion,
   EventDetail,
@@ -51,17 +52,24 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-async function fetchWithTimeout(path: string, init: RequestInit = {}): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = globalThis.setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS,
-  );
+async function fetchWithTimeout(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = timeoutMs === null ? null : new AbortController();
+  const timeoutId =
+    timeoutMs === null
+      ? undefined
+      : globalThis.setTimeout(
+          () => controller?.abort(),
+          timeoutMs,
+        );
 
   try {
     return await fetch(path, {
       ...init,
-      signal: controller.signal,
+      signal: controller?.signal ?? init.signal,
     });
   } catch (error) {
     if (isAbortError(error)) {
@@ -69,7 +77,9 @@ async function fetchWithTimeout(path: string, init: RequestInit = {}): Promise<R
     }
     throw new ApiError("网络连接失败，请稍后重试", 0);
   } finally {
-    globalThis.clearTimeout(timeoutId);
+    if (timeoutId !== undefined) {
+      globalThis.clearTimeout(timeoutId);
+    }
   }
 }
 
@@ -104,8 +114,12 @@ async function parseError(response: Response): Promise<string> {
   return `请求失败（HTTP ${response.status}）`;
 }
 
-async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetchWithTimeout(path, init);
+async function requestJson<T>(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs: number | null = REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const response = await fetchWithTimeout(path, init, timeoutMs);
   if (!response.ok) {
     throw new ApiError(await parseError(response), response.status);
   }
@@ -256,6 +270,16 @@ export async function importDataAsset(
       headers: authHeaders(),
       body,
     },
+    null,
+  );
+}
+
+export async function getDataAssetImportJob(
+  jobId: string,
+): Promise<DataAssetImportJob> {
+  return requestJson<DataAssetImportJob>(
+    `/api/v1/data-asset-import-jobs/${encodeURIComponent(jobId)}`,
+    { headers: authHeaders() },
   );
 }
 

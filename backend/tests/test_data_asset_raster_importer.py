@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
+from pyproj import Transformer
 from rasterio.coords import BoundingBox
 from rasterio.transform import Affine
 
@@ -93,6 +94,47 @@ def test_geotiff_importer_accepts_numeric_esri_authority(
     )
 
     assert descriptor.srid == 102025
+    assert descriptor.source_crs == "ESRI:102025"
+
+
+def test_geotiff_importer_normalizes_projected_bounds_to_wgs84(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "projected.tif"
+    source_bounds = (500_000.0, 3_450_000.0, 504_000.0, 3_453_000.0)
+    with rasterio.open(
+        source,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=3,
+        count=1,
+        dtype="float32",
+        crs="EPSG:32651",
+        transform=Affine(
+            1000,
+            0,
+            source_bounds[0],
+            0,
+            -1000,
+            source_bounds[3],
+        ),
+    ) as dataset:
+        dataset.write(np.ones((1, 3, 4), dtype=np.float32))
+
+    descriptor = GeoTiffAssetImporter().load(
+        source,
+        get_asset_definition("shanghai.gdp.raster"),
+    )
+    expected = Transformer.from_crs(
+        "EPSG:32651",
+        "EPSG:4326",
+        always_xy=True,
+    ).transform_bounds(*source_bounds, densify_pts=21)
+
+    assert descriptor.srid == 32651
+    assert descriptor.source_crs == "EPSG:32651"
+    assert descriptor.spatial_extent == pytest.approx(expected, abs=1e-9)
 
 
 def test_geotiff_importer_rejects_unknown_crs(tmp_path: Path) -> None:

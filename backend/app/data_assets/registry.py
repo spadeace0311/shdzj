@@ -1,4 +1,5 @@
 from app.data_assets.domain import (
+    AggregateFieldTolerance,
     AssetContract,
     AssetDataType,
     AssetFieldContract,
@@ -12,6 +13,21 @@ def _field(name: str, python_type: str, *, required: bool = True, nonnegative: b
         python_type=python_type,
         required=required,
         nonnegative=nonnegative,
+    )
+
+
+def _aggregate_tolerance(
+    field_name: str,
+    *,
+    warning_threshold: float = 0.001,
+    error_threshold: float,
+    basis: str,
+) -> AggregateFieldTolerance:
+    return AggregateFieldTolerance(
+        field_name=field_name,
+        warning_threshold=warning_threshold,
+        error_threshold=error_threshold,
+        basis=basis,
     )
 
 
@@ -96,6 +112,16 @@ FIRST_PARTY_ASSETS = (
             ),
             expected_record_count=17,
             aggregate_of="shanghai.population.city",
+            aggregate_tolerances=(
+                _aggregate_tolerance(
+                    "FAMILY",
+                    error_threshold=0.04,
+                    basis=(
+                        "2022 MDB city/county measured 3.501419%; "
+                        "policy ceiling rounded to 4%"
+                    ),
+                ),
+            ),
         ),
         "COUNTY_POPULATION",
     ),
@@ -141,7 +167,12 @@ FIRST_PARTY_ASSETS = (
             (
                 _field("id", "string"),
                 _field("TOTAL_AREA", "number", nonnegative=True),
-                _field("HIGH_RISE", "number", nonnegative=True),
+                _field(
+                    "HIGH_RISE",
+                    "number",
+                    required=False,
+                    nonnegative=True,
+                ),
                 _field("RCFRAME", "number", nonnegative=True),
                 _field("BRICK_STRUCTURE", "number", nonnegative=True),
                 _field("SINGLE_AREA", "number", nonnegative=True),
@@ -165,7 +196,12 @@ FIRST_PARTY_ASSETS = (
             (
                 _field("id", "string"),
                 _field("TOTAL_AREA", "number", nonnegative=True),
-                _field("HIGH_RISE", "number", nonnegative=True),
+                _field(
+                    "HIGH_RISE",
+                    "number",
+                    required=False,
+                    nonnegative=True,
+                ),
                 _field("RCFRAME", "number", nonnegative=True),
                 _field("BRICK_STRUCTURE", "number", nonnegative=True),
                 _field("SINGLE_AREA", "number", nonnegative=True),
@@ -204,6 +240,48 @@ FIRST_PARTY_ASSETS = (
             ),
             expected_record_count=212,
             aggregate_of="shanghai.building.county",
+            aggregate_tolerances=(
+                _aggregate_tolerance(
+                    "TOTAL_AREA",
+                    error_threshold=0.02,
+                    basis=(
+                        "2022 MDB county/town measured 1.540624%; "
+                        "policy ceiling rounded to 2%"
+                    ),
+                ),
+                _aggregate_tolerance(
+                    "RCFRAME",
+                    error_threshold=0.02,
+                    basis=(
+                        "2022 MDB county/town measured 1.609432%; "
+                        "policy ceiling rounded to 2%"
+                    ),
+                ),
+                _aggregate_tolerance(
+                    "BRICK_STRUCTURE",
+                    error_threshold=0.01,
+                    basis=(
+                        "2022 MDB county/town measured 0.821258%; "
+                        "policy ceiling rounded to 1%"
+                    ),
+                ),
+                _aggregate_tolerance(
+                    "SINGLE_AREA",
+                    error_threshold=0.03,
+                    basis=(
+                        "2022 MDB county/town measured 2.162433%; "
+                        "policy ceiling rounded to 3%"
+                    ),
+                ),
+                _aggregate_tolerance(
+                    "OTHER_STRUCTURE",
+                    error_threshold=0.05,
+                    basis=(
+                        "2022 MDB county/town measured 4.657517%; "
+                        "policy ceiling rounded to 5%"
+                    ),
+                ),
+            ),
         ),
         "TOWN_BUILDING",
     ),

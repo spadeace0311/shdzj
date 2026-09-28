@@ -52,6 +52,7 @@ class AssetVersionResponse(BaseModel):
     version: str
     status: AssetVersionStatus
     source_uri: str
+    source_crs: str
     license_name: str | None
     acquired_at: datetime | None
     valid_from: datetime | None
@@ -69,6 +70,22 @@ class AssetVersionResponse(BaseModel):
     retired_at: datetime | None
     validation_errors: list[ValidationIssueResponse]
     validation_warnings: list[ValidationIssueResponse]
+    statistics: dict
+
+
+class ImportJobResponse(BaseModel):
+    job_id: str
+    asset_key: str
+    version: str
+    version_id: str
+    status: ImportJobStatus
+    error_summary: str | None
+    validation_errors: list[ValidationIssueResponse]
+    validation_warnings: list[ValidationIssueResponse]
+    statistics: dict
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
 
 
 class LifecycleActionRequest(BaseModel):

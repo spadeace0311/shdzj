@@ -14,7 +14,15 @@ from shapely.geometry import box
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.data_assets.coverage import (
+    RegionCoveragePolicy,
+    evaluate_region_coverage,
+    load_policy_region_profile,
+    load_region_coverage_policy,
+)
 from app.data_assets.domain import (
+    AggregateFieldTolerance,
     AssetDataType,
     AssetVersionStatus,
     NormalizedAssetData,
@@ -27,14 +35,17 @@ from app.data_assets.domain import (
 from app.data_assets.models import (
     DataAsset,
     DataAssetAuditLog,
+    DataAssetImportJob,
     DataAssetRaster,
     DataAssetRecord,
     DataAssetVersion,
 )
+from app.data_assets.locks import lock_data_asset_catalog
 from app.data_assets.raster_repository import save_raster_version
-from app.data_assets.registry import get_asset_definition
+from app.data_assets.registry import FIRST_PARTY_ASSETS, get_asset_definition
 from app.data_assets.repository import DataAssetRepository
 from app.data_assets.validators import DataAssetValidator
+from app.regions.models import RegionBoundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +72,7 @@ class AssetVersionView:
     version: str
     status: AssetVersionStatus
     source_uri: str
+    source_crs: str
     license_name: str | None
     acquired_at: datetime | None
     valid_from: datetime | None
@@ -78,11 +90,34 @@ class AssetVersionView:
     retired_at: datetime | None
     validation_errors: tuple[ValidationIssue, ...]
     validation_warnings: tuple[ValidationIssue, ...]
+    statistics: dict
 
 
 @dataclass(frozen=True, slots=True)
 class AssetVersionDetailView:
     summary: AssetVersionView
+
+
+@dataclass(frozen=True, slots=True)
+class ImportJobView:
+    job_id: UUID
+    asset_key: str
+    version: str
+    version_id: UUID
+    status: str
+    error_summary: str | None
+    validation_errors: tuple[ValidationIssue, ...]
+    validation_warnings: tuple[ValidationIssue, ...]
+    statistics: dict
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AggregateCheckEvaluation:
+    errors: tuple[ValidationIssue, ...] = ()
+    warnings: tuple[ValidationIssue, ...] = ()
 
 
 ALLOWED_TRANSITIONS: dict[AssetVersionStatus, frozenset[AssetVersionStatus]] = {
@@ -108,9 +143,14 @@ class DataAssetDecisionError(ValueError):
 
 
 class DataAssetService:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        coverage_policy: RegionCoveragePolicy | None = None,
+    ) -> None:
         self._repository = DataAssetRepository()
         self._validator = DataAssetValidator()
+        self._coverage_policy = coverage_policy
 
     async def list_assets(
         self,
@@ -122,31 +162,89 @@ class DataAssetService:
         if region_id is not None:
             statement = statement.where(DataAsset.region_id == region_id)
         statement = statement.order_by(DataAsset.asset_key)
-        assets = (await session.scalars(statement)).all()
+        stored_assets = list((await session.scalars(statement)).all())
+        definitions = [
+            definition
+            for definition in FIRST_PARTY_ASSETS
+            if region_id is None or definition.region_id == region_id
+        ]
+        summary_inputs: list[
+            tuple[
+                str,
+                str,
+                str,
+                str,
+                str,
+                str,
+                int,
+                bool,
+            ]
+        ] = []
+        for definition in definitions:
+            summary_inputs.append(
+                (
+                    definition.asset_key,
+                    definition.region_id,
+                    definition.name,
+                    definition.data_type.value,
+                    definition.spatial_granularity,
+                    definition.responsibility_unit,
+                    definition.update_interval_days,
+                    definition.is_core,
+                )
+            )
+        for asset in stored_assets:
+            if (asset.region_id, asset.asset_key) in {
+                (definition.region_id, definition.asset_key)
+                for definition in definitions
+            }:
+                continue
+            summary_inputs.append(
+                (
+                    asset.asset_key,
+                    asset.region_id,
+                    asset.name,
+                    asset.data_type,
+                    asset.spatial_granularity,
+                    asset.responsibility_unit,
+                    asset.update_interval_days,
+                    asset.is_core,
+                )
+            )
+        summary_inputs.sort(key=lambda item: (item[1], item[0]))
         views: list[AssetSummaryView] = []
         now = datetime.now(UTC)
-        for asset in assets:
+        for (
+            asset_key,
+            asset_region_id,
+            name,
+            data_type,
+            spatial_granularity,
+            responsibility_unit,
+            update_interval_days,
+            is_core,
+        ) in summary_inputs:
             published = await self._repository.get_published_version(
                 session,
-                asset_key=asset.asset_key,
-                region_id=asset.region_id,
+                asset_key=asset_key,
+                region_id=asset_region_id,
             )
             published_at = published.published_at if published else None
             update_due_at = (
-                published_at + timedelta(days=asset.update_interval_days)
+                published_at + timedelta(days=update_interval_days)
                 if published_at is not None
                 else None
             )
             views.append(
                 AssetSummaryView(
-                    asset_key=asset.asset_key,
-                    region_id=asset.region_id,
-                    name=asset.name,
-                    data_type=asset.data_type,
-                    spatial_granularity=asset.spatial_granularity,
-                    responsibility_unit=asset.responsibility_unit,
-                    update_interval_days=asset.update_interval_days,
-                    is_core=asset.is_core,
+                    asset_key=asset_key,
+                    region_id=asset_region_id,
+                    name=name,
+                    data_type=data_type,
+                    spatial_granularity=spatial_granularity,
+                    responsibility_unit=responsibility_unit,
+                    update_interval_days=update_interval_days,
+                    is_core=is_core,
                     published_version=published.version if published else None,
                     published_at=published_at,
                     update_due_at=update_due_at,
@@ -170,7 +268,8 @@ class DataAssetService:
             region_id=region_id,
         )
         return [
-            self._version_view(
+            await self._version_view(
+                session,
                 version,
                 await session.get(DataAsset, version.asset_id),
             )
@@ -189,7 +288,42 @@ class DataAssetService:
         if asset is None:
             raise LookupError("data asset version references a missing asset")
         return AssetVersionDetailView(
-            summary=self._version_view(version, asset)
+            summary=await self._version_view(session, version, asset)
+        )
+
+    async def get_import_job(
+        self,
+        session: AsyncSession,
+        job_id: UUID,
+    ) -> ImportJobView:
+        job = await session.get(DataAssetImportJob, job_id)
+        if job is None:
+            raise LookupError("data asset import job not found")
+        asset = await session.get(DataAsset, job.asset_id)
+        version = await session.get(DataAssetVersion, job.asset_version_id)
+        if asset is None or version is None:
+            raise LookupError(
+                "data asset import job references missing catalog data"
+            )
+        return ImportJobView(
+            job_id=job.id,
+            asset_key=asset.asset_key,
+            version=version.version,
+            version_id=version.id,
+            status=job.status,
+            error_summary=job.error_summary,
+            validation_errors=_stored_validation_issues(
+                job.validation_errors,
+                "error",
+            ),
+            validation_warnings=_stored_validation_issues(
+                job.validation_warnings,
+                "warning",
+            ),
+            statistics=dict(job.statistics),
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            created_at=job.created_at,
         )
 
     async def populate_candidate_version(
@@ -243,6 +377,7 @@ class DataAssetService:
                 )
             version.schema_summary = dict(schema_summary)
             version.record_count = 0
+            version.source_crs = normalized.source_crs
             version.spatial_extent = _bounds_wkt_element(
                 normalized.spatial_extent
             )
@@ -337,6 +472,12 @@ class DataAssetService:
                 statistics=report.statistics,
                 checked_at=report.checked_at,
             )
+        report = await self._apply_region_coverage(
+            session,
+            definition,
+            normalized,
+            report,
+        )
         report = await self._apply_aggregate_checks(
             session,
             definition,
@@ -349,6 +490,10 @@ class DataAssetService:
         version.status = report.status.value
         version.validated_at = now
         version.updated_at = now
+        version.schema_summary = {
+            **dict(version.schema_summary),
+            "validation_statistics": dict(report.statistics),
+        }
         session.add(
             DataAssetAuditLog(
                 asset_id=asset.id,
@@ -408,6 +553,7 @@ class DataAssetService:
         actor: str,
         reason: str,
     ) -> DataAssetVersion:
+        await lock_data_asset_catalog(session)
         target = await session.get(
             DataAssetVersion,
             version_id,
@@ -447,6 +593,7 @@ class DataAssetService:
         actor: str,
         reason: str,
     ) -> DataAssetVersion:
+        await lock_data_asset_catalog(session)
         target = await session.get(
             DataAssetVersion,
             version_id,
@@ -496,6 +643,7 @@ class DataAssetService:
         actor: str,
         reason: str,
     ) -> DataAssetVersion:
+        await lock_data_asset_catalog(session)
         target = await session.get(
             DataAssetVersion,
             version_id,
@@ -603,11 +751,18 @@ class DataAssetService:
                 width=raster.width,
                 height=raster.height,
                 srid=raster.srid,
+                source_crs=version.source_crs,
                 band_count=int(manifest.get("band_count", 1)),
                 dtype=str(manifest.get("dtype", "float32")),
                 nodata=manifest.get("nodata"),
                 resolution_x=float(manifest["resolution_x"]),
                 resolution_y=float(manifest["resolution_y"]),
+                native_spatial_extent=tuple(
+                    manifest.get(
+                        "native_bounds",
+                        _wkt_to_bounds(raster.spatial_extent_wkt),
+                    )
+                ),
                 spatial_extent=_wkt_to_bounds(raster.spatial_extent_wkt),
             )
 
@@ -641,6 +796,78 @@ class DataAssetService:
             )
         )
         return _wkt_to_bounds(wkt)
+
+    async def _apply_region_coverage(
+        self,
+        session: AsyncSession,
+        definition,
+        normalized: NormalizedAssetData,
+        report: ValidationReport,
+    ) -> ValidationReport:
+        try:
+            policy = self._coverage_policy or load_region_coverage_policy(
+                settings.data_asset_coverage_policy_path
+            )
+            if policy.region_id != definition.region_id:
+                raise ValueError(
+                    "coverage policy region_id does not match the asset region"
+                )
+            profile = load_policy_region_profile(policy)
+        except Exception as exc:
+            statistics = dict(report.statistics)
+            statistics.update(
+                {
+                    "area_crs": None,
+                    "projected_area": None,
+                    "coverage_ratio": None,
+                    "coverage_status": "configuration_error",
+                    "coverage_policy_version": None,
+                }
+            )
+            return ValidationReport(
+                version_id=report.version_id,
+                status=AssetVersionStatus.REJECTED,
+                errors=(
+                    *report.errors,
+                    ValidationIssue(
+                        severity="error",
+                        code="coverage_configuration_invalid",
+                        message=f"coverage configuration is invalid: {exc}",
+                    ),
+                ),
+                warnings=report.warnings,
+                statistics=statistics,
+                checked_at=report.checked_at,
+            )
+
+        boundary_wkt = await session.scalar(
+            select(func.ST_AsText(RegionBoundary.geom))
+            .where(RegionBoundary.is_active.is_(True))
+            .limit(1)
+        )
+        coverage = evaluate_region_coverage(
+            policy=policy,
+            profile=profile,
+            asset_key=definition.asset_key,
+            normalized=normalized,
+            boundary_wkt=boundary_wkt,
+        )
+        errors = (*report.errors, *coverage.errors)
+        warnings = (*report.warnings, *coverage.warnings)
+        statistics = dict(report.statistics)
+        statistics.update(coverage.statistics)
+        return ValidationReport(
+            version_id=report.version_id,
+            status=(
+                AssetVersionStatus.REJECTED
+                if errors
+                else AssetVersionStatus.VALIDATED
+            ),
+            errors=errors,
+            warnings=warnings,
+            statistics=statistics,
+            checked_at=report.checked_at,
+        )
 
     async def _apply_aggregate_checks(
         self,
@@ -684,77 +911,17 @@ class DataAssetService:
                 session,
                 parent.id,
             )
-            for field in definition.contract.fields:
-                if field.python_type not in {"number", "integer"}:
-                    continue
-                parent_values = [
-                    _matching_numeric_value(record.properties, field.name)
-                    for record in parent_records
-                ]
-                parent_values = [value for value in parent_values if value is not None]
-                if not parent_values:
-                    continue
-                child_total = sum(
-                    _matching_numeric_value(record.properties, field.name) or 0
-                    for record in normalized.records
+            aggregate_checks.extend(
+                build_aggregate_checks(
+                    definition,
+                    normalized,
+                    parent_records,
                 )
-                parent_total = sum(parent_values)
-                absolute_difference = abs(child_total - parent_total)
-                relative_difference = (
-                    absolute_difference / abs(parent_total)
-                    if parent_total
-                    else (
-                        0.0
-                        if absolute_difference == 0
-                        else float("inf")
-                    )
-                )
-                aggregate_checks.append(
-                    {
-                        "field_name": field.name,
-                        "child_total": child_total,
-                        "parent_total": parent_total,
-                        "absolute_difference": absolute_difference,
-                        "relative_difference": relative_difference,
-                    }
-                )
+            )
 
-        errors = list(report.errors)
-        warnings = list(report.warnings)
-        for check in aggregate_checks:
-            relative = check.get("relative_difference")
-            if relative is None:
-                warnings.append(
-                    ValidationIssue(
-                        severity="warning",
-                        code="aggregate_difference_exceeded",
-                        message="aggregate parent asset is not published",
-                    )
-                )
-            elif relative > 0.005:
-                errors.append(
-                    ValidationIssue(
-                        severity="error",
-                        code="aggregate_difference_exceeded",
-                        message=(
-                            "aggregate difference exceeds the allowed "
-                            f"threshold for {check.get('field_name')}"
-                        ),
-                        field_name=str(check.get("field_name")),
-                    )
-                )
-            elif relative > 0.001:
-                warnings.append(
-                    ValidationIssue(
-                        severity="warning",
-                        code="aggregate_difference_exceeded",
-                        message=(
-                            "aggregate difference exceeds the warning "
-                            f"threshold for {check.get('field_name')}"
-                        ),
-                        field_name=str(check.get("field_name")),
-                    )
-                )
+        evaluation = evaluate_aggregate_checks(aggregate_checks)
+        errors = [*report.errors, *evaluation.errors]
+        warnings = [*report.warnings, *evaluation.warnings]
 
         statistics = dict(report.statistics)
         statistics["aggregate_checks"] = aggregate_checks
@@ -824,12 +991,30 @@ class DataAssetService:
         return None
 
     @staticmethod
-    def _version_view(
+    async def _version_view(
+        session: AsyncSession,
         version: DataAssetVersion,
         asset: DataAsset | None,
     ) -> AssetVersionView:
         if asset is None:
             raise LookupError("data asset version references a missing asset")
+        import_job = await session.scalar(
+            select(DataAssetImportJob)
+            .where(DataAssetImportJob.asset_version_id == version.id)
+            .order_by(
+                DataAssetImportJob.completed_at.desc().nullslast(),
+                DataAssetImportJob.created_at.desc(),
+            )
+            .limit(1)
+        )
+        validation_errors = _stored_validation_issues(
+            import_job.validation_errors if import_job is not None else [],
+            "error",
+        )
+        validation_warnings = _stored_validation_issues(
+            import_job.validation_warnings if import_job is not None else [],
+            "warning",
+        )
         return AssetVersionView(
             version_id=version.id,
             asset_key=asset.asset_key,
@@ -837,6 +1022,7 @@ class DataAssetService:
             version=version.version,
             status=AssetVersionStatus(version.status),
             source_uri=version.source_uri,
+            source_crs=version.source_crs,
             license_name=version.license_name,
             acquired_at=version.acquired_at,
             valid_from=version.valid_from,
@@ -852,8 +1038,13 @@ class DataAssetService:
             validated_at=version.validated_at,
             published_at=version.published_at,
             retired_at=version.retired_at,
-            validation_errors=(),
-            validation_warnings=(),
+            validation_errors=validation_errors,
+            validation_warnings=validation_warnings,
+            statistics=(
+                dict(import_job.statistics)
+                if import_job is not None
+                else {}
+            ),
         )
 
 
@@ -899,6 +1090,159 @@ def _table_checksum(normalized: NormalizedTableData) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def build_aggregate_checks(
+    definition,
+    normalized: NormalizedTableData,
+    parent_records,
+) -> list[dict[str, object]]:
+    tolerance_by_field = {
+        tolerance.field_name.upper(): tolerance
+        for tolerance in definition.contract.aggregate_tolerances
+    }
+    checks: list[dict[str, object]] = []
+    for field in definition.contract.fields:
+        if field.python_type not in {"number", "integer"}:
+            continue
+        tolerance = tolerance_by_field.get(
+            field.name.upper(),
+            AggregateFieldTolerance(
+                field_name=field.name,
+                warning_threshold=0.001,
+                error_threshold=0.005,
+                basis="strict default: 0.1% warning, 0.5% error",
+            ),
+        )
+        child_values = [
+            _matching_numeric_value(record.properties, field.name)
+            for record in normalized.records
+        ]
+        parent_values = [
+            _matching_numeric_value(record.properties, field.name)
+            for record in parent_records
+        ]
+        check: dict[str, object] = {
+            "field_name": field.name,
+            "child_total": None,
+            "parent_total": None,
+            "absolute_difference": None,
+            "relative_difference": None,
+            "warning_threshold": tolerance.warning_threshold,
+            "error_threshold": tolerance.error_threshold,
+            "tolerance_basis": tolerance.basis,
+        }
+        if not any(value is not None for value in child_values) and not any(
+            value is not None for value in parent_values
+        ):
+            check["status"] = "not_applicable"
+            checks.append(check)
+            continue
+        if any(value is None for value in child_values) or any(
+            value is None for value in parent_values
+        ):
+            check["status"] = "incomplete"
+            checks.append(check)
+            continue
+
+        child_total = sum(
+            value for value in child_values if value is not None
+        )
+        parent_total = sum(
+            value for value in parent_values if value is not None
+        )
+        absolute_difference = abs(child_total - parent_total)
+        relative_difference = (
+            absolute_difference / abs(parent_total)
+            if parent_total
+            else (
+                0.0
+                if absolute_difference == 0
+                else float("inf")
+            )
+        )
+        check.update(
+            {
+                "child_total": child_total,
+                "parent_total": parent_total,
+                "absolute_difference": absolute_difference,
+                "relative_difference": relative_difference,
+                "status": (
+                    "error"
+                    if relative_difference > tolerance.error_threshold
+                    else (
+                        "warning"
+                        if relative_difference > tolerance.warning_threshold
+                        else "within_tolerance"
+                    )
+                ),
+            }
+        )
+        checks.append(check)
+    return checks
+
+
+def evaluate_aggregate_checks(
+    checks: list[dict[str, object]],
+) -> AggregateCheckEvaluation:
+    errors: list[ValidationIssue] = []
+    warnings: list[ValidationIssue] = []
+    for check in checks:
+        status = str(check.get("status", "incomplete"))
+        field_name = (
+            str(check["field_name"])
+            if check.get("field_name") is not None
+            else None
+        )
+        if status == "missing_parent":
+            warnings.append(
+                ValidationIssue(
+                    severity="warning",
+                    code="aggregate_difference_exceeded",
+                    message="aggregate parent asset is not published",
+                )
+            )
+        elif status == "incomplete":
+            warnings.append(
+                ValidationIssue(
+                    severity="warning",
+                    code="aggregate_values_incomplete",
+                    message=(
+                        "aggregate comparison was not performed because "
+                        "one or more values are null"
+                    ),
+                    field_name=field_name,
+                )
+            )
+        elif status == "error":
+            warnings_or_errors = errors
+            warnings_or_errors.append(
+                ValidationIssue(
+                    severity="error",
+                    code="aggregate_difference_exceeded",
+                    message=(
+                        "aggregate difference exceeds the allowed "
+                        f"threshold for {field_name}"
+                    ),
+                    field_name=field_name,
+                )
+            )
+        elif status == "warning":
+            warnings.append(
+                ValidationIssue(
+                    severity="warning",
+                    code="aggregate_difference_exceeded",
+                    message=(
+                        "aggregate difference exceeds the warning "
+                        f"threshold for {field_name}"
+                    ),
+                    field_name=field_name,
+                )
+            )
+    return AggregateCheckEvaluation(
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
+
+
 def _matching_numeric_value(
     properties: dict,
     field_name: str,
@@ -910,3 +1254,19 @@ def _matching_numeric_value(
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _stored_validation_issues(
+    payloads: list[dict],
+    severity: str,
+) -> tuple[ValidationIssue, ...]:
+    return tuple(
+        ValidationIssue(
+            severity=severity,
+            code=str(payload.get("code", "unknown")),
+            message=str(payload.get("message", "")),
+            row_number=payload.get("row_number"),
+            field_name=payload.get("field_name"),
+        )
+        for payload in payloads
+    )

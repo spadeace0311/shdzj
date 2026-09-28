@@ -116,6 +116,15 @@ def _asset_contract(definition: DataAssetDefinition) -> dict:
         "expected_record_count": definition.contract.expected_record_count,
         "excluded_business_keys": list(definition.contract.excluded_business_keys),
         "exclusion_reason": definition.contract.exclusion_reason,
+        "aggregate_tolerances": [
+            {
+                "field_name": tolerance.field_name,
+                "warning_threshold": tolerance.warning_threshold,
+                "error_threshold": tolerance.error_threshold,
+                "basis": tolerance.basis,
+            }
+            for tolerance in definition.contract.aggregate_tolerances
+        ],
     }
 
 
@@ -211,6 +220,7 @@ async def _ensure_published_admin_town(session_factory) -> UUID:
     from app.data_assets.service import DataAssetService
 
     definition = _definition("shanghai.admin.town")
+    await _with_boundary(session_factory)
     async with session_factory() as session:
         async with session.begin():
             existing = await session.scalar(

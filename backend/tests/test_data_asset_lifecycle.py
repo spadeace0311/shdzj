@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
+from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.import_jobs import fail_import_job
 from app.data_assets.models import (
     DataAsset,
@@ -12,7 +13,13 @@ from app.data_assets.models import (
     DataAssetRecord,
     DataAssetVersion,
 )
-from app.data_assets.service import DataAssetDecisionError, DataAssetService
+from app.data_assets.registry import get_asset_definition
+from app.data_assets.service import (
+    DataAssetDecisionError,
+    DataAssetService,
+    build_aggregate_checks,
+    evaluate_aggregate_checks,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -340,6 +347,141 @@ async def test_aggregate_check_uses_parent_not_prior_child_version(
     )
 
 
+def test_building_hierarchy_uses_optional_high_rise_and_field_tolerances() -> None:
+    city_rows = (
+        NormalizedRecord(
+            1,
+            "city",
+            {
+                "id": "city",
+                "TOTAL_AREA": 1000.0,
+                "HIGH_RISE": None,
+                "RCFRAME": 1000.0,
+                "BRICK_STRUCTURE": 1000.0,
+                "SINGLE_AREA": 1000.0,
+                "OTHER_STRUCTURE": 1000.0,
+            },
+        ),
+    )
+    county = _building_normalized(
+        asset_prefix="county",
+        values={
+            "TOTAL_AREA": (500.0, 500.0),
+            "HIGH_RISE": (None, None),
+            "RCFRAME": (500.0, 500.0),
+            "BRICK_STRUCTURE": (500.0, 500.0),
+            "SINGLE_AREA": (500.0, 500.0),
+            "OTHER_STRUCTURE": (500.0, 500.0),
+        },
+    )
+    county_checks = build_aggregate_checks(
+        get_asset_definition("shanghai.building.county"),
+        county,
+        city_rows,
+    )
+    assert evaluate_aggregate_checks(county_checks).errors == ()
+    high_rise = next(
+        check
+        for check in county_checks
+        if check["field_name"] == "HIGH_RISE"
+    )
+    assert high_rise["status"] == "not_applicable"
+    assert high_rise["child_total"] is None
+    assert high_rise["parent_total"] is None
+
+    town = _building_normalized(
+        asset_prefix="town",
+        values={
+            "TOTAL_AREA": (500.0, 515.406236),
+            "HIGH_RISE": (None, None),
+            "RCFRAME": (500.0, 516.09432),
+            "BRICK_STRUCTURE": (500.0, 508.212577),
+            "SINGLE_AREA": (500.0, 521.62433),
+            "OTHER_STRUCTURE": (500.0, 546.575173),
+        },
+    )
+    town_checks = build_aggregate_checks(
+        get_asset_definition("shanghai.building.town"),
+        town,
+        county.records,
+    )
+    town_result = evaluate_aggregate_checks(town_checks)
+    assert town_result.errors == ()
+    assert all(
+        check["tolerance_basis"]
+        for check in town_checks
+        if check["status"] not in {"not_applicable", "missing_parent"}
+    )
+
+
+def test_aggregate_tolerances_do_not_loosen_unconfigured_fields() -> None:
+    parent_rows = (
+        NormalizedRecord(
+            1,
+            "parent",
+            {"ID": "parent", "TOTAL": 100.0, "FAMILY": 100.0},
+        ),
+    )
+    child = NormalizedTableData(
+        columns=("ID", "total", "family"),
+        records=(
+            NormalizedRecord(
+            1,
+            "child",
+            {"ID": "child", "total": 100.6, "family": 103.501419},
+        ),
+        ),
+        source_crs="EPSG:4326",
+        spatial_extent=None,
+    )
+    checks = build_aggregate_checks(
+        get_asset_definition("shanghai.population.county"),
+        child,
+        parent_rows,
+    )
+    result = evaluate_aggregate_checks(checks)
+
+    assert any(
+        issue.field_name is not None
+        and issue.field_name.upper() == "TOTAL"
+        for issue in result.errors
+    )
+    assert not any(
+        issue.field_name is not None
+        and issue.field_name.upper() == "FAMILY"
+        for issue in result.errors
+    )
+
+
+def _building_normalized(
+    *,
+    asset_prefix: str,
+    values: dict[str, tuple[float | None, float | None]],
+) -> NormalizedTableData:
+    records = []
+    for row_number in (1, 2):
+        properties = {"id": f"{asset_prefix}-{row_number}", "name": "building"}
+        properties.update(
+            {
+                field_name: field_values[row_number - 1]
+                for field_name, field_values in values.items()
+            }
+        )
+        records.append(
+            NormalizedRecord(
+                row_number,
+                properties["id"],
+                properties,
+            )
+        )
+    return NormalizedTableData(
+        columns=("id", "name", *values),
+        records=tuple(records),
+        source_crs="EPSG:4326",
+        spatial_extent=None,
+    )
+
+
 async def test_table_repopulation_same_checksum_is_idempotent(
     session_factory,
 ) -> None:
@@ -429,6 +571,35 @@ async def test_table_repopulation_rejects_different_checksum(
                     changed,
                     importer="geojson",
                 )
+
+
+async def test_validated_and_published_versions_reject_direct_child_mutation(
+    session_factory,
+    candidate_factory,
+) -> None:
+    validated_id = await candidate_factory("2022.4")
+    published_id = await candidate_factory("2022.5")
+    service = DataAssetService()
+    async with session_factory() as session:
+        async with session.begin():
+            await service.validate_version(session, validated_id)
+            await service.validate_version(session, published_id)
+            await service.publish_version(
+                session,
+                published_id,
+                "publisher",
+                "publication",
+            )
+
+    for version_id in (validated_id, published_id):
+        async with session_factory() as session:
+            with pytest.raises(Exception, match="data_asset_child_is_immutable"):
+                async with session.begin():
+                    await session.execute(
+                        DataAssetRecord.__table__.update()
+                        .where(DataAssetRecord.version_id == version_id)
+                        .values(properties={"ID": "mutated"})
+                    )
 
 
 def _town_codes():
@@ -700,7 +871,7 @@ async def _seed_published_parent_asset(
             version = DataAssetVersion(
                 asset_id=asset.id,
                 version=f"parent-{uuid4()}",
-                status="published",
+                status="imported",
                 source_uri="https://example.gov.invalid/parent",
                 schema_summary={},
                 record_count=len(rows),
@@ -710,8 +881,6 @@ async def _seed_published_parent_asset(
                 imported_by=FIXTURE_ACTOR,
                 reviewed_by=FIXTURE_ACTOR,
                 imported_at=now,
-                validated_at=now,
-                published_at=now,
                 created_at=now,
                 updated_at=now,
             )
@@ -729,4 +898,10 @@ async def _seed_published_parent_asset(
                         properties=row,
                     )
                 )
+            await session.flush()
+            version.status = "validated"
+            version.validated_at = now
+            await session.flush()
+            version.status = "published"
+            version.published_at = now
             await session.flush()

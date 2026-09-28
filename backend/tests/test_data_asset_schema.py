@@ -14,7 +14,7 @@ from app.data_assets.models import DataAssetSnapshot
 
 
 BACKEND_DIR = Path(__file__).parents[1]
-LATEST_REVISION = "0012_data_asset_center"
+LATEST_REVISION = "0013_data_asset_final_fixes"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 DATA_ASSET_TABLES = {
     "data_assets",
@@ -158,9 +158,37 @@ async def _data_asset_schema_state() -> dict[str, object]:
                         )
                     )
                 ).scalar_one_or_none()
+                child_trigger = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT tgname
+                            FROM pg_trigger
+                            WHERE tgrelid = 'data_asset_records'::regclass
+                              AND tgname = 'trg_data_asset_records_immutable'
+                              AND NOT tgisinternal
+                            """
+                        )
+                    )
+                ).scalar_one_or_none()
+                snapshot_trigger = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT tgname
+                            FROM pg_trigger
+                            WHERE tgrelid = 'data_asset_snapshots'::regclass
+                              AND tgname = 'trg_data_asset_snapshots_validate_reference'
+                              AND NOT tgisinternal
+                            """
+                        )
+                    )
+                ).scalar_one_or_none()
             else:
                 status_check = None
                 lifecycle_trigger = None
+                child_trigger = None
+                snapshot_trigger = None
         return {
             "tables": tables,
             "run_columns": run_columns,
@@ -169,6 +197,8 @@ async def _data_asset_schema_state() -> dict[str, object]:
             "snapshot_unique": snapshot_unique,
             "status_check": status_check,
             "lifecycle_trigger": lifecycle_trigger,
+            "child_trigger": child_trigger,
+            "snapshot_trigger": snapshot_trigger,
         }
     finally:
         await engine.dispose()
@@ -201,6 +231,8 @@ async def test_data_asset_center_migration_is_reversible() -> None:
         assert "asset_key" in head["snapshot_unique"]
         assert head["status_check"] is not None
         assert head["lifecycle_trigger"] is not None
+        assert head["child_trigger"] is not None
+        assert head["snapshot_trigger"] is not None
 
         _set_revision(DATA_ASSET_PREVIOUS_REVISION)
         downgraded = await _data_asset_schema_state()

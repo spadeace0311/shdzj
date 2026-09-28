@@ -150,12 +150,17 @@ async def complete_import_job(
     session: AsyncSession,
     job_id: UUID,
     version_id: UUID,
+    report: ValidationReport | None = None,
 ) -> None:
     job = await session.get(DataAssetImportJob, job_id, with_for_update=True)
     if job is None:
         raise LookupError("data asset import job not found")
     job.asset_version_id = version_id
     job.status = "completed"
+    if report is not None:
+        job.validation_errors = _validation_payload(report.errors)
+        job.validation_warnings = _validation_payload(report.warnings)
+        job.statistics = dict(report.statistics)
     job.completed_at = datetime.now(UTC)
 
 
@@ -168,24 +173,9 @@ async def reject_import_job(
     if job is None:
         raise LookupError("data asset import job not found")
     job.status = "rejected"
-    job.validation_errors = [
-        {
-            "code": issue.code,
-            "message": issue.message,
-            "row_number": issue.row_number,
-            "field_name": issue.field_name,
-        }
-        for issue in report.errors
-    ]
-    job.validation_warnings = [
-        {
-            "code": issue.code,
-            "message": issue.message,
-            "row_number": issue.row_number,
-            "field_name": issue.field_name,
-        }
-        for issue in report.warnings
-    ]
+    job.validation_errors = _validation_payload(report.errors)
+    job.validation_warnings = _validation_payload(report.warnings)
+    job.statistics = dict(report.statistics)
     job.error_summary = "; ".join(issue.message for issue in report.errors)[:1000]
     job.completed_at = datetime.now(UTC)
     await _reject_candidate_version(session, job.asset_version_id)
@@ -312,6 +302,15 @@ async def _ensure_asset(session: AsyncSession, definition) -> DataAsset:
                 definition.contract.excluded_business_keys
             ),
             "exclusion_reason": definition.contract.exclusion_reason,
+            "aggregate_tolerances": [
+                {
+                    "field_name": tolerance.field_name,
+                    "warning_threshold": tolerance.warning_threshold,
+                    "error_threshold": tolerance.error_threshold,
+                    "basis": tolerance.basis,
+                }
+                for tolerance in definition.contract.aggregate_tolerances
+            ],
         },
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -319,3 +318,15 @@ async def _ensure_asset(session: AsyncSession, definition) -> DataAsset:
     session.add(asset)
     await session.flush()
     return asset
+
+
+def _validation_payload(issues) -> list[dict]:
+    return [
+        {
+            "code": issue.code,
+            "message": issue.message,
+            "row_number": issue.row_number,
+            "field_name": issue.field_name,
+        }
+        for issue in issues
+    ]

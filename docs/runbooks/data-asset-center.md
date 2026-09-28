@@ -19,6 +19,7 @@ The loss formulas remain future work. Snapshotting a published asset is already 
 
 - `DATA_ASSET_REGION_ID`: catalog region, default `shanghai`.
 - `DATA_ASSET_REQUIRED_REGISTRY_PATH`: required/optional asset registry, default `/config/data_assets/shanghai-required-assets.yaml`.
+- `DATA_ASSET_COVERAGE_POLICY_PATH`: region coverage policy, default `/config/data_assets/shanghai-coverage-policy.yaml`.
 - `DATA_ASSET_STORAGE_ROOT`: in-container raw-file root, default `/var/lib/data-assets`.
 - `DATA_ASSET_STORAGE_HOST_DIR`: host bind mount backing that root, default `../data/data-assets`.
 - `DATA_ASSET_MAX_UPLOAD_BYTES`: maximum source file size, default `1073741824`.
@@ -44,7 +45,7 @@ Confirm the migration head:
 docker compose --env-file .env -f infra/compose.yaml run --rm api alembic current
 ```
 
-Expected: `0012_data_asset_center (head)`.
+Expected: `0013_data_asset_final_fixes (head)`.
 
 Authenticate before API calls:
 
@@ -97,6 +98,16 @@ Invoke-RestMethod `
 
 The response contains `job_id`, `version_id`, and the initial `queued` status. Poll the worker through the version or import-job query below; it performs normalization and validation.
 
+Poll the import job until it reaches `completed`, `rejected`, or `failed`:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/v1/data-asset-import-jobs/<job-id>" `
+  -Headers $headers
+```
+
+The response includes the job status, error summary, persisted validation errors and warnings, validation statistics, timestamps, asset key, version, and version ID.
+
 ## Importing The Shanghai MDB On Windows
 
 MDB import runs on the Windows host because the Microsoft Access ODBC driver is not available in the Linux API container. The importer opens the file read-only (`ReadOnly=True`) and never updates the source file.
@@ -125,6 +136,40 @@ Supported MDB catalog keys:
 - `shanghai.fault` -> `ACTIVEFAULT`
 
 The host CLI returns the import job UUID. It populates the candidate, validates it, and either completes or rejects the job in the same transaction.
+### Importing The Full Parent/Child Hierarchy
+
+The city and county tables are parent governance records. They are not part of the required registry and are not consumed by the loss formulas; import them so the town assets can be validated against published parents, then publish them when the comparison passes. The published order that satisfies every `aggregate_of` dependency is:
+
+1. `shanghai.population.city` (`CITY_POPULATION`)
+2. `shanghai.building.city` (`CITY_BUILDING`)
+3. `shanghai.population.county` (`COUNTY_POPULATION`)
+4. `shanghai.building.county` (`COUNTY_BUILDING`)
+5. `shanghai.admin.town` (`TOWN_CODE`)
+6. `shanghai.population.town` (`TOWN_POPULATION`)
+7. `shanghai.building.town` (`TOWN_BUILDING`)
+
+Each parent is imported with the host CLI and then published through the API before its children are validated, so the aggregate comparison always finds a published parent. A child validated before its parent is published only receives the `aggregate_difference_exceeded` warning, not a rejection; publishing the parent first keeps the aggregate result meaningful.
+
+Reusable import and publish steps for each level:
+
+```powershell
+.\scripts\run-mdb-import.ps1 `
+  -AssetKey shanghai.population.city `
+  -File "D:\地震应急辅助决策系统\基础数据\上海应急基础数据2022.mdb" `
+  -Version "2022.1" `
+  -SourceUri "https://example.gov.invalid/shanghai-base-data-2022" `
+  -Actor "data-maintainer"
+
+$body = @{ reason = "approved for hierarchy validation" } | ConvertTo-Json
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/v1/data-asset-versions/<version-id>/publish" `
+  -Method Post `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Repeat with each `-AssetKey` in the published order above before importing the town assets. The city and county candidates are validation-only governance records: they carry the published parent totals, and the town validators read them through `aggregate_of`, but no loss formula reads them.
 
 ## Importing GDP And DEM GeoTIFF Files
 
@@ -145,7 +190,9 @@ Invoke-RestMethod `
   -Form $form
 ```
 
-Repeat for `shanghai.dem.raster`. The worker requires a valid numeric EPSG or ESRI authority code known to PostGIS, positive dimensions and band count, finite resolution, and valid bounds. It persists the raster in `data_asset_rasters` and verifies that the PostGIS export checksum, width, height, SRID, band metadata, nodata, and bounds match the source.
+Repeat for `shanghai.dem.raster`. The worker requires a valid numeric EPSG or ESRI authority code known to PostGIS, positive dimensions and band count, finite resolution, and valid bounds. It persists the raster in `data_asset_rasters` and verifies that the PostGIS export checksum, width, height, SRID, band metadata, nodata, and bounds match the source. It rejects a source CRS that cannot be transformed to `EPSG:4326`.
+
+The raster's actual source CRS is stored on the version as `source_crs` and its native SRID is retained in `data_asset_rasters.srid`. The native bounds are kept in `data_asset_rasters.band_manifest.native_bounds`. The persisted extents, `data_asset_versions.spatial_extent` and `data_asset_rasters.spatial_extent`, are reprojected to and stored in `EPSG:4326`; the band manifest verification compares the native bounds against the source raster. The real GDP file, for example, keeps `ESRI:102025` as its version `source_crs` while its persisted extent is WGS84.
 
 ## Validating A Candidate Version
 
@@ -166,7 +213,11 @@ Invoke-RestMethod `
   -Headers $headers
 ```
 
-Validation checks data type, business keys, required fields, numeric types and bounds, geometry type, spatial extent, expected record count, raster metadata, and configured aggregate relationships. A publishable report has status `validated` and no errors. Warnings do not block publication.
+Validation checks data type, business keys, required fields, numeric types and bounds, geometry type, spatial extent, expected record count, raster metadata, and configured aggregate relationships. Spatial assets are additionally checked against the active configured region boundary through `DATA_ASSET_COVERAGE_POLICY_PATH`. That policy names the region profile, the coverage mode and basis for each asset key, and the warning/error ratios, so no region-specific checks are hard-coded in the service.
+
+Full-coverage assets are measured against the configured boundary using either the `asset` or `region` basis; partial feature assets are declared as `partial` in the policy and reported with their partial coverage ratio instead of being silently skipped. Projected area is computed in the region profile projection (`EPSG:32651` for the Shanghai profile) rather than in `EPSG:4326`. Coverage ratio, coverage status, coverage policy version, area CRS, projected area, and the configured aggregate checks are persisted in the version schema summary under `validation_statistics` and are also returned on the version and import-job responses. A publishable report has status `validated` and no errors. Warnings do not block publication.
+
+Aggregate differences default to the strict `0.1%` warning and `0.5%` error thresholds. Only fields listed with a contract-level tolerance use a wider measured threshold, each with its rationale recorded in `tolerance_basis`: county population `FAMILY` uses a `4%` error ceiling, and town building `TOTAL_AREA`, `RCFRAME`, `BRICK_STRUCTURE`, `SINGLE_AREA`, and `OTHER_STRUCTURE` use `2%`, `2%`, `1%`, `3%`, and `5%` error ceilings from the 2022 MDB county/town measurements. Every aggregate check record still reports child total, parent total, absolute difference, relative difference, warning threshold, error threshold, and tolerance basis.
 
 ## Publishing A Version
 
@@ -234,6 +285,16 @@ Job states:
 - `failed`: normalization or persistence raised an exception.
 
 Do not mutate `status` by hand to hide a failure. Re-import the corrected source as a new candidate version.
+
+For HTTP imports, poll the authenticated import-job endpoint instead of querying the database:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/v1/data-asset-import-jobs/<job-id>" `
+  -Headers $headers
+```
+
+The response reports `status`, `error_summary`, `validation_errors`, `validation_warnings`, `statistics`, `started_at`, `completed_at`, `created_at`, `asset_key`, `version`, and `version_id`. The management UI polls the same endpoint after starting a first import, shows the diagnostics, and then refreshes the asset and version lists.
 
 ## Inspecting Evaluation Snapshots
 
@@ -336,15 +397,15 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run b
 Task 9 verification on 2026-09-29:
 
 - Compose configuration: exit `0`.
-- Alembic: `0012_data_asset_center (head)`.
-- Backend: `589 passed, 2 skipped, 2 warnings in 268.93s`.
+- Alembic: `0013_data_asset_final_fixes (head)`.
+- Backend: `601 passed, 3 skipped, 2 warnings in 281.94s`.
 - Ruff: `All checks passed!`.
-- Frontend tests: `10` files passed, `44` tests passed.
+- Frontend tests: `11` files passed, `47` tests passed.
 - Typecheck: `tsc -b` exit `0`.
 - Production build: `51 modules transformed`, Vite build succeeded.
 - Placeholder scan: no matches.
 
-Focused review verification for the domain, MDB importer, raster importer/repository, and data-asset permission routes passed `54` tests in `9.59s`.
+Final-review focused verification for data-asset coverage, domain, lifecycle, import-job, raster importer/repository, snapshot, migration, and permission behavior passed `69` tests with `3` skipped in `22.90s`. Focused migration/schema verification passed `11` tests in `186.98s`.
 
 The two backend warnings are third-party deprecations:
 
@@ -443,9 +504,9 @@ The raw MDB checksum matched the accepted source:
 
 ### HIGH_RISE Contract Decision
 
-Controller ruling: the specification requires a required-field contract, but it does not name `HIGH_RISE`. The authoritative `TOWN_BUILDING` source contains 212 rows and 212 null `HIGH_RISE` values, so `shanghai.building.town.HIGH_RISE` is optional for the first Shanghai catalog. This avoids inventing zero values. The other numerical and structural fields remain required, and the city/county building contracts are unchanged.
+Controller ruling: the specification requires a required-field contract, but it does not name `HIGH_RISE`. The authoritative `CITY_BUILDING`, `COUNTY_BUILDING`, and `TOWN_BUILDING` tables all contain null `HIGH_RISE` values, so `HIGH_RISE` is optional for all three building assets in the first Shanghai catalog. This keeps one consistent contract across the three levels and avoids inventing zero values. The other numerical and structural fields remain required.
 
-Reversal path: if authoritative `HIGH_RISE` values are supplied, set the town contract field back to required, update its regression expectation, and import a new immutable version through validation and publication. Existing assessment snapshots retain their prior version and checksum, so the contract change does not rewrite historical runs. Keeping the field required without source values would reject all 212 town-building rows and block publication.
+Reversal path: if authoritative `HIGH_RISE` values are supplied, set the affected contract fields back to required, update the regression expectations, and import new immutable versions through validation and publication. Existing assessment snapshots retain their prior version and checksum, so the contract change does not rewrite historical runs. Keeping the field required without source values would reject every building row and block publication.
 
 The accepted GDP raster uses the PostGIS-known `ESRI:102025` authority. Its source-file checksum is `3dad0bbdd4203126b05cccfe7bbe546794de1a505a7b5462887f7cbeccaa80da`; the canonical PostGIS GTiff export checksum is `fb0ba2b8f837691dbef44d465d6b51023714a18a52eae749cf6ca4abed9ea5a1`.
 

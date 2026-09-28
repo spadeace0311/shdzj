@@ -2,7 +2,8 @@ from math import hypot, isclose, isfinite
 from pathlib import Path
 
 import rasterio
-from pyproj import CRS
+from pyproj import CRS, Transformer
+from pyproj.exceptions import CRSError, ProjError
 
 from app.data_assets.domain import DataAssetDefinition, NormalizedRasterData
 
@@ -18,7 +19,8 @@ class GeoTiffAssetImporter:
         with rasterio.open(path) as dataset:
             if dataset.crs is None:
                 raise ValueError("GeoTIFF CRS is required")
-            srid = _resolve_srid(CRS.from_user_input(dataset.crs))
+            source_crs = CRS.from_user_input(dataset.crs)
+            srid = _resolve_srid(source_crs)
             if srid is None:
                 raise ValueError(
                     "GeoTIFF CRS must map to a numeric EPSG or ESRI code"
@@ -53,16 +55,42 @@ class GeoTiffAssetImporter:
                 or bounds.bottom >= bounds.top
             ):
                 raise ValueError("GeoTIFF bounds are invalid")
+            try:
+                wgs84_bounds = tuple(
+                    Transformer.from_crs(
+                        source_crs,
+                        "EPSG:4326",
+                        always_xy=True,
+                    ).transform_bounds(
+                        *bounds,
+                        densify_pts=21,
+                    )
+                )
+            except (CRSError, ProjError, ValueError) as exc:
+                raise ValueError(
+                    "GeoTIFF CRS cannot be transformed to EPSG:4326"
+                ) from exc
+            if (
+                not all(isfinite(value) for value in wgs84_bounds)
+                or wgs84_bounds[0] >= wgs84_bounds[2]
+                or wgs84_bounds[1] >= wgs84_bounds[3]
+            ):
+                raise ValueError(
+                    "GeoTIFF transformed bounds are invalid"
+                )
+            source_crs_text, source_code = source_crs.to_authority()
             return NormalizedRasterData(
                 width=dataset.width,
                 height=dataset.height,
                 srid=srid,
+                source_crs=f"{source_crs_text}:{source_code}",
                 band_count=dataset.count,
                 dtype=dataset.dtypes[0],
                 nodata=dataset.nodata,
                 resolution_x=resolution_x,
                 resolution_y=resolution_y,
-                spatial_extent=tuple(dataset.bounds),
+                native_spatial_extent=tuple(bounds),
+                spatial_extent=wgs84_bounds,
             )
 
 

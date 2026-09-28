@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assessment.models import AssessmentRun
 from app.config import settings
+from app.data_assets.locks import lock_data_asset_catalog
 from app.data_assets.models import DataAssetSnapshot, DataAssetVersion
 from app.data_assets.repository import (
     AssetRaster,
@@ -50,6 +51,7 @@ class DataAssetSnapshotService:
     ) -> DataAssetSnapshotResult:
         if region_id != self._registry.region_id:
             raise ValueError("required asset registry does not match region_id")
+        await lock_data_asset_catalog(session)
         run_exists = await session.scalar(
             select(AssessmentRun.id)
             .where(AssessmentRun.id == run_id)

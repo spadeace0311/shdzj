@@ -73,6 +73,25 @@ class AssetFieldContract:
 
 
 @dataclass(frozen=True, slots=True)
+class AggregateFieldTolerance:
+    field_name: str
+    warning_threshold: float
+    error_threshold: float
+    basis: str
+
+    def __post_init__(self) -> None:
+        if not self.field_name.strip():
+            raise ValueError("aggregate tolerance field_name must not be empty")
+        if not 0 <= self.warning_threshold <= self.error_threshold:
+            raise ValueError(
+                "aggregate tolerance thresholds must satisfy "
+                "0 <= warning <= error"
+            )
+        if not self.basis.strip():
+            raise ValueError("aggregate tolerance basis must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class AssetContract:
     business_key_fields: tuple[str, ...]
     fields: tuple[AssetFieldContract, ...]
@@ -82,6 +101,7 @@ class AssetContract:
     expected_record_count: int | None = None
     excluded_business_keys: tuple[str, ...] = ()
     exclusion_reason: str | None = None
+    aggregate_tolerances: tuple[AggregateFieldTolerance, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,11 +166,13 @@ class NormalizedRasterData:
     width: int
     height: int
     srid: int
+    source_crs: str
     band_count: int
     dtype: str
     nodata: float | None
     resolution_x: float
     resolution_y: float
+    native_spatial_extent: tuple[float, float, float, float]
     spatial_extent: tuple[float, float, float, float]
 
 

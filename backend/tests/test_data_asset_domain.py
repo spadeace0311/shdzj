@@ -81,6 +81,16 @@ def test_first_party_catalog_has_required_contracts() -> None:
         ).contract.fields
     }
     assert building_town_fields["HIGH_RISE"].required is False
+    for asset_key in (
+        "shanghai.building.city",
+        "shanghai.building.county",
+        "shanghai.building.town",
+    ):
+        fields = {
+            field.name: field
+            for field in get_asset_definition(asset_key).contract.fields
+        }
+        assert fields["HIGH_RISE"].required is False
 
 
 @pytest.mark.parametrize(

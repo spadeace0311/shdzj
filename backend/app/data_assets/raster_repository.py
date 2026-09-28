@@ -32,6 +32,7 @@ def _band_manifest(descriptor: NormalizedRasterData) -> dict:
         "nodata": descriptor.nodata,
         "resolution_x": descriptor.resolution_x,
         "resolution_y": descriptor.resolution_y,
+        "native_bounds": list(descriptor.native_spatial_extent),
     }
 
 
@@ -54,6 +55,29 @@ def _manifest_matches(stored: dict, expected: dict) -> bool:
                 return False
         except (KeyError, TypeError, ValueError):
             return False
+    stored_bounds = stored.get("native_bounds")
+    expected_bounds = expected.get("native_bounds")
+    if not isinstance(stored_bounds, list) or not isinstance(expected_bounds, list):
+        return False
+    if len(stored_bounds) != 4 or len(expected_bounds) != 4:
+        return False
+    try:
+        if any(
+            not isclose(
+                float(stored_value),
+                float(expected_value),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+            for stored_value, expected_value in zip(
+                stored_bounds,
+                expected_bounds,
+                strict=True,
+            )
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
     stored_nodata = stored.get("nodata")
     expected_nodata = expected.get("nodata")
     if stored_nodata is None or expected_nodata is None:
@@ -81,7 +105,7 @@ def _validate_descriptor(descriptor: NormalizedRasterData) -> None:
         raise ValueError("raster resolution is invalid")
     if descriptor.nodata is not None and not isfinite(float(descriptor.nodata)):
         raise ValueError("raster nodata must be finite")
-    extent = descriptor.spatial_extent
+    extent = descriptor.native_spatial_extent
     if len(extent) != 4 or not all(isfinite(float(value)) for value in extent):
         raise ValueError("raster bounds are invalid")
     if extent[0] >= extent[2] or extent[1] >= extent[3]:
@@ -170,10 +194,10 @@ async def _verify_saved_raster(
             ),
             {
                 "id": raster_id,
-                "min_x": descriptor.spatial_extent[0],
-                "min_y": descriptor.spatial_extent[1],
-                "max_x": descriptor.spatial_extent[2],
-                "max_y": descriptor.spatial_extent[3],
+                "min_x": descriptor.native_spatial_extent[0],
+                "min_y": descriptor.native_spatial_extent[1],
+                "max_x": descriptor.native_spatial_extent[2],
+                "max_y": descriptor.native_spatial_extent[3],
                 "srid": descriptor.srid,
             },
         )

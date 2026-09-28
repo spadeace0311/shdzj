@@ -90,7 +90,12 @@ async def process_import_job(
         await fail_import_job(session, job.id, error)
         return
     if report.publishable:
-        await complete_import_job(session, job.id, job.asset_version_id)
+        await complete_import_job(
+            session,
+            job.id,
+            job.asset_version_id,
+            report,
+        )
     else:
         await reject_import_job(session, job.id, report)
 
