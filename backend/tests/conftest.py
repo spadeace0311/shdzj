@@ -20,6 +20,16 @@ os.environ.setdefault(
 
 from app.db import SessionFactory  # noqa: E402
 
+from tests.data_asset_helpers import (  # noqa: E402, F401
+    candidate_factory,
+    data_asset_client,
+    geojson_town_file,
+    published_population_asset,
+    seeded_assessment_run,
+    seeded_imported_version,
+    seeded_outbox,
+)
+
 _original_cenc_collector_enabled = os.environ.get("CENC_COLLECTOR_ENABLED")
 os.environ["CENC_COLLECTOR_ENABLED"] = "false"
 
