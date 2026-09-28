@@ -26,7 +26,11 @@ def test_first_party_catalog_has_required_contracts() -> None:
         "shanghai.admin.city",
         "shanghai.admin.county",
         "shanghai.admin.town",
+        "shanghai.population.city",
+        "shanghai.population.county",
         "shanghai.population.town",
+        "shanghai.building.city",
+        "shanghai.building.county",
         "shanghai.building.town",
         "shanghai.economy.county",
         "shanghai.fault",
@@ -38,6 +42,38 @@ def test_first_party_catalog_has_required_contracts() -> None:
     assert town.contract.business_key_fields == ("ID",)
     assert town.contract.geometry_type == "MULTIPOLYGON"
     assert town.source_table == "TOWN_CODE"
+    assert (
+        get_asset_definition("shanghai.population.town").contract.aggregate_of
+        == "shanghai.population.county"
+    )
+    assert (
+        get_asset_definition("shanghai.population.county").contract.aggregate_of
+        == "shanghai.population.city"
+    )
+    assert (
+        get_asset_definition("shanghai.building.town").contract.aggregate_of
+        == "shanghai.building.county"
+    )
+    assert (
+        get_asset_definition("shanghai.building.county").contract.aggregate_of
+        == "shanghai.building.city"
+    )
+    assert (
+        get_asset_definition("shanghai.economy.county").contract.aggregate_of
+        is None
+    )
+    assert get_asset_definition("shanghai.population.city").source_table == (
+        "CITY_POPULATION"
+    )
+    assert get_asset_definition("shanghai.population.county").source_table == (
+        "COUNTY_POPULATION"
+    )
+    assert get_asset_definition("shanghai.building.city").source_table == (
+        "CITY_BUILDING"
+    )
+    assert get_asset_definition("shanghai.building.county").source_table == (
+        "COUNTY_BUILDING"
+    )
 
 
 @pytest.mark.parametrize(

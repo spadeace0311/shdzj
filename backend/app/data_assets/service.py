@@ -652,6 +652,20 @@ class DataAssetService:
     ) -> ValidationReport:
         if definition.contract.aggregate_of is None:
             return report
+        if definition.contract.aggregate_of == definition.asset_key:
+            self_issue = ValidationIssue(
+                severity="error",
+                code="aggregate_difference_exceeded",
+                message="aggregate_of must reference a coarser parent asset",
+            )
+            return ValidationReport(
+                version_id=str(version.id),
+                status=AssetVersionStatus.REJECTED,
+                errors=(*report.errors, self_issue),
+                warnings=report.warnings,
+                statistics=report.statistics,
+                checked_at=report.checked_at,
+            )
         parent = await self._repository.get_published_version(
             session,
             asset_key=definition.contract.aggregate_of,
@@ -673,14 +687,18 @@ class DataAssetService:
             for field in definition.contract.fields:
                 if field.python_type not in {"number", "integer"}:
                     continue
+                parent_values = [
+                    _matching_numeric_value(record.properties, field.name)
+                    for record in parent_records
+                ]
+                parent_values = [value for value in parent_values if value is not None]
+                if not parent_values:
+                    continue
                 child_total = sum(
-                    float(record.properties.get(field.name) or 0)
+                    _matching_numeric_value(record.properties, field.name) or 0
                     for record in normalized.records
                 )
-                parent_total = sum(
-                    float(record.properties.get(field.name) or 0)
-                    for record in parent_records
-                )
+                parent_total = sum(parent_values)
                 absolute_difference = abs(child_total - parent_total)
                 relative_difference = (
                     absolute_difference / abs(parent_total)
@@ -879,3 +897,16 @@ def _table_checksum(normalized: NormalizedTableData) -> str:
         default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _matching_numeric_value(
+    properties: dict,
+    field_name: str,
+) -> float | None:
+    for key, value in properties.items():
+        if str(key).lower() == field_name.lower() and value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None

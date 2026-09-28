@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from app.data_assets.import_jobs import fail_import_job
 from app.data_assets.models import (
+    DataAsset,
     DataAssetAuditLog,
     DataAssetImportJob,
     DataAssetRecord,
@@ -260,10 +261,36 @@ async def test_population_validation_reports_extra_business_keys(
     )
 
 
+async def test_aggregate_hierarchy_matching_parent_has_no_issue(
+    session_factory,
+) -> None:
+    from tests.data_asset_helpers import _ensure_published_admin_town
+
+    await _ensure_published_admin_town(session_factory)
+    await _seed_published_parent_asset(
+        session_factory,
+        "shanghai.population.county",
+        _population_parent_rows(17),
+    )
+    report = await _validate_population_with_total(session_factory, 100.0)
+
+    assert not any(
+        issue.code == "aggregate_difference_exceeded"
+        for issue in (*report.errors, *report.warnings)
+    )
+
+
 async def test_aggregate_check_warns_within_tolerance(
     session_factory,
-    published_population_asset,
 ) -> None:
+    from tests.data_asset_helpers import _ensure_published_admin_town
+
+    await _ensure_published_admin_town(session_factory)
+    await _seed_published_parent_asset(
+        session_factory,
+        "shanghai.population.county",
+        _population_parent_rows(17),
+    )
     report = await _validate_population_with_total(session_factory, 100.2)
 
     assert report.publishable is True
@@ -275,14 +302,41 @@ async def test_aggregate_check_warns_within_tolerance(
 
 async def test_aggregate_check_rejects_excessive_drift(
     session_factory,
-    published_population_asset,
 ) -> None:
+    from tests.data_asset_helpers import _ensure_published_admin_town
+
+    await _ensure_published_admin_town(session_factory)
+    await _seed_published_parent_asset(
+        session_factory,
+        "shanghai.population.county",
+        _population_parent_rows(17),
+    )
     report = await _validate_population_with_total(session_factory, 101.0)
 
     assert report.publishable is False
     assert any(
         issue.code == "aggregate_difference_exceeded"
         for issue in report.errors
+    )
+
+
+async def test_aggregate_check_uses_parent_not_prior_child_version(
+    session_factory,
+) -> None:
+    from tests.data_asset_helpers import _ensure_published_admin_town
+
+    await _ensure_published_admin_town(session_factory)
+    await _publish_population_version_with_total(session_factory, 999.0)
+    await _seed_published_parent_asset(
+        session_factory,
+        "shanghai.population.county",
+        _population_parent_rows(17),
+    )
+    report = await _validate_population_with_total(session_factory, 100.0)
+
+    assert not any(
+        issue.code == "aggregate_difference_exceeded"
+        for issue in (*report.errors, *report.warnings)
     )
 
 
@@ -523,3 +577,156 @@ async def _validate_population_with_total(
                 session,
                 job.asset_version_id,
             )
+
+
+async def _publish_population_version_with_total(
+    session_factory,
+    total: float,
+):
+    from app.data_assets.domain import NormalizedRecord, NormalizedTableData
+    from tests.data_asset_helpers import (
+        FIXTURE_ACTOR,
+        _population_records,
+        _populate,
+        _queue_candidate,
+    )
+
+    base = _population_records()
+    changed = NormalizedTableData(
+        base.columns,
+        tuple(
+            NormalizedRecord(
+                record.row_number,
+                record.business_key,
+                {**record.properties, "total": total},
+            )
+            for record in base.records
+        ),
+        base.source_crs,
+        base.spatial_extent,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"prior-child-{uuid4()}",
+            )
+            await _populate(
+                session,
+                job.asset_version_id,
+                changed,
+                importer="geojson",
+            )
+            service = DataAssetService()
+            report = await service.validate_version(
+                session,
+                job.asset_version_id,
+            )
+            if not report.publishable:
+                raise AssertionError("prior population version is not publishable")
+            await service.publish_version(
+                session,
+                job.asset_version_id,
+                FIXTURE_ACTOR,
+                "prior child fixture",
+            )
+
+
+def _population_parent_rows(record_count: int) -> list[dict]:
+    totals = {
+        "TOTAL": 21200,
+        "RESIDENT": 14840,
+        "FAMILY": 10600,
+        "OVER65": 3180,
+        "UNDER14": 2120,
+    }
+    distributions = {
+        field: _distribute_total(value, record_count)
+        for field, value in totals.items()
+    }
+    return [
+        {
+            "ID": f"parent-{index}",
+            **{
+                field: values[index]
+                for field, values in distributions.items()
+            },
+        }
+        for index in range(record_count)
+    ]
+
+
+def _distribute_total(total: int, record_count: int) -> list[int]:
+    base = total // record_count
+    remainder = total % record_count
+    return [base + 1] * remainder + [base] * (record_count - remainder)
+
+
+async def _seed_published_parent_asset(
+    session_factory,
+    asset_key: str,
+    rows: list[dict],
+) -> None:
+    from datetime import UTC, datetime
+
+    from app.data_assets.registry import get_asset_definition
+    from tests.data_asset_helpers import FIXTURE_ACTOR, _asset_contract
+
+    definition = get_asset_definition(asset_key)
+    async with session_factory() as session:
+        async with session.begin():
+            asset = await session.scalar(
+                select(DataAsset).where(
+                    DataAsset.asset_key == asset_key,
+                    DataAsset.region_id == definition.region_id,
+                )
+            )
+            if asset is None:
+                asset = DataAsset(
+                    asset_key=definition.asset_key,
+                    region_id=definition.region_id,
+                    name=definition.name,
+                    data_type=definition.data_type.value,
+                    spatial_granularity=definition.spatial_granularity,
+                    responsibility_unit=definition.responsibility_unit,
+                    update_interval_days=definition.update_interval_days,
+                    is_core=definition.is_core,
+                    contract=_asset_contract(definition),
+                )
+                session.add(asset)
+                await session.flush()
+            now = datetime.now(UTC)
+            version = DataAssetVersion(
+                asset_id=asset.id,
+                version=f"parent-{uuid4()}",
+                status="published",
+                source_uri="https://example.gov.invalid/parent",
+                schema_summary={},
+                record_count=len(rows),
+                spatial_extent=None,
+                source_crs=definition.contract.source_crs,
+                checksum="a" * 64,
+                imported_by=FIXTURE_ACTOR,
+                reviewed_by=FIXTURE_ACTOR,
+                imported_at=now,
+                validated_at=now,
+                published_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(version)
+            await session.flush()
+            for row_number, row in enumerate(rows, start=1):
+                business_key = str(
+                    row[definition.contract.business_key_fields[0]]
+                )
+                session.add(
+                    DataAssetRecord(
+                        version_id=version.id,
+                        row_number=row_number,
+                        business_key=business_key,
+                        properties=row,
+                    )
+                )
+            await session.flush()
