@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -539,13 +540,13 @@ async def seeded_imported_version(
 
     import numpy as np
     import rasterio
-    from rasterio.transform import from_origin
+    from rasterio.transform import Affine
     from sqlalchemy import select
 
     from app.data_assets.models import DataAsset, DataAssetVersion
 
     source_path = tmp_path / "gdp.tif"
-    transform = from_origin(121.0, 31.5, 0.01, 0.01)
+    transform = Affine(0.01, 0, 121.0, 0, -0.01, 31.5)
     with rasterio.open(
         source_path,
         "w",
@@ -559,6 +560,7 @@ async def seeded_imported_version(
         nodata=0,
     ) as target:
         target.write(np.ones((5, 4), dtype="uint8"), 1)
+    source_checksum = hashlib.sha256(source_path.read_bytes()).hexdigest()
 
     definition = _definition("shanghai.gdp.raster")
     version = f"gdp-raster-{uuid4()}"
@@ -596,7 +598,7 @@ async def seeded_imported_version(
                 record_count=0,
                 spatial_extent=None,
                 source_crs="EPSG:4326",
-                checksum="a" * 64,
+                checksum=source_checksum,
                 managed_path=None,
                 imported_by=FIXTURE_ACTOR,
                 imported_at=now,

@@ -1,3 +1,4 @@
+from math import hypot, isclose, isfinite
 from pathlib import Path
 
 import rasterio
@@ -22,9 +23,33 @@ class GeoTiffAssetImporter:
                 raise ValueError("GeoTIFF CRS must map to an EPSG code")
             if dataset.width <= 0 or dataset.height <= 0 or dataset.count <= 0:
                 raise ValueError("GeoTIFF dimensions and band count must be positive")
-            if dataset.transform.a <= 0 or dataset.transform.e >= 0:
+            transform = dataset.transform
+            coefficients = (
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            )
+            if not all(isfinite(value) for value in coefficients):
                 raise ValueError("GeoTIFF resolution is invalid")
-            if not dataset.bounds or not all(map(lambda value: value == value, dataset.bounds)):
+            determinant = transform.a * transform.e - transform.b * transform.d
+            resolution_x = hypot(transform.a, transform.b)
+            resolution_y = hypot(transform.d, transform.e)
+            if (
+                resolution_x <= 0
+                or resolution_y <= 0
+                or isclose(determinant, 0.0, rel_tol=0.0, abs_tol=1e-15)
+            ):
+                raise ValueError("GeoTIFF resolution is invalid")
+            bounds = dataset.bounds
+            if (
+                not bounds
+                or not all(isfinite(value) for value in bounds)
+                or bounds.left >= bounds.right
+                or bounds.bottom >= bounds.top
+            ):
                 raise ValueError("GeoTIFF bounds are invalid")
             return NormalizedRasterData(
                 width=dataset.width,
@@ -33,7 +58,7 @@ class GeoTiffAssetImporter:
                 band_count=dataset.count,
                 dtype=dataset.dtypes[0],
                 nodata=dataset.nodata,
-                resolution_x=abs(dataset.res[0]),
-                resolution_y=abs(dataset.res[1]),
+                resolution_x=resolution_x,
+                resolution_y=resolution_y,
                 spatial_extent=tuple(dataset.bounds),
             )
