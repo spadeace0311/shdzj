@@ -74,6 +74,7 @@ class MdbAssetImporter:
         if definition.source_table is None:
             raise ValueError("data asset does not define an MDB source table")
         connection = self._connection_factory.connect(path)
+        cursor = None
         try:
             cursor = connection.cursor()
             cursor.execute(f"SELECT * FROM [{definition.source_table}]")
@@ -104,6 +105,8 @@ class MdbAssetImporter:
                 spatial_extent=_extent(records),
             )
         finally:
+            if cursor is not None:
+                cursor.close()
             connection.close()
 
     @staticmethod
@@ -144,6 +147,11 @@ class MdbAssetImporter:
             if not has_shape_field:
                 raise ValueError("MDB row is missing the SHAPE geometry field")
             geometry = parse_esri_shape(shape_value)
+            _require_contract_geometry(
+                geometry,
+                contract.geometry_type,
+                row_number,
+            )
             geometry_wkt = geometry.wkt
         elif has_shape_field and shape_value is not None:
             parse_esri_shape(shape_value)
@@ -173,30 +181,55 @@ def parse_esri_shape(blob: bytes) -> BaseGeometry:
     if shape_type not in SUPPORTED_SHAPE_TYPES:
         raise ValueError(f"unsupported ESRI shape type: {shape_type}")
 
-    if shape_type in {1, 11, 21}:
+    if shape_type == 1:
         return _point(buffer)
+    if shape_type == 11:
+        return _point_z(buffer)
+    if shape_type == 21:
+        return _point_m(buffer)
     if shape_type in {3, 13, 23}:
-        return _polyline(buffer)
+        return _polyline(buffer, shape_type)
     if shape_type in {5, 15, 25}:
-        return _polygon(buffer)
+        return _polygon(buffer, shape_type)
     if shape_type in {8, 18, 28}:
-        return _multipoint(buffer)
+        return _multipoint(buffer, shape_type)
     raise ValueError(f"unsupported ESRI shape type: {shape_type}")
 
 
 def _point(buffer: bytes) -> Point:
     if len(buffer) < 20:
         raise ValueError("truncated ESRI point shape")
+    if len(buffer) != 20:
+        raise ValueError(f"invalid ESRI point record length: {len(buffer)}")
     x, y = struct.unpack_from("<2d", buffer, 4)
     _require_finite(x, y)
     return Point(x, y)
 
 
-def _multipoint(buffer: bytes) -> MultiPoint:
+def _point_z(buffer: bytes) -> Point:
+    _validate_length(buffer, {28, 36}, "point Z")
+    x, y, z = struct.unpack_from("<3d", buffer, 4)
+    _require_finite(x, y, z)
+    return Point(x, y)
+
+
+def _point_m(buffer: bytes) -> Point:
+    _validate_length(buffer, {20, 28}, "point M")
+    x, y = struct.unpack_from("<2d", buffer, 4)
+    _require_finite(x, y)
+    return Point(x, y)
+
+
+def _multipoint(buffer: bytes, shape_type: int) -> MultiPoint:
     if len(buffer) < 40:
         raise ValueError("truncated ESRI multipoint shape")
     num_points = struct.unpack_from("<i", buffer, 36)[0]
     _require_shape_counts(num_points)
+    _validate_length(
+        buffer,
+        _multipoint_lengths(shape_type, num_points),
+        "multipoint",
+    )
     offset = 40
     coordinates = _read_coordinates(buffer, offset, num_points)
     geometry = MultiPoint(coordinates)
@@ -204,9 +237,14 @@ def _multipoint(buffer: bytes) -> MultiPoint:
     return geometry
 
 
-def _polyline(buffer: bytes) -> MultiLineString:
+def _polyline(buffer: bytes, shape_type: int) -> MultiLineString:
     header = _read_poly_header(buffer)
-    parts, coordinates = _read_parts_and_coordinates(
+    _validate_length(
+        buffer,
+        _poly_lengths(shape_type, header["num_parts"], header["num_points"]),
+        "polyline",
+    )
+    parts = _read_parts(
         buffer,
         header["num_parts"],
         header["num_points"],
@@ -221,9 +259,14 @@ def _polyline(buffer: bytes) -> MultiLineString:
     return geometry
 
 
-def _polygon(buffer: bytes) -> MultiPolygon:
+def _polygon(buffer: bytes, shape_type: int) -> MultiPolygon:
     header = _read_poly_header(buffer)
-    parts, coordinates = _read_parts_and_coordinates(
+    _validate_length(
+        buffer,
+        _poly_lengths(shape_type, header["num_parts"], header["num_points"]),
+        "polygon",
+    )
+    parts = _read_parts(
         buffer,
         header["num_parts"],
         header["num_points"],
@@ -235,7 +278,7 @@ def _polygon(buffer: bytes) -> MultiPolygon:
         if part[0] != part[-1]:
             raise ValueError("ESRI polygon ring is not closed")
         ring = LinearRing(part)
-        if ring.area == 0:
+        if Polygon(part).area == 0:
             raise ValueError("ESRI polygon ring has zero area")
         rings.append(ring)
     polygons = _group_polygon_rings(rings)
@@ -254,11 +297,11 @@ def _read_poly_header(buffer: bytes) -> dict[str, int]:
     return {"num_parts": num_parts, "num_points": num_points}
 
 
-def _read_parts_and_coordinates(
+def _read_parts(
     buffer: bytes,
     num_parts: int,
     num_points: int,
-) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]:
+) -> tuple[tuple[tuple[float, float], ...], ...]:
     offset = 44
     part_values, offset = _unpack_from(
         buffer,
@@ -266,10 +309,7 @@ def _read_parts_and_coordinates(
         f"<{num_parts}i",
         "part indices",
     )
-    if part_values != tuple(sorted(part_values)):
-        raise ValueError("ESRI shape part indices are not ordered")
-    if any(part < 0 or part >= num_points for part in part_values):
-        raise ValueError("ESRI shape part index is out of range")
+    _validate_part_indices(part_values, num_points)
 
     raw_coordinates, _ = _unpack_from(
         buffer,
@@ -292,7 +332,7 @@ def _read_parts_and_coordinates(
             else num_points
         )
         parts.append(coordinates[start:end])
-    return tuple(parts), coordinates
+    return tuple(parts)
 
 
 def _read_coordinates(
@@ -313,6 +353,68 @@ def _read_coordinates(
     for x, y in coordinates:
         _require_finite(x, y)
     return coordinates
+
+
+def _validate_part_indices(
+    part_values: tuple[int, ...],
+    num_points: int,
+) -> None:
+    if not part_values:
+        raise ValueError("ESRI shape has no part indices")
+    if part_values[0] != 0:
+        raise ValueError("ESRI shape part indices must start at zero")
+    if any(
+        current <= previous
+        for previous, current in zip(part_values, part_values[1:])
+    ):
+        raise ValueError("ESRI shape part indices must be strictly increasing")
+    if any(part < 0 or part >= num_points for part in part_values):
+        raise ValueError("ESRI shape part index is out of range")
+
+
+def _validate_length(
+    buffer: bytes,
+    allowed_lengths: set[int],
+    label: str,
+) -> None:
+    if len(buffer) not in allowed_lengths:
+        allowed = ", ".join(str(value) for value in sorted(allowed_lengths))
+        raise ValueError(
+            f"invalid ESRI {label} record length: "
+            f"{len(buffer)} (expected {allowed})"
+        )
+
+
+def _multipoint_lengths(shape_type: int, num_points: int) -> set[int]:
+    base = 40 + (16 * num_points)
+    if shape_type == 8:
+        return {base}
+    if shape_type == 28:
+        return {base, base + 16 + (8 * num_points)}
+    if shape_type == 18:
+        return {
+            base + 16 + (8 * num_points),
+            base + 32 + (16 * num_points),
+        }
+    raise ValueError(f"unsupported ESRI multipoint shape type: {shape_type}")
+
+
+def _poly_lengths(
+    shape_type: int,
+    num_parts: int,
+    num_points: int,
+) -> set[int]:
+    base = 44 + (4 * num_parts) + (16 * num_points)
+    if shape_type in {3, 5}:
+        return {base}
+    if shape_type in {23, 25}:
+        return {base, base + 16 + (8 * num_points)}
+    if shape_type in {13, 15}:
+        return {
+            base + 16 + (8 * num_points),
+            base + 32 + (16 * num_points),
+        }
+    raise ValueError(f"unsupported ESRI poly shape type: {shape_type}")
 
 
 def _unpack_from(
@@ -344,11 +446,27 @@ def _require_valid(geometry: BaseGeometry, label: str) -> None:
         )
 
 
+def _require_contract_geometry(
+    geometry: BaseGeometry,
+    expected: str | None,
+    row_number: int,
+) -> None:
+    if expected is None:
+        return
+    if geometry.geom_type.upper() != expected.upper():
+        raise ValueError(
+            f"geometry type mismatch at row {row_number}: "
+            f"expected {expected}, got {geometry.geom_type}"
+        )
+
+
 def _group_polygon_rings(rings: list[LinearRing]) -> list[Polygon]:
     exteriors = [ring for ring in rings if not ring.is_ccw]
     holes = [ring for ring in rings if ring.is_ccw]
     if not exteriors:
-        exteriors = [max(rings, key=lambda ring: abs(ring.area))]
+        exteriors = [
+            max(rings, key=lambda ring: abs(Polygon(ring).area))
+        ]
         holes = [ring for ring in rings if ring is not exteriors[0]]
 
     polygons: list[Polygon] = []

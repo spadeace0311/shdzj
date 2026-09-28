@@ -14,6 +14,9 @@ Get-Content -LiteralPath $envFile | ForEach-Object {
     $values[$matches[1].Trim()] = $matches[2].Trim()
   }
 }
+foreach ($key in $values.Keys) {
+  Set-Item -Path "Env:$key" -Value $values[$key]
+}
 $hostPort = if ($values.ContainsKey("POSTGRES_HOST_PORT")) {
   $values["POSTGRES_HOST_PORT"]
 } else {
@@ -22,9 +25,14 @@ $hostPort = if ($values.ContainsKey("POSTGRES_HOST_PORT")) {
 $databaseUrl = $values["DATABASE_URL"] -replace "@postgres:5432", "@127.0.0.1:$hostPort"
 $env:DATABASE_URL = $databaseUrl
 $storageRoot = if ($values.ContainsKey("DATA_ASSET_STORAGE_HOST_DIR")) {
-  [IO.Path]::GetFullPath(
-    (Join-Path (Split-Path -Parent $envFile) $values["DATA_ASSET_STORAGE_HOST_DIR"])
-  )
+  $configuredStorage = $values["DATA_ASSET_STORAGE_HOST_DIR"]
+  if ([IO.Path]::IsPathRooted($configuredStorage)) {
+    [IO.Path]::GetFullPath($configuredStorage)
+  } else {
+    [IO.Path]::GetFullPath(
+      (Join-Path (Join-Path $root "infra") $configuredStorage)
+    )
+  }
 } else {
   Join-Path $root "data\data-assets"
 }

@@ -12,6 +12,7 @@ from app.data_assets.import_jobs import (
     complete_import_job,
     queue_import_job,
     reject_import_job,
+    sanitize_error,
 )
 from app.data_assets.mdb_importer import MdbAssetImporter
 from app.data_assets.registry import get_asset_definition
@@ -105,16 +106,19 @@ def main() -> None:
     args = _build_parser().parse_args()
     if args.command != "import":
         raise SystemExit("expected the import subcommand")
-    job_id = asyncio.run(
-        run_mdb_import(
-            source_path=args.file,
-            asset_key=args.asset_key,
-            version=args.version,
-            source_uri=args.source_uri,
-            actor=args.actor,
-            storage_root=args.storage_root,
+    try:
+        job_id = asyncio.run(
+            run_mdb_import(
+                source_path=args.file,
+                asset_key=args.asset_key,
+                version=args.version,
+                source_uri=args.source_uri,
+                actor=args.actor,
+                storage_root=args.storage_root,
+            )
         )
-    )
+    except Exception as error:
+        raise SystemExit(sanitize_error(error)) from error
     print(job_id)
 
 
