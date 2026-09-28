@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -98,6 +99,12 @@ _ADMIN_TOWN_DEPENDENTS = {
     "shanghai.population.town",
     "shanghai.building.town",
 }
+
+
+class DataAssetDecisionError(ValueError):
+    def __init__(self, issue: ValidationIssue) -> None:
+        self.issue = issue
+        super().__init__(issue.message)
 
 
 class DataAssetService:
@@ -247,7 +254,16 @@ class DataAssetService:
                 .select_from(DataAssetRecord)
                 .where(DataAssetRecord.version_id == version_id)
             )
+            checksum = _table_checksum(normalized)
             if existing_count:
+                stored_checksum = (version.schema_summary or {}).get(
+                    "normalized_checksum"
+                )
+                if stored_checksum != checksum:
+                    raise ValueError(
+                        "normalized data checksum does not match existing "
+                        "candidate version"
+                    )
                 return version
             session.add_all(
                 [
@@ -265,7 +281,9 @@ class DataAssetService:
                     for record in normalized.records
                 ]
             )
-            version.schema_summary = dict(schema_summary)
+            summary = dict(schema_summary)
+            summary["normalized_checksum"] = checksum
+            version.schema_summary = summary
             version.record_count = normalized.record_count
             version.spatial_extent = _bounds_wkt_element(
                 normalized.spatial_extent
@@ -305,6 +323,20 @@ class DataAssetService:
             statistics=report.statistics,
             checked_at=report.checked_at,
         )
+        dependency_issue = await self._admin_town_key_set_issue(
+            session,
+            version,
+            asset,
+        )
+        if dependency_issue is not None:
+            report = ValidationReport(
+                version_id=report.version_id,
+                status=AssetVersionStatus.REJECTED,
+                errors=(*report.errors, dependency_issue),
+                warnings=report.warnings,
+                statistics=report.statistics,
+                checked_at=report.checked_at,
+            )
         report = await self._apply_aggregate_checks(
             session,
             definition,
@@ -397,7 +429,9 @@ class DataAssetService:
                 f"invalid data asset version status transition: "
                 f"{current_status.value} -> {target_status.value}"
             )
-        await self._ensure_admin_town_key_set(session, target, asset)
+        issue = await self._admin_town_key_set_issue(session, target, asset)
+        if issue is not None:
+            raise DataAssetDecisionError(issue)
         return await self._publish_target(
             session,
             asset,
@@ -483,7 +517,9 @@ class DataAssetService:
                 f"invalid data asset version status transition: "
                 f"{current_status.value} -> {target_status.value}"
             )
-        await self._ensure_admin_town_key_set(session, target, asset)
+        issue = await self._admin_town_key_set_issue(session, target, asset)
+        if issue is not None:
+            raise DataAssetDecisionError(issue)
         return await self._publish_target(
             session,
             asset,
@@ -718,21 +754,28 @@ class DataAssetService:
             checked_at=report.checked_at,
         )
 
-    async def _ensure_admin_town_key_set(
+    async def _admin_town_key_set_issue(
         self,
         session: AsyncSession,
         version: DataAssetVersion,
         asset: DataAsset,
-    ) -> None:
+    ) -> ValidationIssue | None:
         if asset.asset_key not in _ADMIN_TOWN_DEPENDENTS:
-            return
+            return None
         admin_town = await self._repository.get_published_version(
             session,
             asset_key="shanghai.admin.town",
             region_id=asset.region_id,
         )
         if admin_town is None:
-            return
+            return ValidationIssue(
+                severity="error",
+                code="business_key_set_mismatch",
+                message=(
+                    "dependent data asset requires a published "
+                    "shanghai.admin.town version"
+                ),
+            )
         target_keys = {
             record.business_key
             for record in await self._repository.list_records(
@@ -750,12 +793,17 @@ class DataAssetService:
         if target_keys != admin_keys:
             missing = sorted(admin_keys - target_keys)
             extra = sorted(target_keys - admin_keys)
-            raise ValueError(
-                "business_key_set_mismatch: dependent asset keys must match "
-                "shanghai.admin.town"
-                + (f"; missing={missing}" if missing else "")
-                + (f"; extra={extra}" if extra else "")
+            return ValidationIssue(
+                severity="error",
+                code="business_key_set_mismatch",
+                message=(
+                    "dependent asset business key set does not match "
+                    "shanghai.admin.town"
+                    + (f"; missing={missing}" if missing else "")
+                    + (f"; extra={extra}" if extra else "")
+                ),
             )
+        return None
 
     @staticmethod
     def _version_view(
@@ -808,3 +856,26 @@ def _wkt_to_bounds(
         return None
     geometry = shapely_wkt.loads(wkt)
     return tuple(float(value) for value in geometry.bounds)
+
+
+def _table_checksum(normalized: NormalizedTableData) -> str:
+    payload = {
+        "columns": list(normalized.columns),
+        "records": [
+            {
+                "row_number": record.row_number,
+                "business_key": record.business_key,
+                "properties": record.properties,
+                "geometry_wkt": record.geometry_wkt,
+            }
+            for record in normalized.records
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

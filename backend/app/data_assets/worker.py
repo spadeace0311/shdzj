@@ -35,10 +35,20 @@ async def process_import_job(
     job: DataAssetImportJob,
 ) -> None:
     if job.asset_version_id is None:
-        raise RuntimeError("data asset import job has no candidate version")
+        await fail_import_job(
+            session,
+            job.id,
+            RuntimeError("data asset import job has no candidate version"),
+        )
+        return
     asset = await session.get(DataAsset, job.asset_id)
     if asset is None:
-        raise LookupError("data asset import job references a missing asset")
+        await fail_import_job(
+            session,
+            job.id,
+            LookupError("data asset import job references a missing asset"),
+        )
+        return
     definition = get_asset_definition(asset.asset_key)
     importer = IMPORTERS.get(job.file_format)
     if importer is None:

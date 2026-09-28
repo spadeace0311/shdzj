@@ -144,6 +144,7 @@ class DataAssetSnapshotService:
         snapshot = await session.scalar(
             select(DataAssetSnapshot).where(
                 DataAssetSnapshot.run_id == run_id,
+                DataAssetSnapshot.region_id == self._registry.region_id,
                 DataAssetSnapshot.asset_key == asset_key,
             )
         )

@@ -15,6 +15,9 @@ def _field(name: str, python_type: str, *, required: bool = True, nonnegative: b
     )
 
 
+# The numeric town/county tables currently have no published coarser numeric
+# parent in the first-party catalog. Their aggregate source points at the same
+# asset so validation measures drift against the previously published version.
 FIRST_PARTY_ASSETS = (
     DataAssetDefinition(
         "shanghai.admin.city",
@@ -76,6 +79,7 @@ FIRST_PARTY_ASSETS = (
             expected_record_count=212,
             excluded_business_keys=("31012000000000",),
             exclusion_reason="district aggregate row without matching TOWN_CODE",
+            aggregate_of="shanghai.population.town",
         ),
         "TOWN_POPULATION",
     ),
@@ -101,6 +105,7 @@ FIRST_PARTY_ASSETS = (
                 _field("OTHER_STRUCTURE", "number", nonnegative=True),
             ),
             expected_record_count=212,
+            aggregate_of="shanghai.building.town",
         ),
         "TOWN_BUILDING",
     ),
@@ -124,6 +129,7 @@ FIRST_PARTY_ASSETS = (
                 _field("service_value", "number", nonnegative=True),
                 _field("income", "number", nonnegative=True),
             ),
+            aggregate_of="shanghai.economy.county",
         ),
         "economy",
     ),

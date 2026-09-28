@@ -318,6 +318,7 @@ async def wait_for_import_job(session_factory, job_id: UUID) -> UUID:
 async def candidate_factory(session_factory):
     async def factory(version: str) -> UUID:
         definition = _definition("shanghai.population.town")
+        await _ensure_published_admin_town(session_factory)
         async with session_factory() as session:
             async with session.begin():
                 job = await _queue_candidate(

@@ -1,15 +1,17 @@
 import asyncio
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.data_assets.import_jobs import fail_import_job
 from app.data_assets.models import (
     DataAssetAuditLog,
     DataAssetImportJob,
+    DataAssetRecord,
     DataAssetVersion,
 )
-from app.data_assets.service import DataAssetService
+from app.data_assets.service import DataAssetDecisionError, DataAssetService
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +21,14 @@ async def _dispose_engine_between_tests():
     await engine.dispose()
     yield
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def _cleanup_fixture_versions(session_factory):
+    from tests.data_asset_helpers import _cleanup_fixture_data
+
+    yield
+    await _cleanup_fixture_data(session_factory)
 
 
 async def test_candidate_validation_publish_and_single_published_version(
@@ -40,21 +50,30 @@ async def test_candidate_validation_publish_and_single_published_version(
             rows = (
                 await session.scalars(
                     select(DataAssetVersion).where(
-                        DataAssetVersion.status == "published"
+                        DataAssetVersion.status == "published",
+                        DataAssetVersion.id.in_([first_id, second_id]),
                     )
                 )
             ).all()
-            audit_rows = (await session.scalars(select(DataAssetAuditLog))).all()
+            audit_rows = (
+                await session.scalars(
+                    select(DataAssetAuditLog).where(
+                        DataAssetAuditLog.version_id.in_(
+                            [first_id, second_id]
+                        )
+                    )
+                )
+            ).all()
 
     assert [str(row.id) for row in rows] == [str(second_id)]
-    assert [row.action for row in audit_rows] == [
+    assert sorted(row.action for row in audit_rows) == [
         "import",
         "import",
-        "validate",
         "publish",
-        "validate",
+        "publish",
         "retire",
-        "publish",
+        "validate",
+        "validate",
     ]
 
 
@@ -157,8 +176,350 @@ async def test_concurrent_publish_keeps_single_published_version(
         published = (
             await session.scalars(
                 select(DataAssetVersion).where(
-                    DataAssetVersion.status == "published"
+                    DataAssetVersion.status == "published",
+                    DataAssetVersion.id.in_([first_id, second_id]),
                 )
             )
         ).all()
     assert len(published) == 1
+
+
+async def test_population_publish_requires_published_admin_town(
+    session_factory,
+) -> None:
+    from tests.data_asset_helpers import (
+        _population_records,
+        _populate,
+        _queue_candidate,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"no-admin-{uuid4()}",
+            )
+            await _populate(
+                session,
+                job.asset_version_id,
+                _population_records(),
+                importer="geojson",
+            )
+            version = await session.get(
+                DataAssetVersion,
+                job.asset_version_id,
+                with_for_update=True,
+            )
+            version.status = "validated"
+            with pytest.raises(DataAssetDecisionError) as exc_info:
+                await DataAssetService().publish_version(
+                    session,
+                    job.asset_version_id,
+                    "publisher",
+                    "missing admin town",
+                )
+    assert exc_info.value.issue.code == "business_key_set_mismatch"
+
+
+async def test_population_validation_reports_missing_business_keys(
+    session_factory,
+) -> None:
+    await _publish_admin_town_with_keys(
+        session_factory,
+        set(_town_codes()[:-1]),
+    )
+    report = await _validate_population_with_keys(
+        session_factory,
+        tuple(_town_codes()),
+    )
+
+    assert report.publishable is False
+    assert any(
+        issue.code == "business_key_set_mismatch"
+        for issue in report.errors
+    )
+
+
+async def test_population_validation_reports_extra_business_keys(
+    session_factory,
+) -> None:
+    await _publish_admin_town_with_keys(
+        session_factory,
+        set(_town_codes()),
+    )
+    report = await _validate_population_with_keys(
+        session_factory,
+        (*_town_codes(), "310115999999"),
+    )
+
+    assert report.publishable is False
+    assert any(
+        issue.code == "business_key_set_mismatch"
+        for issue in report.errors
+    )
+
+
+async def test_aggregate_check_warns_within_tolerance(
+    session_factory,
+    published_population_asset,
+) -> None:
+    report = await _validate_population_with_total(session_factory, 100.2)
+
+    assert report.publishable is True
+    assert any(
+        issue.code == "aggregate_difference_exceeded"
+        for issue in report.warnings
+    )
+
+
+async def test_aggregate_check_rejects_excessive_drift(
+    session_factory,
+    published_population_asset,
+) -> None:
+    report = await _validate_population_with_total(session_factory, 101.0)
+
+    assert report.publishable is False
+    assert any(
+        issue.code == "aggregate_difference_exceeded"
+        for issue in report.errors
+    )
+
+
+async def test_table_repopulation_same_checksum_is_idempotent(
+    session_factory,
+) -> None:
+    from tests.data_asset_helpers import (
+        _population_records,
+        _populate,
+        _queue_candidate,
+    )
+
+    version_id = None
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"same-pop-{uuid4()}",
+            )
+            version_id = job.asset_version_id
+            await _populate(
+                session,
+                version_id,
+                _population_records(),
+                importer="geojson",
+            )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await _populate(
+                session,
+                version_id,
+                _population_records(),
+                importer="geojson",
+            )
+            count = await session.scalar(
+                select(func.count())
+                .select_from(DataAssetRecord)
+                .where(DataAssetRecord.version_id == version_id)
+            )
+    assert count == 212
+
+
+async def test_table_repopulation_rejects_different_checksum(
+    session_factory,
+) -> None:
+    from app.data_assets.domain import NormalizedRecord, NormalizedTableData
+    from tests.data_asset_helpers import (
+        _population_records,
+        _populate,
+        _queue_candidate,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"diff-pop-{uuid4()}",
+            )
+            version_id = job.asset_version_id
+            await _populate(
+                session,
+                version_id,
+                _population_records(),
+                importer="geojson",
+            )
+
+    base = _population_records()
+    changed = NormalizedTableData(
+        base.columns,
+        tuple(
+            NormalizedRecord(
+                record.row_number,
+                record.business_key,
+                {**record.properties, "total": 101},
+            )
+            for record in base.records
+        ),
+        base.source_crs,
+        base.spatial_extent,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            with pytest.raises(ValueError, match="checksum"):
+                await _populate(
+                    session,
+                    version_id,
+                    changed,
+                    importer="geojson",
+                )
+
+
+def _town_codes():
+    from tests.data_asset_helpers import _town_codes as helper
+
+    return helper()
+
+
+async def _publish_admin_town_with_keys(session_factory, keys) -> None:
+    from app.data_assets.domain import NormalizedTableData
+    from app.data_assets.registry import get_asset_definition
+    from tests.data_asset_helpers import (
+        FIXTURE_ACTOR,
+        _populate,
+        _queue_candidate,
+        _town_records,
+    )
+
+    base = _town_records()
+    records = tuple(
+        record for record in base.records if record.business_key in keys
+    )
+    normalized = NormalizedTableData(
+        base.columns,
+        records,
+        base.source_crs,
+        base.spatial_extent,
+    )
+    definition = get_asset_definition("shanghai.admin.town")
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key=definition.asset_key,
+                version=f"admin-test-{uuid4()}",
+            )
+            await _populate(
+                session,
+                job.asset_version_id,
+                normalized,
+                importer="geojson",
+            )
+            service = DataAssetService()
+            report = await service.validate_version(
+                session,
+                job.asset_version_id,
+            )
+            if not report.publishable:
+                raise AssertionError("test admin town version is not publishable")
+            await service.publish_version(
+                session,
+                job.asset_version_id,
+                FIXTURE_ACTOR,
+                "admin town dependency fixture",
+            )
+
+
+async def _validate_population_with_keys(
+    session_factory,
+    keys,
+):
+    from app.data_assets.domain import NormalizedRecord, NormalizedTableData
+    from tests.data_asset_helpers import _populate, _queue_candidate
+
+    records = tuple(
+        NormalizedRecord(
+            row_number=index,
+            business_key=key,
+            properties={
+                "ID": key,
+                "NAME": f"town-{index}",
+                "total": 100,
+                "resident": 70,
+                "floating": 20,
+                "family": 50,
+                "under14": 10,
+                "over65": 15,
+            },
+        )
+        for index, key in enumerate(keys, start=1)
+    )
+    normalized = NormalizedTableData(
+        ("ID", "NAME", "family", "floating", "over65", "resident", "total", "under14"),
+        records,
+        "EPSG:4326",
+        None,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"population-test-{uuid4()}",
+            )
+            await _populate(
+                session,
+                job.asset_version_id,
+                normalized,
+                importer="geojson",
+            )
+            return await DataAssetService().validate_version(
+                session,
+                job.asset_version_id,
+            )
+
+
+async def _validate_population_with_total(
+    session_factory,
+    total: float,
+):
+    from app.data_assets.domain import NormalizedRecord, NormalizedTableData
+    from tests.data_asset_helpers import (
+        _population_records,
+        _populate,
+        _queue_candidate,
+    )
+
+    base = _population_records()
+    changed = NormalizedTableData(
+        base.columns,
+        tuple(
+            NormalizedRecord(
+                record.row_number,
+                record.business_key,
+                {**record.properties, "total": total},
+            )
+            for record in base.records
+        ),
+        base.source_crs,
+        base.spatial_extent,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            job = await _queue_candidate(
+                session,
+                asset_key="shanghai.population.town",
+                version=f"aggregate-test-{uuid4()}",
+            )
+            await _populate(
+                session,
+                job.asset_version_id,
+                changed,
+                importer="geojson",
+            )
+            return await DataAssetService().validate_version(
+                session,
+                job.asset_version_id,
+            )

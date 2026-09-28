@@ -16,10 +16,18 @@ def load_required_asset_registry(path: str | Path) -> RequiredAssetRegistry:
     if not isinstance(payload, dict):
         raise ValueError("required asset registry must be a mapping")
     region_id = str(payload.get("region_id", "")).strip()
-    required = tuple(str(item) for item in payload.get("required", ()))
-    optional = tuple(str(item) for item in payload.get("optional", ()))
+    required = _asset_key_list(payload.get("required"), "required")
+    optional = _asset_key_list(payload.get("optional"), "optional")
     if not region_id or not required:
         raise ValueError("required asset registry needs region_id and required keys")
     if set(required) & set(optional):
         raise ValueError("required and optional asset keys must not overlap")
     return RequiredAssetRegistry(region_id, required, optional)
+
+
+def _asset_key_list(value: object, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} asset keys must be a list")
+    return tuple(str(item) for item in value)

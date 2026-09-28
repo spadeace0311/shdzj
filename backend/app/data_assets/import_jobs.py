@@ -250,6 +250,7 @@ def sanitize_error(error: Exception) -> str:
             r"rediss|mongodb(?:\+srv)?|amqp|amqps|oracle|sqlite)://\S+"
         ),
         r"(?i)\b[A-Za-z]:\\[^\s;]+",
+        r"(?i)\b/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.\w+)?",
     )
     for pattern in patterns:
         message = re.sub(pattern, "[redacted]", message)

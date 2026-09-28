@@ -208,6 +208,10 @@ async def test_fail_import_job_records_sanitized_summary_and_audit(
             "secret",
         ),
         (r"D:\secrets\key.pem", r"D:\secrets\key.pem"),
+        (
+            "/var/lib/data-assets/private/key.pem",
+            "/var/lib/data-assets/private/key.pem",
+        ),
     ],
 )
 def test_sanitize_error_redacts_sensitive_forms(

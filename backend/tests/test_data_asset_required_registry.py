@@ -25,3 +25,13 @@ def test_required_registry_rejects_overlap(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="must not overlap"):
         load_required_asset_registry(path)
+
+
+def test_required_registry_rejects_scalar_required_list(tmp_path: Path) -> None:
+    path = tmp_path / "assets.yaml"
+    path.write_text(
+        "region_id: test\nrequired: a\noptional: [b]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must be a list"):
+        load_required_asset_registry(path)
