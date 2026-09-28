@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data_assets.domain import ValidationReport, validate_source_uri
@@ -43,6 +44,18 @@ async def queue_import_job(
     source_uri = validate_source_uri(request.source_uri)
     definition = get_asset_definition(request.asset_key)
     asset = await _ensure_asset(session, definition)
+    existing_version = await session.scalar(
+        select(DataAssetVersion)
+        .join(DataAsset, DataAssetVersion.asset_id == DataAsset.id)
+        .where(
+            DataAsset.asset_key == definition.asset_key,
+            DataAsset.region_id == definition.region_id,
+            DataAssetVersion.version == request.version,
+        )
+        .with_for_update()
+    )
+    if existing_version is not None:
+        raise ValueError("data asset version already exists")
     now = datetime.now(UTC)
     version = DataAssetVersion(
         asset_id=asset.id,
@@ -71,7 +84,11 @@ async def queue_import_job(
         updated_at=now,
     )
     session.add(version)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ValueError("data asset version already exists") from exc
     job = DataAssetImportJob(
         asset_id=asset.id,
         asset_version_id=version.id,
@@ -171,6 +188,7 @@ async def reject_import_job(
     ]
     job.error_summary = "; ".join(issue.message for issue in report.errors)[:1000]
     job.completed_at = datetime.now(UTC)
+    await _reject_candidate_version(session, job.asset_version_id)
     await append_import_audit(
         session,
         job,
@@ -190,6 +208,7 @@ async def fail_import_job(
     job.status = "failed"
     job.error_summary = sanitize_error(error)[:1000]
     job.completed_at = datetime.now(UTC)
+    await _reject_candidate_version(session, job.asset_version_id)
     await append_import_audit(
         session,
         job,
@@ -235,6 +254,22 @@ def sanitize_error(error: Exception) -> str:
     for pattern in patterns:
         message = re.sub(pattern, "[redacted]", message)
     return message[:1000]
+
+
+async def _reject_candidate_version(
+    session: AsyncSession,
+    version_id: UUID | None,
+) -> None:
+    if version_id is None:
+        return
+    version = await session.get(
+        DataAssetVersion,
+        version_id,
+        with_for_update=True,
+    )
+    if version is not None and version.status == "imported":
+        version.status = "rejected"
+        version.updated_at = datetime.now(UTC)
 
 
 async def _ensure_asset(session: AsyncSession, definition) -> DataAsset:

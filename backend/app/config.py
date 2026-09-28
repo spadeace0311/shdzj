@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     data_asset_storage_root: str = "/var/lib/data-assets"
     data_asset_max_upload_bytes: int = 1_073_741_824
     data_asset_mdb_driver: str = "Microsoft Access Driver (*.mdb, *.accdb)"
+    data_asset_worker_poll_seconds: float = 1.0
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -115,6 +116,8 @@ class Settings(BaseSettings):
             raise ValueError("DATA_ASSET_MAX_UPLOAD_BYTES must be positive")
         if not self.data_asset_mdb_driver.strip():
             raise ValueError("DATA_ASSET_MDB_DRIVER must not be empty")
+        if self.data_asset_worker_poll_seconds <= 0:
+            raise ValueError("DATA_ASSET_WORKER_POLL_SECONDS must be positive")
         return self
 
 

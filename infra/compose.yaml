@@ -44,6 +44,21 @@ services:
       postgres:
         condition: service_healthy
 
+  data-asset-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    command: ["python", "-m", "app.data_assets.worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   temporal-postgres:
     image: postgres:16
     environment:

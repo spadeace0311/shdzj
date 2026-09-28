@@ -228,7 +228,7 @@ async def _ensure_published_admin_town(session_factory) -> UUID:
             job = await _queue_candidate(
                 session,
                 asset_key=definition.asset_key,
-                version=f"admin-town-{uuid4()}",
+                version="2022.1",
             )
             await _populate(
                 session,
