@@ -82,6 +82,8 @@ async def get_intensity_result(
         is_latest_revision=event.latest_assessment_run_id == run.id,
         is_fallback=effective is not None and effective.id != run.id,
         products=products,
+        data_asset_snapshot_fingerprint=run.data_asset_snapshot_fingerprint,
+        data_asset_snapshot=run.data_asset_snapshot_result,
     )
 
 
@@ -135,6 +137,8 @@ async def get_current_assessment(
                     is_latest_revision=event.latest_assessment_run_id == result_run.id,
                     is_fallback=effective is not None and effective.id != run.id,
                     products=products,
+                    data_asset_snapshot_fingerprint=run.data_asset_snapshot_fingerprint,
+                    data_asset_snapshot=run.data_asset_snapshot_result,
                 )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -183,4 +187,6 @@ def _run_response(
             for task in tasks
         ],
         intensity=intensity,
+        data_asset_snapshot_fingerprint=run.data_asset_snapshot_fingerprint,
+        data_asset_snapshot=run.data_asset_snapshot_result,
     )

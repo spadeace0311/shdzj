@@ -191,6 +191,28 @@ async def _request_assessment(event_id: str):
             app.dependency_overrides[get_current_user] = previous
 
 
+async def _request_intensity(run_id: UUID):
+    previous = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        username="operator",
+        role="group_member",
+        workgroup="震害评估组",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            return await client.get(
+                f"/api/v1/assessments/runs/{run_id}/intensity"
+            )
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous
+
+
 async def test_get_current_assessment_returns_run_and_task_progress(session_factory) -> None:
     event_id, run_id = await _seed_assessment(session_factory)
 
@@ -223,6 +245,12 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
     assert body["intensity"]["run_status"] == "pending"
     assert body["intensity"]["effective_run_id"] is None
     assert body["intensity"]["products"] == []
+    assert body["data_asset_snapshot_fingerprint"]
+    assert body["data_asset_snapshot"]["missing_required"]
+    assert body["intensity"]["data_asset_snapshot_fingerprint"] == (
+        body["data_asset_snapshot_fingerprint"]
+    )
+    assert body["intensity"]["data_asset_snapshot"] == body["data_asset_snapshot"]
 
 
 async def test_get_current_assessment_returns_404_when_run_does_not_exist() -> None:
@@ -230,6 +258,21 @@ async def test_get_current_assessment_returns_404_when_run_does_not_exist() -> N
 
     assert response.status_code == 404
     assert response.json() == {"detail": "assessment_run_not_found"}
+
+
+async def test_get_intensity_result_returns_persisted_data_asset_snapshot(
+    session_factory,
+) -> None:
+    event_id, run_id = await _seed_assessment(session_factory)
+
+    response = await _request_intensity(run_id)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == str(run_id)
+    assert body["event_id"] == str(event_id)
+    assert body["data_asset_snapshot_fingerprint"]
+    assert body["data_asset_snapshot"]["missing_required"]
 
 
 async def test_get_current_assessment_rejects_invalid_event_id() -> None:

@@ -7,6 +7,7 @@ from sqlalchemy import delete, func, select
 
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.assessment.repository import AssessmentRepository
+from app.config import settings
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
@@ -132,14 +133,15 @@ async def test_repository_creates_run_and_nine_tasks_idempotently(session_factor
     assert first.deadline_at == datetime(2026, 9, 26, 1, 8, tzinfo=UTC)
     assert first.report_ingested_at == first.t1_at
     assert first.deadline_basis_at == first.t1_at
-    assert first.snapshot == {
-        "event_id": str(event.id),
-        "revision_id": str(revision.id),
-        "revision_no": revision.revision_no,
-        "t1_at": "2026-09-26T01:03:00+00:00",
-        "response_rule_version": revision.response_rule_version,
-        "region_boundary_version": "test-2026.1",
-    }
+    assert first.snapshot["event_id"] == str(event.id)
+    assert first.snapshot["revision_id"] == str(revision.id)
+    assert first.snapshot["revision_no"] == revision.revision_no
+    assert first.snapshot["t1_at"] == "2026-09-26T01:03:00+00:00"
+    assert first.snapshot["response_rule_version"] == revision.response_rule_version
+    assert first.snapshot["region_boundary_version"] == "test-2026.1"
+    assert first.snapshot["region_id"] == settings.data_asset_region_id
+    assert first.snapshot["data_asset_snapshot"]["missing_required"]
+    assert first.data_asset_snapshot_fingerprint
     assert task_count == 9
 
 

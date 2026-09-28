@@ -55,6 +55,8 @@ class IntensityResultResponse(BaseModel):
     is_latest_revision: bool
     is_fallback: bool
     products: list[IntensityProductSummary]
+    data_asset_snapshot_fingerprint: str | None
+    data_asset_snapshot: dict | None
 
 
 class AssessmentRunStatusResponse(BaseModel):
@@ -70,3 +72,5 @@ class AssessmentRunStatusResponse(BaseModel):
     total_task_count: int
     tasks: list[AssessmentTaskStatusResponse]
     intensity: IntensityResultResponse | None = None
+    data_asset_snapshot_fingerprint: str | None
+    data_asset_snapshot: dict | None

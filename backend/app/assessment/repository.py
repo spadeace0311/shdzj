@@ -6,14 +6,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.assessment.plan import AssessmentPlanBuilder
+from app.config import settings
+from app.data_assets.snapshot_service import DataAssetSnapshotService
 from app.events.domain import EventKind
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox
 from app.intensity.models import AssessmentTaskAttempt, IntensityFieldProduct
 
 
 class AssessmentRepository:
-    def __init__(self, plan_builder: AssessmentPlanBuilder | None = None) -> None:
+    def __init__(
+        self,
+        plan_builder: AssessmentPlanBuilder | None = None,
+        data_asset_snapshot_service: DataAssetSnapshotService | None = None,
+    ) -> None:
         self._plan_builder = plan_builder or AssessmentPlanBuilder()
+        self._data_asset_snapshot_service = (
+            data_asset_snapshot_service or DataAssetSnapshotService()
+        )
 
     async def ensure_run_and_tasks(
         self,
@@ -124,21 +133,38 @@ class AssessmentRepository:
                 )
             )
         await session.flush()
+
+        snapshot_result = await self._data_asset_snapshot_service.capture_required_assets(
+            session,
+            run_id=run.id,
+            region_id=settings.data_asset_region_id,
+            strict=False,
+        )
+        run.data_asset_snapshot_fingerprint = snapshot_result.fingerprint
+        run.data_asset_snapshot_result = {
+            "snapshot_count": snapshot_result.snapshot_count,
+            "missing_required": list(snapshot_result.missing_required),
+        }
+        run.snapshot = {
+            **dict(run.snapshot),
+            "region_id": settings.data_asset_region_id,
+            "data_asset_snapshot": run.data_asset_snapshot_result,
+        }
         return run
 
     async def ensure_run_from_outbox(
         self,
         session: AsyncSession,
         *,
-        event_id: str,
-        revision_id: str,
-        outbox_id: str,
+        event_id: str | UUID,
+        revision_id: str | UUID,
+        outbox_id: str | UUID,
     ) -> AssessmentRun:
         try:
-            event_uuid = UUID(event_id)
-            revision_uuid = UUID(revision_id)
-            outbox_uuid = UUID(outbox_id)
-        except ValueError as exc:
+            event_uuid = _coerce_uuid(event_id, "event_id")
+            revision_uuid = _coerce_uuid(revision_id, "revision_id")
+            outbox_uuid = _coerce_uuid(outbox_id, "outbox_id")
+        except (TypeError, ValueError) as exc:
             raise ValueError("assessment trigger identifiers must be UUIDs") from exc
 
         outbox = await session.get(EventLifecycleOutbox, outbox_uuid)
@@ -800,6 +826,15 @@ def _validate_trigger_identity(
         raise ValueError("outbox does not belong to revision")
     if outbox.trigger_type != "assessment.requested":
         raise ValueError("outbox is not an assessment request")
+
+
+def _coerce_uuid(value: object, field: str) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a UUID") from exc
 
 
 def _normalize_utc(value: datetime, field: str) -> datetime:
