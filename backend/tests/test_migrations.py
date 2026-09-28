@@ -14,8 +14,9 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0011_intensity_assessment"
+LATEST_REVISION = "0012_data_asset_center"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
+DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 NON_CENC_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"

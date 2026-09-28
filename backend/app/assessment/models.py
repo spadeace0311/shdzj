@@ -68,6 +68,11 @@ class AssessmentRun(Base):
         index=True,
     )
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    data_asset_snapshot_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+    )
+    data_asset_snapshot_result: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),

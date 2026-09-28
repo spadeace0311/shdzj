@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     intensity_parameters_path: str = "/config/intensity/shanghai-2019.yaml"
     intensity_region_profile_path: str = "/config/intensity/shanghai-region.yaml"
     assessment_workflow_safety_timeout_seconds: int = 1800
+    data_asset_region_id: str = "shanghai"
+    data_asset_required_registry_path: str = "/config/data_assets/shanghai-required-assets.yaml"
+    data_asset_storage_root: str = "/var/lib/data-assets"
+    data_asset_max_upload_bytes: int = 1_073_741_824
+    data_asset_mdb_driver: str = "Microsoft Access Driver (*.mdb, *.accdb)"
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -100,6 +105,16 @@ class Settings(BaseSettings):
             raise ValueError("INTENSITY_REGION_PROFILE_PATH must not be empty")
         if self.assessment_workflow_safety_timeout_seconds <= 0:
             raise ValueError("ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS must be positive")
+        if not self.data_asset_storage_root.strip():
+            raise ValueError("DATA_ASSET_STORAGE_ROOT must not be empty")
+        if not self.data_asset_region_id.strip():
+            raise ValueError("DATA_ASSET_REGION_ID must not be empty")
+        if not self.data_asset_required_registry_path.strip():
+            raise ValueError("DATA_ASSET_REQUIRED_REGISTRY_PATH must not be empty")
+        if self.data_asset_max_upload_bytes < 1:
+            raise ValueError("DATA_ASSET_MAX_UPLOAD_BYTES must be positive")
+        if not self.data_asset_mdb_driver.strip():
+            raise ValueError("DATA_ASSET_MDB_DRIVER must not be empty")
         return self
 
 

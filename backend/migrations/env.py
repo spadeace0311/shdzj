@@ -10,6 +10,7 @@ from app.auth import models as auth_models  # noqa: F401
 from app.assessment import models as assessment_models  # noqa: F401
 from app.collector import models as collector_models  # noqa: F401
 from app.config import settings
+from app.data_assets import models as data_asset_models  # noqa: F401
 from app.db import Base
 
 # Importing model modules registers all application tables with Base.metadata.

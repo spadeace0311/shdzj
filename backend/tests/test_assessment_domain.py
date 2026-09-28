@@ -31,6 +31,8 @@ def test_assessment_settings_defaults() -> None:
     assert configured.intensity_parameters_path.endswith("shanghai-2019.yaml")
     assert configured.intensity_region_profile_path.endswith("shanghai-region.yaml")
     assert configured.assessment_workflow_safety_timeout_seconds == 1800
+    assert configured.data_asset_storage_root == "/var/lib/data-assets"
+    assert configured.data_asset_max_upload_bytes == 1_073_741_824
 
 
 def test_assessment_settings_validate_bounded_values() -> None:
@@ -47,6 +49,11 @@ def test_assessment_settings_validate_bounded_values() -> None:
         {"intensity_parameters_path": " "},
         {"intensity_region_profile_path": ""},
         {"assessment_workflow_safety_timeout_seconds": 0},
+        {"data_asset_storage_root": " "},
+        {"data_asset_max_upload_bytes": 0},
+        {"data_asset_mdb_driver": ""},
+        {"data_asset_region_id": " "},
+        {"data_asset_required_registry_path": ""},
     )
 
     for overrides in invalid_values:
