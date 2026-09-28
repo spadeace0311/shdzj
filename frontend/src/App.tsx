@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
 
-import { clearAccessToken, getAccessToken } from "./api/client";
+import { clearAccessToken, getCurrentUser } from "./api/client";
 import { CollectorStatusPage } from "./pages/CollectorStatusPage";
+import { DataAssetsPage } from "./pages/DataAssetsPage";
 import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
 import { LoginPage } from "./pages/LoginPage";
@@ -10,9 +11,10 @@ import { ManualEventPage } from "./pages/ManualEventPage";
 
 interface ConsoleShellProps {
   onLogout: () => void;
+  userRole: string;
 }
 
-function ConsoleShell({ onLogout }: ConsoleShellProps) {
+function ConsoleShell({ onLogout, userRole }: ConsoleShellProps) {
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -58,6 +60,12 @@ function ConsoleShell({ onLogout }: ConsoleShellProps) {
             >
               采集状态
             </NavLink>
+            <NavLink
+              to="/data-assets"
+              className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
+            >
+              数据资产
+            </NavLink>
           </nav>
           <div className="sidebar-note">
             <p>当前工作区</p>
@@ -71,6 +79,10 @@ function ConsoleShell({ onLogout }: ConsoleShellProps) {
             <Route path="/events/:eventId" element={<EventDetailPage />} />
             <Route path="/manual" element={<ManualEventPage />} />
             <Route path="/collector" element={<CollectorStatusPage />} />
+            <Route
+              path="/data-assets"
+              element={<DataAssetsPage userRole={userRole} />}
+            />
           </Routes>
         </main>
       </div>
@@ -79,20 +91,34 @@ function ConsoleShell({ onLogout }: ConsoleShellProps) {
 }
 
 export default function App() {
-  const [authenticated, setAuthenticated] = useState(() => getAccessToken() !== null);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [userRole, setUserRole] = useState("");
 
   function handleLogout() {
     clearAccessToken();
+    setUserRole("");
     setAuthenticated(false);
   }
 
+  async function handleLoginSuccess() {
+    try {
+      const currentUser = await getCurrentUser();
+      setUserRole(currentUser.role);
+      setAuthenticated(true);
+    } catch {
+      clearAccessToken();
+      setUserRole("");
+      setAuthenticated(false);
+    }
+  }
+
   if (!authenticated) {
-    return <LoginPage onLoginSuccess={() => setAuthenticated(true)} />;
+    return <LoginPage onLoginSuccess={() => void handleLoginSuccess()} />;
   }
 
   return (
     <BrowserRouter>
-      <ConsoleShell onLogout={handleLogout} />
+      <ConsoleShell onLogout={handleLogout} userRole={userRole} />
     </BrowserRouter>
   );
 }

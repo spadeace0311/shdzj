@@ -1,11 +1,17 @@
 import type {
   AssessmentRunStatus,
   CollectorStatus,
+  CurrentUser,
+  DataAssetImportAccepted,
+  DataAssetImportInput,
+  DataAssetSummary,
+  DataAssetVersion,
   EventDetail,
   EventIngestResponse,
   EventSummary,
   ManualEventInput,
   TokenResponse,
+  ValidationReport,
 } from "../types";
 
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -32,6 +38,13 @@ export function getAccessToken(): string | null {
 
 export function clearAccessToken(): void {
   accessToken = null;
+}
+
+function authHeaders(): Record<string, string> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后管理数据资产", 401);
+  }
+  return { Authorization: `Bearer ${accessToken}` };
 }
 
 function isAbortError(error: unknown): boolean {
@@ -143,6 +156,12 @@ export async function login(username: string, password: string): Promise<TokenRe
   return token;
 }
 
+export async function getCurrentUser(): Promise<CurrentUser> {
+  return requestJson<CurrentUser>("/api/v1/auth/me", {
+    headers: authHeaders(),
+  });
+}
+
 export async function listEvents(): Promise<EventSummary[]> {
   return requestJson<EventSummary[]>("/api/v1/events");
 }
@@ -201,4 +220,92 @@ export async function createManualEvent(
     },
     body: JSON.stringify(input),
   });
+}
+
+export async function listDataAssets(): Promise<DataAssetSummary[]> {
+  return requestJson<DataAssetSummary[]>("/api/v1/data-assets", {
+    headers: authHeaders(),
+  });
+}
+
+export async function listDataAssetVersions(
+  assetKey?: string,
+): Promise<DataAssetVersion[]> {
+  const query = assetKey ? `?asset_key=${encodeURIComponent(assetKey)}` : "";
+  return requestJson<DataAssetVersion[]>(`/api/v1/data-asset-versions${query}`, {
+    headers: authHeaders(),
+  });
+}
+
+export async function importDataAsset(
+  assetKey: string,
+  input: DataAssetImportInput,
+): Promise<DataAssetImportAccepted> {
+  const body = new FormData();
+  body.set("version", input.version);
+  body.set("source_uri", input.source_uri);
+  body.set("change_note", input.change_note);
+  if (input.license_name) {
+    body.set("license_name", input.license_name);
+  }
+  body.set("file", input.file);
+  return requestJson<DataAssetImportAccepted>(
+    `/api/v1/data-assets/${encodeURIComponent(assetKey)}/import`,
+    {
+      method: "POST",
+      headers: authHeaders(),
+      body,
+    },
+  );
+}
+
+export async function validateDataAssetVersion(
+  versionId: string,
+): Promise<ValidationReport> {
+  return requestJson<ValidationReport>(
+    `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/validate`,
+    { method: "POST", headers: authHeaders() },
+  );
+}
+
+export async function publishDataAssetVersion(
+  versionId: string,
+  reason: string,
+): Promise<DataAssetVersion> {
+  return requestJson<DataAssetVersion>(
+    `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/publish`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+export async function retireDataAssetVersion(
+  versionId: string,
+  reason: string,
+): Promise<DataAssetVersion> {
+  return requestJson<DataAssetVersion>(
+    `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/retire`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+export async function rollbackDataAssetVersion(
+  versionId: string,
+  reason: string,
+): Promise<DataAssetVersion> {
+  return requestJson<DataAssetVersion>(
+    `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/rollback`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
 }

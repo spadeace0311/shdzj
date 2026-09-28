@@ -113,6 +113,95 @@ export interface TokenResponse {
   token_type?: string;
 }
 
+export interface CurrentUser {
+  username: string;
+  role: string;
+  workgroup: string | null;
+}
+
+export type DataAssetType = "vector" | "table" | "raster" | "parameter";
+
+export type DataAssetVersionStatus =
+  | "imported"
+  | "validated"
+  | "published"
+  | "retired"
+  | "rejected";
+
+export interface DataAssetSummary {
+  asset_key: string;
+  region_id: string;
+  name: string;
+  data_type: DataAssetType;
+  spatial_granularity: string;
+  responsibility_unit: string;
+  update_interval_days: number;
+  is_core: boolean;
+  published_version: string | null;
+  published_at: string | null;
+  update_due_at: string | null;
+  is_update_overdue: boolean;
+}
+
+export interface ValidationIssue {
+  severity: string;
+  code: string;
+  message: string;
+  row_number: number | null;
+  field_name: string | null;
+}
+
+export interface DataAssetVersion {
+  id: string;
+  asset_key: string;
+  region_id: string;
+  version: string;
+  status: DataAssetVersionStatus;
+  source_uri: string;
+  license_name: string | null;
+  acquired_at: string | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  quality_grade: string | null;
+  change_note: string | null;
+  schema_summary: Record<string, unknown>;
+  record_count: number;
+  checksum: string;
+  imported_by: string;
+  reviewed_by: string | null;
+  imported_at: string;
+  validated_at: string | null;
+  published_at: string | null;
+  retired_at: string | null;
+  validation_errors: ValidationIssue[];
+  validation_warnings: ValidationIssue[];
+}
+
+export interface DataAssetImportInput {
+  version: string;
+  source_uri: string;
+  license_name?: string;
+  change_note: string;
+  file: File;
+}
+
+export interface DataAssetImportAccepted {
+  job_id: string;
+  version_id: string;
+  asset_key: string;
+  version: string;
+  status: "queued" | "running" | "completed" | "rejected" | "failed";
+}
+
+export interface ValidationReport {
+  version_id: string;
+  status: string;
+  errors: ValidationIssue[];
+  warnings: ValidationIssue[];
+  statistics: Record<string, unknown>;
+  checked_at: string;
+}
+
 export type AssessmentRunStatusValue =
   | "pending"
   | "running"
