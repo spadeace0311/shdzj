@@ -119,3 +119,39 @@ class ValidationReport:
     @property
     def publishable(self) -> bool:
         return self.status is AssetVersionStatus.VALIDATED and not self.errors
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedRecord:
+    row_number: int
+    business_key: str
+    properties: dict[str, object]
+    geometry_wkt: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedTableData:
+    columns: tuple[str, ...]
+    records: tuple[NormalizedRecord, ...]
+    source_crs: str
+    spatial_extent: tuple[float, float, float, float] | None
+
+    @property
+    def record_count(self) -> int:
+        return len(self.records)
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedRasterData:
+    width: int
+    height: int
+    srid: int
+    band_count: int
+    dtype: str
+    nodata: float | None
+    resolution_x: float
+    resolution_y: float
+    spatial_extent: tuple[float, float, float, float]
+
+
+type NormalizedAssetData = NormalizedTableData | NormalizedRasterData
