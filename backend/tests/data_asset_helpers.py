@@ -6,6 +6,9 @@ import pytest
 
 from app.data_assets.domain import DataAssetDefinition
 
+FIXTURE_ACTOR = "data-asset-fixture"
+ASSESSMENT_OUTBOX_TYPE = "assessment.requested"
+
 
 @dataclass(frozen=True, slots=True)
 class SeededImportedVersion:
@@ -115,12 +118,46 @@ def _asset_contract(definition: DataAssetDefinition) -> dict:
     }
 
 
+async def _cleanup_fixture_data(session_factory) -> None:
+    from sqlalchemy import delete
+
+    from app.data_assets.models import DataAssetVersion
+
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(DataAssetVersion).where(
+                    DataAssetVersion.imported_by == FIXTURE_ACTOR
+                )
+            )
+
+
+async def _published_version_has_town_keys(
+    session,
+    version_id: UUID,
+) -> bool:
+    from sqlalchemy import select
+
+    from app.data_assets.models import DataAssetRecord
+
+    stored_keys = set(
+        (
+            await session.scalars(
+                select(DataAssetRecord.business_key).where(
+                    DataAssetRecord.version_id == version_id
+                )
+            )
+        ).all()
+    )
+    return stored_keys == set(_town_codes())
+
+
 async def _queue_candidate(
     session,
     *,
     asset_key: str,
     version: str,
-    requested_by: str,
+    requested_by: str = FIXTURE_ACTOR,
 ):
     from app.data_assets.import_jobs import QueueImportRequest, queue_import_job
 
@@ -182,13 +219,15 @@ async def _ensure_published_admin_town(session_factory) -> UUID:
                 .where(DataAsset.asset_key == definition.asset_key)
                 .where(DataAsset.region_id == definition.region_id)
             )
-            if existing is not None:
+            if existing is not None and await _published_version_has_town_keys(
+                session,
+                existing.id,
+            ):
                 return existing.id
             job = await _queue_candidate(
                 session,
                 asset_key=definition.asset_key,
                 version=f"admin-town-{uuid4()}",
-                requested_by="tester",
             )
             await _populate(
                 session,
@@ -200,14 +239,14 @@ async def _ensure_published_admin_town(session_factory) -> UUID:
             report = await service.validate_version(
                 session,
                 job.asset_version_id,
-                actor="tester",
+                actor=FIXTURE_ACTOR,
             )
             if not report.publishable:
                 raise ValueError("synthetic admin town version is not publishable")
             await service.publish_version(
                 session,
                 job.asset_version_id,
-                "tester",
+                FIXTURE_ACTOR,
                 "synthetic admin town fixture",
             )
             return job.asset_version_id
@@ -227,7 +266,6 @@ async def publish_new_population_version(
                 session,
                 asset_key=definition.asset_key,
                 version=version,
-                requested_by="tester",
             )
             await _populate(
                 session,
@@ -239,14 +277,14 @@ async def publish_new_population_version(
             report = await service.validate_version(
                 session,
                 job.asset_version_id,
-                actor="tester",
+                actor=FIXTURE_ACTOR,
             )
             if not report.publishable:
                 raise ValueError("synthetic population version is not publishable")
             await service.publish_version(
                 session,
                 job.asset_version_id,
-                "tester",
+                FIXTURE_ACTOR,
                 "synthetic population fixture",
             )
             return job.asset_version_id
@@ -276,7 +314,7 @@ async def wait_for_import_job(session_factory, job_id: UUID) -> UUID:
 
 
 @pytest.fixture
-def candidate_factory(session_factory):
+async def candidate_factory(session_factory):
     async def factory(version: str) -> UUID:
         definition = _definition("shanghai.population.town")
         async with session_factory() as session:
@@ -285,7 +323,6 @@ def candidate_factory(session_factory):
                     session,
                     asset_key=definition.asset_key,
                     version=version,
-                    requested_by="tester",
                 )
                 await _populate(
                     session,
@@ -295,12 +332,15 @@ def candidate_factory(session_factory):
                 )
                 return job.asset_version_id
 
-    return factory
+    yield factory
+    await _cleanup_fixture_data(session_factory)
 
 
 @pytest.fixture
 async def published_population_asset(session_factory) -> UUID:
-    return await publish_new_population_version(session_factory, "2022.1")
+    version_id = await publish_new_population_version(session_factory, "2022.1")
+    yield version_id
+    await _cleanup_fixture_data(session_factory)
 
 
 async def _ensure_active_boundary(session) -> str:
@@ -390,7 +430,8 @@ async def seeded_outbox(session_factory) -> SeededOutbox:
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type == ASSESSMENT_OUTBOX_TYPE,
                 )
             )
             if outbox is None:
@@ -557,7 +598,7 @@ async def seeded_imported_version(
                 source_crs="EPSG:4326",
                 checksum="a" * 64,
                 managed_path=None,
-                imported_by="tester",
+                imported_by=FIXTURE_ACTOR,
                 imported_at=now,
                 created_at=now,
                 updated_at=now,
@@ -565,4 +606,5 @@ async def seeded_imported_version(
             session.add(version_row)
             await session.flush()
             version_id = version_row.id
-    return SeededImportedVersion(version_id, source_path, definition)
+    yield SeededImportedVersion(version_id, source_path, definition)
+    await _cleanup_fixture_data(session_factory)
