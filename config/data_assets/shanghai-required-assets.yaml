@@ -1,0 +1,13 @@
+region_id: shanghai
+required:
+  - shanghai.admin.city
+  - shanghai.admin.county
+  - shanghai.admin.town
+  - shanghai.population.town
+  - shanghai.building.town
+  - shanghai.economy.county
+  - shanghai.loss.parameters
+optional:
+  - shanghai.fault
+  - shanghai.gdp.raster
+  - shanghai.dem.raster

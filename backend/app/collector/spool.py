@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator
+
+from app.collector.domain import (
+    CollectorEnvelope,
+    CollectorLane,
+    CollectorProvider,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class CollectorSpool:
+    """Durable one-envelope-per-file JSON spool with bounded capacity."""
+
+    def __init__(self, directory: str | Path, max_bytes: int) -> None:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        self._directory = Path(directory)
+        self._max_bytes = max_bytes
+        self._directory.mkdir(parents=True, exist_ok=True)
+
+    def append(self, envelope: CollectorEnvelope) -> Path:
+        if not isinstance(envelope, CollectorEnvelope):
+            raise TypeError("envelope must be a CollectorEnvelope")
+
+        data = json.dumps(
+            {
+                "provider": envelope.provider.value,
+                "lane": envelope.lane.value,
+                "received_at": envelope.received_at.isoformat(),
+                "payload": envelope.payload,
+                "trigger_reason": envelope.trigger_reason,
+                "recovery_complete": envelope.recovery_complete,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+        if self._usage_bytes() + len(data) > self._max_bytes:
+            raise OverflowError("collector spool capacity exceeded")
+
+        filename = self._filename(envelope.received_at)
+        path = self._directory / filename
+        temp_path = self._directory / f".{filename}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temp_path.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            self._fsync_directory()
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return path
+
+    def iter_pending(self) -> Iterator[tuple[Path, CollectorEnvelope]]:
+        pending: list[tuple[Path, CollectorEnvelope]] = []
+        for path in self._directory.iterdir():
+            if not path.is_file() or not self._is_pending_file(path):
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                envelope = self._deserialize(payload)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                self._quarantine(path, "invalid spool file")
+                continue
+            pending.append((path, envelope))
+        pending.sort(key=lambda pair: pair[1].received_at)
+        yield from pending
+
+    def remove(self, path: Path) -> None:
+        if path.name.endswith(".json.deleting"):
+            deleting_path = path
+        elif path.name.endswith(".json"):
+            deleting_path = path.with_name(path.name + ".deleting")
+            os.replace(path, deleting_path)
+        else:
+            raise ValueError(f"not a collector spool file: {path}")
+
+        # The rename starts the logical delete commit. Until this directory
+        # sync succeeds, iter_pending() treats the .deleting file as pending.
+        self._fsync_directory()
+        deleting_path.unlink(missing_ok=True)
+        self._fsync_directory()
+
+    def _usage_bytes(self) -> int:
+        total = 0
+        for path in self._directory.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _filename(self, received_at: datetime) -> str:
+        stamp = received_at.isoformat().replace(":", "").replace("+", "")
+        return f"envelope-{stamp}-{uuid.uuid4().hex}.json"
+
+    @staticmethod
+    def _deserialize(payload: dict[str, object]) -> CollectorEnvelope:
+        received_at = datetime.fromisoformat(str(payload["received_at"]))
+        return CollectorEnvelope(
+            provider=CollectorProvider(str(payload["provider"])),
+            lane=CollectorLane(str(payload["lane"])),
+            received_at=received_at,
+            payload=payload["payload"],
+            trigger_reason=str(payload.get("trigger_reason", "live")),
+            recovery_complete=bool(payload.get("recovery_complete", False)),
+        )
+
+    def _fsync_directory(self) -> None:
+        if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            return
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        fd = os.open(self._directory, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _is_pending_file(path: Path) -> bool:
+        return path.name.endswith(".json") or path.name.endswith(".json.deleting")
+
+    def _quarantine(self, path: Path, reason: str) -> None:
+        quarantine_path = path.with_suffix(path.suffix + ".corrupt")
+        try:
+            os.replace(path, quarantine_path)
+            logger.error("collector spool quarantined corrupt file path=%s reason=%s", path, reason)
+        except OSError:
+            logger.exception("collector spool failed to quarantine corrupt file path=%s", path)

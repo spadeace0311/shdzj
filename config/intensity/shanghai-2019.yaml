@@ -1,0 +1,40 @@
+version: "shanghai-2019.1"
+
+model:
+  reference_doi: "10.3969/j.issn.1005-586X.2019.03.002"
+  long_axis:
+    intercept: 3.4142
+    magnitude_coefficient: 1.0353
+    decay_coefficient: 0.96272
+    distance_offset_km: 8.0209
+    sigma: 0.6310
+  short_axis:
+    intercept: 3.1626
+    magnitude_coefficient: 1.0379
+    decay_coefficient: 0.97451
+    distance_offset_km: 7.6851
+    sigma: 0.6638
+  valid_magnitude:
+    min: 4.0
+    max: 6.2
+  solver:
+    intensity_min: -20.0
+    intensity_max: 12.0
+    tolerance: 0.000001
+    max_iterations: 64
+
+fusion:
+  model_quality_weight: 1.0
+  quality_weights:
+    Q1: 1.0
+    Q2: 0.5
+    Q3: 0.25
+    Q0: 0.0
+  epsilon: 0.000001
+  interval_z: 1.2816
+  f1:
+    min_coverage: 0.90
+    max_sigma_p95: 0.75
+  f2:
+    min_coverage: 0.50
+    max_sigma_p95: 1.25

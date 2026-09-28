@@ -1,0 +1,12 @@
+version: "shanghai-region-v1"
+region_id: "shanghai"
+name: "上海市"
+administrative_level: "province"
+boundary_version: null
+grid_buffer_km: 100
+grid_resolution_m: 1000
+grid_crs: "EPSG:32651"
+model_parameter_version: "shanghai-2019.1"
+fusion_strategy_version: "fusion-inverse-variance-v1"
+instrument_provider: "unavailable"
+fault_data_version: null

@@ -1,0 +1,37 @@
+version: "2026.1"
+
+institutional:
+  local_magnitude:
+    - {min: 6.0, level: special_major}
+    - {min: 5.0, max_exclusive: 6.0, level: major}
+    - {min: 4.0, max_exclusive: 5.0, level: larger}
+    - {min: 3.0, max_exclusive: 4.0, level: general}
+  external_deaths:
+    - {min: 100, level: special_major}
+    - {min: 10, max_exclusive: 100, level: major}
+    - {min: 1, max_exclusive: 10, level: larger}
+    - {min: 0, max_exclusive: 1, level: general}
+  downgrade:
+    local_depth_gt_km: 60
+    external_boundary_distance_km:
+      min_inclusive: 20
+      max_inclusive: 100
+    order:
+      - special_major
+      - major
+      - larger
+      - general
+      - none
+
+service:
+  region_class: yangtze_large_city
+  bands:
+    - {min: 6.0, level: 1}
+    - {min: 5.0, max_exclusive: 6.0, level: 2}
+    - {min: 4.0, max_exclusive: 5.0, level: 3}
+    - {min: 3.0, max_exclusive: 4.0, level: 4}
+  downgrade_location_depth_gt_km: 70
+
+trigger:
+  default_max_intensity_threshold: 2.0
+  automatic_external_boundary_distance_km: 20
