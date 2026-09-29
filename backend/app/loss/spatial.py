@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from math import isfinite
+from math import isclose, isfinite
 from uuid import UUID
 
+from pyproj import CRS
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -115,6 +116,44 @@ def allocate_integers(
     return result
 
 
+def _select_dominant_cells(
+    rows: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    """Select one town per grid cell deterministically.
+
+    The task contract requires each ``LossGridCell`` to have a unique
+    ``cell_id``. For cells that overlap several town polygons, this is an
+    approximation: the town with the largest intersection area owns the cell,
+    with ``town_code`` as the deterministic tie-break. Secondary overlaps are
+    intentionally not represented as separate cell rows.
+    """
+    grouped: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        cell_id = str(row["cell_id"])
+        if float(row["area_ratio"]) <= 0.0:
+            continue
+        if row.get("response_weight") is None:
+            continue
+        grouped.setdefault(cell_id, []).append(row)
+
+    selected: list[Mapping[str, object]] = []
+    for cell_id, candidates in grouped.items():
+        winner = sorted(
+            candidates,
+            key=lambda row: (
+                -float(row["area_ratio"]),
+                str(row["town_code"]),
+            ),
+        )[0]
+        selected.append(winner)
+    return tuple(
+        sorted(
+            selected,
+            key=lambda row: (str(row["cell_id"]), str(row["town_code"])),
+        )
+    )
+
+
 class TownIntensityDistributionService:
     def __init__(self, *, profile: RegionLossProfile | None = None) -> None:
         self._profile = profile or load_region_loss_profile(
@@ -134,6 +173,113 @@ class TownIntensityDistributionService:
             region_id=region_id,
         )
         raster_id = await self._fusion_raster_id(session, run_id=run_id)
+        await self._ensure_raster_metadata(session, raster_id)
+        rows = await self._load_compute_rows(
+            session,
+            raster_id=raster_id,
+            town_version_id=town_version_id,
+        )
+        return tuple(
+            TownIntensityShare(
+                town_code=str(row["town_code"]),
+                intensity_bin=int(row["intensity_bin"]),
+                area_ratio=float(row["area_ratio"]),
+                intensity_min=float(row["intensity_min"]),
+                intensity_max=float(row["intensity_max"]),
+            )
+            for row in rows
+        )
+
+    async def load_cells(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+    ) -> tuple[LossGridCell, ...]:
+        region_id = await self._run_region_id(session, run_id)
+        town_version_id = await self._town_version_id(
+            session,
+            run_id=run_id,
+            region_id=region_id,
+        )
+        raster_id = await self._fusion_raster_id(session, run_id=run_id)
+        await self._ensure_raster_metadata(session, raster_id)
+        rows = await self._load_cell_rows(
+            session,
+            raster_id=raster_id,
+            town_version_id=town_version_id,
+        )
+        rows = _select_dominant_cells(rows)
+        cells = tuple(
+            LossGridCell(
+                cell_id=str(row["cell_id"]),
+                town_code=str(row["town_code"]),
+                area_ratio=float(row["area_ratio"]),
+                response_weight=float(row["response_weight"]),
+            )
+            for row in rows
+        )
+        await self._ensure_metric_towns_covered(session, run_id, cells)
+        return cells
+
+    def _expected_area_srid(self) -> int:
+        srid = CRS.from_user_input(self._profile.area_crs).to_epsg()
+        if srid is None:
+            raise ValueError("region profile area CRS must map to an EPSG code")
+        return srid
+
+    async def _ensure_raster_metadata(
+        self,
+        session: AsyncSession,
+        raster_id: UUID,
+    ) -> None:
+        row = await self._raster_metadata(session, raster_id)
+        expected_srid = self._expected_area_srid()
+        if int(row["srid"]) != expected_srid:
+            raise ValueError(
+                "fused intensity raster SRID does not match region profile area CRS"
+            )
+        if not isclose(
+            float(row["resolution_m"]),
+            float(self._profile.grid_resolution_m),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "fused intensity raster resolution does not match "
+                "region profile grid_resolution_m"
+            )
+
+    async def _raster_metadata(
+        self,
+        session: AsyncSession,
+        raster_id: UUID,
+    ) -> Mapping[str, object]:
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT
+                        ST_SRID(rast) AS srid,
+                        ABS(ST_ScaleX(rast)) AS resolution_m
+                    FROM intensity_rasters
+                    WHERE id = :raster_id
+                    """
+                ),
+                {"raster_id": raster_id},
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            raise LookupError("fused intensity raster metadata not found")
+        return row
+
+    async def _load_compute_rows(
+        self,
+        session: AsyncSession,
+        *,
+        raster_id: UUID,
+        town_version_id: UUID,
+    ) -> tuple[Mapping[str, object], ...]:
         rows = (
             await session.execute(
                 text(
@@ -256,30 +402,15 @@ class TownIntensityDistributionService:
                 },
             )
         ).mappings()
-        return tuple(
-            TownIntensityShare(
-                town_code=str(row["town_code"]),
-                intensity_bin=int(row["intensity_bin"]),
-                area_ratio=float(row["area_ratio"]),
-                intensity_min=float(row["intensity_min"]),
-                intensity_max=float(row["intensity_max"]),
-            )
-            for row in rows
-        )
+        return tuple(rows)
 
-    async def load_cells(
+    async def _load_cell_rows(
         self,
         session: AsyncSession,
         *,
-        run_id: UUID,
-    ) -> tuple[LossGridCell, ...]:
-        region_id = await self._run_region_id(session, run_id)
-        town_version_id = await self._town_version_id(
-            session,
-            run_id=run_id,
-            region_id=region_id,
-        )
-        raster_id = await self._fusion_raster_id(session, run_id=run_id)
+        raster_id: UUID,
+        town_version_id: UUID,
+    ) -> tuple[Mapping[str, object], ...]:
         rows = (
             await session.execute(
                 text(
@@ -341,17 +472,11 @@ class TownIntensityDistributionService:
                                     )
                                 )
                             ) / ST_Area(cells.cell_geom) AS area_ratio,
-                            GREATEST(
-                                COALESCE(
-                                    ST_Value(
-                                        cells.rast,
-                                        1,
-                                        (cells.column_index + 1)::integer,
-                                        (cells.row_index + 1)::integer
-                                    ),
-                                    0.0
-                                ),
-                                0.0
+                            ST_Value(
+                                cells.rast,
+                                1,
+                                (cells.column_index + 1)::integer,
+                                (cells.row_index + 1)::integer
                             ) AS response_weight
                         FROM cells
                         JOIN towns
@@ -362,23 +487,15 @@ class TownIntensityDistributionService:
                                   ST_SRID(cells.cell_geom)
                               )
                           )
-                    ),
-                    ranked AS (
-                        SELECT
-                            intersections.*,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY cell_id
-                                ORDER BY area_ratio DESC, town_code
-                            ) AS cell_rank
-                        FROM intersections
                     )
                     SELECT
                         cell_id,
                         town_code,
                         area_ratio,
                         response_weight
-                    FROM ranked
-                    WHERE cell_rank = 1
+                    FROM intersections
+                    WHERE response_weight IS NOT NULL
+                      AND area_ratio > 0
                     ORDER BY cell_id, town_code
                     """
                 ),
@@ -388,17 +505,27 @@ class TownIntensityDistributionService:
                 },
             )
         ).mappings()
-        cells = tuple(
-            LossGridCell(
-                cell_id=str(row["cell_id"]),
-                town_code=str(row["town_code"]),
-                area_ratio=float(row["area_ratio"]),
-                response_weight=float(row["response_weight"]),
-            )
-            for row in rows
+        return tuple(rows)
+
+    async def _metric_town_codes(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> set[str]:
+        values = await session.scalars(
+            text(
+                """
+                SELECT DISTINCT metric.area_code
+                FROM loss_metric_values AS metric
+                JOIN loss_products AS product
+                  ON product.id = metric.product_id
+                WHERE product.run_id = :run_id
+                  AND metric.area_scope = 'town'
+                """
+            ),
+            {"run_id": run_id},
         )
-        await self._ensure_metric_towns_covered(session, run_id, cells)
-        return cells
+        return {str(value) for value in values.all()}
 
     async def _run_region_id(
         self,
@@ -481,23 +608,7 @@ class TownIntensityDistributionService:
         run_id: UUID,
         cells: Sequence[LossGridCell],
     ) -> None:
-        metric_towns = set(
-            (
-                await session.scalars(
-                    text(
-                        """
-                        SELECT DISTINCT metric.area_code
-                        FROM loss_metric_values AS metric
-                        JOIN loss_products AS product
-                          ON product.id = metric.product_id
-                        WHERE product.run_id = :run_id
-                          AND metric.area_scope = 'town'
-                        """
-                    ),
-                    {"run_id": run_id},
-                )
-            ).all()
-        )
+        metric_towns = await self._metric_town_codes(session, run_id)
         covered = {cell.town_code for cell in cells}
         missing = sorted(metric_towns - covered)
         if missing:
