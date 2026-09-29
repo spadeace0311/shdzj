@@ -126,7 +126,6 @@ class _TaskPreparation:
     profile: RegionLossProfile
     parameter_set: ParameterSet
     shares: tuple[TownIntensityShare, ...]
-    synthetic_spatial: bool
     coverage_ratio: float
 
 
@@ -460,12 +459,9 @@ class LossAssessmentService:
                         profile=profile,
                     )
                     model = parameter_set.models[model_type]
-                    shares, synthetic = await self._town_intensity_shares(
+                    shares = await self._town_intensity_shares(
                         session,
                         run_uuid,
-                        model_type,
-                        parameter_set,
-                        exposure,
                     )
                     prep_seconds = perf_counter() - prep_started
                     input_fingerprint = _input_fingerprint(
@@ -507,7 +503,6 @@ class LossAssessmentService:
                         profile=profile,
                         parameter_set=parameter_set,
                         shares=shares,
-                        synthetic_spatial=synthetic,
                         coverage_ratio=_coverage_ratio(exposure, shares),
                     )
                     model_started = perf_counter()
@@ -658,7 +653,6 @@ class LossAssessmentService:
                     prep.parameter_set,
                     LossModelType.BUILDING_DAMAGE,
                     scenario,
-                    prep.synthetic_spatial,
                 ),
             )
             for scenario in _SCENARIO_ORDER
@@ -673,7 +667,6 @@ class LossAssessmentService:
                     prep.parameter_set,
                     LossModelType.POPULATION_IMPACT,
                     scenario,
-                    False,
                 ),
             )
             for scenario in _SCENARIO_ORDER
@@ -698,7 +691,6 @@ class LossAssessmentService:
                     prep.parameter_set,
                     LossModelType.CASUALTIES,
                     scenario,
-                    False,
                 ),
             )
             for scenario in _SCENARIO_ORDER
@@ -717,7 +709,6 @@ class LossAssessmentService:
                     prep.parameter_set,
                     LossModelType.ECONOMIC_LOSS,
                     scenario,
-                    False,
                 ),
             )
             for scenario in _SCENARIO_ORDER
@@ -748,7 +739,6 @@ class LossAssessmentService:
                     prep.parameter_set,
                     LossModelType.RESOURCE_DEMAND,
                     scenario,
-                    False,
                 ),
             )
             for scenario in _SCENARIO_ORDER
@@ -790,44 +780,13 @@ class LossAssessmentService:
         self,
         session,
         run_id,
-        model_type,
-        parameter_set,
-        exposure,
-    ) -> tuple[tuple[TownIntensityShare, ...], bool]:
-        compute = getattr(self._spatial_service, "compute", None)
-        if compute is not None:
-            return (
-                tuple(
-                    await compute(session, run_id=run_id)
-                ),
-                False,
-            )
-        cells = tuple(
-            await self._spatial_service.load_cells(
+    ) -> tuple[TownIntensityShare, ...]:
+        return tuple(
+            await self._spatial_service.compute(
                 session,
                 run_id=run_id,
             )
         )
-        intensity_bin = _available_intensity_bin(
-            parameter_set.models[model_type]
-        )
-        by_town: dict[str, float] = {}
-        for cell in cells:
-            by_town[cell.town_code] = by_town.get(cell.town_code, 0.0) + (
-                cell.area_ratio
-            )
-        shares = tuple(
-            TownIntensityShare(
-                town_code=town_code,
-                intensity_bin=intensity_bin,
-                area_ratio=min(max(total, 0.0), 1.0),
-                intensity_min=intensity_bin - 0.5,
-                intensity_max=intensity_bin + 0.5,
-            )
-            for town_code, total in sorted(by_town.items())
-            if town_code in {town.town_code for town in exposure.towns}
-        )
-        return shares, True
 
     async def _build_raster(
         self,
@@ -949,26 +908,7 @@ class LossAssessmentService:
         prep: _TaskPreparation,
         cells: tuple[LossGridCell, ...],
     ) -> tuple[GridDefinition, dict[str, tuple[int, int]]]:
-        if prep.synthetic_spatial:
-            width = max(len(cells), 1)
-            definition = GridDefinition(
-                version=f"{prep.profile.version}:synthetic-test-seam",
-                crs=prep.profile.output_crs,
-                resolution_m=prep.profile.grid_resolution_m,
-                origin_x=0.0,
-                origin_y=float(prep.profile.grid_resolution_m),
-                width=width,
-                height=1,
-            )
-            positions = {
-                cell.cell_id: (0, index)
-                for index, cell in enumerate(
-                    sorted(cells, key=lambda item: item.cell_id)
-                )
-            }
-            return definition, positions
-
-        bands, metadata = await self._intensity_repository.load_raster(
+        _, metadata = await self._intensity_repository.load_raster(
             session,
             UUID(prep.context.fused_intensity_product_id),
         )
@@ -1123,38 +1063,8 @@ def _scenario_parameters(
     parameter_set: ParameterSet,
     model_type: LossModelType,
     scenario: LossValueType,
-    synthetic_spatial: bool,
 ) -> ScenarioParameters:
-    parameters = parameter_set.models[model_type].scenarios[scenario]
-    if not synthetic_spatial or model_type is not LossModelType.BUILDING_DAMAGE:
-        return parameters
-    values = dict(parameters.values)
-    for key in tuple(parameters.values):
-        if not key.startswith("vulnerability."):
-            continue
-        parts = key.split(".")
-        if len(parts) != 4:
-            continue
-        structure = parts[1]
-        intensity_bin = parts[2]
-        state = parts[3]
-        values[
-            f"vulnerability.{structure}.1990_1999.{intensity_bin}.{state}"
-        ] = parameters.values[key]
-    return ScenarioParameters(values=values)
-
-
-def _available_intensity_bin(model) -> int:
-    bins: set[int] = set()
-    for scenario in model.scenarios.values():
-        for key in scenario.values:
-            parts = key.split(".")
-            if key.startswith("vulnerability.") and len(parts) == 4:
-                try:
-                    bins.add(int(parts[2]))
-                except ValueError:
-                    continue
-    return min(bins) if bins else 7
+    return parameter_set.models[model_type].scenarios[scenario]
 
 
 def _metric_descriptors(product_type: LossProductType) -> tuple[_MetricDescriptor, ...]:

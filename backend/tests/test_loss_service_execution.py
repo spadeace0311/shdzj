@@ -5,13 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+import numpy as np
+
 from app.loss.domain import LossProductType, LossRunContext
 from app.loss.exposure import build_exposure_dataset
 from app.loss.artifacts import LossArtifactCodec
 from app.loss.models_registry import load_parameter_set
 from app.loss.region import load_region_loss_profile
 from app.loss.service import LossAssessmentService
-from app.loss.spatial import LossGridCell
+from app.loss.spatial import LossGridCell, TownIntensityShare
 
 
 class _FakeSession:
@@ -157,7 +159,7 @@ class _FakeExposureService:
                 {
                     "town_code": "t1",
                     "structure": "rc_frame",
-                    "era": "1990_1999",
+                    "era": None,
                     "area_m2": 10000.0,
                 }
             ],
@@ -165,8 +167,19 @@ class _FakeExposureService:
 
 
 class _FakeSpatialService:
+    async def compute(self, session, *, run_id):
+        return (
+            TownIntensityShare(
+                town_code="t1",
+                intensity_bin=7,
+                area_ratio=1.0,
+                intensity_min=6.5,
+                intensity_max=7.5,
+            ),
+        )
+
     async def load_cells(self, session, *, run_id):
-        return (LossGridCell("g1", "t1", 1.0, 1.0),)
+        return (LossGridCell("0:0", "t1", 1.0, 1.0),)
 
 
 class _FakeContextSession:
@@ -179,11 +192,28 @@ class _FakeContextSession:
 
 
 class _FakeIntensityRepository:
+    def __init__(self):
+        self.fusion_id = uuid4()
+
     async def get_product(self, session, *, run_id, product_type):
         return {
-            "id": uuid4(),
+            "id": self.fusion_id,
             "status": "available",
             "output_checksum": "a" * 64,
+        }
+
+    async def load_raster(self, session, product_id):
+        assert product_id == self.fusion_id
+        return [
+            np.asarray([[6.5]], dtype=np.float64)
+        ], {
+            "grid_definition_version": "loss-service-test-grid-v1",
+            "crs": "EPSG:32651",
+            "resolution_m": 1000,
+            "origin_x": 0.0,
+            "origin_y": 1000.0,
+            "width": 1,
+            "height": 1,
         }
 
 
@@ -192,6 +222,7 @@ async def test_loss_service_executes_all_six_tasks_idempotently(
 ) -> None:
     run_id = uuid4()
     repository = _FakeLossRepository()
+    intensity_repository = _FakeIntensityRepository()
     profile = load_region_loss_profile(
         Path("/config/loss/shanghai-region.yaml")
     )
@@ -210,6 +241,7 @@ async def test_loss_service_executes_all_six_tasks_idempotently(
         assessment_repository=_FakeAssessmentRepository(),
         region_profile=profile,
         spatial_service=_FakeSpatialService(),
+        intensity_repository=intensity_repository,
     )
 
     async def load_context(self, session, run_id, exposure):
@@ -224,7 +256,7 @@ async def test_loss_service_executes_all_six_tasks_idempotently(
             grid_residual_review_threshold=(
                 profile.grid_residual_review_threshold
             ),
-            fused_intensity_product_id="i1",
+            fused_intensity_product_id=str(intensity_repository.fusion_id),
             fused_intensity_checksum="a" * 64,
             data_asset_snapshot_checksum=exposure.snapshot_checksum,
         )
@@ -315,6 +347,7 @@ async def test_uncalibrated_l1_product_is_demoted_to_l2(monkeypatch) -> None:
 
     run_id = uuid4()
     repository = _FakeLossRepository()
+    intensity_repository = _FakeIntensityRepository()
     profile = load_region_loss_profile(
         Path("/config/loss/shanghai-region.yaml")
     )
@@ -333,6 +366,7 @@ async def test_uncalibrated_l1_product_is_demoted_to_l2(monkeypatch) -> None:
         assessment_repository=_FakeAssessmentRepository(),
         region_profile=profile,
         spatial_service=_FakeSpatialService(),
+        intensity_repository=intensity_repository,
     )
 
     async def load_context(self, session, run_id, exposure):
@@ -347,7 +381,7 @@ async def test_uncalibrated_l1_product_is_demoted_to_l2(monkeypatch) -> None:
             grid_residual_review_threshold=(
                 profile.grid_residual_review_threshold
             ),
-            fused_intensity_product_id="i1",
+            fused_intensity_product_id=str(intensity_repository.fusion_id),
             fused_intensity_checksum="a" * 64,
             data_asset_snapshot_checksum=exposure.snapshot_checksum,
         )
