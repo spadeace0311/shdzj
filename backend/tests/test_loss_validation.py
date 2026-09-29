@@ -401,13 +401,70 @@ def test_partial_scope_is_review() -> None:
     assert "partial_scope" in _review_codes(result)
 
 
-def test_unavailable_resource_parameter_is_blocking() -> None:
+def test_explicit_unavailable_resource_parameter_is_review_not_blocking() -> None:
     resources = resource_demand_result()
     values = dict(resources.values)
     values[ResourceKind.TENT] = ResourceDemandValue(
         quantity=None,
         status="unavailable",
         reason="missing_parameter:tent.base",
+    )
+    result = validate_loss_assessment(
+        building_damage_result(),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        replace(resources, values=values),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is True
+    assert result.needs_review is True
+    assert result.quality_grade.value == "L3"
+    issue = next(
+        issue
+        for issue in result.review_issues
+        if issue.code == "resource_unavailable"
+    )
+    assert issue.context["resource_kind"] == "tent"
+    assert issue.context["reason"] == "missing_parameter:tent.base"
+    assert resources.values[ResourceKind.DRINKING_WATER].quantity is not None
+
+
+def test_missing_resource_kind_is_blocking() -> None:
+    resources = resource_demand_result()
+    values = dict(resources.values)
+    del values[ResourceKind.TENT]
+    result = validate_loss_assessment(
+        building_damage_result(),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        replace(resources, values=values),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is False
+    issue = next(
+        issue
+        for issue in result.blocking_issues
+        if issue.code == "required_parameter_unavailable"
+    )
+    assert issue.context["resource_kind"] == "tent"
+    assert issue.context["reason"] == "missing_resource_kind"
+
+
+def test_malformed_resource_status_is_blocking() -> None:
+    resources = resource_demand_result()
+    values = dict(resources.values)
+    values[ResourceKind.TENT] = ResourceDemandValue(
+        quantity=None,
+        status="broken",
+        reason="malformed",
     )
     result = validate_loss_assessment(
         building_damage_result(),
@@ -427,5 +484,33 @@ def test_unavailable_resource_parameter_is_blocking() -> None:
         if issue.code == "required_parameter_unavailable"
     )
     assert issue.context["resource_kind"] == "tent"
-    assert issue.context["reason"] == "missing_parameter:tent.base"
-    assert resources.values[ResourceKind.DRINKING_WATER].quantity is not None
+    assert issue.context["reason"] == "resource_status_and_quantity_mismatch"
+
+
+def test_invalid_resource_parameter_is_blocking() -> None:
+    resources = resource_demand_result()
+    values = dict(resources.values)
+    values[ResourceKind.TENT] = ResourceDemandValue(
+        quantity=None,
+        status="unavailable",
+        reason="invalid_parameter:tent.base",
+    )
+    result = validate_loss_assessment(
+        building_damage_result(),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        replace(resources, values=values),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is False
+    issue = next(
+        issue
+        for issue in result.blocking_issues
+        if issue.code == "required_parameter_unavailable"
+    )
+    assert issue.context["resource_kind"] == "tent"
+    assert issue.context["reason"] == "resource_status_and_quantity_mismatch"

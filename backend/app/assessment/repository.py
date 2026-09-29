@@ -11,6 +11,8 @@ from app.data_assets.snapshot_service import DataAssetSnapshotService
 from app.events.domain import EventKind
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox
 from app.intensity.models import AssessmentTaskAttempt, IntensityFieldProduct
+from app.loss.domain import LossProductStatus
+from app.loss.models import LossProduct
 
 
 class AssessmentRepository:
@@ -529,6 +531,17 @@ class AssessmentRepository:
             task.task_key for task in required_tasks if task.status == "succeeded"
         } != required_task_keys:
             raise ValueError("required assessment tasks have not succeeded")
+        validation_product = await session.scalar(
+            select(LossProduct).where(
+                LossProduct.run_id == run.id,
+                LossProduct.product_type == "validation",
+            )
+        )
+        if (
+            validation_product is not None
+            and validation_product.status != LossProductStatus.COMPLETE.value
+        ):
+            raise ValueError("loss validation product is not complete")
         now = datetime.now(UTC)
         run.status = "completed"
         run.completed_at = now
@@ -801,6 +814,17 @@ class AssessmentRepository:
             )
         ).all()
         for product in products:
+            if product.published_at is None:
+                product.published_at = now
+        loss_products = (
+            await session.scalars(
+                select(LossProduct).where(
+                    LossProduct.run_id == run_id,
+                    LossProduct.status == LossProductStatus.COMPLETE.value,
+                )
+            )
+        ).all()
+        for product in loss_products:
             if product.published_at is None:
                 product.published_at = now
 

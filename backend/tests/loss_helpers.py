@@ -330,15 +330,14 @@ async def _publish_fixed_assets(
             ),
             building_records,
         )
-    for asset_key in ("shanghai.admin.city", "shanghai.admin.county"):
-        assets[asset_key] = _table(
+    assets["shanghai.admin.city"] = _table(
             ("ID", "NAME", "geometry_wkt"),
             (
                 NormalizedRecord(
                     row_number=1,
-                    business_key="310000",
+                    business_key="shanghai",
                     properties={
-                        "ID": "310000",
+                        "ID": "shanghai",
                         "NAME": "上海市",
                     },
                     geometry_wkt=(
@@ -348,6 +347,23 @@ async def _publish_fixed_assets(
                 ),
             ),
         )
+    assets["shanghai.admin.county"] = _table(
+        ("ID", "NAME", "geometry_wkt"),
+        (
+            NormalizedRecord(
+                row_number=1,
+                business_key="310115000",
+                properties={
+                    "ID": "310115000",
+                    "NAME": "浦东新区",
+                },
+                geometry_wkt=(
+                    "MULTIPOLYGON (((121.40 31.15, 121.60 31.15, "
+                    "121.60 31.30, 121.40 31.30, 121.40 31.15)))"
+                ),
+            ),
+        ),
+    )
     assets["shanghai.economy.county"] = _table(
         (
             "id",

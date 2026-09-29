@@ -818,26 +818,76 @@ def validate_loss_assessment(
 
     for kind in ResourceKind:
         value = resources.values.get(kind)
-        if (
-            value is None
-            or value.status != "available"
-            or value.quantity is None
-        ):
+        if value is None:
             blocking.append(
                 _issue(
                     "required_parameter_unavailable",
-                    f"resource demand for {kind.value} is unavailable",
+                    f"resource demand for {kind.value} is missing",
                     blocking=True,
                     context={
                         "resource_kind": kind.value,
-                        "reason": (
-                            "missing_resource_kind"
-                            if value is None
-                            else value.reason
-                        ),
+                        "reason": "missing_resource_kind",
                     },
                 )
             )
+            continue
+
+        status = getattr(value, "status", None)
+        quantity = getattr(value, "quantity", None)
+        reason = getattr(value, "reason", None)
+        if status == "available":
+            if quantity is None:
+                blocking.append(
+                    _issue(
+                        "required_parameter_unavailable",
+                        f"resource demand for {kind.value} has no quantity",
+                        blocking=True,
+                        context={
+                            "resource_kind": kind.value,
+                            "reason": "missing_resource_quantity",
+                        },
+                    )
+                )
+            continue
+        if (
+            status == "unavailable"
+            and quantity is None
+            and (
+                reason is None
+                or (
+                    isinstance(reason, str)
+                    and reason.startswith("missing_parameter:")
+                )
+            )
+        ):
+            review.append(
+                _issue(
+                    "resource_unavailable",
+                    f"resource demand for {kind.value} is explicitly "
+                    "unavailable",
+                    blocking=False,
+                    context={
+                        "resource_kind": kind.value,
+                        "reason": reason,
+                    },
+                )
+            )
+            continue
+        blocking.append(
+            _issue(
+                "required_parameter_unavailable",
+                f"resource demand for {kind.value} is malformed",
+                blocking=True,
+                context={
+                    "resource_kind": kind.value,
+                    "reason": (
+                        "malformed_resource_kind"
+                        if status is None
+                        else "resource_status_and_quantity_mismatch"
+                    ),
+                },
+            )
+        )
 
     _validate_grid_review(
         grid_residuals,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
@@ -60,6 +61,7 @@ from app.loss.spatial import (
     allocate_integers,
 )
 from app.loss.validation import (
+    ValidationInputUnavailable,
     ValidationContext,
     validate_loss_assessment,
 )
@@ -89,6 +91,10 @@ class LossTaskOutcome:
     started_at: datetime
     completed_at: datetime
     stage_seconds: dict[str, float]
+
+
+class LossValidationFailed(Exception):
+    """Raised when loss validation produces blocking issues."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +280,7 @@ class LossAssessmentService:
         started_at = datetime.now(UTC)
         run_uuid = _coerce_uuid(run_id)
         task_id: UUID | None = None
+        validation_failed = False
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -369,7 +376,11 @@ class LossAssessmentService:
                         run_id=run_uuid,
                         task_id=task.id,
                         product_type=LossProductType.VALIDATION,
-                        status=LossProductStatus.COMPLETE,
+                        status=(
+                            LossProductStatus.COMPLETE
+                            if validation_result.valid
+                            else LossProductStatus.INVALID
+                        ),
                         quality_grade=validation_result.quality_grade,
                         calibration_status=parameter_set.calibration_status,
                         coverage_ratio=snapshot.coverage_ratio,
@@ -391,32 +402,48 @@ class LossAssessmentService:
                         session,
                         write,
                     )
-                    await self._assessment_repository.complete_task(
-                        session,
-                        task.id,
-                        output_checksum,
-                        {
-                            "product_id": str(product.id),
-                            "task_key": "loss.validate",
-                            "valid": validation_result.valid,
-                            "needs_review": validation_result.needs_review,
-                            "quality_grade": (
-                                validation_result.quality_grade.value
-                            ),
-                            "stage_seconds": stage_seconds,
-                        },
-                    )
-                    return LossTaskOutcome(
-                        product_id=product.id,
-                        task_key="loss.validate",
-                        status="succeeded",
-                        started_at=started_at,
-                        completed_at=datetime.now(UTC),
-                        stage_seconds={
-                            **stage_seconds,
-                            "snapshot_and_exposure": prep_seconds,
-                        },
-                    )
+                    if validation_result.valid:
+                        await self._assessment_repository.complete_task(
+                            session,
+                            task.id,
+                            output_checksum,
+                            {
+                                "product_id": str(product.id),
+                                "task_key": "loss.validate",
+                                "valid": validation_result.valid,
+                                "needs_review": (
+                                    validation_result.needs_review
+                                ),
+                                "quality_grade": (
+                                    validation_result.quality_grade.value
+                                ),
+                                "stage_seconds": stage_seconds,
+                            },
+                        )
+                        return LossTaskOutcome(
+                            product_id=product.id,
+                            task_key="loss.validate",
+                            status="succeeded",
+                            started_at=started_at,
+                            completed_at=datetime.now(UTC),
+                            stage_seconds={
+                                **stage_seconds,
+                                "snapshot_and_exposure": prep_seconds,
+                            },
+                        )
+                    else:
+                        await self._assessment_repository.fail_task(
+                            session,
+                            task.id,
+                            "validation_failed",
+                            "loss validation produced blocking issues",
+                        )
+                        validation_failed = True
+
+            if validation_failed:
+                raise LossValidationFailed(
+                    "loss validation produced blocking issues"
+                )
         except Exception as exc:
             await self._record_task_failure(
                 run_id,
@@ -946,8 +973,24 @@ class LossAssessmentService:
             run_uuid = _coerce_uuid(run_id)
         except ValueError:
             return
-        category = type(exc).__name__
-        summary = f"{category}: {exc}"[:2000]
+        if isinstance(exc, LossValidationFailed):
+            category = "validation_failed"
+            summary = "loss validation produced blocking issues"
+        elif isinstance(exc, ValidationInputUnavailable):
+            category = "validation_input_unavailable"
+            summary = "loss validation inputs are unavailable"
+        elif isinstance(exc, LookupError):
+            category = "lookup_error"
+            summary = "required loss assessment data was not found"
+        elif isinstance(exc, ValueError):
+            category = "invalid_input"
+            summary = "loss assessment input was invalid"
+        elif isinstance(exc, ArithmeticError):
+            category = "computation_error"
+            summary = "loss assessment computation failed"
+        else:
+            category = "internal_error"
+            summary = "loss assessment task failed"
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -1184,14 +1227,19 @@ def _build_metrics(
     town_names = {
         town.town_code: town.town_name for town in prep.exposure.towns
     }
+    town_counties = {
+        town.town_code: town.county_code for town in prep.exposure.towns
+    }
     quality_grade = _central_quality_grade(prep, central_result)
     writes: list[LossMetricValueWrite] = []
     for scenario in _SCENARIO_ORDER:
         result = scenario_results[scenario]
         for descriptor in descriptors:
             if descriptor.scope == "town":
+                town_values: dict[str, object] = {}
                 for town_code in sorted(result.towns):
                     value = descriptor.extractor(result.towns[town_code])
+                    town_values[town_code] = value
                     writes.append(
                         _metric_write(
                             prep,
@@ -1205,6 +1253,44 @@ def _build_metrics(
                             quality_grade=quality_grade,
                         )
                     )
+                county_values: dict[str, dict[str, object]] = {}
+                for town_code, value in town_values.items():
+                    county_code = town_counties.get(
+                        town_code,
+                        town_code[:9],
+                    )
+                    county_values.setdefault(county_code, {})[
+                        town_code
+                    ] = value
+                for county_code in sorted(county_values):
+                    writes.append(
+                        _metric_write(
+                            prep,
+                            descriptor,
+                            scenario,
+                            _aggregate_metric_value(
+                                county_values[county_code]
+                            ),
+                            area_scope="county",
+                            area_code=county_code,
+                            area_name=None,
+                            note=None,
+                            quality_grade=quality_grade,
+                        )
+                    )
+                writes.append(
+                    _metric_write(
+                        prep,
+                        descriptor,
+                        scenario,
+                        _aggregate_metric_value(town_values),
+                        area_scope="city",
+                        area_code=prep.context.region_id,
+                        area_name=None,
+                        note=None,
+                        quality_grade=quality_grade,
+                    )
+                )
             else:
                 value = descriptor.extractor(result)
                 writes.append(
@@ -1228,6 +1314,20 @@ def _build_metrics(
                     )
                 )
     return tuple(writes)
+
+
+def _aggregate_metric_value(values: dict[str, object]) -> object:
+    if not values:
+        return None
+    total = 0.0
+    for value in values.values():
+        if value is None:
+            return None
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0:
+            return None
+        total += numeric
+    return total
 
 
 def _metric_write(
