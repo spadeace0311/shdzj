@@ -23,6 +23,7 @@ interface LossAssessmentPanelProps {
   runId: string;
   result: LossResult;
   fusedIntensityProductId?: string | null;
+  fusedIntensityRunId?: string;
 }
 
 interface MetricRow {
@@ -100,6 +101,7 @@ export function LossAssessmentPanel({
   runId,
   result,
   fusedIntensityProductId,
+  fusedIntensityRunId = runId,
 }: LossAssessmentPanelProps) {
   const spatializedProducts = result.products.filter(
     (product) => product.spatialized_estimate,
@@ -195,7 +197,7 @@ export function LossAssessmentPanel({
     let active = true;
     setFusedIntensityArtifact(null);
     setFusedArtifactLoadFailed(false);
-    getIntensityArtifact(runId, fusedIntensityProductId)
+    getIntensityArtifact(fusedIntensityRunId, fusedIntensityProductId)
       .then((artifact) => {
         if (active) {
           setFusedIntensityArtifact(artifact);
@@ -210,7 +212,7 @@ export function LossAssessmentPanel({
     return () => {
       active = false;
     };
-  }, [fusedIntensityProductId, runId]);
+  }, [fusedIntensityProductId, fusedIntensityRunId]);
 
   const selectedProduct = spatializedProducts.find(
     (product) => product.product_id === selectedProductId,

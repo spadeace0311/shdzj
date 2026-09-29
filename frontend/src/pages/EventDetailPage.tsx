@@ -89,6 +89,8 @@ export function EventDetailPage() {
   }, []);
 
   const assessmentRunId = assessment?.run_id;
+  const fusedIntensityRunId =
+    assessment?.intensity?.run_id ?? assessmentRunId;
   const fusedIntensityProductId = assessment?.intensity?.products.find(
     (product) =>
       product.product_type === "fusion" &&
@@ -235,6 +237,7 @@ export function EventDetailPage() {
               runId={assessmentRunId}
               result={lossState.result}
               fusedIntensityProductId={fusedIntensityProductId}
+              fusedIntensityRunId={fusedIntensityRunId}
             />
           ) : null}
 

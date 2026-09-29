@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import {
+  ApiError,
   getCurrentAssessment,
   getEvent,
   getLossAssessment,
@@ -15,19 +16,29 @@ import type {
 } from "../src/types";
 
 vi.mock("../src/components/LossAssessmentPanel", () => ({
-  LossAssessmentPanel: (props: { fusedIntensityProductId?: string | null }) => (
+  LossAssessmentPanel: (props: {
+    runId: string;
+    fusedIntensityProductId?: string | null;
+    fusedIntensityRunId?: string;
+  }) => (
     <div
       data-testid="loss-panel"
       data-fused={props.fusedIntensityProductId ?? ""}
+      data-run={props.runId ?? ""}
+      data-fused-run={props.fusedIntensityRunId ?? ""}
     />
   ),
 }));
 
-vi.mock("../src/api/client", () => ({
-  getCurrentAssessment: vi.fn(),
-  getEvent: vi.fn(),
-  getLossAssessment: vi.fn(),
-}));
+vi.mock("../src/api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/api/client")>();
+  return {
+    ...actual,
+    getCurrentAssessment: vi.fn(),
+    getEvent: vi.fn(),
+    getLossAssessment: vi.fn(),
+  };
+});
 
 const getCurrentAssessmentMock = vi.mocked(getCurrentAssessment);
 const getEventMock = vi.mocked(getEvent);
@@ -178,4 +189,87 @@ test("passes the first available fusion product into the loss map", async () => 
 
   const panel = await screen.findByTestId("loss-panel");
   expect(panel).toHaveAttribute("data-fused", "fusion-1");
+  expect(panel).toHaveAttribute("data-fused-run", "run-1");
+});
+
+test("passes the intensity response run ID when it differs from the outer run", async () => {
+  const assessment: AssessmentRunStatus = {
+    run_id: "run-outer",
+    event_id: "event-1",
+    revision_id: "revision-outer",
+    run_no: 1,
+    status: "completed",
+    t1_at: "2026-09-17T02:31:00Z",
+    deadline_at: "2026-09-17T02:36:00Z",
+    completed_task_count: 0,
+    failed_task_count: 0,
+    total_task_count: 0,
+    tasks: [],
+    intensity: {
+      run_id: "run-effective",
+      event_id: "event-1",
+      revision_id: "revision-effective",
+      run_status: "completed",
+      products: [
+        {
+          product_id: "fusion-1",
+          product_type: "fusion",
+          status: "available",
+          quality_grade: null,
+          coverage_ratio: 1,
+          output_checksum: "f".repeat(64),
+          statistics: {},
+        },
+      ],
+    },
+  };
+  const loss: LossResult = {
+    run_id: "run-outer",
+    event_id: "event-1",
+    revision_id: "revision-outer",
+    effective_run_id: "run-outer",
+    is_fallback: false,
+    products: [],
+  };
+
+  getEventMock.mockResolvedValue(baseDetail);
+  getCurrentAssessmentMock.mockResolvedValue(assessment);
+  getLossAssessmentMock.mockResolvedValue(loss);
+
+  renderDetail("event-1");
+
+  const panel = await screen.findByTestId("loss-panel");
+  expect(panel).toHaveAttribute("data-run", "run-outer");
+  expect(panel).toHaveAttribute("data-fused-run", "run-effective");
+});
+
+test("treats a 404 ApiError from loss loading as an idle result", async () => {
+  const assessment: AssessmentRunStatus = {
+    run_id: "run-1",
+    event_id: "event-1",
+    revision_id: "revision-1",
+    run_no: 1,
+    status: "completed",
+    t1_at: "2026-09-17T02:31:00Z",
+    deadline_at: "2026-09-17T02:36:00Z",
+    completed_task_count: 0,
+    failed_task_count: 0,
+    total_task_count: 0,
+    tasks: [],
+  };
+
+  getEventMock.mockResolvedValue(baseDetail);
+  getCurrentAssessmentMock.mockResolvedValue(assessment);
+  getLossAssessmentMock.mockRejectedValue(
+    new ApiError("loss_result_not_found", 404),
+  );
+
+  renderDetail("event-1");
+
+  await screen.findByText("当前修订");
+  await waitFor(() =>
+    expect(getLossAssessmentMock).toHaveBeenCalledWith("run-1"),
+  );
+  expect(screen.queryByTestId("loss-panel")).not.toBeInTheDocument();
+  expect(screen.queryByText("无法加载损失评估结果")).not.toBeInTheDocument();
 });
