@@ -174,6 +174,7 @@ class _FakeExposureService:
     async def prepare(self, session, *, run_id):
         return build_exposure_dataset(
             snapshot_checksum="f" * 64,
+            city=[{"ID": "310000", "NAME": "上海市"}],
             towns=[
                 {
                     "town_code": "t1",
@@ -335,6 +336,7 @@ async def test_load_context_freezes_region_profile_and_thresholds() -> None:
     )
     exposure = build_exposure_dataset(
         snapshot_checksum="f" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[],
         geometries=[],
         buildings=[],

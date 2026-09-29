@@ -55,6 +55,7 @@ def _exposure(
 ) -> object:
     return build_exposure_dataset(
         snapshot_checksum="a" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[
             {
                 "town_code": town_code,
@@ -193,6 +194,7 @@ def test_top_level_grade_is_worst_town_grade() -> None:
     )
     exposure = build_exposure_dataset(
         snapshot_checksum="b" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[
             {
                 "town_code": "t1",
@@ -246,6 +248,7 @@ def test_top_level_grade_is_worst_town_grade() -> None:
 def test_empty_exposure_is_unavailable() -> None:
     exposure = build_exposure_dataset(
         snapshot_checksum="c" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[],
         geometries=[],
         buildings=[],

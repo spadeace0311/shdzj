@@ -201,6 +201,12 @@ async def test_successful_workflow_persists_all_advertised_area_scopes(
             if metric.metric_key == "collapsed_area_m2"
             and metric.value_type == "central"
         ]
+        city_metrics = [
+            metric for metric in central if metric.area_scope == "city"
+        ]
+        assert city_metrics
+        assert {metric.area_code for metric in city_metrics} == {"310000"}
+        assert {metric.area_name for metric in city_metrics} == {"上海市"}
         town_total = sum(
             float(metric.numeric_value)
             for metric in central
@@ -209,9 +215,8 @@ async def test_successful_workflow_persists_all_advertised_area_scopes(
         )
         city_value = next(
             float(metric.numeric_value)
-            for metric in central
-            if metric.area_scope == "city"
-            and metric.numeric_value is not None
+            for metric in city_metrics
+            if metric.numeric_value is not None
         )
         assert city_value == pytest.approx(town_total)
 
@@ -226,7 +231,12 @@ async def test_successful_workflow_persists_all_advertised_area_scopes(
         assert county_response.json()["features"]
         assert city_response.status_code == 200
         assert city_response.json()["scope"] == "city"
-        assert city_response.json()["features"]
+        city_features = city_response.json()["features"]
+        assert len(city_features) == 1
+        city_feature = city_features[0]
+        assert city_feature["area_code"] == "310000"
+        assert city_feature["area_name"] == "上海市"
+        assert city_feature["geometry"]
 
     await _with_loss_workflow(session_factory, assert_scopes)
 

@@ -1285,8 +1285,8 @@ def _build_metrics(
                         scenario,
                         _aggregate_metric_value(town_values),
                         area_scope="city",
-                        area_code=prep.context.region_id,
-                        area_name=None,
+                        area_code=prep.exposure.city.area_code,
+                        area_name=prep.exposure.city.area_name,
                         note=None,
                         quality_grade=quality_grade,
                     )
@@ -1300,8 +1300,8 @@ def _build_metrics(
                         scenario,
                         value,
                         area_scope="city",
-                        area_code=prep.context.region_id,
-                        area_name=None,
+                        area_code=prep.exposure.city.area_code,
+                        area_name=prep.exposure.city.area_name,
                         note=(
                             result.values[
                                 ResourceKind(descriptor.metric_key.split(".", 1)[0])

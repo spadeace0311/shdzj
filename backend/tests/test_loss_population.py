@@ -33,6 +33,7 @@ def _parameters_with(values: dict[str, float]) -> ScenarioParameters:
 def _exposure(*, population: float = 10000.0, town_code: str = "t1") -> object:
     return build_exposure_dataset(
         snapshot_checksum="a" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[
             {
                 "town_code": town_code,
@@ -106,6 +107,7 @@ def test_below_threshold_bins_remain_in_by_intensity() -> None:
 def test_by_intensity_is_ordered_by_town_code_then_intensity_bin() -> None:
     exposure = build_exposure_dataset(
         snapshot_checksum="b" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[
             {
                 "town_code": "t2",
@@ -152,6 +154,7 @@ def test_by_intensity_is_ordered_by_town_code_then_intensity_bin() -> None:
 def test_empty_exposure_is_unavailable() -> None:
     exposure = build_exposure_dataset(
         snapshot_checksum="c" * 64,
+        city=[{"ID": "310000", "NAME": "上海市"}],
         towns=[],
         geometries=[],
         buildings=[],

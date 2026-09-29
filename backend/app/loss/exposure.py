@@ -28,8 +28,15 @@ class TownExposure:
 
 
 @dataclass(frozen=True, slots=True)
+class CityExposure:
+    area_code: str
+    area_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExposureDataset:
     snapshot_checksum: str
+    city: CityExposure
     towns: tuple[TownExposure, ...]
 
 
@@ -126,12 +133,20 @@ def _building_areas(
 def build_exposure_dataset(
     *,
     snapshot_checksum: str,
+    city: Sequence[AssetRecord | Mapping[str, object]],
     towns: Sequence[AssetRecord | Mapping[str, object]],
     geometries: Sequence[AssetRecord | Mapping[str, object]],
     buildings: Sequence[AssetRecord | Mapping[str, object]],
 ) -> ExposureDataset:
     if len(snapshot_checksum) != 64:
         raise ValueError("snapshot checksum must be a SHA-256 digest")
+    if len(city) != 1:
+        raise ValueError("city asset requires exactly one record")
+    city_record = city[0]
+    city_exposure = CityExposure(
+        area_code=_business_key(city_record, "city_code", "ID", "AREA_CODE"),
+        area_name=_required_text(city_record, "city_name", "NAME", "name"),
+    )
 
     town_rows = {_business_key(row, "town_code", "ID", "TOWN_CODE"): row for row in towns}
     geometry_rows = {
@@ -192,6 +207,7 @@ def build_exposure_dataset(
         )
     return ExposureDataset(
         snapshot_checksum=snapshot_checksum,
+        city=city_exposure,
         towns=tuple(result),
     )
 

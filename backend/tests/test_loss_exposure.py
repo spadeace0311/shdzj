@@ -53,6 +53,9 @@ class FakeSession:
 
 async def _locked_records(session, *, run_id, asset_key):
     payloads = {
+        "shanghai.admin.city": (
+            {"ID": "310000", "NAME": "上海市"},
+        ),
         "shanghai.population.town": (
             {"ID": "310101001", "NAME": "测试街道", "total": 10000.0},
         ),
@@ -102,6 +105,8 @@ async def test_exposure_combines_population_buildings_and_geometry() -> None:
         run_id=uuid4(),
     )
     assert dataset.snapshot_checksum == "f" * 64
+    assert dataset.city.area_code == "310000"
+    assert dataset.city.area_name == "上海市"
     assert len(dataset.towns) == 1
     assert dataset.towns[0].population_total == pytest.approx(10000.0)
     assert dataset.towns[0].buildings[0].area_m2 == pytest.approx(50000.0)
@@ -110,6 +115,14 @@ async def test_exposure_combines_population_buildings_and_geometry() -> None:
 def test_exposure_accepts_locked_asset_records() -> None:
     dataset = build_exposure_dataset(
         snapshot_checksum="f" * 64,
+        city=(
+            AssetRecord(
+                row_number=1,
+                business_key="310000",
+                properties={"ID": "310000", "NAME": "上海市"},
+                geometry_wkt=None,
+            ),
+        ),
         towns=(
             AssetRecord(
                 row_number=1,
@@ -146,6 +159,8 @@ def test_exposure_accepts_locked_asset_records() -> None:
     )
 
     assert dataset.towns[0].town_code == "310101001"
+    assert dataset.city.area_code == "310000"
+    assert dataset.city.area_name == "上海市"
     assert dataset.towns[0].buildings[0].area_m2 == pytest.approx(50000.0)
 
 
@@ -305,6 +320,7 @@ def test_build_exposure_dataset_rejects_invalid_inputs(
     with pytest.raises(ValueError, match=match):
         build_exposure_dataset(
             snapshot_checksum=CHECKSUM,
+            city=[{"ID": "310000", "NAME": "上海市"}],
             towns=towns,
             geometries=geometries,
             buildings=buildings,

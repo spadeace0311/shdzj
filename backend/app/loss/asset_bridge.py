@@ -47,6 +47,11 @@ class LossAssetBridge:
             strict=True,
         )
         keys = self._profile.asset_keys
+        city_version = await self._snapshots.get_locked_version(
+            session,
+            run_id=run_id,
+            asset_key=keys.admin_city,
+        )
         town_version = await self._snapshots.get_locked_version(
             session,
             run_id=run_id,
@@ -62,8 +67,18 @@ class LossAssetBridge:
             run_id=run_id,
             asset_key=keys.building_town,
         )
-        if town_version is None or population_version is None or building_version is None:
+        if (
+            city_version is None
+            or town_version is None
+            or population_version is None
+            or building_version is None
+        ):
             raise LookupError("required loss data asset is not locked")
+        city = await self._list_records(
+            session,
+            run_id=run_id,
+            asset_key=keys.admin_city,
+        )
         towns = await self._list_records(
             session,
             run_id=run_id,
@@ -81,6 +96,7 @@ class LossAssetBridge:
         )
         return build_exposure_dataset(
             snapshot_checksum=snapshot.fingerprint,
+            city=city,
             towns=towns,
             geometries=geometries,
             buildings=buildings,
