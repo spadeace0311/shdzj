@@ -12,6 +12,10 @@ from app.loss.models_registry import canonical_intensity_bin
 from app.loss.spatial import TownIntensityShare
 
 
+class BuildingDamageUnavailable(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class BuildingDamageStateArea:
     structure: BuildingStructure
@@ -105,6 +109,11 @@ def assess_building_damage(
     intensity_shares: Sequence[TownIntensityShare],
     parameters: ScenarioParameters,
 ) -> BuildingDamageResult:
+    if not exposure.towns:
+        raise BuildingDamageUnavailable(
+            "building damage cannot be assessed without exposure"
+        )
+
     exposure_by_town = {town.town_code: town for town in exposure.towns}
     shares_by_town: dict[str, list[TownIntensityShare]] = {}
     for share in intensity_shares:
@@ -115,6 +124,13 @@ def assess_building_damage(
     fallback_model_used = False
     for town_code in sorted(exposure_by_town):
         town = exposure_by_town[town_code]
+        has_building_exposure = any(
+            building.area_m2 > 0.0 for building in town.buildings
+        )
+        if has_building_exposure and not shares_by_town.get(town_code):
+            raise BuildingDamageUnavailable(
+                f"building exposure has no intensity coverage for town {town_code}"
+            )
         states: list[BuildingDamageStateArea] = []
         town_fallback_model_used = False
         for building in town.buildings:

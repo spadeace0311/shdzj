@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.loss.buildings import assess_building_damage
+from app.loss.buildings import BuildingDamageUnavailable, assess_building_damage
 from app.loss.domain import (
     DamageState,
     LossModelType,
@@ -241,6 +241,30 @@ def test_top_level_grade_is_worst_town_grade() -> None:
     assert result.towns["t2"].quality_grade is LossQualityGrade.L3
     assert result.quality_grade is LossQualityGrade.L3
     assert result.fallback_model_used is True
+
+
+def test_empty_exposure_is_unavailable() -> None:
+    exposure = build_exposure_dataset(
+        snapshot_checksum="c" * 64,
+        towns=[],
+        geometries=[],
+        buildings=[],
+    )
+    with pytest.raises(BuildingDamageUnavailable):
+        assess_building_damage(
+            exposure,
+            (),
+            _parameters(),
+        )
+
+
+def test_building_town_without_intensity_share_is_unavailable() -> None:
+    with pytest.raises(BuildingDamageUnavailable):
+        assess_building_damage(
+            _exposure(),
+            (),
+            _parameters(),
+        )
 
 
 def test_shared_building_factory_preserves_total_area() -> None:
