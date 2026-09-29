@@ -120,7 +120,6 @@ class _TaskPreparation:
     model_version: str
     parameter_version: str
     input_fingerprint: str
-    task: object
     exposure: ExposureDataset
     context: LossRunContext
     profile: RegionLossProfile
@@ -459,10 +458,6 @@ class LossAssessmentService:
                         profile=profile,
                     )
                     model = parameter_set.models[model_type]
-                    shares = await self._town_intensity_shares(
-                        session,
-                        run_uuid,
-                    )
                     prep_seconds = perf_counter() - prep_started
                     input_fingerprint = _input_fingerprint(
                         context,
@@ -488,23 +483,31 @@ class LossAssessmentService:
                             {},
                             started_at,
                         )
-                    prep = _TaskPreparation(
-                        run_id=run_uuid,
-                        task_key=task_key,
-                        product_type=product_type,
-                        model_type=model_type,
-                        algorithm_version=algorithm_version,
-                        model_version=model.formula_version,
-                        parameter_version=parameter_set.version,
-                        input_fingerprint=input_fingerprint,
-                        task=task,
-                        exposure=exposure,
-                        context=context,
-                        profile=profile,
-                        parameter_set=parameter_set,
-                        shares=shares,
-                        coverage_ratio=_coverage_ratio(exposure, shares),
-                    )
+
+            async with self._session_factory() as session:
+                shares = await self._town_intensity_shares(
+                    session,
+                    run_uuid,
+                )
+
+            prep = _TaskPreparation(
+                run_id=run_uuid,
+                task_key=task_key,
+                product_type=product_type,
+                model_type=model_type,
+                algorithm_version=algorithm_version,
+                model_version=model.formula_version,
+                parameter_version=parameter_set.version,
+                input_fingerprint=input_fingerprint,
+                exposure=exposure,
+                context=context,
+                profile=profile,
+                parameter_set=parameter_set,
+                shares=shares,
+                coverage_ratio=_coverage_ratio(exposure, shares),
+            )
+
+            async with self._session_factory() as session:
                     model_started = perf_counter()
                     scenario_results = await scenario_runner(session, prep)
                     model_seconds = perf_counter() - model_started
@@ -586,6 +589,9 @@ class LossAssessmentService:
                         raster=raster,
                         reason=None,
                     )
+
+            async with self._session_factory() as session:
+                async with session.begin():
                     product = await self._repository.write_product(
                         session,
                         write,
@@ -600,14 +606,14 @@ class LossAssessmentService:
                             "stage_seconds": stage_seconds,
                         },
                     )
-                    return LossTaskOutcome(
-                        product_id=product.id,
-                        task_key=task_key,
-                        status="succeeded",
-                        started_at=started_at,
-                        completed_at=datetime.now(UTC),
-                        stage_seconds=stage_seconds,
-                    )
+                return LossTaskOutcome(
+                    product_id=product.id,
+                    task_key=task_key,
+                    status="succeeded",
+                    started_at=started_at,
+                    completed_at=datetime.now(UTC),
+                    stage_seconds=stage_seconds,
+                )
         except Exception as exc:
             await self._record_task_failure(
                 run_id,

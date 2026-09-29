@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -7,7 +8,12 @@ from uuid import uuid4
 
 import numpy as np
 
-from app.loss.domain import LossProductType, LossRunContext
+from app.loss.domain import (
+    LossModelType,
+    LossProductType,
+    LossRunContext,
+    LossValueType,
+)
 from app.loss.exposure import build_exposure_dataset
 from app.loss.artifacts import LossArtifactCodec
 from app.loss.models_registry import load_parameter_set
@@ -28,6 +34,33 @@ class _FakeSessionFactory:
 
     async def __aenter__(self):
         return _FakeSession()
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _LockingSession:
+    def __init__(self, owner):
+        self._owner = owner
+
+    @asynccontextmanager
+    async def begin(self):
+        async with self._owner.transaction_lock:
+            self._owner.events.append("write_begin")
+            yield self
+            self._owner.events.append("write_commit")
+
+
+class _LockingSessionFactory:
+    def __init__(self):
+        self.transaction_lock = asyncio.Lock()
+        self.events = []
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return _LockingSession(self)
 
     async def __aexit__(self, exc_type, exc, traceback):
         return False
@@ -407,3 +440,114 @@ async def test_uncalibrated_l1_product_is_demoted_to_l2(monkeypatch) -> None:
     assert {
         metric.quality_grade for metric in repository.writes[0].metrics
     } == {LossQualityGrade.L2}
+
+
+async def test_parallel_loss_tasks_commit_start_task_before_compute(monkeypatch) -> None:
+    from tests.loss_factories import (
+        building_damage_result,
+        population_impact_result,
+    )
+
+    run_id = uuid4()
+    session_factory = _LockingSessionFactory()
+    repository = _FakeLossRepository()
+    intensity_repository = _FakeIntensityRepository()
+    profile = load_region_loss_profile(
+        Path("/config/loss/shanghai-region.yaml")
+    )
+    parameters = load_parameter_set(
+        Path("/app/tests/fixtures/loss-test-parameters.yaml")
+    )
+
+    async def load_parameters(session, *, run_id, profile):
+        return parameters
+
+    service = LossAssessmentService(
+        session_factory,
+        exposure_service=_FakeExposureService(),
+        parameter_loader=load_parameters,
+        repository=repository,
+        assessment_repository=_FakeAssessmentRepository(),
+        region_profile=profile,
+        spatial_service=_FakeSpatialService(),
+        intensity_repository=intensity_repository,
+    )
+
+    async def load_context(self, session, run_id, exposure):
+        return LossRunContext(
+            run_id=str(run_id),
+            event_id="e1",
+            revision_id="r1",
+            report_ingested_at=datetime(2026, 9, 28, tzinfo=UTC),
+            region_id="shanghai",
+            region_profile_version=profile.version,
+            minimum_town_coverage_ratio=profile.minimum_town_coverage_ratio,
+            grid_residual_review_threshold=(
+                profile.grid_residual_review_threshold
+            ),
+            fused_intensity_product_id=str(intensity_repository.fusion_id),
+            fused_intensity_checksum="a" * 64,
+            data_asset_snapshot_checksum=exposure.snapshot_checksum,
+        )
+
+    monkeypatch.setattr(
+        LossAssessmentService,
+        "_load_context",
+        load_context,
+    )
+
+    building_started = asyncio.Event()
+    population_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def building_runner(session, prep):
+        building_started.set()
+        await release.wait()
+        result = building_damage_result()
+        return {
+            scenario: result
+            for scenario in (
+                LossValueType.LOW,
+                LossValueType.CENTRAL,
+                LossValueType.HIGH,
+            )
+        }
+
+    async def population_runner(session, prep):
+        population_started.set()
+        await release.wait()
+        result = population_impact_result()
+        return {
+            scenario: result
+            for scenario in (
+                LossValueType.LOW,
+                LossValueType.CENTRAL,
+                LossValueType.HIGH,
+            )
+        }
+
+    building_task = asyncio.create_task(
+        service._run_model_task(
+            str(run_id),
+            product_type=LossProductType.BUILDING_DAMAGE,
+            task_key="loss.buildings",
+            model_type=LossModelType.BUILDING_DAMAGE,
+            scenario_runner=building_runner,
+        )
+    )
+    population_task = asyncio.create_task(
+        service._run_model_task(
+            str(run_id),
+            product_type=LossProductType.POPULATION_IMPACT,
+            task_key="loss.population",
+            model_type=LossModelType.POPULATION_IMPACT,
+            scenario_runner=population_runner,
+        )
+    )
+
+    await asyncio.wait_for(building_started.wait(), timeout=1.0)
+    await asyncio.wait_for(population_started.wait(), timeout=1.0)
+    release.set()
+    await asyncio.gather(building_task, population_task)
+
+    assert session_factory.events.count("write_commit") >= 2
