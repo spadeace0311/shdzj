@@ -5576,6 +5576,185 @@ git add frontend/package.json frontend/package-lock.json frontend/src/api/client
 git commit -m "feat: link loss products to map layers"
 ```
 
+### Task 16A: Functional Fused-Intensity Map Contract
+
+**Files:**
+- Create: `backend/app/raster_tiles.py`
+- Create: `backend/tests/test_intensity_api.py`
+- Modify: `backend/app/assessment/router.py`
+- Modify: `backend/app/assessment/schemas.py`
+- Modify: `backend/app/loss/router.py`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/types.ts`
+- Modify: `frontend/src/components/LossMap.tsx`
+- Modify: `frontend/src/components/LossAssessmentPanel.tsx`
+- Modify: `frontend/src/pages/EventDetailPage.tsx`
+- Modify: `frontend/tests/loss-map.test.tsx`
+- Modify: `frontend/tests/event-detail.test.tsx`
+- Modify: `frontend/e2e/loss-map.spec.ts`
+
+**Interfaces:**
+- Consumes the persisted `intensity.fusion` `IntensityFieldProduct` and `IntensityRaster`, the current run's `fusion` product summary from `AssessmentRunStatusResponse.intensity`, and the existing `RasterCodec`/`IntensityRepository.load_raster` verified raster contract.
+- Produces authenticated intensity artifact metadata at `GET /api/v1/assessments/runs/{run_id}/intensity/artifact?product_id={product_id}&band={band}`.
+- Produces authenticated PNG tiles at `GET /api/v1/assessments/runs/{run_id}/intensity/artifact/{product_id}/{band}/{z}/{x}/{y}.png`.
+- Produces `LossMap` fused-intensity rendering with a real raster source, visibility toggle, and no-data handling.
+
+- [ ] **Step 1: Write failing backend intensity artifact and tile tests**
+
+Create `backend/tests/test_intensity_api.py` with the project's real PostgreSQL/PostGIS session fixture. Seed one completed run with a `fusion` product and a verified raster containing at least the `value` band. Test:
+
+```python
+async def test_intensity_artifact_returns_verified_tile_template(...):
+    response = await _request_intensity_artifact(run_id, product_id)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["product_id"] == str(product_id)
+    assert payload["bands"][0]["name"] == "value"
+    assert payload["tile_template"].endswith("/{z}/{x}/{y}.png")
+
+
+async def test_intensity_tile_returns_nonblank_png(...):
+    response = await _request_intensity_tile(run_id, product_id, "value", z, x, y)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+```
+
+Also test missing authentication, an unknown run/product, an unknown band, and an unavailable/terminal fusion product. Tests must use the real verified `IntensityRepository.load_raster` path; do not mock the raster checksum away.
+
+- [ ] **Step 2: Run the focused backend tests to verify failure**
+
+Run:
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest tests/test_intensity_api.py -v
+```
+
+Expected: FAIL because the intensity artifact/tile routes do not exist.
+
+- [ ] **Step 3: Implement the shared tile renderer and intensity routes**
+
+Move the existing loss tile geometry/rendering helpers from `backend/app/loss/router.py` into `backend/app/raster_tiles.py` without changing their output:
+
+```python
+MIN_TILE_ZOOM = 0
+MAX_TILE_ZOOM = 22
+
+
+def render_raster_tile(
+    values: np.ndarray,
+    metadata: dict,
+    z: int,
+    x: int,
+    y: int,
+) -> bytes: ...
+```
+
+Update the loss route to import and call `render_raster_tile`; keep the loss tile response behavior unchanged.
+
+Add these response types to `backend/app/assessment/schemas.py`:
+
+```python
+class IntensityGridBandResponse(BaseModel):
+    name: str
+    unit: str | None
+    precision: int | None
+
+
+class IntensityGridArtifactResponse(BaseModel):
+    product_id: str
+    checksum: str
+    width: int
+    height: int
+    srid: int
+    bbox: tuple[float, float, float, float]
+    coverage_ratio: float
+    bands: list[IntensityGridBandResponse]
+    tile_template: str
+```
+
+Add routes in `backend/app/assessment/router.py`:
+
+- Resolve the run and require the product to belong to the run and have `product_type == "fusion"`.
+- Require status `available` or `partial`; terminal products return 404 for artifact requests.
+- Load metadata through `IntensityRepository().load_raster` only when the artifact metadata is needed.
+- Default the selected band to `value` when present, otherwise the first manifest band.
+- Return the same authorization roles as the existing assessment intensity route.
+- Render tiles through the shared `render_raster_tile` helper.
+- Return 422 for zoom outside 0-22 and 404 for unknown run, product, raster, or band.
+- Do not expose raw file paths, local storage locations, credentials, or unverified raster bytes.
+
+- [ ] **Step 4: Write failing frontend contract and map tests**
+
+Add typed intensity product/result/artifact contracts and the client:
+
+```typescript
+export interface IntensityProductSummary {
+  product_id: string;
+  product_type: "model" | "instrument" | "fusion";
+  status: string;
+  quality_grade: string | null;
+  coverage_ratio: number;
+  output_checksum: string | null;
+  statistics: Record<string, unknown>;
+}
+
+export interface IntensityGridArtifact {
+  product_id: string;
+  checksum: string;
+  width: number;
+  height: number;
+  srid: number;
+  bbox: [number, number, number, number];
+  coverage_ratio: number;
+  bands: Array<{
+    name: string;
+    unit: string | null;
+    precision: number | null;
+  }>;
+  tile_template: string;
+}
+
+
+export function getIntensityArtifact(
+  runId: string,
+  productId: string,
+  band?: string,
+): Promise<IntensityGridArtifact>;
+```
+
+Extend `AssessmentRunStatus` with the optional `intensity` result returned by `/events/{event_id}/current`. In `LossAssessmentPanel`, accept `fusedIntensityProductId?: string | null`; when it is present, fetch and pass a `fusedIntensityArtifact` to `LossMap`. `EventDetailPage` derives that ID from the first available/partial `fusion` product and passes it to the panel.
+
+In `frontend/tests/loss-map.test.tsx`, prove:
+
+- `融合烈度` is visible only when a fused artifact is supplied.
+- Toggling it calls `setLayoutProperty` on the real fused raster layer.
+- A missing token creates neither MapLibre nor the intensity raster source.
+- Authenticated requests attach the bearer header only to same-origin loss/intensity artifact tile URLs.
+- Changing the fused artifact band updates the source with `setTiles`.
+- A run/product change that removes the fused artifact removes the fused source/layer and disables the control.
+
+Update the real MapLibre E2E smoke to assert that the fused-intensity toggle and canvas are visible when the fixed Shanghai fixture supplies a fused raster.
+
+- [ ] **Step 5: Run focused and full frontend verification**
+
+Run:
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm test
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run typecheck
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run build
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/app/raster_tiles.py backend/app/assessment/router.py backend/app/assessment/schemas.py backend/app/loss/router.py backend/tests/test_intensity_api.py frontend/src/api/client.ts frontend/src/types.ts frontend/src/components/LossMap.tsx frontend/src/components/LossAssessmentPanel.tsx frontend/src/pages/EventDetailPage.tsx frontend/tests/loss-map.test.tsx frontend/tests/event-detail.test.tsx frontend/e2e/loss-map.spec.ts
+git commit -m "feat: render fused intensity map layer"
+```
+
 ### Task 17: Fixed Scenario, Failure Injection, and Z440 Performance Evidence
 
 **Files:**
