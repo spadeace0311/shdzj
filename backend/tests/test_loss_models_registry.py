@@ -43,3 +43,16 @@ def test_registry_resolves_default_and_version() -> None:
     )
     assert definition.is_default is True
     assert definition.formula_version == "building-structure-matrix-v1"
+
+
+def test_resolved_definition_preserves_source_requirements() -> None:
+    parameter_set = load_parameter_set(PRODUCTION_PARAMETERS)
+    registry = LossModelRegistry()
+    registry.register_defaults(parameter_set)
+    definition = registry.resolve(
+        LossModelType.BUILDING_DAMAGE,
+        "building-structure-matrix-v1",
+    )
+    assert definition.source_requirements == parameter_set.models[
+        LossModelType.BUILDING_DAMAGE
+    ].source_requirements

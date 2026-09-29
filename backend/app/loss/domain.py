@@ -110,6 +110,7 @@ class ModelDefinition:
     input_contract: tuple[str, ...]
     output_contract: tuple[str, ...]
     source_citations: tuple[str, ...]
+    source_requirements: tuple[str, ...]
     calibration_status: LossCalibrationStatus
     is_default: bool
 

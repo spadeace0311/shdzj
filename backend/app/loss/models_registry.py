@@ -166,6 +166,7 @@ class LossModelRegistry:
                     input_contract=parameter_model.input_contract,
                     output_contract=parameter_model.output_contract,
                     source_citations=parameter_model.source_citations,
+                    source_requirements=parameter_model.source_requirements,
                     calibration_status=parameter_set.calibration_status,
                     is_default=True,
                 )
