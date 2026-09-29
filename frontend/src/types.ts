@@ -336,6 +336,40 @@ export interface LossResult {
   products: LossProductSummary[];
 }
 
+export type LossAreaScope = "city" | "county" | "town";
+
+export interface LossAreaFeature {
+  area_scope: LossAreaScope;
+  area_code: string;
+  area_name: string;
+  geometry: Record<string, unknown>;
+  metrics: LossValue[];
+}
+
+export interface LossAreaResponse {
+  run_id: string;
+  scope: LossAreaScope;
+  features: LossAreaFeature[];
+}
+
+export interface LossGridArtifact {
+  product_id: string;
+  checksum: string;
+  width: number;
+  height: number;
+  srid: number;
+  bbox: [number, number, number, number];
+  spatial_allocation_rule: string;
+  coverage_ratio: number;
+  bands: Array<{
+    name: string;
+    unit: string;
+    precision: number | null;
+  }>;
+  spatialized_estimate: boolean;
+  tile_template: string;
+}
+
 const INSTITUTIONAL_LEVEL_LABELS: Record<string, string> = {
   special_major: "特别重大响应",
   major: "重大响应",

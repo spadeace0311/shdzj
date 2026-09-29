@@ -1,5 +1,15 @@
+import { useEffect, useState } from "react";
+
+import {
+  getAccessToken,
+  getLossAreas,
+  getLossArtifact,
+} from "../api/client";
+import { LossMap } from "./LossMap";
 import type {
   LossCalibrationStatus,
+  LossAreaFeature,
+  LossGridArtifact,
   LossProductSummary,
   LossProductType,
   LossResult,
@@ -69,10 +79,97 @@ const RESOURCE_LABELS: Record<string, string> = {
   sickbed: "病床",
 };
 
+const DEFAULT_SHANGHAI_CENTER: [number, number] = [31.2, 121.5];
+
+function selectSpatializedProduct(
+  products: LossProductSummary[],
+): LossProductSummary | null {
+  const candidates = products
+    .filter(
+      (product) =>
+        product.status === "complete" && product.spatialized_estimate,
+    )
+    .sort((left, right) => left.product_type.localeCompare(right.product_type));
+  return candidates[0] ?? null;
+}
+
 export function LossAssessmentPanel({
   runId,
   result,
 }: LossAssessmentPanelProps) {
+  const spatializedProducts = result.products.filter(
+    (product) => product.spatialized_estimate,
+  );
+  const [selectedProductId, setSelectedProductId] = useState<string | null>(
+    () => selectSpatializedProduct(result.products)?.product_id ?? null,
+  );
+  const [selectedTownCode, setSelectedTownCode] = useState<string | null>(null);
+  const [townFeatures, setTownFeatures] = useState<LossAreaFeature[]>([]);
+  const [gridArtifact, setGridArtifact] = useState<LossGridArtifact | null>(
+    null,
+  );
+  const [areaLoadFailed, setAreaLoadFailed] = useState(false);
+  const [artifactLoadFailed, setArtifactLoadFailed] = useState(false);
+
+  useEffect(() => {
+    if (!getAccessToken()) {
+      return;
+    }
+    let active = true;
+    setAreaLoadFailed(false);
+    getLossAreas(runId, "town")
+      .then((response) => {
+        if (active) {
+          setTownFeatures(response.features);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setTownFeatures([]);
+          setAreaLoadFailed(true);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [runId]);
+
+  useEffect(() => {
+    if (!getAccessToken()) {
+      return;
+    }
+    if (!selectedProductId) {
+      setGridArtifact(null);
+      setArtifactLoadFailed(false);
+      return;
+    }
+
+    let active = true;
+    setGridArtifact(null);
+    setArtifactLoadFailed(false);
+    getLossArtifact(runId, selectedProductId)
+      .then((artifact) => {
+        if (active) {
+          setGridArtifact(artifact);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setGridArtifact(null);
+          setArtifactLoadFailed(true);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [runId, selectedProductId]);
+
+  const selectedProduct = spatializedProducts.find(
+    (product) => product.product_id === selectedProductId,
+  );
+  const tileUrlTemplate = import.meta.env
+    .VITE_AMAP_TILE_URL_TEMPLATE as string | undefined;
+
   return (
     <section
       className="loss-assessment"
@@ -91,6 +188,51 @@ export function LossAssessmentPanel({
           ) : null}
         </div>
       </header>
+
+      <div className="loss-map-block">
+        <div className="loss-map-block__controls">
+          <label className="loss-map-product">
+            <span>空间化产品</span>
+            <select
+              value={selectedProductId ?? ""}
+              onChange={(event) => setSelectedProductId(event.target.value)}
+            >
+              <option value="" disabled>
+                请选择空间化产品
+              </option>
+              {spatializedProducts.map((product) => (
+                <option key={product.product_id} value={product.product_id}>
+                  {PRODUCT_LABELS[product.product_type] ?? product.product_type}
+                </option>
+              ))}
+            </select>
+          </label>
+          {areaLoadFailed ? (
+            <span className="loss-map-block__notice">
+              街镇空间数据不可用
+            </span>
+          ) : null}
+          {selectedProductId && artifactLoadFailed ? (
+            <span className="loss-map-block__notice">
+              格网数据不可用
+            </span>
+          ) : null}
+        </div>
+        <LossMap
+          center={DEFAULT_SHANGHAI_CENTER}
+          tileUrlTemplate={tileUrlTemplate}
+          townFeatures={townFeatures}
+          gridArtifact={gridArtifact}
+          selectedTownCode={selectedTownCode}
+          selectedProductLabel={
+            selectedProduct
+              ? PRODUCT_LABELS[selectedProduct.product_type] ??
+                selectedProduct.product_type
+              : undefined
+          }
+          onTownSelect={setSelectedTownCode}
+        />
+      </div>
 
       {result.products.length === 0 ? (
         <p className="loss-assessment__empty">损失评估结果尚未发布</p>

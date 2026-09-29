@@ -10,6 +10,9 @@ import type {
   EventDetail,
   EventIngestResponse,
   EventSummary,
+  LossAreaResponse,
+  LossAreaScope,
+  LossGridArtifact,
   LossResult,
   ManualEventInput,
   TokenResponse,
@@ -216,6 +219,36 @@ export async function getLossAssessment(runId: string): Promise<LossResult> {
     `/api/v1/assessments/runs/${encodeURIComponent(runId)}/loss`,
     {
       headers: authenticatedHeaders("请先登录后查看损失评估结果"),
+    },
+  );
+}
+
+export async function getLossAreas(
+  runId: string,
+  scope: LossAreaScope,
+): Promise<LossAreaResponse> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后查看损失空间结果", 401);
+  }
+  return requestJson<LossAreaResponse>(
+    `/api/v1/assessments/runs/${encodeURIComponent(runId)}/loss/areas?scope=${scope}`,
+    {
+      headers: authenticatedHeaders(),
+    },
+  );
+}
+
+export async function getLossArtifact(
+  runId: string,
+  productId: string,
+): Promise<LossGridArtifact> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后查看损失格网", 401);
+  }
+  return requestJson<LossGridArtifact>(
+    `/api/v1/assessments/runs/${encodeURIComponent(runId)}/loss/artifact?product_id=${encodeURIComponent(productId)}`,
+    {
+      headers: authenticatedHeaders(),
     },
   );
 }
