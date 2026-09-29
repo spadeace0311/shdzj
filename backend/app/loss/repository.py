@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
 
 import numpy as np
@@ -419,7 +419,7 @@ async def _validate_existing_product(
         "status": write.status.value,
         "quality_grade": write.quality_grade.value,
         "calibration_status": write.calibration_status.value,
-        "coverage_ratio": float(write.coverage_ratio),
+        "coverage_ratio": write.coverage_ratio,
         "partial_scope": write.partial_scope,
         "needs_review": write.needs_review,
         "spatialized_estimate": write.spatialized_estimate,
@@ -439,7 +439,7 @@ async def _validate_existing_product(
         "status": existing.status,
         "quality_grade": existing.quality_grade,
         "calibration_status": existing.calibration_status,
-        "coverage_ratio": float(existing.coverage_ratio),
+        "coverage_ratio": existing.coverage_ratio,
         "partial_scope": existing.partial_scope,
         "needs_review": existing.needs_review,
         "spatialized_estimate": existing.spatialized_estimate,
@@ -537,7 +537,7 @@ async def _validate_existing_raster(
         or row.height != incoming.definition.height
         or row.srid != srid
         or row.spatial_allocation_rule != incoming.spatial_allocation_rule
-        or not _same_value(float(row.coverage_ratio), incoming.coverage_ratio)
+        or not _same_value(row.coverage_ratio, incoming.coverage_ratio)
         or dict(row.band_manifest or {}) != incoming.band_manifest
     ):
         raise ValueError("published loss product cannot be overwritten")
@@ -868,21 +868,23 @@ def _residuals_from_manifest(manifest: dict) -> list[GridResidual]:
 
 
 def _same_value(incoming: object, existing: object) -> bool:
-    if isinstance(incoming, Decimal) or isinstance(existing, Decimal):
-        try:
-            return math.isclose(
-                float(incoming),
-                float(existing),
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            )
-        except (TypeError, ValueError):
-            return incoming == existing
-    if isinstance(incoming, float) and isinstance(existing, (int, float)):
-        return math.isclose(float(incoming), float(existing), rel_tol=0.0, abs_tol=1e-12)
-    if isinstance(existing, float) and isinstance(incoming, (int, float)):
-        return math.isclose(float(incoming), float(existing), rel_tol=0.0, abs_tol=1e-12)
+    if _is_stored_numeric(incoming) and _is_stored_numeric(existing):
+        return _canonical_stored_numeric(incoming) == _canonical_stored_numeric(
+            existing
+        )
     return incoming == existing
+
+
+def _is_stored_numeric(value: object) -> bool:
+    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+
+def _canonical_stored_numeric(value: object) -> Decimal:
+    decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    return decimal_value.quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_HALF_UP,
+    )
 
 
 def _grid_definition_from_manifest(manifest: dict) -> GridDefinition:

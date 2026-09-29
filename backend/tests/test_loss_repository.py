@@ -64,6 +64,7 @@ async def _loss_product_write(
     *,
     output_checksum: str = "a" * 64,
     numeric_value: float = 10.0,
+    coverage_ratio: float = 1.0,
 ) -> LossProductWrite:
     async with session_factory() as session:
         task_id = await session.scalar(
@@ -80,7 +81,7 @@ async def _loss_product_write(
         status=LossProductStatus.COMPLETE,
         quality_grade=LossQualityGrade.L3,
         calibration_status=LossCalibrationStatus.UNCALIBRATED,
-        coverage_ratio=1.0,
+        coverage_ratio=coverage_ratio,
         partial_scope=False,
         needs_review=False,
         spatialized_estimate=False,
@@ -304,6 +305,52 @@ async def test_decimal_metric_idempotency_after_database_rounding(
             first = await repository.write_product(session, write)
             second = await repository.write_product(session, write)
         assert first.id == second.id
+
+
+async def test_small_changed_metric_is_rejected_after_database_rounding(
+    session_factory,
+    seeded_assessment_run,
+) -> None:
+    repository = LossRepository()
+    first_write = await _loss_product_write(
+        session_factory,
+        seeded_assessment_run,
+        numeric_value=0.1,
+    )
+    changed_write = await _loss_product_write(
+        session_factory,
+        seeded_assessment_run,
+        numeric_value=0.1000009,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await repository.write_product(session, first_write)
+        with pytest.raises(ValueError, match="cannot be overwritten"):
+            async with session.begin():
+                await repository.write_product(session, changed_write)
+
+
+async def test_small_changed_coverage_is_rejected_after_database_rounding(
+    session_factory,
+    seeded_assessment_run,
+) -> None:
+    repository = LossRepository()
+    first_write = await _loss_product_write(
+        session_factory,
+        seeded_assessment_run,
+        coverage_ratio=0.5,
+    )
+    changed_write = await _loss_product_write(
+        session_factory,
+        seeded_assessment_run,
+        coverage_ratio=0.5000009,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await repository.write_product(session, first_write)
+        with pytest.raises(ValueError, match="cannot be overwritten"):
+            async with session.begin():
+                await repository.write_product(session, changed_write)
 
 
 async def test_persisted_raster_round_trip_recovers_original_grid_version(
