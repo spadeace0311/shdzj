@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- The data-asset-center plan must be complete before Task 3 starts. Its migration `0012_data_asset_center` must already be the database head.
+- The data-asset-center plan must be complete before Task 3 starts. Its migration `0013_data_asset_final_fixes` must already be the database head.
 - Use the frozen `DataAssetService`, `DataAssetSnapshotService`, `data_asset_versions`, `data_asset_snapshots`, `data_asset_records`, and `data_asset_rasters` contracts. Do not create another importer, asset repository, publication workflow, record table, raster table, or snapshot table in `app/loss`.
 - Keep the existing modular monolith, FastAPI, PostgreSQL/PostGIS, Temporal, and 1 km raster boundaries.
 - The authoritative spatial result unit is the town. The 1 km result is a derived spatialized estimate and must be marked `spatialized_estimate=true`.
@@ -131,7 +131,7 @@ Domain modules never import FastAPI, Temporal, SQLAlchemy, GeoAlchemy, or PostGI
 ### Task 1: Loss Schema, ORM Models, and Migration
 
 **Files:**
-- Create: `backend/migrations/versions/0013_loss_assessment.py`
+- Create: `backend/migrations/versions/0014_loss_assessment.py`
 - Create: `backend/app/loss/__init__.py`
 - Create: `backend/app/loss/models.py`
 - Create: `backend/tests/test_loss_schema.py`
@@ -252,8 +252,8 @@ async def test_loss_product_uses_known_status_and_quality_values() -> None:
 Modify `backend/tests/test_migrations.py`:
 
 ```python
-LATEST_REVISION = "0013_loss_assessment"
-LOSS_PREVIOUS_REVISION = "0012_data_asset_center"
+LATEST_REVISION = "0014_loss_assessment"
+LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
 LOSS_TABLES = {
     "loss_model_definitions",
     "loss_parameter_sets",
@@ -275,7 +275,7 @@ async def _loss_tables_exist() -> bool:
     return LOSS_TABLES <= names
 
 
-async def test_0013_loss_assessment_is_reversible() -> None:
+async def test_0014_loss_assessment_is_reversible() -> None:
     _set_revision(LOSS_PREVIOUS_REVISION)
     assert await _loss_tables_exist() is False
     try:
@@ -296,11 +296,11 @@ Run:
 docker compose --env-file .env -f infra/compose.yaml run --rm api pytest tests/test_loss_schema.py tests/test_migrations.py -v
 ```
 
-Expected: FAIL because migration `0013_loss_assessment` and the loss tables do not exist.
+Expected: FAIL because migration `0014_loss_assessment` and the loss tables do not exist.
 
 - [ ] **Step 3: Implement the migration and ORM models**
 
-Create `backend/migrations/versions/0013_loss_assessment.py` with `revision = "0013_loss_assessment"` and `down_revision = "0012_data_asset_center"`.
+Create `backend/migrations/versions/0014_loss_assessment.py` with `revision = "0014_loss_assessment"` and `down_revision = "0013_data_asset_final_fixes"`.
 
 Create the five tables with these required columns:
 
@@ -397,12 +397,12 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api pytest tests/t
 docker compose --env-file .env -f infra/compose.yaml run --rm api ruff check app/loss tests/test_loss_schema.py tests/test_migrations.py
 ```
 
-Expected: PASS and Alembic head is `0013_loss_assessment`.
+Expected: PASS and Alembic head is `0014_loss_assessment`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/migrations/versions/0013_loss_assessment.py backend/migrations/env.py backend/app/loss/__init__.py backend/app/loss/models.py backend/tests/test_loss_schema.py backend/tests/test_migrations.py
+git add backend/migrations/versions/0014_loss_assessment.py backend/migrations/env.py backend/app/loss/__init__.py backend/app/loss/models.py backend/tests/test_loss_schema.py backend/tests/test_migrations.py
 git commit -m "feat: add loss assessment schema"
 ```
 
@@ -7016,7 +7016,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run b
 Expected:
 
 - Compose configuration passes.
-- Alembic head is `0013_loss_assessment`.
+- Alembic head is `0014_loss_assessment`.
 - All backend and frontend tests pass.
 - The fixed Shanghai loss benchmark meets every stage budget and the 300-second hard limit.
 - Ruff passes.
