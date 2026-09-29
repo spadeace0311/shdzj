@@ -10,6 +10,7 @@ from app.collector.router import router as collector_router
 from app.data_assets.router import router as data_assets_router
 from app.db import SessionFactory
 from app.events.router import router as events_router
+from app.loss.router import router as loss_router
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Shanghai Earthquake Emergency API", lifespan=lifespan)
 app.include_router(assessment_router)
+app.include_router(loss_router)
 app.include_router(auth_router)
 app.include_router(events_router)
 app.include_router(collector_router)

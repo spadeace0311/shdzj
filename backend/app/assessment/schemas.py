@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from app.assessment.domain import AssessmentRunStatus, AssessmentTaskStatus
+from app.loss.schemas import LossResultResponse
 
 
 class AssessmentTaskStatusResponse(BaseModel):
@@ -72,5 +73,6 @@ class AssessmentRunStatusResponse(BaseModel):
     total_task_count: int
     tasks: list[AssessmentTaskStatusResponse]
     intensity: IntensityResultResponse | None = None
+    loss: LossResultResponse | None = None
     data_asset_snapshot_fingerprint: str | None
     data_asset_snapshot: dict | None

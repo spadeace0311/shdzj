@@ -15,6 +15,7 @@ from app.auth.router import require_role
 from app.db import SessionFactory
 from app.events.models import EarthquakeEvent
 from app.intensity.repository import IntensityRepository
+from app.loss.router import build_assessment_loss
 
 router = APIRouter(prefix="/api/v1/assessments", tags=["assessments"])
 
@@ -140,11 +141,16 @@ async def get_current_assessment(
                     data_asset_snapshot_fingerprint=run.data_asset_snapshot_fingerprint,
                     data_asset_snapshot=run.data_asset_snapshot_result,
                 )
+                loss = await build_assessment_loss(
+                    session,
+                    run,
+                    effective,
+                )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="assessment storage is unavailable") from exc
-    return _run_response(run, tasks, intensity=intensity)
+    return _run_response(run, tasks, intensity=intensity, loss=loss)
 
 
 def _run_response(
@@ -152,6 +158,7 @@ def _run_response(
     tasks: list[AssessmentTask],
     *,
     intensity: IntensityResultResponse | None,
+    loss: object | None = None,
 ) -> AssessmentRunStatusResponse:
     return AssessmentRunStatusResponse(
         run_id=str(run.id),
@@ -187,6 +194,7 @@ def _run_response(
             for task in tasks
         ],
         intensity=intensity,
+        loss=loss,
         data_asset_snapshot_fingerprint=run.data_asset_snapshot_fingerprint,
         data_asset_snapshot=run.data_asset_snapshot_result,
     )
