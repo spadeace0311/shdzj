@@ -59,26 +59,25 @@ def population_impact_result(
         TownPopulationImpact,
     )
 
+    emergency_shelter_population = min(
+        emergency_shelter_population,
+        affected_population,
+    )
+    temporary_shelter_population = emergency_shelter_population * 0.5
     return PopulationImpactResult(
         towns={
             "t1": TownPopulationImpact(
                 town_code="t1",
-                full_population=1200.0,
+                full_population=affected_population,
                 affected_population=affected_population,
                 emergency_shelter_population=emergency_shelter_population,
-                temporary_shelter_population=500.0,
+                temporary_shelter_population=temporary_shelter_population,
                 by_intensity=(
                     IntensityPopulation(
                         town_code="t1",
-                        intensity_bin=6,
-                        population=600.0,
-                        area_ratio=0.5,
-                    ),
-                    IntensityPopulation(
-                        town_code="t1",
                         intensity_bin=7,
-                        population=400.0,
-                        area_ratio=0.5,
+                        population=affected_population,
+                        area_ratio=1.0,
                     ),
                 ),
             )

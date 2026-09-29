@@ -195,14 +195,25 @@ def assess_casualties(
             intensity = int(_canonical_intensity(item.intensity_bin))
             population_by_bin[intensity] = item
 
-        missing_bins = sorted(
-            set(building_states_by_bin) - set(population_by_bin)
-        )
-        if missing_bins:
-            rendered = ", ".join(str(value) for value in missing_bins)
+        building_bins = set(building_states_by_bin)
+        population_bins = set(population_by_bin)
+        if not building_bins and not population_bins:
             raise CasualtyAssessmentUnavailable(
-                f"building intensity bins have no population coverage "
-                f"for town {town_code}: {rendered}"
+                f"town {town_code} has no building or population intensity coverage"
+            )
+        if building_bins != population_bins:
+            building_only = sorted(building_bins - population_bins)
+            population_only = sorted(population_bins - building_bins)
+            building_only_text = ", ".join(
+                str(value) for value in building_only
+            ) or "-"
+            population_only_text = ", ".join(
+                str(value) for value in population_only
+            ) or "-"
+            raise CasualtyAssessmentUnavailable(
+                f"building and population intensity coverage do not match "
+                f"for town {town_code}; building only: {building_only_text}; "
+                f"population only: {population_only_text}"
             )
 
         injury_ratios = {
@@ -216,9 +227,7 @@ def assess_casualties(
         deaths = 0.0
         injuries = 0.0
         for intensity in sorted(population_by_bin):
-            states = building_states_by_bin.get(intensity, ())
-            if not states:
-                continue
+            states = building_states_by_bin[intensity]
             denominator = sum(
                 _non_negative_value(
                     state.area_m2,
