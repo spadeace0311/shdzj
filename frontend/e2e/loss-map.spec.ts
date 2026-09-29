@@ -20,6 +20,8 @@ test("renders town and grid loss layers with the real MapLibre bundle", async ({
   await expect(map).toBeVisible();
   await expect(map.locator("canvas.maplibregl-canvas")).toBeVisible();
   await expect(page.getByLabel("公里格网为空间化估算")).toBeVisible();
+  await expect(page.getByLabel("融合烈度")).toBeVisible();
+  await page.getByLabel("融合烈度").uncheck();
   await page.getByLabel("街镇损失").uncheck();
   await expect(map.locator(".maplibregl-canvas")).toBeVisible();
 });

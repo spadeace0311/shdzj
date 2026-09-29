@@ -89,6 +89,11 @@ export function EventDetailPage() {
   }, []);
 
   const assessmentRunId = assessment?.run_id;
+  const fusedIntensityProductId = assessment?.intensity?.products.find(
+    (product) =>
+      product.product_type === "fusion" &&
+      (product.status === "available" || product.status === "partial"),
+  )?.product_id;
 
   useEffect(() => {
     if (!assessmentRunId) {
@@ -229,6 +234,7 @@ export function EventDetailPage() {
             <LossAssessmentPanel
               runId={assessmentRunId}
               result={lossState.result}
+              fusedIntensityProductId={fusedIntensityProductId}
             />
           ) : null}
 

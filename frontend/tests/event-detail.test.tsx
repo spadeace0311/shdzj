@@ -2,17 +2,36 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, expect, test, vi } from "vitest";
 
-import { getCurrentAssessment, getEvent } from "../src/api/client";
+import {
+  getCurrentAssessment,
+  getEvent,
+  getLossAssessment,
+} from "../src/api/client";
 import { EventDetailPage } from "../src/pages/EventDetailPage";
-import type { EventDetail } from "../src/types";
+import type {
+  AssessmentRunStatus,
+  EventDetail,
+  LossResult,
+} from "../src/types";
+
+vi.mock("../src/components/LossAssessmentPanel", () => ({
+  LossAssessmentPanel: (props: { fusedIntensityProductId?: string | null }) => (
+    <div
+      data-testid="loss-panel"
+      data-fused={props.fusedIntensityProductId ?? ""}
+    />
+  ),
+}));
 
 vi.mock("../src/api/client", () => ({
   getCurrentAssessment: vi.fn(),
   getEvent: vi.fn(),
+  getLossAssessment: vi.fn(),
 }));
 
 const getCurrentAssessmentMock = vi.mocked(getCurrentAssessment);
 const getEventMock = vi.mocked(getEvent);
+const getLossAssessmentMock = vi.mocked(getLossAssessment);
 
 const baseDetail: EventDetail = {
   id: "event-1",
@@ -53,6 +72,7 @@ beforeEach(() => {
   getCurrentAssessmentMock.mockReset();
   getCurrentAssessmentMock.mockResolvedValue(null);
   getEventMock.mockReset();
+  getLossAssessmentMock.mockReset();
 });
 
 test.each([
@@ -99,4 +119,63 @@ test("renders the event lifecycle state and immutable T1", async () => {
   expect(await screen.findByText("正式报已触发评估")).toBeInTheDocument();
   expect(screen.getByText("T1")).toBeInTheDocument();
   expect(screen.getByText("2026/09/17 10:31:00")).toBeInTheDocument();
+});
+
+test("passes the first available fusion product into the loss map", async () => {
+  const assessment: AssessmentRunStatus = {
+    run_id: "run-1",
+    event_id: "event-1",
+    revision_id: "revision-1",
+    run_no: 1,
+    status: "completed",
+    t1_at: "2026-09-17T02:31:00Z",
+    deadline_at: "2026-09-17T02:36:00Z",
+    completed_task_count: 0,
+    failed_task_count: 0,
+    total_task_count: 0,
+    tasks: [],
+    intensity: {
+      run_id: "run-1",
+      event_id: "event-1",
+      revision_id: "revision-1",
+      run_status: "completed",
+      products: [
+        {
+          product_id: "instrument-1",
+          product_type: "instrument",
+          status: "available",
+          quality_grade: null,
+          coverage_ratio: 1,
+          output_checksum: null,
+          statistics: {},
+        },
+        {
+          product_id: "fusion-1",
+          product_type: "fusion",
+          status: "available",
+          quality_grade: null,
+          coverage_ratio: 1,
+          output_checksum: "f".repeat(64),
+          statistics: {},
+        },
+      ],
+    },
+  };
+  const loss: LossResult = {
+    run_id: "run-1",
+    event_id: "event-1",
+    revision_id: "revision-1",
+    effective_run_id: "run-1",
+    is_fallback: false,
+    products: [],
+  };
+
+  getEventMock.mockResolvedValue(baseDetail);
+  getCurrentAssessmentMock.mockResolvedValue(assessment);
+  getLossAssessmentMock.mockResolvedValue(loss);
+
+  renderDetail("event-1");
+
+  const panel = await screen.findByTestId("loss-panel");
+  expect(panel).toHaveAttribute("data-fused", "fusion-1");
 });

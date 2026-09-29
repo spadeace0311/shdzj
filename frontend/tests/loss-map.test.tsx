@@ -6,6 +6,7 @@ import { buildLossTileRequest, LossMap } from "../src/components/LossMap";
 import { LossAssessmentPanel } from "../src/components/LossAssessmentPanel";
 import { clearAccessToken, setAccessToken } from "../src/api/client";
 import type {
+  IntensityGridArtifact,
   LossAreaFeature,
   LossGridArtifact,
   LossProductSummary,
@@ -203,6 +204,35 @@ const gridArtifact: LossGridArtifact = {
     "/api/v1/assessments/runs/r1/loss/artifact/p1/{band}/{z}/{x}/{y}.png",
 };
 
+const fusedArtifact: IntensityGridArtifact = {
+  product_id: "f1",
+  checksum: "f".repeat(64),
+  width: 1,
+  height: 1,
+  srid: 32651,
+  bbox: [356000, 3449000, 357000, 3450000] as [
+    number,
+    number,
+    number,
+    number,
+  ],
+  coverage_ratio: 1,
+  bands: [
+    {
+      name: "value",
+      unit: null,
+      precision: null,
+    },
+    {
+      name: "sigma",
+      unit: null,
+      precision: null,
+    },
+  ],
+  tile_template:
+    "/api/v1/assessments/runs/r1/intensity/artifact/f1/{band}/{z}/{x}/{y}.png",
+};
+
 function mapModule(): { __maps: MockMap[] } {
   return maplibregl as unknown as { __maps: MockMap[] };
 }
@@ -213,6 +243,7 @@ async function renderMap(
     tileUrlTemplate: string;
     townFeatures: LossAreaFeature[];
     gridArtifact: LossGridArtifact | null;
+    fusedIntensityArtifact: IntensityGridArtifact | null;
     selectedTownCode: string | null;
     onTownSelect: (townCode: string) => void;
   }> = {},
@@ -224,6 +255,7 @@ async function renderMap(
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[]}
       gridArtifact={null}
+      fusedIntensityArtifact={null}
       {...props}
     />,
   );
@@ -246,6 +278,7 @@ it("removes the unavailable fused intensity control", () => {
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[]}
       gridArtifact={null}
+      fusedIntensityArtifact={null}
     />,
   );
 
@@ -259,6 +292,7 @@ it("labels the derived layer as spatialized estimate", () => {
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[]}
       gridArtifact={gridArtifact}
+      fusedIntensityArtifact={null}
     />,
   );
 
@@ -319,6 +353,14 @@ it("authorizes only same-origin loss artifact tile requests", () => {
     url: "/api/v1/assessments/runs/r1/loss/artifact/p1/band/0/0/0.png",
     headers: { Authorization: "Bearer secret-token" },
   });
+  expect(
+    buildLossTileRequest(
+      "/api/v1/assessments/runs/r1/intensity/artifact/f1/band/0/0/0.png",
+    ),
+  ).toEqual({
+    url: "/api/v1/assessments/runs/r1/intensity/artifact/f1/band/0/0/0.png",
+    headers: { Authorization: "Bearer secret-token" },
+  });
   expect(buildLossTileRequest("/api/v1/events")).toEqual({
     url: "/api/v1/events",
   });
@@ -345,10 +387,100 @@ it("does not create a map or loss raster source without a token", () => {
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[]}
       gridArtifact={gridArtifact}
+      fusedIntensityArtifact={fusedArtifact}
     />,
   );
 
   expect(mapModule().__maps).toHaveLength(0);
+});
+
+it("shows the fused intensity control only when a fused artifact is supplied", async () => {
+  const { unmount } = render(
+    <LossMap
+      center={[31.2, 121.5]}
+      tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
+      townFeatures={[]}
+      gridArtifact={null}
+      fusedIntensityArtifact={fusedArtifact}
+    />,
+  );
+
+  expect(screen.getByLabelText("融合烈度")).toBeInTheDocument();
+  unmount();
+
+  render(
+    <LossMap
+      center={[31.2, 121.5]}
+      tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
+      townFeatures={[]}
+      gridArtifact={null}
+      fusedIntensityArtifact={null}
+    />,
+  );
+
+  expect(screen.queryByLabelText("融合烈度")).not.toBeInTheDocument();
+});
+
+it("toggles fused intensity visibility through setLayoutProperty", async () => {
+  const { map } = await renderMap({ fusedIntensityArtifact: fusedArtifact });
+
+  fireEvent.click(screen.getByLabelText("融合烈度"));
+
+  await waitFor(() =>
+    expect(map.setLayoutProperty).toHaveBeenCalledWith(
+      "loss-map-fused-intensity-raster",
+      "visibility",
+      "none",
+    ),
+  );
+});
+
+it("changes the fused artifact band through setTiles", async () => {
+  const { map } = await renderMap({
+    fusedIntensityArtifact: fusedArtifact,
+  });
+
+  await waitFor(() =>
+    expect(map.sources.get("loss-map-fused-intensity")?.tiles).toEqual([
+      "/api/v1/assessments/runs/r1/intensity/artifact/f1/value/{z}/{x}/{y}.png",
+    ]),
+  );
+
+  fireEvent.change(screen.getByLabelText("融合烈度指标"), {
+    target: { value: "sigma" },
+  });
+
+  await waitFor(() =>
+    expect(map.sources.get("loss-map-fused-intensity")?.tiles).toEqual([
+      "/api/v1/assessments/runs/r1/intensity/artifact/f1/sigma/{z}/{x}/{y}.png",
+    ]),
+  );
+});
+
+it("removes the fused source and layer when the artifact disappears", async () => {
+  const { map, rerender } = await renderMap({
+    fusedIntensityArtifact: fusedArtifact,
+  });
+
+  await waitFor(() =>
+    expect(map.getSource("loss-map-fused-intensity")).toBeTruthy(),
+  );
+
+  rerender(
+    <LossMap
+      center={[31.2, 121.5]}
+      tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
+      townFeatures={[]}
+      gridArtifact={null}
+      fusedIntensityArtifact={null}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(map.getSource("loss-map-fused-intensity")).toBeUndefined();
+    expect(map.getLayer("loss-map-fused-intensity-raster")).toBeUndefined();
+  });
+  expect(screen.queryByLabelText("融合烈度")).not.toBeInTheDocument();
 });
 
 it("recreates and synchronizes the map after center changes", async () => {
@@ -362,6 +494,7 @@ it("recreates and synchronizes the map after center changes", async () => {
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[townFeature]}
       gridArtifact={null}
+      fusedIntensityArtifact={null}
     />,
   );
 
@@ -386,6 +519,7 @@ it("updates town fill paint when the selected town changes", async () => {
       tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
       townFeatures={[townFeature]}
       gridArtifact={null}
+      fusedIntensityArtifact={null}
       selectedTownCode="310115001"
     />,
   );
@@ -431,6 +565,7 @@ it("makes basemap tiles reactive to tileUrlTemplate changes", async () => {
       tileUrlTemplate="http://localhost/tiles/b/{z}/{x}/{y}.png"
       townFeatures={[]}
       gridArtifact={null}
+      fusedIntensityArtifact={null}
     />,
   );
 

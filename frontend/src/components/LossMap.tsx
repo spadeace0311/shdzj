@@ -12,7 +12,11 @@ import type {
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import { getAccessToken } from "../api/client";
-import type { LossAreaFeature, LossGridArtifact } from "../types";
+import type {
+  IntensityGridArtifact,
+  LossAreaFeature,
+  LossGridArtifact,
+} from "../types";
 
 const BASEMAP_SOURCE = "loss-map-amap";
 const BASEMAP_LAYER = "loss-map-amap-layer";
@@ -21,6 +25,8 @@ const TOWN_FILL_LAYER = "loss-map-town-fill";
 const TOWN_LINE_LAYER = "loss-map-town-line";
 const GRID_SOURCE = "loss-map-grid";
 const GRID_LAYER = "loss-map-grid-raster";
+const FUSED_SOURCE = "loss-map-fused-intensity";
+const FUSED_LAYER = "loss-map-fused-intensity-raster";
 const BACKGROUND_LAYER = "loss-map-background";
 
 interface LossMapProps {
@@ -28,6 +34,7 @@ interface LossMapProps {
   tileUrlTemplate?: string;
   townFeatures: LossAreaFeature[];
   gridArtifact: LossGridArtifact | null;
+  fusedIntensityArtifact: IntensityGridArtifact | null;
   onTownSelect?: (townCode: string) => void;
   selectedTownCode?: string | null;
   selectedProductLabel?: string;
@@ -46,7 +53,8 @@ export function isLossArtifactTileUrl(url: string): boolean {
     const parsed = new URL(url, window.location.origin);
     return (
       parsed.origin === window.location.origin &&
-      parsed.pathname.includes("/loss/artifact/")
+      (parsed.pathname.includes("/loss/artifact/") ||
+        parsed.pathname.includes("/intensity/artifact/"))
     );
   } catch {
     return false;
@@ -107,6 +115,7 @@ export function LossMap({
   tileUrlTemplate,
   townFeatures,
   gridArtifact,
+  fusedIntensityArtifact,
   onTownSelect,
   selectedTownCode,
   selectedProductLabel,
@@ -116,8 +125,12 @@ export function LossMap({
   const [mapReady, setMapReady] = useState(false);
   const [showTownLoss, setShowTownLoss] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
+  const [showFusedIntensity, setShowFusedIntensity] = useState(true);
   const [selectedBand, setSelectedBand] = useState(
     gridArtifact?.bands[0]?.name ?? "",
+  );
+  const [fusedBand, setFusedBand] = useState(
+    fusedIntensityArtifact?.bands[0]?.name ?? "",
   );
   const centerKey = center.join("|");
 
@@ -129,6 +142,15 @@ export function LossMap({
       setSelectedBand(gridArtifact.bands[0]?.name ?? "");
     }
   }, [gridArtifact, selectedBand]);
+
+  useEffect(() => {
+    if (
+      fusedIntensityArtifact &&
+      !fusedIntensityArtifact.bands.some((band) => band.name === fusedBand)
+    ) {
+      setFusedBand(fusedIntensityArtifact.bands[0]?.name ?? "");
+    }
+  }, [fusedIntensityArtifact, fusedBand]);
 
   const onTownSelectRef = useRef(onTownSelect);
   useEffect(() => {
@@ -299,6 +321,61 @@ export function LossMap({
       return;
     }
 
+    const token = getAccessToken();
+    const tileTemplate =
+      fusedIntensityArtifact && fusedBand && token
+        ? expandTileTemplate(fusedIntensityArtifact.tile_template, fusedBand)
+        : null;
+
+    if (!tileTemplate) {
+      if (map.getLayer(FUSED_LAYER)) {
+        map.removeLayer(FUSED_LAYER);
+      }
+      if (map.getSource(FUSED_SOURCE)) {
+        map.removeSource(FUSED_SOURCE);
+      }
+      return;
+    }
+
+    if (!map.getSource(FUSED_SOURCE)) {
+      map.addSource(FUSED_SOURCE, {
+        type: "raster",
+        tiles: [tileTemplate],
+        tileSize: 256,
+      } satisfies RasterSourceSpecification);
+    } else {
+      (map.getSource(FUSED_SOURCE) as unknown as RasterSourceLike).setTiles([
+        tileTemplate,
+      ]);
+    }
+
+    if (!map.getLayer(FUSED_LAYER)) {
+      map.addLayer(
+        {
+          id: FUSED_LAYER,
+          type: "raster",
+          source: FUSED_SOURCE,
+          layout: {
+            visibility: showFusedIntensity ? "visible" : "none",
+          },
+          paint: {
+            "raster-opacity": 0.68,
+          },
+        },
+        map.getLayer(GRID_LAYER) ? GRID_LAYER : undefined,
+      );
+    }
+  }, [fusedIntensityArtifact, fusedBand, mapReady, showFusedIntensity]);
+
+  useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
     if (!map.getSource(TOWN_SOURCE)) {
       map.addSource(TOWN_SOURCE, {
         type: "geojson",
@@ -383,6 +460,21 @@ export function LossMap({
     );
   }, [mapReady, showGrid]);
 
+  useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
+    const map = mapRef.current;
+    if (!map || !map.getLayer(FUSED_LAYER)) {
+      return;
+    }
+    map.setLayoutProperty(
+      FUSED_LAYER,
+      "visibility",
+      showFusedIntensity ? "visible" : "none",
+    );
+  }, [mapReady, showFusedIntensity]);
+
   const selectedTown =
     townFeatures.find((feature) => feature.area_code === selectedTownCode)
       ?.area_name ?? selectedTownCode;
@@ -407,6 +499,16 @@ export function LossMap({
           />
           <span>公里格网为空间化估算</span>
         </label>
+        {fusedIntensityArtifact ? (
+          <label className="loss-map__toggle">
+            <input
+              type="checkbox"
+              checked={showFusedIntensity}
+              onChange={(event) => setShowFusedIntensity(event.target.checked)}
+            />
+            <span>融合烈度</span>
+          </label>
+        ) : null}
         {gridArtifact && gridArtifact.bands.length > 1 ? (
           <label className="loss-map__band">
             <span>格网指标</span>
@@ -415,6 +517,21 @@ export function LossMap({
               onChange={(event) => setSelectedBand(event.target.value)}
             >
               {gridArtifact.bands.map((band) => (
+                <option key={band.name} value={band.name}>
+                  {band.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        {fusedIntensityArtifact && fusedIntensityArtifact.bands.length > 1 ? (
+          <label className="loss-map__band">
+            <span>融合烈度指标</span>
+            <select
+              value={fusedBand}
+              onChange={(event) => setFusedBand(event.target.value)}
+            >
+              {fusedIntensityArtifact.bands.map((band) => (
                 <option key={band.name} value={band.name}>
                   {band.name}
                 </option>

@@ -60,6 +60,24 @@ class IntensityResultResponse(BaseModel):
     data_asset_snapshot: dict | None
 
 
+class IntensityGridBandResponse(BaseModel):
+    name: str
+    unit: str | None
+    precision: int | None
+
+
+class IntensityGridArtifactResponse(BaseModel):
+    product_id: str
+    checksum: str
+    width: int
+    height: int
+    srid: int
+    bbox: tuple[float, float, float, float]
+    coverage_ratio: float
+    bands: list[IntensityGridBandResponse]
+    tile_template: str
+
+
 class AssessmentRunStatusResponse(BaseModel):
     run_id: str
     event_id: str

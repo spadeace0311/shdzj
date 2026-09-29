@@ -10,6 +10,7 @@ import type {
   EventDetail,
   EventIngestResponse,
   EventSummary,
+  IntensityGridArtifact,
   LossAreaResponse,
   LossAreaScope,
   LossGridArtifact,
@@ -247,6 +248,26 @@ export async function getLossArtifact(
   }
   return requestJson<LossGridArtifact>(
     `/api/v1/assessments/runs/${encodeURIComponent(runId)}/loss/artifact?product_id=${encodeURIComponent(productId)}`,
+    {
+      headers: authenticatedHeaders(),
+    },
+  );
+}
+
+export function getIntensityArtifact(
+  runId: string,
+  productId: string,
+  band?: string,
+): Promise<IntensityGridArtifact> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后查看融合烈度", 401);
+  }
+  const query = new URLSearchParams({ product_id: productId });
+  if (band) {
+    query.set("band", band);
+  }
+  return requestJson<IntensityGridArtifact>(
+    `/api/v1/assessments/runs/${encodeURIComponent(runId)}/intensity/artifact?${query.toString()}`,
     {
       headers: authenticatedHeaders(),
     },

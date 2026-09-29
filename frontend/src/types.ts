@@ -250,6 +250,42 @@ export interface AssessmentTaskStatus {
   last_error: string | null;
 }
 
+export interface IntensityProductSummary {
+  product_id: string;
+  product_type: "model" | "instrument" | "fusion";
+  status: string;
+  quality_grade: string | null;
+  coverage_ratio: number;
+  output_checksum: string | null;
+  statistics: Record<string, unknown>;
+}
+
+export interface IntensityResult {
+  run_id: string;
+  event_id: string;
+  revision_id: string;
+  run_status: string;
+  products: IntensityProductSummary[];
+}
+
+export interface IntensityGridBand {
+  name: string;
+  unit: string | null;
+  precision: number | null;
+}
+
+export interface IntensityGridArtifact {
+  product_id: string;
+  checksum: string;
+  width: number;
+  height: number;
+  srid: number;
+  bbox: [number, number, number, number];
+  coverage_ratio: number;
+  bands: IntensityGridBand[];
+  tile_template: string;
+}
+
 export interface AssessmentRunStatus {
   run_id: string;
   event_id: string;
@@ -262,6 +298,7 @@ export interface AssessmentRunStatus {
   failed_task_count: number;
   total_task_count: number;
   tasks: AssessmentTaskStatus[];
+  intensity?: IntensityResult | null;
 }
 
 export type LossProductType =

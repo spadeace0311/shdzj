@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 
 import {
   getAccessToken,
+  getIntensityArtifact,
   getLossAreas,
   getLossArtifact,
 } from "../api/client";
 import { LossMap } from "./LossMap";
 import type {
   LossCalibrationStatus,
+  IntensityGridArtifact,
   LossAreaFeature,
   LossGridArtifact,
   LossProductSummary,
@@ -20,6 +22,7 @@ import type {
 interface LossAssessmentPanelProps {
   runId: string;
   result: LossResult;
+  fusedIntensityProductId?: string | null;
 }
 
 interface MetricRow {
@@ -96,6 +99,7 @@ function selectSpatializedProduct(
 export function LossAssessmentPanel({
   runId,
   result,
+  fusedIntensityProductId,
 }: LossAssessmentPanelProps) {
   const spatializedProducts = result.products.filter(
     (product) => product.spatialized_estimate,
@@ -108,8 +112,11 @@ export function LossAssessmentPanel({
   const [gridArtifact, setGridArtifact] = useState<LossGridArtifact | null>(
     null,
   );
+  const [fusedIntensityArtifact, setFusedIntensityArtifact] =
+    useState<IntensityGridArtifact | null>(null);
   const [areaLoadFailed, setAreaLoadFailed] = useState(false);
   const [artifactLoadFailed, setArtifactLoadFailed] = useState(false);
+  const [fusedArtifactLoadFailed, setFusedArtifactLoadFailed] = useState(false);
 
   const defaultProductId =
     selectSpatializedProduct(result.products)?.product_id ?? null;
@@ -175,6 +182,36 @@ export function LossAssessmentPanel({
     };
   }, [runId, selectedProductId]);
 
+  useEffect(() => {
+    if (!getAccessToken()) {
+      return;
+    }
+    if (!fusedIntensityProductId) {
+      setFusedIntensityArtifact(null);
+      setFusedArtifactLoadFailed(false);
+      return;
+    }
+
+    let active = true;
+    setFusedIntensityArtifact(null);
+    setFusedArtifactLoadFailed(false);
+    getIntensityArtifact(runId, fusedIntensityProductId)
+      .then((artifact) => {
+        if (active) {
+          setFusedIntensityArtifact(artifact);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setFusedIntensityArtifact(null);
+          setFusedArtifactLoadFailed(true);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [fusedIntensityProductId, runId]);
+
   const selectedProduct = spatializedProducts.find(
     (product) => product.product_id === selectedProductId,
   );
@@ -228,12 +265,18 @@ export function LossAssessmentPanel({
               格网数据不可用
             </span>
           ) : null}
+          {fusedIntensityProductId && fusedArtifactLoadFailed ? (
+            <span className="loss-map-block__notice">
+              融合烈度格网不可用
+            </span>
+          ) : null}
         </div>
         <LossMap
           center={DEFAULT_SHANGHAI_CENTER}
           tileUrlTemplate={tileUrlTemplate}
           townFeatures={townFeatures}
           gridArtifact={gridArtifact}
+          fusedIntensityArtifact={fusedIntensityArtifact}
           selectedTownCode={selectedTownCode}
           selectedProductLabel={
             selectedProduct
