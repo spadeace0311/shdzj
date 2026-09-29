@@ -53,9 +53,26 @@ def _validated_parameter_ratio(
     parameters: ScenarioParameters,
     key: str,
 ) -> float:
-    value = parameters.values[key]
-    if not isfinite(value) or not 0.0 <= value <= 1.0:
+    value = _required_parameter(parameters, key)
+    if not 0.0 <= value <= 1.0:
         raise ValueError(f"{key} must be between zero and one")
+    return value
+
+
+def _required_parameter(
+    parameters: ScenarioParameters,
+    key: str,
+) -> float:
+    try:
+        value = parameters.values[key]
+    except KeyError as exc:
+        raise PopulationImpactUnavailable(
+            f"{key} parameter unavailable"
+        ) from exc
+    if not isfinite(value):
+        raise PopulationImpactUnavailable(
+            f"{key} parameter must be finite"
+        )
     return float(value)
 
 
@@ -77,12 +94,24 @@ def assess_population_impact(
             shares_by_town.setdefault(share.town_code, []).append(share)
 
     affected_min = ceil(
-        parameters.values["affected_population_min_intensity"]
+        _required_parameter(
+            parameters,
+            "affected_population_min_intensity",
+        )
     )
     temporary_shelter_ratio = _validated_parameter_ratio(
         parameters,
         "temporary_shelter_ratio",
     )
+    shelter_ratios = {
+        share.intensity_bin: _validated_parameter_ratio(
+            parameters,
+            f"shelter_ratio.{share.intensity_bin}",
+        )
+        for town_shares in shares_by_town.values()
+        for share in town_shares
+        if share.intensity_bin >= affected_min
+    }
 
     towns: dict[str, TownPopulationImpact] = {}
     for town_code in sorted(exposure_by_town):
@@ -113,10 +142,7 @@ def assess_population_impact(
         affected_population = sum(item.population for item in affected)
         emergency_shelter_population = sum(
             item.population
-            * _validated_parameter_ratio(
-                parameters,
-                f"shelter_ratio.{item.intensity_bin}",
-            )
+            * shelter_ratios[item.intensity_bin]
             for item in affected
         )
         temporary_shelter_population = (

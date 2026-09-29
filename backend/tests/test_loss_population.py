@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from app.loss.domain import LossModelType, LossQualityGrade, LossValueType
+from app.loss.domain import (
+    LossModelType,
+    LossQualityGrade,
+    LossValueType,
+    ScenarioParameters,
+)
 from app.loss.exposure import build_exposure_dataset
 from app.loss.models_registry import load_parameter_set
 from app.loss.population import (
@@ -19,6 +24,10 @@ def _parameters() -> object:
     return load_parameter_set(PARAMETERS).models[
         LossModelType.POPULATION_IMPACT
     ].scenarios[LossValueType.CENTRAL]
+
+
+def _parameters_with(values: dict[str, float]) -> ScenarioParameters:
+    return ScenarioParameters(values=values)
 
 
 def _exposure(*, population: float = 10000.0, town_code: str = "t1") -> object:
@@ -191,11 +200,9 @@ def test_invalid_intensity_bin_is_rejected(intensity_bin: float) -> None:
 
 
 def test_invalid_shelter_ratio_is_rejected() -> None:
-    from app.loss.domain import ScenarioParameters
-
-    parameters = ScenarioParameters(
-        values={
-            "affected_population_min_intensity": 6,
+    parameters = _parameters_with(
+        {
+            "affected_population_min_intensity": 6.0,
             "shelter_ratio.6": 1.01,
             "temporary_shelter_ratio": 0.5,
         }
@@ -209,11 +216,9 @@ def test_invalid_shelter_ratio_is_rejected() -> None:
 
 
 def test_invalid_temporary_shelter_ratio_is_rejected() -> None:
-    from app.loss.domain import ScenarioParameters
-
-    parameters = ScenarioParameters(
-        values={
-            "affected_population_min_intensity": 6,
+    parameters = _parameters_with(
+        {
+            "affected_population_min_intensity": 6.0,
             "shelter_ratio.6": 0.1,
             "temporary_shelter_ratio": 1.01,
         }
@@ -236,3 +241,73 @@ def test_temporary_shelter_is_emergency_shelter_times_ratio() -> None:
     assert town.temporary_shelter_population == pytest.approx(
         town.emergency_shelter_population * 0.5
     )
+
+
+def test_missing_affected_population_min_intensity_is_unavailable() -> None:
+    parameters = _parameters_with(
+        {
+            "temporary_shelter_ratio": 0.5,
+            "shelter_ratio.6": 0.1,
+        }
+    )
+    with pytest.raises(
+        PopulationImpactUnavailable,
+        match="affected_population_min_intensity",
+    ):
+        assess_population_impact(
+            _exposure(),
+            (_share(intensity_bin=6),),
+            parameters,
+        )
+
+
+def test_missing_shelter_ratio_for_affected_bin_is_unavailable() -> None:
+    parameters = _parameters_with(
+        {
+            "affected_population_min_intensity": 6.0,
+            "temporary_shelter_ratio": 0.5,
+        }
+    )
+    with pytest.raises(PopulationImpactUnavailable, match="shelter_ratio.6"):
+        assess_population_impact(
+            _exposure(),
+            (_share(intensity_bin=6),),
+            parameters,
+        )
+
+
+def test_missing_temporary_shelter_ratio_is_unavailable() -> None:
+    parameters = _parameters_with(
+        {
+            "affected_population_min_intensity": 6.0,
+            "shelter_ratio.6": 0.1,
+        }
+    )
+    with pytest.raises(
+        PopulationImpactUnavailable,
+        match="temporary_shelter_ratio",
+    ):
+        assess_population_impact(
+            _exposure(),
+            (_share(intensity_bin=6),),
+            parameters,
+        )
+
+
+def test_non_finite_affected_population_min_intensity_is_unavailable() -> None:
+    parameters = _parameters_with(
+        {
+            "affected_population_min_intensity": float("nan"),
+            "temporary_shelter_ratio": 0.5,
+            "shelter_ratio.6": 0.1,
+        }
+    )
+    with pytest.raises(
+        PopulationImpactUnavailable,
+        match="affected_population_min_intensity",
+    ):
+        assess_population_impact(
+            _exposure(),
+            (_share(intensity_bin=6),),
+            parameters,
+        )
