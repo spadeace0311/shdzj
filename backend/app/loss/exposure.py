@@ -140,6 +140,8 @@ def build_exposure_dataset(
     }
     if len(town_rows) != len(towns):
         raise ValueError("duplicate town code in population asset")
+    if len(geometry_rows) != len(geometries):
+        raise ValueError("duplicate town code in boundary asset")
     if set(town_rows) != set(geometry_rows):
         raise ValueError("town population and boundary business keys do not match")
     if any(value is None or not value.strip() for value in geometry_rows.values()):

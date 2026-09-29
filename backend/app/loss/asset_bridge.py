@@ -92,16 +92,17 @@ async def load_locked_parameter_set(
     *,
     run_id: UUID,
     profile: RegionLossProfile,
+    snapshots: DataAssetSnapshotService | None = None,
 ) -> ParameterSet:
-    snapshots = DataAssetSnapshotService()
-    version = await snapshots.get_locked_version(
+    snapshot_service = snapshots or DataAssetSnapshotService()
+    version = await snapshot_service.get_locked_version(
         session,
         run_id=run_id,
         asset_key=profile.asset_keys.loss_parameters,
     )
     if version is None:
         raise LookupError("loss parameter asset is not locked")
-    records = await snapshots.list_locked_records(
+    records = await snapshot_service.list_locked_records(
         session,
         run_id=run_id,
         asset_key=profile.asset_keys.loss_parameters,
