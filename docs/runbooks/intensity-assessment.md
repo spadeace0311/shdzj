@@ -86,8 +86,9 @@ ORDER BY run_no DESC;
 
 - `intensity.model` 为 `succeeded`。
 - `intensity.fusion` 为 `succeeded`。
-- 后六个损失、报告和协同任务为 `skipped`，原因 `out_of_phase_scope`。
-- 运行状态为 `completed`，`algorithm_bundle_version` 为 `intensity-v1`。
+- `loss.population`、`loss.buildings`、`loss.casualties`、`loss.economic`、`loss.resources`、`loss.validate` 为 `succeeded`。
+- `report.rapid_assessment` 与 `workgroup.response_tasks` 为 `skipped`。
+- 运行状态为 `completed`，`algorithm_bundle_version` 为 `intensity-loss-v1`。
 
 仪器任务有两种正确结果：
 

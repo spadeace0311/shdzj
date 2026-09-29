@@ -108,7 +108,7 @@ report.rapid_assessment
 workgroup.response_tasks
 ```
 
-前八个任务必须成功才能完成运行。`report.rapid_assessment` 与 `workgroup.response_tasks` 仍为 `skipped`。
+完成运行的必要任务为 `intensity.model`、`intensity.fusion` 以及 `loss.population`、`loss.buildings`、`loss.casualties`、`loss.economic`、`loss.resources`、`loss.validate`。`intensity.instrument` 是可选降级任务，`report.rapid_assessment` 与 `workgroup.response_tasks` 仍为 `skipped`。
 
 运行完成后，认证读取：
 
@@ -116,7 +116,7 @@ workgroup.response_tasks
 GET /api/v1/assessments/runs/{run_id}/loss
 ```
 
-该请求返回 HTTP 200 并包含六类已发布产品时，视为固定场景验收完成。硬验收时间是 `report_ingested_at` 到该请求返回 HTTP 200 的经过时间，上限 300 秒。
+该请求返回 HTTP 200 并包含六类已发布产品时，视为固定场景验收完成。验收时间从 `report_ingested_at` 到该请求返回 HTTP 200；300 秒是五分钟告警阈值，1800 秒才是技术安全超时。
 
 ## Reading Building, Population, Casualty, Economic, and Resource Products
 
@@ -196,6 +196,8 @@ WHERE product_id = '<product-id>';
 ## Handling Missing Parameters
 
 缺少单个资源系数时，只把该资源指标标记为 `unavailable`，不得阻塞其他已具备完整系数的资源。生产参数集保持 `reference_uncalibrated`，直到每个系数都有审核来源和上海校核证据。
+
+`loss.resources` 只有在每个资源种类都得到最终 `available` 或 `unavailable` 状态时才成功；缺少单个系数对应 `unavailable`，不能把该资源记为成功或计为零。
 
 核验资源缺口：
 
@@ -312,5 +314,5 @@ docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run b
 
 - Alembic 头为 `0014_loss_assessment`。
 - 后端 `pytest -v` 全部通过。
-- 固定上海损失性能测试通过；四个阶段预算为诊断指标，硬验收时间是 `report_ingested_at` 到认证 `GET /loss` HTTP 200 的经过时间不超过 300 秒。阶段耗时之和不等同于总耗时。
+- 固定上海损失性能测试通过；四个阶段预算为诊断指标。五分钟告警阈值为 300 秒，技术安全超时为 1800 秒；硬验收时间是 `report_ingested_at` 到认证 `GET /loss` HTTP 200 的经过时间不超过 300 秒。阶段耗时之和不等同于总耗时。
 - Ruff、前端测试、类型检查和构建全部通过。

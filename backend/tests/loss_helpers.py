@@ -390,15 +390,17 @@ async def _publish_fixed_assets(
             "severely_damaged",
             "collapsed",
         ):
-            source_key = f"vulnerability.rc_frame.7.{damage_state}"
-            target_key = f"vulnerability.rc_frame.6.{damage_state}"
-            values[target_key] = values[source_key]
+            values[f"vulnerability.rc_frame.6.{damage_state}"] = values[
+                f"vulnerability.rc_frame.7.{damage_state}"
+            ]
+            values[f"vulnerability.rc_frame.5.{damage_state}"] = values[
+                f"vulnerability.rc_frame.7.{damage_state}"
+            ]
     casualty_models = loss_document["models"]["casualties"]["scenarios"]
     for scenario in ("low", "central", "high"):
         values = casualty_models[scenario]["values"]
-        values["injury_to_death_ratio.6"] = values[
-            "injury_to_death_ratio.7"
-        ]
+        values["injury_to_death_ratio.6"] = values["injury_to_death_ratio.7"]
+        values["injury_to_death_ratio.5"] = values["injury_to_death_ratio.7"]
     assets["shanghai.loss.parameters"] = NormalizedTableData(
         columns=tuple(sorted(loss_document)),
         records=(
