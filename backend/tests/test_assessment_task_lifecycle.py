@@ -154,12 +154,25 @@ async def _start_task(
             )
 
 
-async def _complete_required_tasks(session, run_id) -> None:
+async def _complete_required_tasks(
+    session,
+    run_id,
+    *,
+    exclude: str | None = None,
+) -> None:
     repository = AssessmentRepository()
     for task_key, algorithm_version, fingerprint in (
         ("intensity.model", "model-axis-ratio-v1", "a" * 64),
         ("intensity.fusion", "fusion-inverse-variance-v1", "b" * 64),
+        ("loss.population", "loss-population-test-v1", "c" * 64),
+        ("loss.buildings", "loss-buildings-test-v1", "d" * 64),
+        ("loss.casualties", "loss-casualties-test-v1", "e" * 64),
+        ("loss.economic", "loss-economic-test-v1", "f" * 64),
+        ("loss.resources", "loss-resources-test-v1", "9" * 64),
+        ("loss.validate", "loss-validate-test-v1", "0" * 64),
     ):
+        if task_key == exclude:
+            continue
         task = await session.scalar(
             select(AssessmentTask).where(
                 AssessmentTask.run_id == run_id,
@@ -427,6 +440,24 @@ async def test_completed_run_sets_deadline_and_effective_pointer(session_factory
 
     assert completed.status == "completed"
     assert event.effective_assessment_run_id == run.id
+
+
+async def test_complete_run_rejects_missing_required_loss_task(
+    session_factory,
+) -> None:
+    run = await _seed_run(session_factory)
+    repository = AssessmentRepository()
+
+    async with session_factory() as session:
+        async with session.begin():
+            await repository.start_run(session, run.id)
+            await _complete_required_tasks(
+                session,
+                run.id,
+                exclude="loss.population",
+            )
+            with pytest.raises(ValueError, match="required assessment tasks"):
+                await repository.complete_run(session, run.id, "bundle-1")
 
 
 async def test_run_transition_and_completion_idempotency(session_factory) -> None:
