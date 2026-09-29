@@ -1,0 +1,32 @@
+version: "shanghai-loss-region-v1"
+region_id: "shanghai"
+name: "上海市"
+administrative_level: "province"
+area_crs: "EPSG:32651"
+output_crs: "EPSG:4326"
+population_field: "total"
+population_fields_for_audit:
+  - "resident"
+  - "floating"
+affected_population_min_intensity: 6.0
+spatial_allocation_rule: "town-uniform-v1"
+grid_resolution_m: 1000
+minimum_town_coverage_ratio: 0.95
+grid_residual_review_threshold: 0.01
+assets:
+  admin_city: "shanghai.admin.city"
+  admin_county: "shanghai.admin.county"
+  admin_town: "shanghai.admin.town"
+  population_town: "shanghai.population.town"
+  building_town: "shanghai.building.town"
+  economy_county: "shanghai.economy.county"
+  loss_parameters: "shanghai.loss.parameters"
+  fault: "shanghai.fault"
+  gdp_raster: "shanghai.gdp.raster"
+  dem_raster: "shanghai.dem.raster"
+default_model_versions:
+  building_damage: "building-structure-matrix-v1"
+  population_impact: "population-intensity-v1"
+  casualties: "casualty-building-intensity-v1"
+  economic_loss: "economic-building-loss-v1"
+  resource_demand: "resource-linear-demand-v1"
