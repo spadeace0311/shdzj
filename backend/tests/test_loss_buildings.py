@@ -13,6 +13,7 @@ from app.loss.domain import (
 from app.loss.exposure import build_exposure_dataset
 from app.loss.models_registry import load_parameter_set
 from app.loss.spatial import TownIntensityShare
+from tests.loss_factories import building_damage_result
 
 
 PARAMETERS = Path("tests/fixtures/loss-test-parameters.yaml")
@@ -240,3 +241,11 @@ def test_top_level_grade_is_worst_town_grade() -> None:
     assert result.towns["t2"].quality_grade is LossQualityGrade.L3
     assert result.quality_grade is LossQualityGrade.L3
     assert result.fallback_model_used is True
+
+
+def test_shared_building_factory_preserves_total_area() -> None:
+    result = building_damage_result()
+    town = result.towns["t1"]
+    assert sum(state.area_m2 for state in town.states) == pytest.approx(
+        town.total_area_m2
+    )
