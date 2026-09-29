@@ -14,14 +14,22 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0013_data_asset_final_fixes"
+LATEST_REVISION = "0014_loss_assessment"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
+LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
 NON_CENC_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"
 MIGRATION_TEST_VERSION = "migration-test-0008"
 NON_CENC_MIGRATION_TEST_PREFIX = "migration-test-noncenc-"
+LOSS_TABLES = {
+    "loss_model_definitions",
+    "loss_parameter_sets",
+    "loss_products",
+    "loss_metric_values",
+    "loss_product_rasters",
+}
 _USE_DATABASE_DEFAULT = object()
 
 
@@ -398,6 +406,18 @@ async def _intensity_tables_exist() -> bool:
     } <= names
 
 
+async def _loss_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+    finally:
+        await engine.dispose()
+    return LOSS_TABLES <= names
+
+
 async def _intensity_schema_state() -> dict[str, object]:
     tables = (
         "assessment_runs",
@@ -756,4 +776,17 @@ async def test_0009_backfills_non_cenc_events_and_downgrade_upgrade_is_reversibl
         assert "not_applicable" in re_upgraded["default"]
     finally:
         await _delete_non_cenc_migration_test_rows()
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0014_loss_assessment_is_reversible() -> None:
+    _set_revision(LOSS_PREVIOUS_REVISION)
+    assert await _loss_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        assert await _loss_tables_exist() is True
+        _set_revision(LOSS_PREVIOUS_REVISION)
+        assert await _loss_tables_exist() is False
+        _set_revision(LATEST_REVISION)
+    finally:
         _set_revision(LATEST_REVISION)
