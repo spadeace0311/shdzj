@@ -4,6 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import numpy as np
@@ -382,6 +383,11 @@ def _normalized_loss_bands(
     if len({name for name, _ in normalized}) != len(normalized):
         raise ValueError("raster band names must be unique")
 
+    if not isinstance(raster.band_manifest.get("grid"), dict):
+        raise ValueError("loss raster manifest must include grid metadata")
+    if _grid_definition_from_manifest(raster.band_manifest) != raster.definition:
+        raise ValueError("loss raster manifest grid does not match raster definition")
+
     manifest_bands = raster.band_manifest.get("bands")
     if not isinstance(manifest_bands, list) or len(manifest_bands) != len(
         normalized
@@ -712,15 +718,14 @@ async def _load_and_verify_raster(
     checksum = str(row["checksum"])
     if expected_checksum is not None and checksum != expected_checksum:
         raise RuntimeError("persisted loss raster checksum verification failed")
-    if expected_definition is not None or isinstance(manifest.get("grid"), dict):
-        computed = RasterCodec.content_checksum(
-            definition,
-            decoded_bands,
-            manifest,
-            checksum_namespace=LOSS_RASTER_CHECKSUM_NAMESPACE,
-        )
-        if checksum != computed:
-            raise RuntimeError("persisted loss raster checksum verification failed")
+    computed = RasterCodec.content_checksum(
+        definition,
+        decoded_bands,
+        manifest,
+        checksum_namespace=LOSS_RASTER_CHECKSUM_NAMESPACE,
+    )
+    if checksum != computed:
+        raise RuntimeError("persisted loss raster checksum verification failed")
 
     return decoded_bands, {
         "crs": CRS.from_epsg(actual_srid).to_string() if actual_srid else None,
@@ -863,6 +868,16 @@ def _residuals_from_manifest(manifest: dict) -> list[GridResidual]:
 
 
 def _same_value(incoming: object, existing: object) -> bool:
+    if isinstance(incoming, Decimal) or isinstance(existing, Decimal):
+        try:
+            return math.isclose(
+                float(incoming),
+                float(existing),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        except (TypeError, ValueError):
+            return incoming == existing
     if isinstance(incoming, float) and isinstance(existing, (int, float)):
         return math.isclose(float(incoming), float(existing), rel_tol=0.0, abs_tol=1e-12)
     if isinstance(existing, float) and isinstance(incoming, (int, float)):
@@ -870,33 +885,29 @@ def _same_value(incoming: object, existing: object) -> bool:
     return incoming == existing
 
 
+def _grid_definition_from_manifest(manifest: dict) -> GridDefinition:
+    grid = manifest.get("grid")
+    if not isinstance(grid, dict):
+        raise RuntimeError("persisted loss raster manifest is missing grid metadata")
+    try:
+        return GridDefinition(
+            version=str(grid["version"]),
+            crs=str(grid["crs"]),
+            resolution_m=int(grid["resolution_m"]),
+            origin_x=float(grid["origin_x"]),
+            origin_y=float(grid["origin_y"]),
+            width=int(grid["width"]),
+            height=int(grid["height"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("persisted loss raster grid metadata is invalid") from exc
+
+
 def _grid_definition_from_raster_row(
     manifest: dict,
     row,
 ) -> GridDefinition:
-    grid = manifest.get("grid")
-    if isinstance(grid, dict):
-        try:
-            return GridDefinition(
-                version=str(grid["version"]),
-                crs=str(grid["crs"]),
-                resolution_m=int(grid["resolution_m"]),
-                origin_x=float(grid["origin_x"]),
-                origin_y=float(grid["origin_y"]),
-                width=int(grid["width"]),
-                height=int(grid["height"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("persisted loss raster grid metadata is invalid") from exc
-    return GridDefinition(
-        version=str(row["raster_version"]),
-        crs=CRS.from_epsg(int(row["actual_srid"])).to_string(),
-        resolution_m=int(abs(float(row["scale_x"]))),
-        origin_x=float(row["origin_x"]),
-        origin_y=float(row["origin_y"]),
-        width=int(row["actual_width"]),
-        height=int(row["actual_height"]),
-    )
+    return _grid_definition_from_manifest(manifest)
 
 
 def _manifest_bands(manifest: dict) -> list[dict]:
