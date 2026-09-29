@@ -1310,3 +1310,251 @@ a:hover {
     position: static;
   }
 }
+
+.loss-assessment {
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--teal);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 18px 20px 20px;
+  box-shadow: var(--shadow);
+}
+
+.loss-assessment__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.loss-assessment__header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.loss-assessment__run {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.loss-assessment__run-label {
+  color: var(--text-muted);
+}
+
+.loss-assessment__fallback {
+  border-radius: 3px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  padding: 3px 7px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.loss-assessment__empty {
+  margin: 18px 0 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  padding: 22px;
+  text-align: center;
+}
+
+.loss-product-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.loss-product {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  padding: 16px;
+}
+
+.loss-product__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.loss-product__header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.loss-product__badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.loss-product-status,
+.loss-product-quality,
+.loss-product-calibration {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 3px;
+  padding: 3px 7px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.loss-product-status--complete {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.loss-product-status--partial {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.loss-product-status--review {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.loss-product-status--unavailable {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.loss-product-quality {
+  background: #edf2f5;
+  color: var(--text);
+}
+
+.loss-product-calibration {
+  background: var(--surface);
+  color: var(--text-muted);
+}
+
+.loss-product-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin: 15px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--line);
+}
+
+.loss-product-facts > div {
+  min-width: 0;
+  min-height: 60px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.loss-product-facts dt {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.loss-product-facts dd {
+  overflow-wrap: anywhere;
+  margin: 7px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.loss-product-reason {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  border-left: 3px solid var(--red);
+  background: var(--red-soft);
+  color: var(--red);
+  padding: 9px 11px;
+}
+
+.loss-product-reason__label {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.loss-product-reason__text {
+  min-width: 0;
+}
+
+.loss-metrics {
+  margin-top: 16px;
+}
+
+.loss-metrics__heading {
+  margin-bottom: 7px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.loss-metrics__scroll {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+}
+
+.loss-metrics__table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.loss-metrics__table th,
+.loss-metrics__table td {
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.loss-metrics__table th {
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.loss-metrics__table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.loss-value {
+  font-weight: 700;
+}
+
+.loss-value--zero,
+.loss-value--rounded_to_zero {
+  color: var(--text-muted);
+}
+
+.loss-value--unavailable,
+.loss-value--not_applicable {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.loss-metrics__empty {
+  margin: 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  padding: 16px;
+  text-align: center;
+}

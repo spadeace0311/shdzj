@@ -264,6 +264,78 @@ export interface AssessmentRunStatus {
   tasks: AssessmentTaskStatus[];
 }
 
+export type LossProductType =
+  | "building_damage"
+  | "population_impact"
+  | "casualties"
+  | "economic_loss"
+  | "resource_demand"
+  | "validation";
+
+export type LossProductStatus =
+  | "complete"
+  | "partial"
+  | "unavailable"
+  | "invalid";
+
+export type LossQualityGrade = "L1" | "L2" | "L3" | "L0";
+
+export type LossCalibrationStatus =
+  | "calibrated"
+  | "reference_uncalibrated"
+  | "uncalibrated";
+
+export type LossValueType = "low" | "central" | "high";
+
+export type LossValueStatus =
+  | "available"
+  | "zero"
+  | "rounded_to_zero"
+  | "unavailable"
+  | "not_applicable";
+
+export interface LossValue {
+  area_scope: string;
+  area_code: string;
+  area_name: string | null;
+  metric_key: string;
+  value_type: LossValueType;
+  value_status: LossValueStatus;
+  numeric_value: number | null;
+  unit: string;
+  precision: number | null;
+  quality_grade: LossQualityGrade;
+  note: string | null;
+}
+
+export interface LossProductSummary {
+  product_id: string;
+  product_type: LossProductType;
+  status: LossProductStatus;
+  quality_grade: LossQualityGrade;
+  calibration_status: LossCalibrationStatus;
+  coverage_ratio: number;
+  partial_scope: boolean;
+  needs_review: boolean;
+  spatialized_estimate: boolean;
+  algorithm_version: string;
+  parameter_version: string;
+  region_profile_version: string;
+  output_checksum: string | null;
+  statistics: Record<string, unknown>;
+  metrics: LossValue[];
+  reason: string | null;
+}
+
+export interface LossResult {
+  run_id: string;
+  event_id: string;
+  revision_id: string;
+  effective_run_id: string | null;
+  is_fallback: boolean;
+  products: LossProductSummary[];
+}
+
 const INSTITUTIONAL_LEVEL_LABELS: Record<string, string> = {
   special_major: "特别重大响应",
   major: "重大响应",

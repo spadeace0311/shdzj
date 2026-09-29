@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { getCurrentAssessment, getEvent } from "../api/client";
+import { ApiError, getCurrentAssessment, getEvent, getLossAssessment } from "../api/client";
 import { AssessmentProgressCard } from "../components/AssessmentProgressCard";
+import { LossAssessmentPanel } from "../components/LossAssessmentPanel";
 import { ResponseSuggestionCard } from "../components/ResponseSuggestionCard";
 import {
   formatCoordinate,
@@ -16,15 +17,23 @@ import {
   isTestOrDrill,
   type AssessmentRunStatus,
   type EventDetail,
+  type LossResult,
 } from "../types";
 
 type DetailStatus = "loading" | "ready" | "error";
+type LossLoadState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; result: LossResult }
+  | { status: "error" };
 
 export function EventDetailPage() {
   const { eventId = "" } = useParams();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [assessment, setAssessment] = useState<AssessmentRunStatus | null>(null);
   const [status, setStatus] = useState<DetailStatus>("loading");
+  const [lossState, setLossState] = useState<LossLoadState>({ status: "idle" });
+  const lossRequestRef = useRef(0);
 
   const loadDetail = useCallback(async () => {
     setStatus("loading");
@@ -58,6 +67,37 @@ export function EventDetailPage() {
       active = false;
     };
   }, [eventId]);
+
+  const loadLoss = useCallback(async (runId: string) => {
+    const requestId = ++lossRequestRef.current;
+    setLossState({ status: "loading" });
+    try {
+      const result = await getLossAssessment(runId);
+      if (requestId === lossRequestRef.current) {
+        setLossState({ status: "ready", result });
+      }
+    } catch (error) {
+      if (requestId !== lossRequestRef.current) {
+        return;
+      }
+      if (error instanceof ApiError && error.status === 404) {
+        setLossState({ status: "idle" });
+      } else {
+        setLossState({ status: "error" });
+      }
+    }
+  }, []);
+
+  const assessmentRunId = assessment?.run_id;
+
+  useEffect(() => {
+    if (!assessmentRunId) {
+      lossRequestRef.current += 1;
+      setLossState({ status: "idle" });
+      return;
+    }
+    void loadLoss(assessmentRunId);
+  }, [assessmentRunId, loadLoss]);
 
   const suggestion = event?.response_suggestion;
   const causes =
@@ -160,6 +200,37 @@ export function EventDetailPage() {
           </section>
 
           <AssessmentProgressCard run={assessment} />
+
+          {lossState.status === "loading" ? (
+            <div className="state-panel">
+              <span className="state-icon" aria-hidden="true" />
+              <p>正在加载损失评估结果</p>
+            </div>
+          ) : null}
+
+          {lossState.status === "error" ? (
+            <div className="state-panel state-panel--error" role="alert">
+              <p>无法加载损失评估结果</p>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => {
+                  if (assessmentRunId) {
+                    void loadLoss(assessmentRunId);
+                  }
+                }}
+              >
+                重试
+              </button>
+            </div>
+          ) : null}
+
+          {lossState.status === "ready" && assessmentRunId ? (
+            <LossAssessmentPanel
+              runId={assessmentRunId}
+              result={lossState.result}
+            />
+          ) : null}
 
           <section className="detail-block">
             <header className="section-header">

@@ -10,6 +10,7 @@ import type {
   EventDetail,
   EventIngestResponse,
   EventSummary,
+  LossResult,
   ManualEventInput,
   TokenResponse,
   ValidationReport,
@@ -41,9 +42,11 @@ export function clearAccessToken(): void {
   accessToken = null;
 }
 
-function authHeaders(): Record<string, string> {
+function authenticatedHeaders(
+  message = "请先登录后管理数据资产",
+): Record<string, string> {
   if (!accessToken) {
-    throw new ApiError("请先登录后管理数据资产", 401);
+    throw new ApiError(message, 401);
   }
   return { Authorization: `Bearer ${accessToken}` };
 }
@@ -172,7 +175,7 @@ export async function login(username: string, password: string): Promise<TokenRe
 
 export async function getCurrentUser(): Promise<CurrentUser> {
   return requestJson<CurrentUser>("/api/v1/auth/me", {
-    headers: authHeaders(),
+    headers: authenticatedHeaders(),
   });
 }
 
@@ -194,9 +197,7 @@ export async function getCurrentAssessment(
     return await requestJson<AssessmentRunStatus>(
       `/api/v1/assessments/events/${encodeURIComponent(eventId)}/current`,
       {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
+        headers: authenticatedHeaders(),
       },
     );
   } catch (error) {
@@ -207,15 +208,25 @@ export async function getCurrentAssessment(
   }
 }
 
+export async function getLossAssessment(runId: string): Promise<LossResult> {
+  if (!accessToken) {
+    throw new ApiError("请先登录后查看损失评估结果", 401);
+  }
+  return requestJson<LossResult>(
+    `/api/v1/assessments/runs/${encodeURIComponent(runId)}/loss`,
+    {
+      headers: authenticatedHeaders("请先登录后查看损失评估结果"),
+    },
+  );
+}
+
 export async function getCollectorStatus(): Promise<CollectorStatus> {
   if (!accessToken) {
     throw new ApiError("请先登录后查看采集状态", 401);
   }
 
   return requestJson<CollectorStatus>("/api/v1/collector/status", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
+    headers: authenticatedHeaders("请先登录后查看采集状态"),
   });
 }
 
@@ -238,7 +249,7 @@ export async function createManualEvent(
 
 export async function listDataAssets(): Promise<DataAssetSummary[]> {
   return requestJson<DataAssetSummary[]>("/api/v1/data-assets", {
-    headers: authHeaders(),
+    headers: authenticatedHeaders(),
   });
 }
 
@@ -247,7 +258,7 @@ export async function listDataAssetVersions(
 ): Promise<DataAssetVersion[]> {
   const query = assetKey ? `?asset_key=${encodeURIComponent(assetKey)}` : "";
   return requestJson<DataAssetVersion[]>(`/api/v1/data-asset-versions${query}`, {
-    headers: authHeaders(),
+    headers: authenticatedHeaders(),
   });
 }
 
@@ -267,7 +278,7 @@ export async function importDataAsset(
     `/api/v1/data-assets/${encodeURIComponent(assetKey)}/import`,
     {
       method: "POST",
-      headers: authHeaders(),
+      headers: authenticatedHeaders(),
       body,
     },
     null,
@@ -279,7 +290,7 @@ export async function getDataAssetImportJob(
 ): Promise<DataAssetImportJob> {
   return requestJson<DataAssetImportJob>(
     `/api/v1/data-asset-import-jobs/${encodeURIComponent(jobId)}`,
-    { headers: authHeaders() },
+    { headers: authenticatedHeaders() },
   );
 }
 
@@ -288,7 +299,7 @@ export async function validateDataAssetVersion(
 ): Promise<ValidationReport> {
   return requestJson<ValidationReport>(
     `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/validate`,
-    { method: "POST", headers: authHeaders() },
+    { method: "POST", headers: authenticatedHeaders() },
   );
 }
 
@@ -300,7 +311,7 @@ export async function publishDataAssetVersion(
     `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/publish`,
     {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { ...authenticatedHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ reason }),
     },
   );
@@ -314,7 +325,7 @@ export async function retireDataAssetVersion(
     `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/retire`,
     {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { ...authenticatedHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ reason }),
     },
   );
@@ -328,7 +339,7 @@ export async function rollbackDataAssetVersion(
     `/api/v1/data-asset-versions/${encodeURIComponent(versionId)}/rollback`,
     {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { ...authenticatedHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({ reason }),
     },
   );
