@@ -15,8 +15,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.assessment.models import AssessmentRun
 from app.assessment.repository import AssessmentRepository
 from app.auth.router import require_role
-from app.config import settings
-from app.data_assets.models import DataAsset, DataAssetRecord, DataAssetVersion
+from app.data_assets.models import DataAssetRecord
+from app.data_assets.snapshot_service import DataAssetSnapshotService
 from app.db import SessionFactory
 from app.loss.domain import LossProductType
 from app.loss.models import LossMetricValue, LossProduct, LossProductRaster
@@ -179,6 +179,7 @@ async def get_loss_areas(
                     )
                 geometries = await _area_geometries(
                     session,
+                    result_run.id,
                     scope,
                     [code for code, _ in grouped],
                 )
@@ -419,10 +420,18 @@ def _value_response(metric: LossMetricValue) -> LossValueResponse:
 
 async def _area_geometries(
     session,
+    run_id: UUID,
     scope: str,
     area_codes: list[str],
 ) -> dict[str, dict]:
     if not area_codes:
+        return {}
+    locked_version = await DataAssetSnapshotService().get_locked_version(
+        session,
+        run_id=run_id,
+        asset_key=_ADMIN_ASSET_KEYS[scope],
+    )
+    if locked_version is None:
         return {}
     rows = (
         await session.execute(
@@ -430,15 +439,8 @@ async def _area_geometries(
                 DataAssetRecord.business_key,
                 func.ST_AsGeoJSON(DataAssetRecord.geom).label("geometry"),
             )
-            .join(
-                DataAssetVersion,
-                DataAssetRecord.version_id == DataAssetVersion.id,
-            )
-            .join(DataAsset, DataAssetVersion.asset_id == DataAsset.id)
             .where(
-                DataAsset.asset_key == _ADMIN_ASSET_KEYS[scope],
-                DataAsset.region_id == settings.data_asset_region_id,
-                DataAssetVersion.status == "published",
+                DataAssetRecord.version_id == locked_version.id,
                 DataAssetRecord.business_key.in_(area_codes),
             )
         )
