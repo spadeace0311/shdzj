@@ -568,7 +568,7 @@ async def _seed_loss_run(
             )
 
 
-async def _request_loss_api(run_id: UUID):
+async def _request_loss_path(path: str):
     previous = app.dependency_overrides.get(get_current_user)
     app.dependency_overrides[get_current_user] = lambda: AuthUser(
         username="loss-test",
@@ -580,14 +580,39 @@ async def _request_loss_api(run_id: UUID):
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            return await client.get(
-                f"/api/v1/assessments/runs/{run_id}/loss"
-            )
+            return await client.get(path)
     finally:
         if previous is None:
             app.dependency_overrides.pop(get_current_user, None)
         else:
             app.dependency_overrides[get_current_user] = previous
+
+
+async def _request_loss_api(run_id: UUID):
+    return await _request_loss_path(
+        f"/api/v1/assessments/runs/{run_id}/loss"
+    )
+
+
+async def _request_loss_artifact(run_id: UUID, product_id: UUID):
+    return await _request_loss_path(
+        f"/api/v1/assessments/runs/{run_id}/loss/artifact"
+        f"?product_id={product_id}"
+    )
+
+
+async def _request_loss_tile(
+    run_id: UUID,
+    product_id: UUID,
+    band: str,
+    z: int,
+    x: int,
+    y: int,
+):
+    return await _request_loss_path(
+        f"/api/v1/assessments/runs/{run_id}/loss/artifact/"
+        f"{product_id}/{band}/{z}/{x}/{y}.png"
+    )
 
 
 async def _restore_fixture_asset_publications(
@@ -1194,11 +1219,14 @@ async def run_partial_asset_publish_recovery(session_factory) -> None:
         if remaining is not None:
             raise AssertionError("fixture asset version was not removed")
     finally:
-        await _delete_baseline_asset(
-            session_factory,
-            asset_key=asset_key,
-            baseline=baseline_state,
-        )
+        try:
+            await _delete_baseline_asset(
+                session_factory,
+                asset_key=asset_key,
+                baseline=baseline_state,
+            )
+        finally:
+            await engine.dispose()
 
 
 async def _metric_rows_for_product(

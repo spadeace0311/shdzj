@@ -7,6 +7,8 @@ from tests.loss_helpers import (
     _execute_loss_workflow,
     _publish_fixed_assets,
     _request_loss_api,
+    _request_loss_artifact,
+    _request_loss_tile,
     _seed_loss_boundary,
     _seed_loss_run,
 )
@@ -64,6 +66,30 @@ async def test_fixed_shanghai_loss_chain_publishes_all_products(
         assert product_map["building_damage"]["quality_grade"] in {"L2", "L3"}
         assert product_map["building_damage"]["calibration_status"] == "uncalibrated"
         assert raster_row.spatial_allocation_rule == "town-uniform-v1"
+        artifact_response = await _request_loss_artifact(
+            seeded.run_id,
+            building_product.id,
+        )
+        assert artifact_response.status_code == 200
+        band_names = {
+            band["name"] for band in artifact_response.json()["bands"]
+        }
+        assert {
+            "buildings_collapsed_area_m2_low",
+            "buildings_collapsed_area_m2_central",
+            "buildings_collapsed_area_m2_high",
+        } <= band_names
+        tile_response = await _request_loss_tile(
+            seeded.run_id,
+            building_product.id,
+            "buildings_collapsed_area_m2_central",
+            10,
+            857,
+            418,
+        )
+        assert tile_response.status_code == 200
+        assert tile_response.headers["content-type"] == "image/png"
+        assert tile_response.content.startswith(b"\x89PNG")
         assert all(
             abs(residual.residual) <= 1e-6
             for residual in validation_inputs.grid_residuals
