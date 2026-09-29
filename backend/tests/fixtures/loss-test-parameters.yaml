@@ -1,0 +1,235 @@
+version: "loss-test-only-v1"
+calibration_status: "uncalibrated"
+test_only: true
+provenance:
+  purpose: "synthetic equation test"
+  requires_review: false
+x-building-low: &building-low
+  vulnerability.rc_frame.7.basic: 0.70
+  vulnerability.rc_frame.7.slightly_damaged: 0.15
+  vulnerability.rc_frame.7.moderately_damaged: 0.10
+  vulnerability.rc_frame.7.severely_damaged: 0.04
+  vulnerability.rc_frame.7.collapsed: 0.01
+x-building-central: &building-central
+  vulnerability.rc_frame.7.basic: 0.60
+  vulnerability.rc_frame.7.slightly_damaged: 0.20
+  vulnerability.rc_frame.7.moderately_damaged: 0.12
+  vulnerability.rc_frame.7.severely_damaged: 0.06
+  vulnerability.rc_frame.7.collapsed: 0.02
+x-building-high: &building-high
+  vulnerability.rc_frame.7.basic: 0.45
+  vulnerability.rc_frame.7.slightly_damaged: 0.25
+  vulnerability.rc_frame.7.moderately_damaged: 0.16
+  vulnerability.rc_frame.7.severely_damaged: 0.10
+  vulnerability.rc_frame.7.collapsed: 0.04
+x-resource-coefficients: &resource-coefficients
+  rescue_team.rescuer_per_missing: 0.002
+  medical_team.team_per_injury: 0.005
+  epidemic_team.team_per_shelter_10000: 0.1
+  tent.per_shelter_population: 0.01
+  drinking_water.per_affected_population: 0.5
+  toilet.per_shelter_population: 0.005
+  clothing.per_affected_population: 0.1
+  quilt.per_shelter_population: 0.1
+  food.per_affected_population: 0.2
+  blanket.per_affected_population: 0.1
+  stretcher.per_injury: 0.02
+  sickbed.per_injury: 0.05
+x-resource-low: &resource-low
+  <<: *resource-coefficients
+  rescue_team.base: 1
+  medical_team.base: 1
+  epidemic_team.base: 1
+  tent.base: 10
+  drinking_water.base: 100
+  toilet.base: 10
+  clothing.base: 100
+  quilt.base: 100
+  food.base: 100
+  blanket.base: 100
+  stretcher.base: 10
+  sickbed.base: 10
+x-resource-central: &resource-central
+  <<: *resource-coefficients
+  rescue_team.base: 2
+  medical_team.base: 2
+  epidemic_team.base: 2
+  tent.base: 20
+  drinking_water.base: 200
+  toilet.base: 20
+  clothing.base: 200
+  quilt.base: 200
+  food.base: 200
+  blanket.base: 200
+  stretcher.base: 20
+  sickbed.base: 20
+x-resource-high: &resource-high
+  <<: *resource-coefficients
+  rescue_team.base: 3
+  medical_team.base: 3
+  epidemic_team.base: 3
+  tent.base: 30
+  drinking_water.base: 300
+  toilet.base: 30
+  clothing.base: 300
+  quilt.base: 300
+  food.base: 300
+  blanket.base: 300
+  stretcher.base: 30
+  sickbed.base: 30
+models:
+  building_damage:
+    model_id: "building-structure-matrix-v1"
+    formula_version: "building-structure-matrix-v1"
+    applicable_region: "shanghai"
+    input_contract: ["exposure", "town_intensity_shares", "parameter_set"]
+    output_contract: ["building_damage"]
+    source_citations: ["synthetic_equation_test"]
+    source_requirements: []
+    scenarios:
+      low: {values: *building-low}
+      central: {values: *building-central}
+      high: {values: *building-high}
+  population_impact:
+    model_id: "population-intensity-v1"
+    formula_version: "population-intensity-v1"
+    applicable_region: "shanghai"
+    input_contract: ["exposure", "town_intensity_shares", "parameter_set"]
+    output_contract: ["population_impact"]
+    source_citations: ["synthetic_equation_test"]
+    source_requirements: []
+    scenarios:
+      low:
+        values:
+          affected_population_min_intensity: 6
+          shelter_ratio.6: 0.03
+          shelter_ratio.7: 0.08
+          temporary_shelter_ratio: 0.40
+      central:
+        values:
+          affected_population_min_intensity: 6
+          shelter_ratio.6: 0.05
+          shelter_ratio.7: 0.10
+          temporary_shelter_ratio: 0.50
+      high:
+        values:
+          affected_population_min_intensity: 6
+          shelter_ratio.6: 0.08
+          shelter_ratio.7: 0.15
+          temporary_shelter_ratio: 0.60
+  casualties:
+    model_id: "casualty-building-intensity-v1"
+    formula_version: "casualty-building-intensity-v1"
+    applicable_region: "shanghai"
+    input_contract: ["building_damage", "population_impact", "parameter_set"]
+    output_contract: ["casualties"]
+    source_citations: ["synthetic_equation_test"]
+    source_requirements: []
+    scenarios:
+      low:
+        values:
+          death.a: 0.020
+          death.b: 0.00
+          death.c: 0.00
+          injury_to_death_ratio.7: 1.2
+          buried.state.basic: 0.00
+          buried.state.slightly_damaged: 0.00
+          buried.state.moderately_damaged: 0.001
+          buried.state.severely_damaged: 0.005
+          buried.state.collapsed: 0.010
+          buried.city_type_factor: 1.0
+          buried.occupancy_factor: 1.0
+      central:
+        values:
+          death.a: 0.050
+          death.b: 0.00
+          death.c: 0.00
+          injury_to_death_ratio.7: 1.5
+          buried.state.basic: 0.00
+          buried.state.slightly_damaged: 0.00
+          buried.state.moderately_damaged: 0.002
+          buried.state.severely_damaged: 0.010
+          buried.state.collapsed: 0.020
+          buried.city_type_factor: 1.0
+          buried.occupancy_factor: 1.0
+      high:
+        values:
+          death.a: 0.080
+          death.b: 0.00
+          death.c: 0.00
+          injury_to_death_ratio.7: 2.0
+          buried.state.basic: 0.00
+          buried.state.slightly_damaged: 0.00
+          buried.state.moderately_damaged: 0.004
+          buried.state.severely_damaged: 0.020
+          buried.state.collapsed: 0.040
+          buried.city_type_factor: 1.0
+          buried.occupancy_factor: 1.0
+  economic_loss:
+    model_id: "economic-building-loss-v1"
+    formula_version: "economic-building-loss-v1"
+    applicable_region: "shanghai"
+    input_contract: ["building_damage", "parameter_set"]
+    output_contract: ["economic_loss"]
+    source_citations: ["synthetic_equation_test"]
+    source_requirements: []
+    scenarios:
+      low:
+        values:
+          replacement_cost_yuan_m2.rc_frame: 3500
+          contents_value_yuan_m2.rc_frame: 600
+          loss_ratio.rc_frame.basic: 0.00
+          loss_ratio.rc_frame.slightly_damaged: 0.05
+          loss_ratio.rc_frame.moderately_damaged: 0.20
+          loss_ratio.rc_frame.severely_damaged: 0.55
+          loss_ratio.rc_frame.collapsed: 0.90
+          contents_ratio.rc_frame.basic: 0.00
+          contents_ratio.rc_frame.slightly_damaged: 0.05
+          contents_ratio.rc_frame.moderately_damaged: 0.20
+          contents_ratio.rc_frame.severely_damaged: 0.50
+          contents_ratio.rc_frame.collapsed: 0.80
+      central:
+        values:
+          replacement_cost_yuan_m2.rc_frame: 4200
+          contents_value_yuan_m2.rc_frame: 800
+          loss_ratio.rc_frame.basic: 0.00
+          loss_ratio.rc_frame.slightly_damaged: 0.08
+          loss_ratio.rc_frame.moderately_damaged: 0.25
+          loss_ratio.rc_frame.severely_damaged: 0.60
+          loss_ratio.rc_frame.collapsed: 1.00
+          contents_ratio.rc_frame.basic: 0.00
+          contents_ratio.rc_frame.slightly_damaged: 0.08
+          contents_ratio.rc_frame.moderately_damaged: 0.25
+          contents_ratio.rc_frame.severely_damaged: 0.55
+          contents_ratio.rc_frame.collapsed: 0.90
+      high:
+        values:
+          replacement_cost_yuan_m2.rc_frame: 5000
+          contents_value_yuan_m2.rc_frame: 1000
+          loss_ratio.rc_frame.basic: 0.00
+          loss_ratio.rc_frame.slightly_damaged: 0.10
+          loss_ratio.rc_frame.moderately_damaged: 0.30
+          loss_ratio.rc_frame.severely_damaged: 0.70
+          loss_ratio.rc_frame.collapsed: 1.00
+          contents_ratio.rc_frame.basic: 0.00
+          contents_ratio.rc_frame.slightly_damaged: 0.10
+          contents_ratio.rc_frame.moderately_damaged: 0.30
+          contents_ratio.rc_frame.severely_damaged: 0.60
+          contents_ratio.rc_frame.collapsed: 1.00
+  resource_demand:
+    model_id: "resource-linear-demand-v1"
+    formula_version: "resource-linear-demand-v1"
+    applicable_region: "shanghai"
+    input_contract: [
+      "building_damage",
+      "population_impact",
+      "casualties",
+      "parameter_set",
+    ]
+    output_contract: ["resource_demand"]
+    source_citations: ["synthetic_equation_test"]
+    source_requirements: []
+    scenarios:
+      low: {values: *resource-low}
+      central: {values: *resource-central}
+      high: {values: *resource-high}
