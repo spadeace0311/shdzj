@@ -149,6 +149,12 @@ async def _complete_required_tasks(session, run_id) -> None:
     for task_key, algorithm_version, fingerprint in (
         ("intensity.model", "model-axis-ratio-v1", "a" * 64),
         ("intensity.fusion", "fusion-inverse-variance-v1", "b" * 64),
+        ("loss.population", "population-impact-v1", "c" * 64),
+        ("loss.casualties", "casualty-model-v1", "d" * 64),
+        ("loss.buildings", "building-damage-v1", "e" * 64),
+        ("loss.economic", "economic-loss-v1", "f" * 64),
+        ("loss.resources", "resource-demand-v1", "0" * 64),
+        ("loss.validate", "loss-validation-v1", "1" * 64),
     ):
         task = await session.scalar(
             select(AssessmentTask).where(
@@ -228,7 +234,7 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
     assert body["deadline_at"] == "2026-09-26T01:08:00Z"
     assert body["completed_task_count"] == 0
     assert body["failed_task_count"] == 0
-    assert body["total_task_count"] == 9
+    assert body["total_task_count"] == 11
     assert [task["task_key"] for task in body["tasks"]] == [
         "intensity.model",
         "intensity.instrument",
@@ -237,6 +243,8 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
         "loss.casualties",
         "loss.buildings",
         "loss.economic",
+        "loss.resources",
+        "loss.validate",
         "report.rapid_assessment",
         "workgroup.response_tasks",
     ]
@@ -251,6 +259,7 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
         body["data_asset_snapshot_fingerprint"]
     )
     assert body["intensity"]["data_asset_snapshot"] == body["data_asset_snapshot"]
+    assert body["loss"] is None
 
 
 async def test_get_current_assessment_returns_404_when_run_does_not_exist() -> None:
@@ -313,3 +322,4 @@ async def test_get_current_assessment_uses_effective_run_for_fallback(
     assert body["intensity"]["is_latest_revision"] is False
     assert body["intensity"]["is_fallback"] is True
     assert body["intensity"]["products"] == []
+    assert body["loss"] is None

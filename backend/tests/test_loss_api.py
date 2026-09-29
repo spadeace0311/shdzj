@@ -354,6 +354,8 @@ async def test_current_assessment_loss_is_none_without_products(
     assert response.json()["loss"] is None
 
 
+@pytest.mark.filterwarnings("ignore:Use `@` matmul")
+@pytest.mark.filterwarnings("ignore:Dataset has no geotransform")
 async def test_get_loss_tile_returns_png_from_persisted_raster(
     session_factory,
     seeded_assessment_run,
