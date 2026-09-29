@@ -72,11 +72,27 @@ _TASKS = (
         deadline_offset_seconds=180,
     ),
     PlannedAssessmentTask(
+        task_key="loss.resources",
+        task_type="loss",
+        component="resource_demand",
+        priority=86,
+        sequence=8,
+        deadline_offset_seconds=210,
+    ),
+    PlannedAssessmentTask(
+        task_key="loss.validate",
+        task_type="loss",
+        component="loss_validation",
+        priority=85,
+        sequence=9,
+        deadline_offset_seconds=220,
+    ),
+    PlannedAssessmentTask(
         task_key="report.rapid_assessment",
         task_type="report",
         component="rapid_assessment_report",
         priority=30,
-        sequence=8,
+        sequence=10,
         deadline_offset_seconds=240,
     ),
     PlannedAssessmentTask(
@@ -84,7 +100,7 @@ _TASKS = (
         task_type="coordination",
         component="workgroup_tasks",
         priority=10,
-        sequence=9,
+        sequence=11,
         deadline_offset_seconds=300,
     ),
 )

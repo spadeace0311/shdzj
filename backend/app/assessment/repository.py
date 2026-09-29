@@ -503,23 +503,32 @@ class AssessmentRepository:
             return run
         if run.status != "running":
             raise ValueError("run must be running before it can complete")
-        # Phase-specific policy: model and fusion are required; instrument is
-        # deliberately optional because a degraded or unavailable instrument can
-        # still produce a valid model-only fusion.
+        # Phase-specific policy: instrument is deliberately optional because a
+        # degraded or unavailable instrument can still produce a valid
+        # model-only fusion. Every intensity prerequisite and loss product must
+        # succeed before an assessment can complete.
+        required_task_keys = {
+            "intensity.model",
+            "intensity.fusion",
+            "loss.population",
+            "loss.buildings",
+            "loss.casualties",
+            "loss.economic",
+            "loss.resources",
+            "loss.validate",
+        }
         required_tasks = (
             await session.scalars(
                 select(AssessmentTask).where(
                     AssessmentTask.run_id == run.id,
-                    AssessmentTask.task_key.in_(
-                        ("intensity.model", "intensity.fusion")
-                    ),
+                    AssessmentTask.task_key.in_(tuple(required_task_keys)),
                 )
             )
         ).all()
         if {
             task.task_key for task in required_tasks if task.status == "succeeded"
-        } != {"intensity.model", "intensity.fusion"}:
-            raise ValueError("required intensity tasks have not succeeded")
+        } != required_task_keys:
+            raise ValueError("required assessment tasks have not succeeded")
         now = datetime.now(UTC)
         run.status = "completed"
         run.completed_at = now

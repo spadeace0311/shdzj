@@ -17,12 +17,14 @@ def test_plan_builder_returns_priority_ordered_assessment_tasks() -> None:
         "loss.casualties",
         "loss.buildings",
         "loss.economic",
+        "loss.resources",
+        "loss.validate",
         "report.rapid_assessment",
         "workgroup.response_tasks",
     ]
     assert [task.priority for task in plan[:3]] == [100, 99, 98]
     assert plan[-1].priority == 10
-    assert [task.sequence for task in plan] == list(range(1, 10))
+    assert [task.sequence for task in plan] == list(range(1, 12))
     assert plan[-1].deadline_offset_seconds == 300
 
 

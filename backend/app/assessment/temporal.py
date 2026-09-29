@@ -13,6 +13,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 if TYPE_CHECKING:
     from app.intensity.service import IntensityService
+    from app.loss.service import LossAssessmentService
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,64 @@ class AssessmentWorkflow:
                     start_to_close_timeout=timedelta(seconds=1800),
                     retry_policy=_retry_policy(),
                 )
+
+                building_handle = workflow.start_activity(
+                    "run_loss_buildings",
+                    IntensityActivityInput(prepared.run_id, "loss.buildings"),
+                    start_to_close_timeout=timedelta(seconds=1800),
+                    retry_policy=_retry_policy(),
+                )
+                population_handle = workflow.start_activity(
+                    "run_loss_population",
+                    IntensityActivityInput(prepared.run_id, "loss.population"),
+                    start_to_close_timeout=timedelta(seconds=1800),
+                    retry_policy=_retry_policy(),
+                )
+                first_stage = await asyncio.gather(
+                    building_handle,
+                    population_handle,
+                    return_exceptions=True,
+                )
+                if any(isinstance(value, BaseException) for value in first_stage):
+                    outcome = "failed"
+
+                if outcome == "completed":
+                    casualty_handle = workflow.start_activity(
+                        "run_loss_casualties",
+                        IntensityActivityInput(prepared.run_id, "loss.casualties"),
+                        start_to_close_timeout=timedelta(seconds=1800),
+                        retry_policy=_retry_policy(),
+                    )
+                    economic_handle = workflow.start_activity(
+                        "run_loss_economic",
+                        IntensityActivityInput(prepared.run_id, "loss.economic"),
+                        start_to_close_timeout=timedelta(seconds=1800),
+                        retry_policy=_retry_policy(),
+                    )
+                    second_stage = await asyncio.gather(
+                        casualty_handle,
+                        economic_handle,
+                        return_exceptions=True,
+                    )
+                    if any(
+                        isinstance(value, BaseException)
+                        for value in second_stage
+                    ):
+                        outcome = "failed"
+
+                if outcome == "completed":
+                    await workflow.execute_activity(
+                        "run_loss_resources",
+                        IntensityActivityInput(prepared.run_id, "loss.resources"),
+                        start_to_close_timeout=timedelta(seconds=1800),
+                        retry_policy=_retry_policy(),
+                    )
+                    await workflow.execute_activity(
+                        "run_loss_validate",
+                        IntensityActivityInput(prepared.run_id, "loss.validate"),
+                        start_to_close_timeout=timedelta(seconds=1800),
+                        retry_policy=_retry_policy(),
+                    )
             except ActivityError:
                 outcome = "failed"
             return await self._finalize(prepared, outcome=outcome)
@@ -221,10 +280,14 @@ class AssessmentActivities:
         session_factory: object,
         *,
         intensity_service_factory: Callable[[], IntensityService] | None = None,
+        loss_service_factory: Callable[[], LossAssessmentService] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._intensity_service_factory = (
             intensity_service_factory or self._default_intensity_service_factory
+        )
+        self._loss_service_factory = (
+            loss_service_factory or self._default_loss_service_factory
         )
 
     def _default_intensity_service_factory(self) -> IntensityService:
@@ -236,6 +299,11 @@ class AssessmentActivities:
             session_factory=self._session_factory,
             parameters=load_parameter_bundle(settings.intensity_parameters_path),
         )
+
+    def _default_loss_service_factory(self) -> LossAssessmentService:
+        from app.loss.service import LossAssessmentService
+
+        return LossAssessmentService(session_factory=self._session_factory)
 
     @activity.defn(name="prepare_assessment")
     async def prepare_assessment(
@@ -294,6 +362,36 @@ class AssessmentActivities:
                 type=type(exc).__name__,
                 non_retryable=True,
             ) from exc
+
+    @activity.defn(name="run_loss_buildings")
+    async def run_loss_buildings(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_buildings(request.run_id)
+
+    @activity.defn(name="run_loss_population")
+    async def run_loss_population(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_population(request.run_id)
+
+    @activity.defn(name="run_loss_casualties")
+    async def run_loss_casualties(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_casualties(request.run_id)
+
+    @activity.defn(name="run_loss_economic")
+    async def run_loss_economic(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_economic(request.run_id)
+
+    @activity.defn(name="run_loss_resources")
+    async def run_loss_resources(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_resources(request.run_id)
+
+    @activity.defn(name="run_loss_validate")
+    async def run_loss_validate(self, request: IntensityActivityInput):
+        service = self._loss_service_factory()
+        return await service.run_validate(request.run_id)
 
     @activity.defn(name="mark_deadline_exceeded")
     async def mark_deadline_exceeded(self, request: AssessmentRunActivityInput):
@@ -379,7 +477,7 @@ class AssessmentActivities:
                     await repository.complete_run(
                         session,
                         run.id,
-                        algorithm_bundle_version="intensity-v1",
+                        algorithm_bundle_version="intensity-loss-v1",
                     )
                     return None
                 if run.status not in {"completed", "failed"}:

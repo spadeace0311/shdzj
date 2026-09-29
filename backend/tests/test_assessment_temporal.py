@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -21,6 +22,7 @@ from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
 from app.events.response_rules import ResponseInput
 from app.events.service import EventService
+from app.loss.service import LossTaskOutcome
 from app.regions.domain import RegionContext
 
 
@@ -116,6 +118,63 @@ def _test_intensity_service(session_factory):
     )
 
 
+def _test_loss_service(session_factory):
+    return _TestLossService(session_factory)
+
+
+class _TestLossService:
+    def __init__(self, session_factory) -> None:
+        self._session_factory = session_factory
+
+    async def _complete(
+        self,
+        run_id: str,
+        task_key: str,
+    ) -> LossTaskOutcome:
+        repository = AssessmentRepository()
+        async with self._session_factory() as session:
+            async with session.begin():
+                task = await session.scalar(
+                    select(AssessmentTask).where(
+                        AssessmentTask.run_id == UUID(run_id),
+                        AssessmentTask.task_key == task_key,
+                    )
+                )
+                assert task is not None
+                await repository.start_task(
+                    session,
+                    UUID(run_id),
+                    task_key,
+                    "loss-test-v1",
+                    "f" * 64,
+                )
+                await repository.complete_task(
+                    session,
+                    task.id,
+                    "c" * 64,
+                    {"product_id": str(uuid4()), "task_key": task_key},
+                )
+        return _loss_outcome(run_id, task_key)
+
+    async def run_buildings(self, run_id: str):
+        return await self._complete(run_id, "loss.buildings")
+
+    async def run_population(self, run_id: str):
+        return await self._complete(run_id, "loss.population")
+
+    async def run_casualties(self, run_id: str):
+        return await self._complete(run_id, "loss.casualties")
+
+    async def run_economic(self, run_id: str):
+        return await self._complete(run_id, "loss.economic")
+
+    async def run_resources(self, run_id: str):
+        return await self._complete(run_id, "loss.resources")
+
+    async def run_validate(self, run_id: str):
+        return await self._complete(run_id, "loss.validate")
+
+
 class _FailingFinalizeActivity:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -144,11 +203,60 @@ class _DegradedInstrumentService:
         return await self._delegate.run_fusion(run_id)
 
 
+def _loss_outcome(run_id: str, task_key: str) -> LossTaskOutcome:
+    now = datetime(2026, 9, 28, 2, 0, tzinfo=UTC)
+    return LossTaskOutcome(
+        product_id=uuid4(),
+        task_key=task_key,
+        status="succeeded",
+        started_at=now,
+        completed_at=now,
+        stage_seconds={},
+    )
+
+
+async def _execute_loss_workflow(session_factory, loss_service):
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: loss_service,
+    )
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="assessment-loss-failure-test",
+            workflows=[AssessmentWorkflow],
+            activities=[
+                activities.prepare_assessment,
+                activities.run_intensity_model,
+                activities.run_intensity_instrument,
+                activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
+                activities.mark_deadline_exceeded,
+                activities.observe_task_deadlines,
+                activities.finalize_assessment,
+            ],
+        ):
+            return await environment.client.execute_workflow(
+                AssessmentWorkflow.run,
+                request,
+                id=f"assessment-loss-failure:{request.event_id}",
+                task_queue="assessment-loss-failure-test",
+            )
+
+
 async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> None:
     request = await _create_workflow_input(session_factory)
     activities = AssessmentActivities(
         session_factory,
         intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
     async with await WorkflowEnvironment.start_time_skipping() as environment:
@@ -161,6 +269,12 @@ async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> No
                 activities.run_intensity_model,
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
@@ -181,20 +295,21 @@ async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> No
             .where(AssessmentTask.run_id == result.run_id)
         )
 
-    assert result.task_count == 9
+    assert result.task_count == 11
     assert run is not None
-    assert task_count == 9
+    assert task_count == 11
     assert run.status == "completed"
     assert run.completed_at is not None
 
 
-async def test_intensity_workflow_executes_three_tasks_and_skips_deferred(
+async def test_assessment_workflow_executes_loss_tasks_and_skips_deferred(
     session_factory,
 ) -> None:
     request = await _create_workflow_input(session_factory)
     activities = AssessmentActivities(
         session_factory,
         intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
     async with await WorkflowEnvironment.start_time_skipping() as environment:
@@ -207,6 +322,12 @@ async def test_intensity_workflow_executes_three_tasks_and_skips_deferred(
                 activities.run_intensity_model,
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
@@ -237,7 +358,13 @@ async def test_intensity_workflow_executes_three_tasks_and_skips_deferred(
     assert statuses["intensity.model"] == "succeeded"
     assert statuses["intensity.instrument"] == "succeeded"
     assert statuses["intensity.fusion"] == "succeeded"
-    assert statuses["loss.population"] == "skipped"
+    assert statuses["loss.buildings"] == "succeeded"
+    assert statuses["loss.population"] == "succeeded"
+    assert statuses["loss.casualties"] == "succeeded"
+    assert statuses["loss.economic"] == "succeeded"
+    assert statuses["loss.resources"] == "succeeded"
+    assert statuses["loss.validate"] == "succeeded"
+    assert statuses["report.rapid_assessment"] == "skipped"
     assert statuses["workgroup.response_tasks"] == "skipped"
 
 
@@ -248,6 +375,7 @@ async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
     activities = AssessmentActivities(
         session_factory,
         intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
     )
     failing_finalize = _FailingFinalizeActivity()
 
@@ -261,6 +389,12 @@ async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
                 activities.run_intensity_model,
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 failing_finalize.finalize_assessment,
@@ -320,6 +454,7 @@ async def test_deadline_marker_persists_without_canceling_workflow(
     activities = AssessmentActivities(
         session_factory,
         intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
     async with await WorkflowEnvironment.start_time_skipping() as environment:
@@ -332,6 +467,12 @@ async def test_deadline_marker_persists_without_canceling_workflow(
                 activities.run_intensity_model,
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
@@ -361,6 +502,7 @@ async def test_instrument_failure_still_completes_model_only(
         intensity_service_factory=lambda: _DegradedInstrumentService(
             _test_intensity_service(session_factory)
         ),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
     async with await WorkflowEnvironment.start_time_skipping() as environment:
@@ -373,6 +515,12 @@ async def test_instrument_failure_still_completes_model_only(
                 activities.run_intensity_model,
                 activities.run_intensity_instrument,
                 activities.run_intensity_fusion,
+                activities.run_loss_buildings,
+                activities.run_loss_population,
+                activities.run_loss_casualties,
+                activities.run_loss_economic,
+                activities.run_loss_resources,
+                activities.run_loss_validate,
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
@@ -400,3 +548,23 @@ async def test_instrument_failure_still_completes_model_only(
     assert statuses["intensity.model"] == "succeeded"
     assert statuses["intensity.instrument"] == "skipped"
     assert statuses["intensity.fusion"] == "succeeded"
+
+
+async def test_building_failure_prevents_casualty_and_economic_activities(
+    session_factory,
+) -> None:
+    calls = []
+
+    class FailingLossService:
+        async def run_buildings(self, run_id):
+            calls.append("buildings")
+            raise ValueError("vulnerability row unavailable")
+
+        async def run_population(self, run_id):
+            calls.append("population")
+            return _loss_outcome(run_id, "loss.population")
+
+    result = await _execute_loss_workflow(session_factory, FailingLossService())
+    assert result.status == "failed"
+    assert "casualties" not in calls
+    assert "economic" not in calls
