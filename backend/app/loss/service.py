@@ -822,7 +822,11 @@ class LossAssessmentService:
                 scenario_values.items(),
                 key=lambda item: _SCENARIO_ORDER.index(item[0]),
             ):
-                band_name = _band_name(prep.product_type, metric_key)
+                band_name = _band_name(
+                    prep.product_type,
+                    metric_key,
+                    scenario,
+                )
                 array = _allocated_array(
                     town_values,
                     cells,
@@ -1312,8 +1316,13 @@ def _integer_metric_key(
     )
 
 
-def _band_name(product_type: LossProductType, metric_key: str) -> str:
-    return f"{_BAND_PREFIX[product_type]}_{metric_key}"
+def _band_name(
+    product_type: LossProductType,
+    metric_key: str,
+    scenario: LossValueType | None = None,
+) -> str:
+    suffix = f"_{scenario.value}" if scenario is not None else ""
+    return f"{_BAND_PREFIX[product_type]}_{metric_key}{suffix}"
 
 
 def _allocated_array(
