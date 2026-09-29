@@ -40,3 +40,17 @@ def test_raster_codec_round_trip_preserves_values_and_georeference() -> None:
         {"number": 1, "name": "value"},
         {"number": 2, "name": "sigma"},
     ]
+
+
+def test_raster_content_checksum_supports_loss_namespace() -> None:
+    definition = GridDefinition("g", "EPSG:32651", 1000, 0, 1000, 1, 1)
+    bands = [("population", np.array([[1.0]], dtype=np.float64))]
+    manifest = {"bands": [{"number": 1, "name": "population"}]}
+    intensity = RasterCodec.content_checksum(definition, bands, manifest)
+    loss = RasterCodec.content_checksum(
+        definition,
+        bands,
+        manifest,
+        checksum_namespace="loss-raster-content-v1",
+    )
+    assert loss != intensity

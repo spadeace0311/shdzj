@@ -100,8 +100,30 @@ class RasterCodec:
         definition: GridDefinition,
         bands: Sequence[BandInput],
         band_manifest: dict,
+        *,
+        checksum_namespace: str = "intensity-raster-content-v1",
     ) -> str:
-        digest = hashlib.sha256(b"intensity-raster-content-v1\0")
+        if not checksum_namespace:
+            raise ValueError("checksum namespace must not be empty")
+        try:
+            namespace_bytes = checksum_namespace.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("checksum namespace must be ASCII") from exc
+        digest = hashlib.sha256(namespace_bytes + b"\0")
+        return _content_checksum_with_digest(
+            digest,
+            definition,
+            bands,
+            band_manifest,
+        )
+
+
+def _content_checksum_with_digest(
+    digest,
+    definition: GridDefinition,
+    bands: Sequence[BandInput],
+    band_manifest: dict,
+) -> str:
         digest.update(
             json.dumps(
                 _json_canonical(
