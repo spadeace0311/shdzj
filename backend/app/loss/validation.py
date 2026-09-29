@@ -158,6 +158,53 @@ def _sorted_building_states(town) -> tuple[object, ...]:
     )
 
 
+def _validate_missing_core_exposure(
+    buildings: BuildingDamageResult,
+    blocking: list[ValidationIssue],
+) -> None:
+    if not buildings.towns:
+        blocking.append(
+            _issue(
+                "missing_core_exposure",
+                "building damage result has no town coverage",
+                blocking=True,
+                context={
+                    "town_code": None,
+                    "town_count": 0,
+                    "state_count": 0,
+                    "total_area_m2": None,
+                },
+            )
+        )
+        return
+
+    for town_code in sorted(buildings.towns):
+        town = buildings.towns[town_code]
+        state_count = len(town.states)
+        total_area_m2 = town.total_area_m2
+        if state_count == 0:
+            reason = "no_building_states"
+        elif not _finite_number(total_area_m2) or float(total_area_m2) <= 0.0:
+            reason = "non_positive_total_area"
+        else:
+            continue
+        blocking.append(
+            _issue(
+                "missing_core_exposure",
+                f"building damage result for town {town_code} has no usable "
+                "core building exposure",
+                blocking=True,
+                context={
+                    "town_code": town_code,
+                    "town_count": len(buildings.towns),
+                    "state_count": state_count,
+                    "total_area_m2": _context_value(total_area_m2),
+                    "reason": reason,
+                },
+            )
+        )
+
+
 def _validate_negative_metrics(
     buildings: BuildingDamageResult,
     population: PopulationImpactResult,
@@ -732,6 +779,7 @@ def validate_loss_assessment(
     blocking: list[ValidationIssue] = []
     review: list[ValidationIssue] = []
 
+    _validate_missing_core_exposure(buildings, blocking)
     _validate_negative_metrics(
         buildings,
         population,

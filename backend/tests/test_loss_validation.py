@@ -140,6 +140,79 @@ def test_building_damage_exceeding_stock_is_blocking() -> None:
     assert "building_damage_exceeds_stock" in _codes(result)
 
 
+def test_empty_building_result_is_missing_core_exposure() -> None:
+    result = validate_loss_assessment(
+        replace(building_damage_result(), towns={}),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        resource_demand_result(),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is False
+    issue = next(
+        issue
+        for issue in result.blocking_issues
+        if issue.code == "missing_core_exposure"
+    )
+    assert issue.context["town_code"] is None
+    assert issue.context["town_count"] == 0
+    assert result.quality_grade.value == "L0"
+
+
+def test_state_less_building_town_is_missing_core_exposure() -> None:
+    buildings = building_damage_result()
+    town = replace(buildings.towns["t1"], states=())
+    result = validate_loss_assessment(
+        replace(buildings, towns={"t1": town}),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        resource_demand_result(),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is False
+    issue = next(
+        issue
+        for issue in result.blocking_issues
+        if issue.code == "missing_core_exposure"
+    )
+    assert issue.context["town_code"] == "t1"
+    assert issue.context["state_count"] == 0
+    assert result.quality_grade.value == "L0"
+
+
+def test_non_positive_building_stock_is_missing_core_exposure() -> None:
+    buildings = building_damage_result()
+    town = replace(buildings.towns["t1"], total_area_m2=0.0)
+    result = validate_loss_assessment(
+        replace(buildings, towns={"t1": town}),
+        population_impact_result(),
+        casualty_result(),
+        economic_loss_result(),
+        resource_demand_result(),
+        coverage_ratio=1.0,
+        grid_residuals=(GridResidual("town", "t1", 0.0),),
+        context=_context(),
+    )
+
+    assert result.valid is False
+    issue = next(
+        issue
+        for issue in result.blocking_issues
+        if issue.code == "missing_core_exposure"
+    )
+    assert issue.context["town_code"] == "t1"
+    assert issue.context["total_area_m2"] == 0.0
+    assert result.quality_grade.value == "L0"
+
+
 def test_shelter_above_affected_population_is_blocking() -> None:
     population = population_impact_result()
     town = replace(
