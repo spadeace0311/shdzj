@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { FeatureCollection, Geometry } from "geojson";
 import type {
   Map as MaplibreMap,
+  DataDrivenPropertyValueSpecification,
   GeoJSONSourceSpecification,
   MapLayerMouseEvent,
   MapOptions,
@@ -15,13 +16,12 @@ import type { LossAreaFeature, LossGridArtifact } from "../types";
 
 const BASEMAP_SOURCE = "loss-map-amap";
 const BASEMAP_LAYER = "loss-map-amap-layer";
-const FUSED_SOURCE = "loss-map-fused-intensity";
-const FUSED_LAYER = "loss-map-fused-intensity-fill";
 const TOWN_SOURCE = "loss-map-town-loss";
 const TOWN_FILL_LAYER = "loss-map-town-fill";
 const TOWN_LINE_LAYER = "loss-map-town-line";
 const GRID_SOURCE = "loss-map-grid";
 const GRID_LAYER = "loss-map-grid-raster";
+const BACKGROUND_LAYER = "loss-map-background";
 
 interface LossMapProps {
   center: [number, number];
@@ -41,15 +41,29 @@ interface RasterSourceLike {
   setTiles(tiles: string[]): void;
 }
 
-function isSameOriginUrl(url: string): boolean {
-  if (url.startsWith("/")) {
-    return true;
-  }
+export function isLossArtifactTileUrl(url: string): boolean {
   try {
-    return new URL(url, window.location.origin).origin === window.location.origin;
+    const parsed = new URL(url, window.location.origin);
+    return (
+      parsed.origin === window.location.origin &&
+      parsed.pathname.includes("/loss/artifact/")
+    );
   } catch {
     return false;
   }
+}
+
+export function buildLossTileRequest(url: string): RequestParameters {
+  const token = getAccessToken();
+  if (!token || !isLossArtifactTileUrl(url)) {
+    return { url };
+  }
+  return {
+    url,
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  };
 }
 
 function expandTileTemplate(template: string, band: string): string {
@@ -58,6 +72,17 @@ function expandTileTemplate(template: string, band: string): string {
     .replace("{z}", "{z}")
     .replace("{x}", "{x}")
     .replace("{y}", "{y}");
+}
+
+function townFillColor(
+  selectedTownCode: string | null | undefined,
+): DataDrivenPropertyValueSpecification<string> {
+  return [
+    "case",
+    ["==", ["get", "area_code"], selectedTownCode ?? ""],
+    "#0d7a6f",
+    "#2b6f9b",
+  ] as unknown as DataDrivenPropertyValueSpecification<string>;
 }
 
 function buildTownFeatureCollection(
@@ -89,12 +114,12 @@ export function LossMap({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MaplibreMap | null>(null);
   const [mapReady, setMapReady] = useState(false);
-  const [showFusedIntensity, setShowFusedIntensity] = useState(true);
   const [showTownLoss, setShowTownLoss] = useState(true);
   const [showGrid, setShowGrid] = useState(true);
   const [selectedBand, setSelectedBand] = useState(
     gridArtifact?.bands[0]?.name ?? "",
   );
+  const centerKey = center.join("|");
 
   useEffect(() => {
     if (
@@ -111,19 +136,7 @@ export function LossMap({
   }, [onTownSelect]);
 
   const transformRequest = useMemo(
-    () =>
-      (url: string): RequestParameters => {
-        const token = getAccessToken();
-        if (token && isSameOriginUrl(url)) {
-          return {
-            url,
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          };
-        }
-        return { url };
-      },
+    () => (url: string): RequestParameters => buildLossTileRequest(url),
     [],
   );
 
@@ -131,9 +144,9 @@ export function LossMap({
     if (!getAccessToken() || !containerRef.current || mapRef.current) {
       return;
     }
+
     let disposed = false;
     let map: MaplibreMap | null = null;
-
     const options: MapOptions = {
       container: containerRef.current,
       center: [center[1], center[0]],
@@ -147,7 +160,7 @@ export function LossMap({
         sources: {},
         layers: [
           {
-            id: "loss-map-background",
+            id: BACKGROUND_LAYER,
             type: "background",
             paint: {
               "background-color": "#dfe6ec",
@@ -166,42 +179,6 @@ export function LossMap({
       mapRef.current = createdMap;
       setMapReady(true);
 
-      if (tileUrlTemplate) {
-        createdMap.addSource(BASEMAP_SOURCE, {
-          type: "raster",
-          tiles: [tileUrlTemplate],
-          tileSize: 256,
-        } satisfies RasterSourceSpecification);
-        createdMap.addLayer({
-          id: BASEMAP_LAYER,
-          type: "raster",
-          source: BASEMAP_SOURCE,
-          paint: {
-            "raster-opacity": 0.95,
-          },
-        });
-      }
-
-      createdMap.addSource(FUSED_SOURCE, {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [],
-        },
-      } satisfies GeoJSONSourceSpecification);
-      createdMap.addLayer({
-        id: FUSED_LAYER,
-        type: "fill",
-        source: FUSED_SOURCE,
-        layout: {
-          visibility: showFusedIntensity ? "visible" : "none",
-        },
-        paint: {
-          "fill-color": "#176b9b",
-          "fill-opacity": 0.12,
-        },
-      });
-
       createdMap.on("click", TOWN_FILL_LAYER, (event: MapLayerMouseEvent) => {
         const feature = event.features?.[0];
         const townCode = feature?.properties?.area_code;
@@ -215,58 +192,55 @@ export function LossMap({
       disposed = true;
       map?.remove();
       mapRef.current = null;
+      setMapReady(false);
     };
-    // MapLibre owns the container for the component lifetime; visibility
-    // changes are synchronized through the focused effects below.
-  }, [center, transformRequest]);
+  }, [centerKey, transformRequest]);
 
   useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
     const map = mapRef.current;
     if (!map) {
       return;
     }
-    if (!map.getSource(TOWN_SOURCE)) {
-      map.addSource(TOWN_SOURCE, {
-        type: "geojson",
-        data: buildTownFeatureCollection(townFeatures),
-      } satisfies GeoJSONSourceSpecification);
-      map.addLayer({
-        id: TOWN_FILL_LAYER,
-        type: "fill",
-        source: TOWN_SOURCE,
-        layout: {
-          visibility: showTownLoss ? "visible" : "none",
-        },
-        paint: {
-          "fill-color": [
-            "case",
-            ["==", ["get", "area_code"], selectedTownCode ?? ""],
-            "#0d7a6f",
-            "#2b6f9b",
-          ],
-          "fill-opacity": 0.3,
-        },
-      });
-      map.addLayer({
-        id: TOWN_LINE_LAYER,
-        type: "line",
-        source: TOWN_SOURCE,
-        layout: {
-          visibility: showTownLoss ? "visible" : "none",
-        },
-        paint: {
-          "line-color": "#173d50",
-          "line-width": 1.2,
-        },
-      });
-    } else {
-      (map.getSource(TOWN_SOURCE) as unknown as GeoJsonSourceLike).setData(
-        buildTownFeatureCollection(townFeatures),
-      );
+
+    if (!tileUrlTemplate) {
+      if (map.getLayer(BASEMAP_LAYER)) {
+        map.removeLayer(BASEMAP_LAYER);
+      }
+      if (map.getSource(BASEMAP_SOURCE)) {
+        map.removeSource(BASEMAP_SOURCE);
+      }
+      return;
     }
-  }, [mapReady, selectedTownCode, showTownLoss, townFeatures]);
+
+    if (!map.getSource(BASEMAP_SOURCE)) {
+      map.addSource(BASEMAP_SOURCE, {
+        type: "raster",
+        tiles: [tileUrlTemplate],
+        tileSize: 256,
+      } satisfies RasterSourceSpecification);
+      map.addLayer({
+        id: BASEMAP_LAYER,
+        type: "raster",
+        source: BASEMAP_SOURCE,
+        paint: {
+          "raster-opacity": 0.95,
+        },
+      });
+      return;
+    }
+
+    (map.getSource(BASEMAP_SOURCE) as unknown as RasterSourceLike).setTiles([
+      tileUrlTemplate,
+    ]);
+  }, [mapReady, tileUrlTemplate]);
 
   useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
     const map = mapRef.current;
     if (!map) {
       return;
@@ -294,17 +268,20 @@ export function LossMap({
         tiles: [tileTemplate],
         tileSize: 256,
       } satisfies RasterSourceSpecification);
-      map.addLayer({
-        id: GRID_LAYER,
-        type: "raster",
-        source: GRID_SOURCE,
-        layout: {
-          visibility: showGrid ? "visible" : "none",
+      map.addLayer(
+        {
+          id: GRID_LAYER,
+          type: "raster",
+          source: GRID_SOURCE,
+          layout: {
+            visibility: showGrid ? "visible" : "none",
+          },
+          paint: {
+            "raster-opacity": 0.72,
+          },
         },
-        paint: {
-          "raster-opacity": 0.72,
-        },
-      });
+        map.getLayer(TOWN_FILL_LAYER) ? TOWN_FILL_LAYER : undefined,
+      );
       return;
     }
 
@@ -314,18 +291,70 @@ export function LossMap({
   }, [gridArtifact, mapReady, selectedBand, showGrid]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !map.getLayer(FUSED_LAYER)) {
+    if (!mapReady) {
       return;
     }
-    map.setLayoutProperty(
-      FUSED_LAYER,
-      "visibility",
-      showFusedIntensity ? "visible" : "none",
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    if (!map.getSource(TOWN_SOURCE)) {
+      map.addSource(TOWN_SOURCE, {
+        type: "geojson",
+        data: buildTownFeatureCollection(townFeatures),
+      } satisfies GeoJSONSourceSpecification);
+      map.addLayer({
+        id: TOWN_FILL_LAYER,
+        type: "fill",
+        source: TOWN_SOURCE,
+        layout: {
+          visibility: showTownLoss ? "visible" : "none",
+        },
+        paint: {
+          "fill-color": townFillColor(selectedTownCode),
+          "fill-opacity": 0.3,
+        },
+      });
+      map.addLayer({
+        id: TOWN_LINE_LAYER,
+        type: "line",
+        source: TOWN_SOURCE,
+        layout: {
+          visibility: showTownLoss ? "visible" : "none",
+        },
+        paint: {
+          "line-color": "#173d50",
+          "line-width": 1.2,
+        },
+      });
+      return;
+    }
+
+    (map.getSource(TOWN_SOURCE) as unknown as GeoJsonSourceLike).setData(
+      buildTownFeatureCollection(townFeatures),
     );
-  }, [mapReady, showFusedIntensity]);
+  }, [mapReady, selectedTownCode, showTownLoss, townFeatures]);
 
   useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
+    const map = mapRef.current;
+    if (!map || !map.getLayer(TOWN_FILL_LAYER)) {
+      return;
+    }
+    map.setPaintProperty(
+      TOWN_FILL_LAYER,
+      "fill-color",
+      townFillColor(selectedTownCode),
+    );
+  }, [mapReady, selectedTownCode]);
+
+  useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
     const map = mapRef.current;
     if (!map) {
       return;
@@ -340,6 +369,9 @@ export function LossMap({
   }, [mapReady, showTownLoss]);
 
   useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
     const map = mapRef.current;
     if (!map || !map.getLayer(GRID_LAYER)) {
       return;
@@ -358,14 +390,6 @@ export function LossMap({
   return (
     <section className="loss-map" aria-label="损失空间分布">
       <div className="loss-map__toolbar">
-        <label className="loss-map__toggle">
-          <input
-            type="checkbox"
-            checked={showFusedIntensity}
-            onChange={(event) => setShowFusedIntensity(event.target.checked)}
-          />
-          <span>融合烈度</span>
-        </label>
         <label className="loss-map__toggle">
           <input
             type="checkbox"

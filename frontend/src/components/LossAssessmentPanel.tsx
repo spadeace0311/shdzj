@@ -84,7 +84,7 @@ const DEFAULT_SHANGHAI_CENTER: [number, number] = [31.2, 121.5];
 function selectSpatializedProduct(
   products: LossProductSummary[],
 ): LossProductSummary | null {
-  const candidates = products
+  const candidates = [...products]
     .filter(
       (product) =>
         product.status === "complete" && product.spatialized_estimate,
@@ -110,6 +110,17 @@ export function LossAssessmentPanel({
   );
   const [areaLoadFailed, setAreaLoadFailed] = useState(false);
   const [artifactLoadFailed, setArtifactLoadFailed] = useState(false);
+
+  const defaultProductId =
+    selectSpatializedProduct(result.products)?.product_id ?? null;
+
+  useEffect(() => {
+    setSelectedProductId(defaultProductId);
+  }, [defaultProductId, runId]);
+
+  useEffect(() => {
+    setSelectedTownCode(null);
+  }, [runId]);
 
   useEffect(() => {
     if (!getAccessToken()) {
