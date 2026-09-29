@@ -150,6 +150,12 @@ async def _complete_required_tasks(session, run_id) -> None:
     for task_key, algorithm_version, fingerprint in (
         ("intensity.model", "model-axis-ratio-v1", "a" * 64),
         ("intensity.fusion", "fusion-inverse-variance-v1", "b" * 64),
+        ("loss.population", "population-intensity-v1", "c" * 64),
+        ("loss.buildings", "building-structure-matrix-v1", "d" * 64),
+        ("loss.casualties", "casualty-building-intensity-v1", "e" * 64),
+        ("loss.economic", "economic-building-loss-v1", "f" * 64),
+        ("loss.resources", "resource-linear-demand-v1", "0" * 64),
+        ("loss.validate", "loss-validation-v1", "1" * 64),
     ):
         task = await session.scalar(
             select(AssessmentTask).where(
@@ -157,6 +163,8 @@ async def _complete_required_tasks(session, run_id) -> None:
                 AssessmentTask.task_key == task_key,
             )
         )
+        if task.status == "succeeded":
+            continue
         await repository.start_task(
             session,
             run_id,
@@ -901,6 +909,7 @@ async def test_service_persists_model_weight_complete_stats_and_publication(
     async with session_factory() as session:
         async with session.begin():
             await repository.start_run(session, run.id)
+            await _complete_required_tasks(session, run.id)
             await repository.complete_run(session, run.id, "intensity-v1")
 
     async with session_factory() as session:

@@ -99,7 +99,7 @@ async def _persisted_assessment_trigger(session_factory):
     return event, revision, outbox
 
 
-async def test_repository_creates_run_and_nine_tasks_idempotently(session_factory) -> None:
+async def test_repository_creates_run_and_eleven_tasks_idempotently(session_factory) -> None:
     event, revision, outbox = await _persisted_assessment_trigger(session_factory)
     repository = AssessmentRepository()
 
@@ -142,7 +142,7 @@ async def test_repository_creates_run_and_nine_tasks_idempotently(session_factor
     assert first.snapshot["region_id"] == settings.data_asset_region_id
     assert first.snapshot["data_asset_snapshot"]["missing_required"]
     assert first.data_asset_snapshot_fingerprint
-    assert task_count == 9
+    assert task_count == 11
 
 
 async def test_repository_increments_run_number_for_each_trigger(session_factory) -> None:

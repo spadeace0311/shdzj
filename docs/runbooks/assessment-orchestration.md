@@ -2,7 +2,7 @@
 
 本文面向评估编排子系统的部署、值守和交接人员，说明 Outbox、Temporal Workflow、Dispatcher、Worker、评估运行和评估任务的核验与恢复方法。
 
-本文只描述当前仓库已经实现的能力。当前版本已编排评估运行和 9 个任务，并执行模型烈度、仪器烈度与融合烈度；损失、制图、报告文件和协同仍在后续阶段。
+本文只描述当前仓库已经实现的能力。当前版本已编排评估运行和 11 个任务，并执行模型烈度、仪器烈度、融合烈度以及六个损失任务；报告文件和协同仍在后续阶段。
 
 ## 1. 子系统范围
 
@@ -11,14 +11,14 @@
 - 正式报和更正报触发 `assessment.requested` Outbox。
 - 独立 `assessment-dispatcher` 认领 Outbox 并启动 Temporal Workflow。
 - 独立 `temporal-worker` 执行幂等 Activity。
-- 为每个事件修订建立一条 `assessment_runs` 记录和 9 条 `assessment_tasks`。
+- 为每个事件修订建立一条 `assessment_runs` 记录和 11 条 `assessment_tasks`。
 - 执行 `intensity.model`、`intensity.instrument`、`intensity.fusion`，并写入烈度产品和 PostGIS raster。
+- 执行 `loss.population`、`loss.casualties`、`loss.buildings`、`loss.economic`、`loss.resources`、`loss.validate`，并写入损失产品、指标和 PostGIS raster。
 - 只读 API `GET /api/v1/assessments/events/{event_id}/current`。
-- 事件详情页展示评估运行版本、状态、任务计数和任务状态点。
+- 事件详情页展示评估运行版本、状态、任务计数、任务状态点、损失汇总、损失地图和融合烈度图层。
 
 当前未实现：
 
-- 受灾人口、人员伤亡、房屋破坏和经济损失计算。
 - 27 类图件、专题图模板和报告文件生成。
 - 工作组成果上传、审核和指挥大厅协同。
 - AI 知识库问答。
@@ -41,9 +41,12 @@ assessment:{event_id}:{revision_id}
 assessment_runs + assessment_tasks
       |
       | run_intensity_model / run_intensity_instrument
-      | run_intensity_fusion / finalize_assessment
+      | run_intensity_fusion / run_loss_buildings / run_loss_population
+      | run_loss_casualties / run_loss_economic / run_loss_resources
+      | run_loss_validate / finalize_assessment
       v
 intensity_field_products + intensity_rasters
++ loss_products + loss_metric_values + loss_product_rasters
       |
       v
 评估状态 API 与前端事件详情
@@ -56,7 +59,7 @@ intensity_field_products + intensity_rasters
 - API 和 Temporal Worker 不运行 Dispatcher；只有 `assessment-dispatcher` 容器显式设置 `ASSESSMENT_DISPATCHER_ENABLED=true`。
 - Workflow ID 固定，重复投递使用 Temporal `USE_EXISTING` 冲突策略。
 - Activity 以 Outbox、事件和修订为幂等键；同一修订重复执行不会重复创建运行或任务。
-- 模型烈度和融合烈度必须成功才能把运行标记为 `completed`；仪器烈度缺失或失败会回退到 `model_only`/`F3`。
+- 模型烈度、融合烈度和六个损失任务必须成功才能把运行标记为 `completed`；仪器烈度缺失或失败会回退到 `model_only`/`F3`。
 
 ## 3. 启动与迁移
 
@@ -83,10 +86,10 @@ docker compose --env-file .env -f infra/compose.yaml ps
 docker compose --env-file .env -f infra/compose.yaml run --rm api alembic current
 ```
 
-当前评估编排与烈度评估迁移头应为：
+当前评估编排、烈度评估与损失评估迁移头应为：
 
 ```text
-0011_intensity_assessment (head)
+0014_loss_assessment (head)
 ```
 
 Temporal UI 只绑定本机：
@@ -211,7 +214,7 @@ ORDER BY das.asset_key;
 }
 ```
 
-创建评估运行时会捕获所有已发布的 required/optional 资产。缺少 required 资产会记录在 `missing_required` 中，但当前阶段只做记录，不使评估运行失败；损失实现启用后，该缺失将变成损失任务失败。
+创建评估运行时会捕获所有已发布的 required/optional 资产。缺少 required 资产会记录在 `missing_required` 中；损失服务读取锁定版本失败时，对应损失任务失败，运行不能标记为 `completed`。
 
 查看该运行的烈度产品：
 
@@ -222,6 +225,31 @@ SELECT product_type, status, quality_grade, coverage_ratio,
 FROM intensity_field_products
 WHERE run_id = '<运行 UUID>'
 ORDER BY product_type;
+```
+
+查看该运行的损失产品、指标和 raster：
+
+```sql
+SELECT product_type, status, quality_grade, calibration_status,
+       coverage_ratio, partial_scope, needs_review,
+       spatialized_estimate, output_checksum
+FROM loss_products
+WHERE run_id = '<运行 UUID>'
+ORDER BY product_type;
+
+SELECT p.product_type, m.area_scope, m.area_code, m.metric_key,
+       m.value_type, m.numeric_value, m.unit, m.quality_grade
+FROM loss_metric_values m
+JOIN loss_products p ON p.id = m.product_id
+WHERE p.run_id = '<运行 UUID>'
+ORDER BY p.product_type, m.area_scope, m.area_code, m.metric_key, m.value_type;
+
+SELECT r.product_id, r.raster_version, ST_Width(r.rast), ST_Height(r.rast),
+       ST_SRID(r.rast), r.spatial_allocation_rule, r.coverage_ratio
+FROM loss_product_rasters r
+JOIN loss_products p ON p.id = r.product_id
+WHERE p.run_id = '<运行 UUID>'
+ORDER BY p.product_type;
 ```
 
 查看可用/部分产品的 raster 元数据：
@@ -254,9 +282,9 @@ assessment:<event_id>:<revision_id>
 核验要点：
 
 - Workflow 类型为 `AssessmentWorkflow`。
-- Activity 名称包括 `prepare_assessment`、`run_intensity_model`、`run_intensity_instrument`、`run_intensity_fusion` 和 `finalize_assessment`。
-- 成功结果中的 `task_count` 为 `9`。
-- 正常完成时三个烈度任务为 `succeeded`，后六个任务为 `skipped`。
+- Activity 名称包括 `prepare_assessment`、三个烈度 Activity、六个损失 Activity、`mark_deadline_exceeded`、`observe_task_deadlines` 和 `finalize_assessment`。
+- 成功结果中的 `task_count` 为 `11`。
+- 正常完成时三个烈度任务和六个损失任务为 `succeeded`，报告与协同任务为 `skipped`。
 - 重复投递不会产生第二条同修订评估运行。
 - Workflow 失败时查看 Activity 错误和重试历史，不删除 Workflow 来掩盖故障。
 
@@ -364,16 +392,17 @@ docker compose --env-file .env -f infra/compose.yaml logs --tail 200 assessment-
 docker compose --env-file .env -f infra/compose.yaml logs --tail 200 temporal-worker
 ```
 
-恢复成功的证据是 Outbox 最终变为 `published`，对应修订存在一条评估运行和 9 条任务；正式报或更正报还会产生模型、仪器、融合三类烈度产品，其中可用/部分产品必须有 `intensity_rasters`。不要通过清空 Outbox、删除 Temporal 历史或重复创建运行来绕过故障。
+恢复成功的证据是 Outbox 最终变为 `published`，对应修订存在一条评估运行和 11 条任务；正式报或更正报还会产生模型、仪器、融合三类烈度产品以及六类损失产品，其中可用/部分空间产品必须有对应 raster。不要通过清空 Outbox、删除 Temporal 历史或重复创建运行来绕过故障。
 
 ## 8. 已知边界与风险
 
-- 本阶段执行模型、仪器和融合烈度；损失、制图、报告文件、成果流转和 AI 问答仍未实现。
+- 本阶段执行模型、仪器和融合烈度以及六类损失任务；制图、报告文件、成果流转和 AI 问答仍未实现。
 - Temporal UI 仅用于本机运维，不得直接暴露到互联网。
 - 当前没有告警或自动清理死信；需要值守人员按本手册核验和处理。
 - 当前未验证生产级 Temporal 高可用、TLS、鉴权或多节点 Worker 部署。
 - 修改 Workflow 代码或 Task Queue 前必须评估运行中 Workflow 的兼容性。
 - `intensity_rasters` 是 PostgreSQL/PostGIS 内的 raster 数据，备份策略必须包含该表，不能只备份普通业务表。
+- `loss_product_rasters` 同样是 PostgreSQL/PostGIS 内的 raster 数据，备份策略必须包含该表及 `loss_products`、`loss_metric_values`。
 - 真实联调中观察到 `intensity.instrument` 首次尝试在 `assessment_runs` 的
   `FOR UPDATE` 上发生一次瞬态 `DBAPIError` 死锁，并由 Temporal 按
   `maximum_attempts=3` 重试成功；作为操作风险监控重复死锁或三次尝试均失败的情况，

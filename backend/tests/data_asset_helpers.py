@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,16 +131,26 @@ def _asset_contract(definition: DataAssetDefinition) -> dict:
 
 async def _cleanup_fixture_data(session_factory) -> None:
     from sqlalchemy import delete
+    from sqlalchemy.exc import DBAPIError
 
     from app.data_assets.models import DataAssetVersion
 
-    async with session_factory() as session:
-        async with session.begin():
-            await session.execute(
-                delete(DataAssetVersion).where(
-                    DataAssetVersion.imported_by == FIXTURE_ACTOR
-                )
-            )
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        delete(DataAssetVersion).where(
+                            DataAssetVersion.imported_by == FIXTURE_ACTOR
+                        )
+                    )
+            return
+        except DBAPIError as exc:
+            last_error = exc
+            await asyncio.sleep(0.05 * (2**attempt))
+    assert last_error is not None
+    raise last_error
 
 
 async def _published_version_has_town_keys(
@@ -391,7 +402,7 @@ async def _ensure_active_boundary(session) -> str:
 
 @pytest.fixture
 async def seeded_outbox(session_factory) -> SeededOutbox:
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from decimal import Decimal
 
     from sqlalchemy import select
@@ -404,12 +415,16 @@ async def seeded_outbox(session_factory) -> SeededOutbox:
 
     boundary_version = await _with_boundary(session_factory)
     source_event_id = f"DATA-ASSET-TEST-{uuid4()}"
-    received_at = datetime(2026, 9, 26, 1, 3, tzinfo=UTC)
+    source = f"data-{uuid4().hex[:16]}"
+    origin_time = datetime(2026, 9, 26, 1, 0, tzinfo=UTC) + timedelta(
+        seconds=int(uuid4().int % 3600) + 180
+    )
+    received_at = origin_time + timedelta(minutes=3)
     event = NormalizedEvent(
         kind=EventKind.FORMAL,
-        source="cenc",
+            source=source,
         source_event_id=source_event_id,
-        origin_time=datetime(2026, 9, 26, 1, 0, tzinfo=UTC),
+        origin_time=origin_time,
         longitude=Decimal("121.500000"),
         latitude=Decimal("31.200000"),
         depth_km=Decimal("10.00"),

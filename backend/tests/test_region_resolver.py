@@ -16,6 +16,7 @@ SOURCE_URI = "https://example.gov.invalid/regions/shanghai-synthetic.geojson"
 
 @pytest.fixture(autouse=True)
 async def dispose_database_engine():
+    await engine.dispose()
     yield
     await engine.dispose()
 

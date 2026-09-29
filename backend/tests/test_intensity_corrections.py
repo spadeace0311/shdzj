@@ -37,6 +37,37 @@ async def _delete(session_factory):
             await session.execute(delete(RawMessage))
 
 
+async def _complete_loss_tasks(session, run_id) -> None:
+    repository = AssessmentRepository()
+    for task_key, algorithm_version, fingerprint in (
+        ("loss.population", "population-intensity-v1", "p" * 64),
+        ("loss.buildings", "building-structure-matrix-v1", "b" * 64),
+        ("loss.casualties", "casualty-building-intensity-v1", "c" * 64),
+        ("loss.economic", "economic-building-loss-v1", "e" * 64),
+        ("loss.resources", "resource-linear-demand-v1", "r" * 64),
+        ("loss.validate", "loss-validation-v1", "v" * 64),
+    ):
+        task = await session.scalar(
+            select(AssessmentTask).where(
+                AssessmentTask.run_id == run_id,
+                AssessmentTask.task_key == task_key,
+            )
+        )
+        await repository.start_task(
+            session,
+            run_id,
+            task_key,
+            algorithm_version,
+            fingerprint,
+        )
+        await repository.complete_task(
+            session,
+            task.id,
+            fingerprint,
+            {},
+        )
+
+
 async def _event(kind: EventKind, magnitude: str, report_time: datetime):
     return NormalizedEvent(
         kind=kind,
@@ -128,6 +159,7 @@ async def test_correction_supersedes_old_run_but_keeps_fallback(session_factory)
                 "fusion-checksum",
                 {},
             )
+            await _complete_loss_tasks(session, first_run.id)
             await repository.complete_run(session, first_run.id, "bundle-1")
             first_run.deadline_at = received + timedelta(seconds=1)
             await repository.mark_deadline_exceeded(

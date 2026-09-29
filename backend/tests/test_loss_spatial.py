@@ -178,36 +178,53 @@ async def _seed_postgis_rows(session, run_id):
             "created_at": now,
         },
     )
-    await session.execute(
+    existing_asset_id = await session.scalar(
         text(
             """
-            INSERT INTO data_assets (
-                id, asset_key, region_id, name, data_type,
-                spatial_granularity, responsibility_unit, update_interval_days,
-                is_core, contract, created_at, updated_at
-            )
-            VALUES (
-                :id, :asset_key, :region_id, :name, :data_type,
-                :spatial_granularity, :responsibility_unit, :update_interval_days,
-                :is_core, :contract, :created_at, :updated_at
-            )
+            SELECT id
+            FROM data_assets
+            WHERE asset_key = :asset_key
+              AND region_id = :region_id
             """
         ),
         {
-            "id": asset_id,
             "asset_key": "shanghai.admin.town",
             "region_id": "shanghai",
-            "name": "test town boundary",
-            "data_type": "vector",
-            "spatial_granularity": "town",
-            "responsibility_unit": "test",
-            "update_interval_days": 365,
-            "is_core": True,
-            "contract": "{}",
-            "created_at": now,
-            "updated_at": now,
         },
     )
+    if existing_asset_id is None:
+        await session.execute(
+            text(
+                """
+                INSERT INTO data_assets (
+                    id, asset_key, region_id, name, data_type,
+                    spatial_granularity, responsibility_unit, update_interval_days,
+                    is_core, contract, created_at, updated_at
+                )
+                VALUES (
+                    :id, :asset_key, :region_id, :name, :data_type,
+                    :spatial_granularity, :responsibility_unit, :update_interval_days,
+                    :is_core, :contract, :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": asset_id,
+                "asset_key": "shanghai.admin.town",
+                "region_id": "shanghai",
+                "name": "test town boundary",
+                "data_type": "vector",
+                "spatial_granularity": "town",
+                "responsibility_unit": "test",
+                "update_interval_days": 365,
+                "is_core": True,
+                "contract": "{}",
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+    else:
+        asset_id = existing_asset_id
     await session.execute(
         text(
             """

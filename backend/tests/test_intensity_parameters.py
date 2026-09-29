@@ -29,11 +29,11 @@ def test_loads_approved_model_and_fusion_parameters() -> None:
 
 
 def test_parameter_checksum_is_stable_and_content_sensitive(tmp_path: Path) -> None:
-    source = PARAMETERS.read_text(encoding="utf-8")
+    source = PARAMETERS.read_bytes()
     first = tmp_path / "first.yaml"
     second = tmp_path / "second.yaml"
-    first.write_text(source, encoding="utf-8")
-    second.write_text(source.replace("0.6310", "0.6311"), encoding="utf-8")
+    first.write_bytes(source)
+    second.write_bytes(source.replace(b"0.6310", b"0.6311"))
 
     assert parameter_bundle_checksum(first) == parameter_bundle_checksum(PARAMETERS)
     assert parameter_bundle_checksum(second) != parameter_bundle_checksum(PARAMETERS)

@@ -1,6 +1,6 @@
 # 上海市地震应急辅助决策系统
 
-本仓库实现地震事件接入、响应研判与评估编排基础。后端接收 CENC 报文并生成制度响应、服务响应建议；前端提供登录、事件列表、事件详情和人工事件录入。正式报与更正报可经 Outbox 和 Temporal 建立评估运行及 9 个任务，其中三个烈度任务执行，其余任务在当前阶段保持 `skipped`。
+本仓库实现地震事件接入、响应研判与评估编排基础，并已贯通烈度与损失评估链。后端接收 CENC 报文并生成制度响应、服务响应建议；前端提供登录、事件列表、事件详情和人工事件录入。正式报与更正报可经 Outbox 和 Temporal 建立评估运行及 11 个任务，其中三个烈度任务和六个损失任务执行，报告与协同任务保持 `skipped`。
 
 ## 前置条件
 
@@ -80,6 +80,12 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
 docker compose --env-file .env -f infra/compose.yaml run --rm api ruff check app tests
 ```
 
+固定上海损失性能基准：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -m performance tests/test_loss_performance.py -v
+```
+
 前端单元测试、类型检查和构建：
 
 ```powershell
@@ -98,18 +104,32 @@ collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx 
 
 正式报和更正报首次入库时创建评估 Outbox。独立的 `assessment-dispatcher` 消费 Outbox，以稳定 Workflow ID 启动 Temporal Workflow；`temporal-worker` 执行幂等 Activity，并在 PostgreSQL 中建立 `assessment_runs` 和 `assessment_tasks`。API 服务不运行 Dispatcher。
 
-当前每个正式报或更正报修订建立 9 个任务：
+当前每个正式报或更正报修订建立 11 个任务：
 
 - 模型烈度、仪器烈度、融合烈度。
-- 受灾人口、人员伤亡、房屋破坏、经济损失。
+- 受灾人口、人员伤亡、房屋破坏、经济损失、应急资源需求、损失校验。
 - 快速评估报告。
 - 工作组响应任务。
 
-当前已实现 `intensity.model`、`intensity.instrument` 和 `intensity.fusion`。模型和融合完成是运行成功的必要条件；仪器缺失或失败会保存 `unavailable`/`invalid` 产品，并由融合回退到 `model_only`/`F3`，不会导致运行失败。损失、制图、报告文件、成果流转和 AI 问答仍不在本阶段范围内，对应任务保持 `skipped`。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+当前已实现 `intensity.model`、`intensity.instrument`、`intensity.fusion`，以及 `loss.population`、`loss.casualties`、`loss.buildings`、`loss.economic`、`loss.resources`、`loss.validate`。模型、融合和六个损失任务必须成功才能把运行标记为 `completed`；仪器缺失或失败会保存 `unavailable`/`invalid` 产品，并由融合回退到 `model_only`/`F3`，不会导致运行失败。报告文件、成果流转和 AI 问答仍不在本阶段范围内，对应任务保持 `skipped`。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+
+损失结果通过以下只读 API 对外提供，并在事件详情页展示产品、指标、城镇/格网地图和融合烈度图层：
+
+```text
+GET /api/v1/assessments/runs/{run_id}/loss
+GET /api/v1/assessments/runs/{run_id}/loss/products/{product_type}
+GET /api/v1/assessments/runs/{run_id}/loss/areas?scope=city|county|town
+GET /api/v1/assessments/runs/{run_id}/loss/artifact?product_id=<product-id>[&band=<band>]
+GET /api/v1/assessments/runs/{run_id}/loss/artifact/{product_id}/{band}/{z}/{x}/{y}.png
+GET /api/v1/assessments/runs/{run_id}/intensity/artifact?product_id=<product-id>[&band=<band>]
+GET /api/v1/assessments/runs/{run_id}/intensity/artifact/{product_id}/{band}/{z}/{x}/{y}.png
+```
 
 烈度评估的启动、正式报核验、产品检查、更正语义、超时处理、仪器降级和栅格备份请参阅 [烈度评估运行手册](docs/runbooks/intensity-assessment.md)。
 
 评估编排的启动、健康检查、Outbox 查询、死信安全重放、Workflow 核验和 Worker 恢复请参阅 [评估编排运行手册](docs/runbooks/assessment-orchestration.md)。
+
+损失评估的启动、数据资产、参数来源、固定上海场景、产品/SQL 核验、缺参处理、更正、恢复和 PostGIS raster 备份请参阅 [损失评估运行手册](docs/runbooks/loss-assessment.md)。
 
 ## 数据资产中心
 
@@ -121,7 +141,7 @@ collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx 
 - `data_publisher`：导入、校验、发布、停用和回滚。
 - `superadmin`：拥有全部数据资产操作。
 
-评估运行创建时会冻结已发布资产版本、校验和以及 required/optional 角色到 `data_asset_snapshots`。当前阶段只捕获快照，受灾人口、人员伤亡、房屋破坏和经济损失等损失公式仍属于后续工作，尚未消费这些快照。
+评估运行创建时会冻结已发布资产版本、校验和以及 required/optional 角色到 `data_asset_snapshots`。损失评估服务通过快照读取运行锁定的行政区划、人口、建筑、经济和损失参数版本；缺少必需资产时，损失任务或运行按对应失败/不可用语义处理。
 
 数据资产的部署、导入、发布、故障排查、快照核验、更新逾期和备份恢复请参阅 [数据资产中心运行手册](docs/runbooks/data-asset-center.md)。
 

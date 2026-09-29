@@ -238,7 +238,7 @@ def _metric_write(
 
 
 async def _create_run_id(session_factory) -> UUID:
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from decimal import Decimal
 
     from app.assessment.repository import AssessmentRepository
@@ -250,13 +250,17 @@ async def _create_run_id(session_factory) -> UUID:
     from tests.data_asset_helpers import _with_boundary
 
     boundary_version = await _with_boundary(session_factory)
-    received_at = datetime(2026, 9, 26, 1, 3, tzinfo=UTC)
+    origin_time = datetime(2026, 9, 26, 1, 0, tzinfo=UTC) + timedelta(
+        seconds=int(uuid4().int % 3600) + 180
+    )
+    received_at = origin_time + timedelta(minutes=3)
     source_event_id = f"LOSS-API-{uuid4()}"
+    source = f"loss-{uuid4().hex[:16]}"
     event = NormalizedEvent(
         kind=EventKind.FORMAL,
-        source="cenc",
+            source=source,
         source_event_id=source_event_id,
-        origin_time=datetime(2026, 9, 26, 1, 0, tzinfo=UTC),
+        origin_time=origin_time,
         longitude=Decimal("121.500000"),
         latitude=Decimal("31.200000"),
         depth_km=Decimal("10.00"),
