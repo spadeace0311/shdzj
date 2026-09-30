@@ -40,6 +40,7 @@ services:
       - ../backend:/app
       - ../config:/config
       - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,6 +136,7 @@ services:
       - ../backend:/app
       - ../config:/config
       - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -184,3 +186,4 @@ volumes:
   temporal_postgres_data:
   frontend_node_modules:
   collector-spool:
+  artifact-data:

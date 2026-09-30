@@ -14,15 +14,28 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0014_loss_assessment"
+LATEST_REVISION = "0015_artifact_production"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
+ARTIFACT_PREVIOUS_REVISION = "0014_loss_assessment"
 NON_CENC_REVISION = "0009_non_cenc_lifecycle"
 REGION_MARITIME_REVISION = "0008_region_boundaries_maritime"
 OLD_REGION_REVISION = "0007_region_boundaries"
 MIGRATION_TEST_VERSION = "migration-test-0008"
 NON_CENC_MIGRATION_TEST_PREFIX = "migration-test-noncenc-"
+ARTIFACT_TABLES = {
+    "artifact_templates",
+    "artifact_template_versions",
+    "production_input_snapshots",
+    "production_input_snapshot_items",
+    "artifact_production_runs",
+    "artifact_production_tasks",
+    "artifact_task_dependency_bindings",
+    "generated_artifacts",
+    "artifact_publications",
+    "artifact_override_requests",
+}
 LOSS_TABLES = {
     "loss_model_definitions",
     "loss_parameter_sets",
@@ -418,6 +431,18 @@ async def _loss_tables_exist() -> bool:
     return LOSS_TABLES <= names
 
 
+async def _artifact_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+    finally:
+        await engine.dispose()
+    return ARTIFACT_TABLES <= names
+
+
 async def _intensity_schema_state() -> dict[str, object]:
     tables = (
         "assessment_runs",
@@ -787,6 +812,19 @@ async def test_0014_loss_assessment_is_reversible() -> None:
         assert await _loss_tables_exist() is True
         _set_revision(LOSS_PREVIOUS_REVISION)
         assert await _loss_tables_exist() is False
+        _set_revision(LATEST_REVISION)
+    finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0015_artifact_production_is_reversible() -> None:
+    _set_revision(ARTIFACT_PREVIOUS_REVISION)
+    assert await _artifact_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        assert await _artifact_tables_exist() is True
+        _set_revision(ARTIFACT_PREVIOUS_REVISION)
+        assert await _artifact_tables_exist() is False
         _set_revision(LATEST_REVISION)
     finally:
         _set_revision(LATEST_REVISION)

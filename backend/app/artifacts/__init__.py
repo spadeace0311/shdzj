@@ -1,0 +1,1 @@
+"""Artifact production domain models."""

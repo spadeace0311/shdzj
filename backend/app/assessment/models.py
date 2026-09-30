@@ -52,7 +52,7 @@ class AssessmentRun(Base):
         default=100,
         server_default=text("100"),
     )
-    t1_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    t1_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

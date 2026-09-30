@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     data_asset_max_upload_bytes: int = 1_073_741_824
     data_asset_mdb_driver: str = "Microsoft Access Driver (*.mdb, *.accdb)"
     data_asset_worker_poll_seconds: float = 1.0
+    artifact_storage_root: str = "/var/lib/artifacts"
+    artifact_template_root: str = "/config/artifact_templates"
+    artifact_catalog_path: str = "/config/artifacts/catalog.yaml"
+    artifact_max_override_bytes: int = 1_073_741_824
+    artifact_render_concurrency: int = 4
+    artifact_optional_dependency_reserve_seconds: int = 30
+    artifact_browser_pool_size: int = 2
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -124,6 +131,29 @@ class Settings(BaseSettings):
             raise ValueError("DATA_ASSET_MDB_DRIVER must not be empty")
         if self.data_asset_worker_poll_seconds <= 0:
             raise ValueError("DATA_ASSET_WORKER_POLL_SECONDS must be positive")
+        return self
+
+    @model_validator(mode="after")
+    def validate_artifact_configuration(self) -> "Settings":
+        artifact_paths = (
+            self.artifact_storage_root,
+            self.artifact_template_root,
+            self.artifact_catalog_path,
+        )
+        for path in artifact_paths:
+            if not path.strip():
+                raise ValueError("artifact configuration paths must not be empty")
+        if self.artifact_max_override_bytes < 1:
+            raise ValueError("ARTIFACT_MAX_OVERRIDE_BYTES must be positive")
+        if not 1 <= self.artifact_render_concurrency <= 6:
+            raise ValueError("ARTIFACT_RENDER_CONCURRENCY must be between 1 and 6")
+        if not 1 <= self.artifact_browser_pool_size <= 8:
+            raise ValueError("ARTIFACT_BROWSER_POOL_SIZE must be between 1 and 8")
+        if not 0 < self.artifact_optional_dependency_reserve_seconds < 300:
+            raise ValueError(
+                "ARTIFACT_OPTIONAL_DEPENDENCY_RESERVE_SECONDS must be positive "
+                "and less than 300"
+            )
         return self
 
 
