@@ -27,6 +27,9 @@ from app.config import settings
 from app.data_assets.locks import lock_data_asset_catalog
 from app.data_assets.models import DataAssetSnapshot
 from app.data_assets.repository import DataAssetRepository
+from app.data_assets.required_registry import (
+    load_production_required_asset_registry,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 from app.loss.region import load_region_loss_profile
 
@@ -345,6 +348,10 @@ class ProductionContextService:
         for definition in catalog.definitions:
             required.update(definition.required_assets)
             optional.update(definition.optional_assets)
+        production_registry = load_production_required_asset_registry()
+        required.update(production_registry.required)
+        optional.update(production_registry.optional)
+        optional.update(production_registry.artifact_assets)
         optional.difference_update(required)
         optional.update(_BASEMAP_KEYS)
         optional.difference_update(required)

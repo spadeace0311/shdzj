@@ -10,14 +10,18 @@ from app.artifacts.context import ProductionContextService
 from app.artifacts.models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
+    ProductionInputSnapshot,
     ProductionInputSnapshotItem,
 )
 from app.artifacts.repository import ArtifactProductionRepository
 from app.assessment.models import AssessmentRun
 from app.config import settings
+from app.data_assets.models import DataAsset, DataAssetVersion
+from app.data_assets.registry import get_asset_definition
 from app.events.models import EarthquakeEvent
 from app.loss.region import load_region_loss_profile
 from tests.data_asset_helpers import (
+    FIXTURE_ACTOR,
     _cleanup_fixture_data,
     publish_new_population_version,
 )
@@ -190,6 +194,64 @@ async def published_population_version(session_factory) -> uuid.UUID:
     await _cleanup_fixture_data(session_factory)
 
 
+@pytest.fixture
+async def published_loss_parameter_version(session_factory) -> uuid.UUID:
+    definition = get_asset_definition("shanghai.loss.parameters")
+    version = f"loss-parameter-{uuid.uuid4()}"
+    await _cleanup_fixture_data(session_factory)
+    async with session_factory() as session:
+        async with session.begin():
+            asset = await session.scalar(
+                select(DataAsset).where(
+                    DataAsset.asset_key == definition.asset_key,
+                    DataAsset.region_id == definition.region_id,
+                )
+            )
+            if asset is None:
+                asset = DataAsset(
+                    asset_key=definition.asset_key,
+                    region_id=definition.region_id,
+                    name=definition.name,
+                    data_type=definition.data_type.value,
+                    spatial_granularity=definition.spatial_granularity,
+                    responsibility_unit="fixture",
+                    update_interval_days=definition.update_interval_days,
+                    is_core=definition.is_core,
+                    contract={
+                        "business_key_fields": ["parameter_set_id"],
+                        "fields": [
+                            {
+                                "name": "parameter_set_id",
+                                "python_type": "string",
+                                "required": True,
+                                "nonnegative": False,
+                                "minimum": None,
+                                "maximum": None,
+                            }
+                        ],
+                    },
+                )
+                session.add(asset)
+                await session.flush()
+            version_id = DataAssetVersion(
+                asset_id=asset.id,
+                version=version,
+                status="published",
+                source_uri="https://example.gov.invalid/loss-parameters",
+                source_crs="EPSG:4326",
+                checksum="b" * 64,
+                schema_summary={"parameter_set_id": "loss-parameter-fixture"},
+                imported_by=FIXTURE_ACTOR,
+                imported_at=datetime.now(UTC),
+                published_at=datetime.now(UTC),
+            )
+            session.add(version_id)
+            await session.flush()
+            result = version_id.id
+    yield result
+    await _cleanup_fixture_data(session_factory)
+
+
 async def test_static_context_is_deterministic_and_does_not_drift(
     seeded_artifact_assessment,
     production_context_service,
@@ -357,3 +419,52 @@ async def test_static_manifest_freezes_design_identity_fields(
     assert templates["map.epicenter"]["version"] == "v1"
     assert len(templates["map.epicenter"]["checksum"]) == 64
     assert templates["map.epicenter"]["kind"] == "map"
+
+
+async def test_loss_parameter_package_freezes_published_identity(
+    seeded_artifact_assessment,
+    production_context_service,
+    session_factory,
+    published_loss_parameter_version,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+
+    async with session_factory() as freeze_session:
+        async with freeze_session.begin():
+            context = await production_context_service.freeze_static_context(
+                freeze_session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+            version = await freeze_session.get(
+                DataAssetVersion,
+                published_loss_parameter_version,
+            )
+            assert version is not None
+
+            package = context.manifest["loss"]["parameter_package"]
+            assert package["resolution_status"] == "bound"
+            assert package["version"] == version.version
+            assert package["checksum"] == version.checksum
+
+            item = context.item("shanghai.loss.parameters")
+            assert item.resolution_status == "bound"
+            assert item.asset_version_id == version.id
+            assert item.checksum == version.checksum
+
+            persisted = await freeze_session.scalar(
+                select(ProductionInputSnapshotItem)
+                .join(
+                    ProductionInputSnapshot,
+                    ProductionInputSnapshotItem.snapshot_id
+                    == ProductionInputSnapshot.id,
+                )
+                .where(
+                    ProductionInputSnapshot.production_run_id == run.id,
+                    ProductionInputSnapshotItem.asset_key
+                    == "shanghai.loss.parameters",
+                )
+            )
+            assert persisted is not None
+            assert persisted.asset_version_id == version.id
+            assert persisted.checksum == version.checksum

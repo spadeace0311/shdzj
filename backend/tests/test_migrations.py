@@ -7,7 +7,7 @@ from pathlib import Path
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 
@@ -460,6 +460,175 @@ async def _production_snapshot_item_identity_nullability() -> dict[str, bool]:
     return {
         "asset_version_id": columns["asset_version_id"],
         "checksum": columns["checksum"],
+    }
+
+
+async def _create_missing_snapshot_item_fixture() -> tuple[uuid.UUID, uuid.UUID]:
+    from datetime import UTC, datetime, timedelta
+
+    from geoalchemy2.elements import WKTElement
+
+    from app.artifacts.models import (
+        ProductionInputSnapshot,
+        ProductionInputSnapshotItem,
+        ProductionRun,
+    )
+    from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    event_id = uuid.uuid4()
+    raw_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                raw = RawMessage(
+                    id=raw_id,
+                    source="migration-0016",
+                    source_message_id=f"migration-0016-{event_id}",
+                    message_kind="test",
+                    checksum=f"{uuid.uuid4().hex}{uuid.uuid4().hex}",
+                    payload={"fixture": "missing-snapshot-item"},
+                    received_at=now,
+                )
+                event = EarthquakeEvent(
+                    id=event_id,
+                    source="migration-0016",
+                    canonical_source_id=f"migration-0016-{event_id}",
+                    event_type="test",
+                    origin_time=now,
+                    longitude=121.500000,
+                    latitude=31.200000,
+                    depth_km=10.00,
+                    magnitude=5.2,
+                    place="migration 0016 fixture",
+                    geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                    lifecycle_state="active",
+                )
+                session.add_all([raw, event])
+                await session.flush()
+                revision = EarthquakeRevision(
+                    event_id=event.id,
+                    raw_message_id=raw.id,
+                    revision_no=1,
+                    revision_kind="test",
+                    origin_time=event.origin_time,
+                    longitude=event.longitude,
+                    latitude=event.latitude,
+                    depth_km=event.depth_km,
+                    magnitude=event.magnitude,
+                    place=event.place,
+                    is_current=True,
+                )
+                session.add(revision)
+                await session.flush()
+                event.current_revision_id = revision.id
+                run = ProductionRun(
+                    event_id=event.id,
+                    revision_id=revision.id,
+                    revision_no=1,
+                    production_mode="test",
+                    launch_mode="standalone",
+                    deadline_basis_at=now,
+                    deadline_at=now + timedelta(seconds=300),
+                    deadline_kind="rebuild_deadline",
+                    catalog_version="migration-test-v1",
+                    generation_seq=1,
+                    generation_scope="fixture",
+                    required_outputs=[],
+                    is_current=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(run)
+                await session.flush()
+                snapshot = ProductionInputSnapshot(
+                    production_run_id=run.id,
+                    context_fingerprint="e" * 64,
+                    region_id="shanghai",
+                    manifest={"fixture": "missing-snapshot-item"},
+                )
+                session.add(snapshot)
+                await session.flush()
+                session.add(
+                    ProductionInputSnapshotItem(
+                        snapshot_id=snapshot.id,
+                        asset_key="migration.missing",
+                        asset_version_id=None,
+                        checksum=None,
+                        role="optional",
+                        coverage={},
+                        selected_for_render=False,
+                    )
+                )
+                await session.flush()
+        return event_id, raw_id
+    finally:
+        await engine.dispose()
+
+
+async def _delete_missing_snapshot_item_fixture(
+    event_id: uuid.UUID,
+    raw_id: uuid.UUID,
+) -> None:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM earthquake_events WHERE id = :event_id"),
+                {"event_id": event_id},
+            )
+            await connection.execute(
+                text("DELETE FROM raw_messages WHERE id = :raw_id"),
+                {"raw_id": raw_id},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _missing_snapshot_item_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            main_count = await connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM production_input_snapshot_items
+                    WHERE asset_key = 'migration.missing'
+                    """
+                )
+            )
+            archive_count = await connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM production_input_snapshot_items_missing
+                    WHERE asset_key = 'migration.missing'
+                    """
+                )
+            )
+            identity = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT asset_version_id, checksum
+                        FROM production_input_snapshot_items
+                        WHERE asset_key = 'migration.missing'
+                        LIMIT 1
+                        """
+                    )
+                )
+            ).one_or_none()
+    finally:
+        await engine.dispose()
+    return {
+        "main_count": main_count,
+        "archive_count": archive_count,
+        "identity": (
+            (identity[0], identity[1]) if identity is not None else None
+        ),
     }
 
 
@@ -972,4 +1141,31 @@ async def test_0016_production_snapshot_item_nullable_identity_is_reversible() -
             "checksum": False,
         }
     finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0016_preserves_missing_snapshot_items_across_downgrade_upgrade() -> None:
+    _set_revision(LATEST_REVISION)
+    event_id, raw_id = await _create_missing_snapshot_item_fixture()
+    try:
+        before = await _missing_snapshot_item_state()
+        assert before["main_count"] == 1
+        assert before["archive_count"] == 0
+
+        _set_revision("0015_artifact_production")
+        downgraded = await _missing_snapshot_item_state()
+        assert downgraded["main_count"] == 0
+        assert downgraded["archive_count"] == 1
+        assert await _production_snapshot_item_identity_nullability() == {
+            "asset_version_id": False,
+            "checksum": False,
+        }
+
+        _set_revision(LATEST_REVISION)
+        upgraded = await _missing_snapshot_item_state()
+        assert upgraded["main_count"] == 1
+        assert upgraded["archive_count"] == 0
+        assert upgraded["identity"] == (None, None)
+    finally:
+        await _delete_missing_snapshot_item_fixture(event_id, raw_id)
         _set_revision(LATEST_REVISION)
