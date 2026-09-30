@@ -72,6 +72,11 @@ class MapRevisionFixture:
 
 
 @dataclass(frozen=True, slots=True)
+class FixtureReference:
+    id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
 class MapRenderFixtureContext:
     artifact_key: str
     display_name: str
@@ -244,8 +249,16 @@ class ArtifactAssessmentFixture:
         return self.assessment.event_id
 
     @property
+    def event(self) -> FixtureReference:
+        return FixtureReference(id=self.assessment.event_id)
+
+    @property
     def revision_id(self) -> uuid.UUID:
         return self.assessment.revision_id
+
+    @property
+    def revision(self) -> FixtureReference:
+        return FixtureReference(id=self.assessment.revision_id)
 
     @property
     def assessment_run_id(self) -> uuid.UUID:
@@ -676,6 +689,51 @@ class ArtifactAssessmentFixture:
             output_profile=output_profile,
             requested_by="artifact-workflow-test",
         )
+
+    async def publish_epicenter_artifact(self) -> GeneratedArtifact:
+        return await self.published_artifact(
+            "map.epicenter",
+            version=1,
+        )
+
+    async def publish_full_progress(self) -> ProductionRun:
+        repository = ArtifactProductionRepository()
+        run = await self.create_full_run()
+        async with self._session_factory() as session:
+            async with session.begin():
+                tasks = await repository.list_tasks(session, run.id)
+                for task in tasks:
+                    await repository.mark_task_succeeded_for_test(
+                        session,
+                        task.id,
+                    )
+                return await repository.finalize_run(
+                    session,
+                    run.id,
+                    datetime.now(UTC),
+                )
+
+    async def full_progress(self, event_id: uuid.UUID) -> str:
+        async with self._session_factory() as session:
+            run = await session.scalar(
+                select(ProductionRun).where(
+                    ProductionRun.event_id == event_id,
+                    ProductionRun.generation_scope == "full",
+                    ProductionRun.is_current.is_(True),
+                    ProductionRun.superseded_at.is_(None),
+                )
+            )
+            if run is None:
+                return "0/0"
+            tasks = await ArtifactProductionRepository().list_tasks(
+                session,
+                run.id,
+            )
+        completed = sum(
+            task.status in {"succeeded", "degraded"}
+            for task in tasks
+        )
+        return f"{completed}/{len(run.required_outputs)}"
 
     def standalone_input(
         self,

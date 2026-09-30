@@ -223,9 +223,12 @@ class ArtifactProductionService:
         artifact_key: str,
         output_profile: str,
         requested_by: str,
+        reason: str | None = None,
     ) -> PreparedProductionRun:
         if not requested_by.strip():
             raise ValueError("requested_by must not be empty")
+        if reason is not None and not reason.strip():
+            raise ValueError("reason must not be empty")
         async with self._session_factory() as session:
             async with session.begin():
                 event = await session.get(EarthquakeEvent, event_id)
@@ -236,6 +239,14 @@ class ArtifactProductionService:
                     raise ValueError("artifact rebuild revision does not belong to event")
                 self._catalog.get(artifact_key, output_profile)
                 now = datetime.now(UTC)
+                production_mode = _production_mode(revision.revision_kind)
+                old_publication = await self._repository.get_publication(
+                    session,
+                    event_id=event.id,
+                    artifact_key=artifact_key,
+                    output_profile=output_profile,
+                    production_mode=production_mode,
+                )
                 parent = await self._repository.get_current_full_run(
                     session,
                     event_id=event.id,
@@ -248,7 +259,7 @@ class ArtifactProductionService:
                     event_id=event.id,
                     revision_id=revision.id,
                     revision_no=revision.revision_no,
-                    production_mode=_production_mode(revision.revision_kind),
+                    production_mode=production_mode,
                     launch_mode="standalone",
                     deadline_basis_at=now,
                     deadline_at=now + timedelta(seconds=300),
@@ -264,10 +275,26 @@ class ArtifactProductionService:
                         "requested_by": requested_by,
                         "artifact_key": artifact_key,
                         "output_profile": output_profile,
+                        "reason": reason,
                     },
                     reuse_existing=False,
                 )
                 run = await self._repository.create_run(session, command)
+                run.snapshot = {
+                    **dict(run.snapshot or {}),
+                    "operator": requested_by,
+                    "rebuild_requested_at": now.isoformat(),
+                    "artifact_key": artifact_key,
+                    "output_profile": output_profile,
+                    "old_current_artifact_id": (
+                        str(old_publication.artifact_id)
+                        if old_publication is not None
+                        else None
+                    ),
+                    "new_production_run_id": str(run.id),
+                    "reason": reason,
+                }
+                await session.flush()
                 tasks = await self._repository.list_tasks(session, run.id)
                 return PreparedProductionRun(
                     production_run_id=run.id,
