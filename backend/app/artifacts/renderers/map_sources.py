@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactTaskDependencyBinding, ProductionRun, ProductionTask
-from app.artifacts.renderers.map_layers import LayerDefinition, MapLayerRegistry
+from app.artifacts.renderers.map_layers import (
+    LayerDefinition,
+    MapLayerRegistry,
+    RequiredDependencyMissingError,
+)
 from app.config import settings
 from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.raster_repository import load_raster_version
@@ -34,8 +38,8 @@ from app.loss.domain import (
     LossQualityGrade,
     LossValueType,
 )
-from app.loss.models import LossMetricValue, LossProduct
-from app.loss.repository import LossMetricValueWrite
+from app.loss.models import LossMetricValue, LossProduct, LossProductRaster
+from app.loss.repository import LossMetricValueWrite, LossRepository
 from app.loss.service import recompute_product_checksum
 
 
@@ -371,6 +375,40 @@ def _merged_value_status(statuses: list[str]) -> str:
     return "available"
 
 
+def _building_grid_central_band(
+    bands: list[np.ndarray],
+    metadata: dict[str, Any],
+) -> np.ndarray:
+    entries = metadata.get("bands")
+    if not isinstance(entries, list):
+        if len(bands) != 1:
+            raise RequiredDependencyMissingError(
+                "loss.buildings raster band manifest is missing"
+            )
+        return bands[0]
+    names = [
+        str(item.get("name") or "")
+        for item in entries
+        if isinstance(item, dict)
+    ]
+    if len(bands) != len(names):
+        raise RequiredDependencyMissingError(
+            "loss.buildings raster band manifest mismatch"
+        )
+    for band, name in zip(bands, names, strict=True):
+        if "_central" in name:
+            return band
+    return bands[0]
+
+
+def _frozen_asset_checksum(asset_versions: Any, source_key: str) -> str | None:
+    if not isinstance(asset_versions, dict):
+        return None
+    item = asset_versions.get(source_key)
+    checksum = getattr(item, "checksum", None)
+    return checksum if isinstance(checksum, str) else None
+
+
 class MapSourceResolver:
     def __init__(self, data_asset_repository: DataAssetRepository | None = None) -> None:
         self._data_asset_repository = data_asset_repository or DataAssetRepository()
@@ -454,6 +492,10 @@ class MapSourceResolver:
             )
             item = asset_versions.get(source_key)
             if item is None or item.resolution_status != "bound":
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(
+                        f"required asset {source_key} is unavailable"
+                    )
                 raise MapSourceResolutionError(
                     f"required asset {source_key} is unavailable"
                 )
@@ -499,6 +541,10 @@ class MapSourceResolver:
                 continue
             binding = bindings_by_key.get(dependency.key)
             if binding is None or binding.resolution_status not in {"bound", "degraded"}:
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(
+                        f"required assessment product {dependency.key} is unavailable"
+                    )
                 raise MapSourceResolutionError(
                     f"required assessment product {dependency.key} is unavailable"
                 )
@@ -523,6 +569,7 @@ class MapSourceResolver:
                 layer_definition=layer_definition,
                 event=event,
                 artifact_key=task.artifact_key,
+                asset_versions=asset_versions,
             )
 
         for layer_definition in MapLayerRegistry.definitions(task.artifact_key):
@@ -624,6 +671,12 @@ class MapSourceResolver:
             "shanghai.hazard_source",
             "shanghai.key_target",
             "shanghai.distance.reference_points",
+            "shanghai.shelter.emergency",
+            "shanghai.reservoir",
+            "shanghai.metro",
+            "shanghai.seismic_station",
+            "shanghai.rescue_team",
+            "shanghai.cultural_relic",
         }
         features, bad_records = self._filtered_features(
             records,
@@ -791,6 +844,7 @@ class MapSourceResolver:
         layer_definition: LayerDefinition,
         event: Any,
         artifact_key: str,
+        asset_versions: Any = None,
     ) -> ResolvedMapSource:
         if product_key == "intensity.fusion":
             intensity_product = await session.get(
@@ -839,6 +893,15 @@ class MapSourceResolver:
             )
         if product.status not in {"complete", "partial"}:
             raise MapSourceResolutionError(f"loss product {product_key} is unavailable")
+        if artifact_key == "map.building_grid":
+            return await self._building_grid_source(
+                session,
+                source_key=source_key,
+                product=product,
+                binding=binding,
+                layer_definition=layer_definition,
+                asset_versions=asset_versions,
+            )
         metric_bindings = tuple(
             (binding.metric_key, binding.property_name or binding.field)
             for binding in layer_definition.attribute_bindings
@@ -875,6 +938,84 @@ class MapSourceResolver:
             version=binding.bound_version,
             style=_style_for_definition(layer_definition),
             status=status,
+        )
+
+    async def _building_grid_source(
+        self,
+        session: AsyncSession,
+        *,
+        source_key: str,
+        product: LossProduct,
+        binding: ArtifactTaskDependencyBinding,
+        layer_definition: LayerDefinition,
+        asset_versions: Any,
+    ) -> ResolvedMapSource:
+        if not product.spatialized_estimate:
+            raise RequiredDependencyMissingError(
+                "loss.buildings has no spatialized estimate"
+            )
+        if not isinstance(product.input_checksum, str) or not product.input_checksum:
+            raise RequiredDependencyMissingError(
+                "loss.buildings has no input checksum"
+            )
+        raster = await session.scalar(
+            select(LossProductRaster).where(
+                LossProductRaster.product_id == product.id
+            )
+        )
+        if raster is None:
+            raise RequiredDependencyMissingError(
+                "loss.buildings spatialized raster is unavailable"
+            )
+        if (
+            not isinstance(raster.spatial_allocation_rule, str)
+            or not raster.spatial_allocation_rule
+        ):
+            raise RequiredDependencyMissingError(
+                "loss.buildings raster has no spatial allocation rule"
+            )
+        if not isinstance(raster.checksum, str) or not raster.checksum:
+            raise RequiredDependencyMissingError(
+                "loss.buildings raster has no checksum"
+            )
+        try:
+            bands, metadata = await LossRepository().load_raster(
+                session,
+                product.id,
+            )
+        except Exception as error:
+            raise RequiredDependencyMissingError(
+                f"loss.buildings raster is invalid: {error}"
+            ) from error
+        central_band = _building_grid_central_band(bands, metadata)
+        source = _array_raster_source(
+            [central_band],
+            metadata,
+            source_key=source_key,
+            identity=product.id,
+            checksum=raster.checksum,
+            version=raster.raster_version,
+        )
+        allocation_inputs = {
+            "loss.buildings": product.input_checksum,
+            "shanghai.building.town": _frozen_asset_checksum(
+                asset_versions,
+                "shanghai.building.town",
+            ),
+            "shanghai.admin.town": _frozen_asset_checksum(
+                asset_versions,
+                "shanghai.admin.town",
+            ),
+        }
+        return replace(
+            source,
+            metadata={
+                **source.metadata,
+                "spatialized_estimate": True,
+                "allocation_rule": raster.spatial_allocation_rule,
+                "input_checksum": product.input_checksum,
+                "allocation_inputs": allocation_inputs,
+            },
         )
 
     def _unavailable_source(

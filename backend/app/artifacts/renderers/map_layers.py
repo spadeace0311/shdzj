@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from app.artifacts.repository import ArtifactQuality
+from app.artifacts.renderers.base import RenderQuality
 from app.config import settings
 
 
@@ -30,12 +30,48 @@ A_CLASS_ARTIFACTS = (
     "map.city_distances",
 )
 
+B_CLASS_ARTIFACTS = (
+    "map.shelter_emergency",
+    "map.pga_zoning",
+    "map.reservoirs",
+    "map.metro",
+    "map.seismic_stations",
+    "map.rescue_teams",
+    "map.cultural_relics",
+)
+
+C_CLASS_ARTIFACTS = ("map.building_grid",)
+
 _TRANSPORT_OPTIONAL_ROAD = "shanghai.road.network"
 _ACTIVE_FAULT_EMPTY_STATEMENT = "检索范围内无活动断裂记录"
+_B_CLASS_EMPTY_STATEMENT = "检索范围内无记录"
+_B_CLASS_DEGRADE_NOTES = {
+    "map.shelter_emergency": "疏散场地数据待复核",
+    "map.pga_zoning": "区划数据待复核",
+    "map.reservoirs": "水库数据待复核",
+    "map.metro": "轨道交通数据待复核",
+    "map.seismic_stations": "台站数据待复核",
+    "map.rescue_teams": "救援队伍数据待复核",
+    "map.cultural_relics": "文物数据待复核",
+}
+_C_CLASS_DEGRADE_NOTE = "模型分配，待复核"
 
 
 class MapSourceUnavailableError(RuntimeError):
     """Raised when a required map source is missing or invalid."""
+
+
+class RequiredDependencyMissingError(RuntimeError):
+    """Raised when a conditional map cannot be produced from traceable inputs."""
+
+
+@dataclass(frozen=True, slots=True)
+class DegradeDecision:
+    status: str
+    needs_review: bool
+    missing_assets: tuple[str, ...] = ()
+    reason: str = ""
+    spatialized_estimate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +104,7 @@ class LayerDefinition:
     optional: bool = False
     verified_empty_statement: str | None = None
     data_kind: str = "vector"
+    degradation_note: str | None = None
 
 
 def _binding(
@@ -99,6 +136,7 @@ def _definition(
     optional: bool = False,
     verified_empty_statement: str | None = None,
     data_kind: str = "vector",
+    degradation_note: str | None = None,
 ) -> LayerDefinition:
     return LayerDefinition(
         layer_id=layer_id,
@@ -111,6 +149,7 @@ def _definition(
         optional=optional,
         verified_empty_statement=verified_empty_statement,
         data_kind=data_kind,
+        degradation_note=degradation_note,
     )
 
 
@@ -391,6 +430,153 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
 }
 
 
+def _event_layer() -> LayerDefinition:
+    return _definition(
+        "epicenter",
+        "event",
+        "point",
+        "epicenter",
+        legend=(_legend("震中"),),
+        attribute_bindings=(
+            _binding("magnitude", allow_zero=True),
+            _binding("depth_km", allow_zero=True),
+        ),
+    )
+
+
+def _admin_city_layer() -> LayerDefinition:
+    return _definition(
+        "admin-boundary",
+        "shanghai.admin.city",
+        "polygon",
+        "admin-boundary",
+        legend=(_legend("行政区界"),),
+    )
+
+
+_B_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
+    "map.shelter_emergency": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "shelter-emergency",
+            "shanghai.shelter.emergency",
+            "point",
+            "shelter-emergency",
+            legend=(_legend("疏散场地"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.shelter_emergency"],
+        ),
+    ),
+    "map.pga_zoning": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "pga-zoning",
+            "shanghai.pga.raster",
+            "raster",
+            "pga-zoning",
+            legend=(_legend("地震动峰值加速度区划"),),
+            optional=True,
+            data_kind="raster",
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.pga_zoning"],
+        ),
+    ),
+    "map.reservoirs": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "reservoirs",
+            "shanghai.reservoir",
+            "point",
+            "reservoirs",
+            legend=(_legend("水库"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.reservoirs"],
+        ),
+    ),
+    "map.metro": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "metro",
+            "shanghai.metro",
+            "line",
+            "metro",
+            legend=(_legend("轨道交通"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.metro"],
+        ),
+    ),
+    "map.seismic_stations": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "seismic-stations",
+            "shanghai.seismic_station",
+            "point",
+            "seismic-stations",
+            legend=(_legend("地震台站"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.seismic_stations"],
+        ),
+    ),
+    "map.rescue_teams": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "rescue-teams",
+            "shanghai.rescue_team",
+            "point",
+            "rescue-teams",
+            legend=(_legend("救援队伍"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.rescue_teams"],
+        ),
+    ),
+    "map.cultural_relics": (
+        _event_layer(),
+        _admin_city_layer(),
+        _definition(
+            "cultural-relics",
+            "shanghai.cultural_relic",
+            "point",
+            "cultural-relics",
+            legend=(_legend("文物单位"),),
+            optional=True,
+            verified_empty_statement=_B_CLASS_EMPTY_STATEMENT,
+            degradation_note=_B_CLASS_DEGRADE_NOTES["map.cultural_relics"],
+        ),
+    ),
+}
+
+
+_C_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
+    "map.building_grid": (
+        _definition(
+            "building-grid",
+            "product:loss.buildings",
+            "raster",
+            "building-grid",
+            legend=(_legend("建筑物公里格网"),),
+            data_kind="raster",
+        ),
+        _definition(
+            "admin-town-boundary",
+            "shanghai.admin.town",
+            "polygon",
+            "admin-town-boundary",
+            legend=(_legend("街镇边界"),),
+        ),
+    ),
+}
+
+
 def _to_map_layer(
     definition: LayerDefinition,
     context: Any,
@@ -420,7 +606,9 @@ def _to_map_layer(
         else getattr(source, "metadata", None)
     )
     source_metadata = source_metadata if isinstance(source_metadata, Mapping) else {}
-    degradation_reason = source_metadata.get("degradation_reason")
+    degradation_reason = definition.degradation_note or source_metadata.get(
+        "degradation_reason"
+    )
     if source_status == "missing":
         if definition.optional:
             return _missing_map_layer(definition, degradation_reason)
@@ -458,6 +646,12 @@ def _to_map_layer(
             if isinstance(source, Mapping)
             else getattr(source, "feature_count", 0)
         ),
+        "spatialized_estimate": bool(
+            source_metadata.get("spatialized_estimate", False)
+        ),
+        "allocation_rule": source_metadata.get("allocation_rule"),
+        "input_checksum": source_metadata.get("input_checksum"),
+        "allocation_inputs": source_metadata.get("allocation_inputs"),
     }
     source_kind = (
         source.get("kind")
@@ -497,6 +691,8 @@ def _missing_map_layer(
 ) -> Any:
     from app.artifacts.renderers.map_renderer import MapLayer
 
+    if not degradation_reason:
+        degradation_reason = definition.degradation_note
     return MapLayer(
         id=definition.layer_id,
         url=f"local://inline/{definition.layer_id}",
@@ -529,30 +725,207 @@ def _missing_map_layer(
             "data_kind": definition.data_kind,
             "verified_empty": False,
             "degradation_reason": degradation_reason,
+            "spatialized_estimate": False,
+            "allocation_rule": None,
+            "input_checksum": None,
+            "allocation_inputs": None,
         },
     )
 
 
 class MapLayerRegistry:
-    """Declarative A-class map layer registry."""
+    """Declarative A/B/C-class map layer registry."""
 
     @classmethod
     def artifact_keys(cls) -> tuple[str, ...]:
-        return A_CLASS_ARTIFACTS
+        return A_CLASS_ARTIFACTS + B_CLASS_ARTIFACTS + C_CLASS_ARTIFACTS
 
     @classmethod
     def definitions(cls, artifact_key: str) -> tuple[LayerDefinition, ...]:
-        try:
+        if artifact_key in _A_CLASS_DEFINITIONS:
             return _A_CLASS_DEFINITIONS[artifact_key]
-        except KeyError as error:
-            raise ValueError(f"unsupported A-class map artifact: {artifact_key}") from error
+        if artifact_key in _B_CLASS_DEFINITIONS:
+            return _B_CLASS_DEFINITIONS[artifact_key]
+        if artifact_key in _C_CLASS_DEFINITIONS:
+            return _C_CLASS_DEFINITIONS[artifact_key]
+        raise ValueError(f"unsupported map artifact: {artifact_key}")
 
     @classmethod
     def build(cls, artifact_key: str, context: Any) -> tuple[Any, ...]:
-        return tuple(
+        layers = tuple(
             _to_map_layer(definition, context)
             for definition in cls.definitions(artifact_key)
         )
+        grade = _catalog_quality(artifact_key)
+        if grade in {"B", "C"}:
+            asset_resolutions = getattr(context, "resolved_sources", None)
+            decision = MapDegradePolicy.evaluate(
+                artifact_key,
+                layers,
+                asset_resolutions if isinstance(asset_resolutions, Mapping) else {},
+            )
+            if decision.status == "blocked":
+                reason = decision.reason or (
+                    f"{artifact_key} is missing a required dependency"
+                )
+                if grade == "B":
+                    raise MapSourceUnavailableError(reason)
+                raise RequiredDependencyMissingError(reason)
+        return layers
+
+
+class MapDegradePolicy:
+    """Decide whether incomplete B/C maps may degrade, and why."""
+
+    @classmethod
+    def evaluate(
+        cls,
+        artifact_key: str,
+        layers: Any,
+        asset_resolutions: Any,
+    ) -> DegradeDecision:
+        grade = _catalog_quality(artifact_key)
+        if grade == "B":
+            return cls._evaluate_b(artifact_key, layers, asset_resolutions)
+        if grade == "C":
+            return cls._evaluate_c(artifact_key, asset_resolutions)
+        return DegradeDecision(status="complete", needs_review=False)
+
+    @classmethod
+    def _evaluate_b(
+        cls,
+        artifact_key: str,
+        layers: Any,
+        asset_resolutions: Any,
+    ) -> DegradeDecision:
+        required = ("event", "shanghai.admin.city")
+        missing_required = tuple(
+            source_key
+            for source_key in required
+            if not cls._bound(asset_resolutions, source_key)
+        )
+        if missing_required:
+            return DegradeDecision(
+                status="blocked",
+                needs_review=True,
+                missing_assets=missing_required,
+                reason=(
+                    f"{artifact_key} requires the event point and administrative "
+                    "boundary before optional data can degrade"
+                ),
+            )
+        missing_optional = tuple(
+            _layer_source_key(layer)
+            for layer in layers
+            if bool(_metadata(layer).get("optional", False))
+            and str(_metadata(layer).get("source_status", "bound")) == "missing"
+        )
+        if missing_optional:
+            return DegradeDecision(
+                status="degraded",
+                needs_review=True,
+                missing_assets=missing_optional,
+                reason=_B_CLASS_DEGRADE_NOTES.get(
+                    artifact_key,
+                    "可选数据待复核",
+                ),
+            )
+        return DegradeDecision(status="complete", needs_review=False)
+
+    @classmethod
+    def _evaluate_c(
+        cls,
+        artifact_key: str,
+        asset_resolutions: Any,
+    ) -> DegradeDecision:
+        missing: list[str] = []
+        for source_key in ("shanghai.admin.town", "shanghai.building.town"):
+            if not cls._bound(asset_resolutions, source_key):
+                missing.append(source_key)
+                continue
+            checksum = cls._attr(asset_resolutions, source_key, "checksum")
+            if not isinstance(checksum, str) or not checksum:
+                missing.append(source_key)
+
+        product = cls._value(asset_resolutions, "product:loss.buildings")
+        product_metadata = cls._metadata_of(product)
+        if not cls._bound(asset_resolutions, "product:loss.buildings"):
+            missing.append("product:loss.buildings")
+        else:
+            if not bool(product_metadata.get("spatialized_estimate")):
+                missing.append("product:loss.buildings")
+            if not isinstance(
+                product_metadata.get("allocation_rule"),
+                str,
+            ) or not product_metadata.get("allocation_rule"):
+                missing.append("product:loss.buildings")
+            if not isinstance(
+                product_metadata.get("input_checksum"),
+                str,
+            ) or not product_metadata.get("input_checksum"):
+                missing.append("product:loss.buildings")
+            if not isinstance(
+                cls._attr(asset_resolutions, "product:loss.buildings", "checksum"),
+                str,
+            ) or not cls._attr(
+                asset_resolutions,
+                "product:loss.buildings",
+                "checksum",
+            ):
+                missing.append("product:loss.buildings")
+
+        if missing:
+            unique = tuple(dict.fromkeys(missing))
+            return DegradeDecision(
+                status="blocked",
+                needs_review=True,
+                missing_assets=unique,
+                reason=(
+                    "map.building_grid requires a traceable spatialized building "
+                    "model and every allocation-source input checksum"
+                ),
+            )
+        return DegradeDecision(
+            status="degraded",
+            needs_review=True,
+            reason=_C_CLASS_DEGRADE_NOTE,
+            spatialized_estimate=True,
+        )
+
+    @staticmethod
+    def _value(asset_resolutions: Any, source_key: str) -> Any:
+        if not isinstance(asset_resolutions, Mapping):
+            return None
+        return asset_resolutions.get(source_key)
+
+    @classmethod
+    def _attr(
+        cls,
+        asset_resolutions: Any,
+        source_key: str,
+        name: str,
+    ) -> Any:
+        value = cls._value(asset_resolutions, source_key)
+        if value is None:
+            return None
+        if isinstance(value, Mapping):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    @classmethod
+    def _bound(cls, asset_resolutions: Any, source_key: str) -> bool:
+        status = cls._attr(asset_resolutions, source_key, "status")
+        return str(status or "missing") in {"bound", "verified_empty"}
+
+    @staticmethod
+    def _metadata_of(value: Any) -> Mapping[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            metadata = value.get("metadata")
+            return metadata if isinstance(metadata, Mapping) else {}
+        metadata = getattr(value, "metadata", None)
+        return metadata if isinstance(metadata, Mapping) else {}
 
 
 def _catalog_quality(artifact_key: str) -> str:
@@ -581,14 +954,16 @@ def _metadata(layer: Any) -> Mapping[str, Any]:
 
 
 class MapQualityPolicy:
-    """Evaluate A-class map quality from declarative layers."""
+    """Evaluate A/B/C-class map quality from declarative layers."""
 
     @classmethod
-    def evaluate(cls, artifact_key: str, layers: Any) -> ArtifactQuality:
+    def evaluate(cls, artifact_key: str, layers: Any) -> RenderQuality:
         grade = _catalog_quality(artifact_key)
         reasons: list[str] = []
+        missing_assets: list[str] = []
+        spatialized_estimate = False
         if not layers:
-            return ArtifactQuality(
+            return RenderQuality(
                 grade=grade,
                 needs_review=True,
                 degradation_reasons=("no map layers",),
@@ -599,6 +974,9 @@ class MapQualityPolicy:
             source_key = _layer_source_key(layer)
             source_status = str(metadata.get("source_status", "bound"))
             optional = bool(metadata.get("optional", False))
+            spatialized_estimate = spatialized_estimate or bool(
+                metadata.get("spatialized_estimate", False)
+            )
             if metadata.get("placeholder"):
                 reasons.append(f"{source_key} contains placeholder text")
             if metadata.get("unexpected_zero"):
@@ -606,6 +984,7 @@ class MapQualityPolicy:
             reasons.extend(_content_quality_reasons(source_key, layer))
             if source_status != "missing":
                 continue
+            missing_assets.append(source_key)
             if (
                 artifact_key == "map.transport"
                 and source_key == _TRANSPORT_OPTIONAL_ROAD
@@ -625,10 +1004,16 @@ class MapQualityPolicy:
                 continue
             reasons.append(f"{source_key} is unavailable")
 
-        return ArtifactQuality(
+        if grade == "C":
+            spatialized_estimate = True
+            reasons.append(_C_CLASS_DEGRADE_NOTE)
+
+        return RenderQuality(
             grade=grade,
             needs_review=bool(reasons),
+            missing_assets=tuple(dict.fromkeys(missing_assets)),
             degradation_reasons=tuple(dict.fromkeys(reasons)),
+            spatialized_estimate=spatialized_estimate,
         )
 
 

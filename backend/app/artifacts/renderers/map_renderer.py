@@ -247,7 +247,24 @@ class MapRenderSpec:
             "context_fingerprint": self.context_fingerprint,
             "input_fingerprint": self.input_fingerprint,
             "quality": self.quality.to_dict(),
+            "allocation_rule": _layer_metadata_first(
+                self.layers,
+                "allocation_rule",
+            ),
+            "allocation_inputs": _layer_metadata_first(
+                self.layers,
+                "allocation_inputs",
+            )
+            or {},
         }
+
+
+def _layer_metadata_first(layers: Any, key: str) -> Any:
+    for layer in layers:
+        metadata = getattr(layer, "metadata", None)
+        if isinstance(metadata, Mapping) and metadata.get(key):
+            return metadata[key]
+    return None
 
 
 def _selected_basemap_payload(value: Any) -> dict[str, Any] | None:
