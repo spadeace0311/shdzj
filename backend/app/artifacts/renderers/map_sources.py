@@ -246,9 +246,23 @@ def _array_raster_source(
     srid = int(srid_value)
     width = int(metadata.get("width") or array.shape[1])
     height = int(metadata.get("height") or array.shape[0])
-    resolution = float(metadata.get("resolution_m") or 1000.0)
-    origin_x = float(metadata.get("origin_x") or 0.0)
-    origin_y = float(metadata.get("origin_y") or 0.0)
+    try:
+        resolution = float(metadata.get("resolution_m"))
+        origin_x = float(metadata.get("origin_x"))
+        origin_y = float(metadata.get("origin_y"))
+    except (TypeError, ValueError) as error:
+        raise MapSourceResolutionError(
+            f"raster source {source_key} has invalid georeference metadata"
+        ) from error
+    if (
+        not math.isfinite(resolution)
+        or resolution <= 0
+        or not math.isfinite(origin_x)
+        or not math.isfinite(origin_y)
+    ):
+        raise MapSourceResolutionError(
+            f"raster source {source_key} has invalid georeference values"
+        )
     transform = from_origin(origin_x, origin_y, resolution, resolution)
     with MemoryFile() as memory:
         with memory.open(
@@ -458,11 +472,16 @@ class MapSourceResolver:
             and town_asset is not None
             and town_asset.resolution_status == "bound"
         ):
-            town_records = await self._load_frozen_asset_records(
-                session,
-                "shanghai.admin.town",
-                town_asset,
-            )
+            try:
+                town_records = await self._load_frozen_asset_records(
+                    session,
+                    "shanghai.admin.town",
+                    town_asset,
+                )
+            except MapSourceResolutionError as error:
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(str(error)) from error
+                raise
         city_asset = asset_versions.get("shanghai.admin.city")
         city_records: list[AssetRecord] = []
         if (
@@ -470,11 +489,16 @@ class MapSourceResolver:
             and city_asset is not None
             and city_asset.resolution_status == "bound"
         ):
-            city_records = await self._load_frozen_asset_records(
-                session,
-                "shanghai.admin.city",
-                city_asset,
-            )
+            try:
+                city_records = await self._load_frozen_asset_records(
+                    session,
+                    "shanghai.admin.city",
+                    city_asset,
+                )
+            except MapSourceResolutionError as error:
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(str(error)) from error
+                raise
 
         registry_definitions = {
             item.source_key: item
@@ -499,14 +523,19 @@ class MapSourceResolver:
                 raise MapSourceResolutionError(
                     f"required asset {source_key} is unavailable"
                 )
-            resolved[source_key] = await self._asset_source(
-                session,
-                source_key=source_key,
-                asset_item=item,
-                layer_definition=layer_definition,
-                event=event,
-                town_records=town_records,
-            )
+            try:
+                resolved[source_key] = await self._asset_source(
+                    session,
+                    source_key=source_key,
+                    asset_item=item,
+                    layer_definition=layer_definition,
+                    event=event,
+                    town_records=town_records,
+                )
+            except MapSourceResolutionError as error:
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(str(error)) from error
+                raise
 
         for source_key in definition.optional_assets:
             if source_key not in registry_definitions:
@@ -558,19 +587,24 @@ class MapSourceResolver:
                     style_id=source_key,
                 ),
             )
-            resolved[source_key] = await self._product_source(
-                session,
-                source_key=source_key,
-                product_key=dependency.key,
-                binding=binding,
-                run=run,
-                town_records=town_records,
-                city_records=city_records,
-                layer_definition=layer_definition,
-                event=event,
-                artifact_key=task.artifact_key,
-                asset_versions=asset_versions,
-            )
+            try:
+                resolved[source_key] = await self._product_source(
+                    session,
+                    source_key=source_key,
+                    product_key=dependency.key,
+                    binding=binding,
+                    run=run,
+                    town_records=town_records,
+                    city_records=city_records,
+                    layer_definition=layer_definition,
+                    event=event,
+                    artifact_key=task.artifact_key,
+                    asset_versions=asset_versions,
+                )
+            except MapSourceResolutionError as error:
+                if task.artifact_key == "map.building_grid":
+                    raise RequiredDependencyMissingError(str(error)) from error
+                raise
 
         for layer_definition in MapLayerRegistry.definitions(task.artifact_key):
             source_key = layer_definition.source_key
@@ -988,6 +1022,18 @@ class MapSourceResolver:
                 f"loss.buildings raster is invalid: {error}"
             ) from error
         central_band = _building_grid_central_band(bands, metadata)
+        central_values = np.asarray(central_band, dtype=np.float64)
+        if (
+            central_values.size == 0
+            or not np.all(np.isfinite(central_values))
+        ):
+            raise RequiredDependencyMissingError(
+                "loss.buildings raster has no finite central signal"
+            )
+        if not np.any(central_values != 0):
+            raise RequiredDependencyMissingError(
+                "loss.buildings raster contains no non-zero signal"
+            )
         source = _array_raster_source(
             [central_band],
             metadata,

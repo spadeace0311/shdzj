@@ -400,6 +400,7 @@ class MapSpecBuilder:
             if artifact_key in MapLayerRegistry.artifact_keys()
             else getattr(context, "quality", None)
         )
+        quality = _coerce_quality(quality_value)
         legend = _collect_map_legend(
             layers,
             tuple(getattr(context, "legend", ())),
@@ -408,6 +409,7 @@ class MapSpecBuilder:
             tuple(str(item) for item in getattr(context, "source_notes", ())),
             layers,
             selected_basemap,
+            quality,
         )
 
         spec = MapRenderSpec(
@@ -435,7 +437,7 @@ class MapSpecBuilder:
             layers=layers,
             legend=legend,
             source_notes=source_notes,
-            quality=_coerce_quality(quality_value),
+            quality=quality,
             marker=getattr(context, "marker", None),
             production_mode=str(getattr(context, "production_mode", "live")),
             output=MapOutput(
@@ -475,6 +477,7 @@ def _collect_map_source_notes(
     context_notes: tuple[str, ...],
     layers: tuple[MapLayer, ...],
     selected_basemap: Mapping[str, Any] | None,
+    quality: Any = None,
 ) -> tuple[str, ...]:
     notes: list[str] = list(context_notes)
     if selected_basemap:
@@ -495,6 +498,15 @@ def _collect_map_source_notes(
             notes.append(
                 str(reason) if reason else f"{source_key} unavailable"
             )
+    if quality is not None and (
+        str(getattr(quality, "grade", "")) == "C"
+        or getattr(quality, "spatialized_estimate", False)
+    ):
+        notes.extend(
+            str(reason)
+            for reason in getattr(quality, "degradation_reasons", ())
+            if reason
+        )
     return tuple(dict.fromkeys(notes))
 
 

@@ -873,6 +873,32 @@ class MapDegradePolicy:
                 "checksum",
             ):
                 missing.append("product:loss.buildings")
+            allocation_inputs = product_metadata.get("allocation_inputs")
+            expected_inputs = {
+                "loss.buildings": product_metadata.get("input_checksum"),
+                "shanghai.building.town": cls._attr(
+                    asset_resolutions,
+                    "shanghai.building.town",
+                    "checksum",
+                ),
+                "shanghai.admin.town": cls._attr(
+                    asset_resolutions,
+                    "shanghai.admin.town",
+                    "checksum",
+                ),
+            }
+            if not isinstance(allocation_inputs, Mapping):
+                missing.append("product:loss.buildings")
+            else:
+                for input_key, expected_checksum in expected_inputs.items():
+                    if (
+                        not isinstance(expected_checksum, str)
+                        or not expected_checksum
+                        or allocation_inputs.get(input_key)
+                        != expected_checksum
+                    ):
+                        missing.append("product:loss.buildings")
+                        break
 
         if missing:
             unique = tuple(dict.fromkeys(missing))

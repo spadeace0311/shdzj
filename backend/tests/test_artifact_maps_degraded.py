@@ -7,9 +7,9 @@ from uuid import UUID, uuid4
 import numpy as np
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
-from app.artifacts.context import ProductionContextService
+from app.artifacts.context import FrozenAssetVersion, ProductionContextService
 from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.renderers.map_layers import (
     B_CLASS_ARTIFACTS,
@@ -23,7 +23,11 @@ from app.artifacts.renderers.map_renderer import (
     MapRenderer,
     MapSpecBuilder,
 )
-from app.artifacts.renderers.map_sources import MapSourceResolutionError
+from app.artifacts.renderers.map_sources import (
+    MapSourceResolver,
+    MapSourceResolutionError,
+    _array_raster_source,
+)
 from app.assessment.models import AssessmentTask
 from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.import_jobs import QueueImportRequest, queue_import_job
@@ -39,6 +43,7 @@ from app.loss.domain import (
     LossProductType,
     LossQualityGrade,
 )
+from app.loss.models import LossProduct
 from app.loss.repository import (
     LossProductWrite,
     LossRasterBandWrite,
@@ -50,12 +55,23 @@ from tests.data_asset_helpers import _town_records
 from tests.test_artifact_maps_a import (
     _admin_city_record,
     _building_town_records,
+    _page_text,
     _settings_manifests,
 )
 
 
 _CREATED_VERSION_IDS: set[UUID] = set()
 _CREATED_ASSET_IDS: set[UUID] = set()
+
+EXPECTED_B_NOTES = {
+    "map.shelter_emergency": "疏散场地数据待复核",
+    "map.pga_zoning": "区划数据待复核",
+    "map.reservoirs": "水库数据待复核",
+    "map.metro": "轨道交通数据待复核",
+    "map.seismic_stations": "台站数据待复核",
+    "map.rescue_teams": "救援队伍数据待复核",
+    "map.cultural_relics": "文物数据待复核",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -318,10 +334,33 @@ async def _build_context(
             return await service.build_map_context(session, task.id)
 
 
+async def _freeze_grid_run(
+    seeded_artifact_assessment,
+    session_factory,
+    service,
+) -> tuple[UUID, UUID]:
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.building_grid")
+    async with session_factory() as session:
+        async with session.begin():
+            await ArtifactProductionRepository().prepare_dependencies(
+                session,
+                run.id,
+            )
+            await service.freeze_static_context(
+                session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+    return task.id, run.id
+
+
 async def _write_building_grid_product(
     seeded_artifact_assessment,
     session_factory,
-) -> str:
+    *,
+    values: np.ndarray | None = None,
+) -> tuple[str, UUID]:
     async with session_factory() as session:
         async with session.begin():
             task = await session.scalar(
@@ -359,7 +398,11 @@ async def _write_building_grid_product(
                 2,
                 2,
             )
-            values = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+            band_values = (
+                np.asarray(values, dtype=np.float64)
+                if values is not None
+                else np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+            )
             band_name = "buildings_collapsed_area_m2_central"
             manifest = {
                 "grid": {
@@ -382,7 +425,7 @@ async def _write_building_grid_product(
             }
             checksum = RasterCodec.content_checksum(
                 definition,
-                [(band_name, values)],
+                [(band_name, band_values)],
                 manifest,
                 checksum_namespace="loss-raster-content-v1",
             )
@@ -411,7 +454,7 @@ async def _write_building_grid_product(
                     bands=(
                         LossRasterBandWrite(
                             name=band_name,
-                            values=values,
+                            values=band_values,
                             unit="m2",
                             precision=2,
                         ),
@@ -424,7 +467,7 @@ async def _write_building_grid_product(
                 reason=None,
             )
             product = await LossRepository().write_product(session, write)
-            return product.input_checksum
+            return product.input_checksum, product.id
 
 
 @pytest.mark.parametrize("artifact_key", B_CLASS_ARTIFACTS)
@@ -468,7 +511,8 @@ async def test_b_class_missing_optional_data_creates_degraded_file(
     assert result.quality.needs_review is True
     assert result.quality.grade == "B"
     assert optional_layer.metadata["source_key"] in result.quality.missing_assets
-    assert "待复核" in result.render_manifest["quality"]["degradation_reasons"][0]
+    assert quality.degradation_reasons == (EXPECTED_B_NOTES[artifact_key],)
+    assert result.quality.degradation_reasons == (EXPECTED_B_NOTES[artifact_key],)
     assert quality.degradation_reasons == result.quality.degradation_reasons
 
 
@@ -571,7 +615,7 @@ async def test_c_class_grid_requires_traceable_spatialized_input(
         "shanghai.building.town",
         records=_building_town_records(),
     )
-    input_checksum = await _write_building_grid_product(
+    input_checksum, _ = await _write_building_grid_product(
         seeded_artifact_assessment,
         session_factory,
     )
@@ -587,18 +631,19 @@ async def test_c_class_grid_requires_traceable_spatialized_input(
         service,
         "map.building_grid",
     )
-    result = await renderer.render(
-        MapSpecBuilder().build(context),
-        tmp_path / "grid.jpg",
-    )
+    spec = MapSpecBuilder().build(context)
+    result = await renderer.render(spec, tmp_path / "grid.jpg")
 
     assert result.task_status == "degraded"
     assert result.quality.spatialized_estimate is True
     assert result.quality.grade == "C"
+    assert "模型分配，待复核" in spec.source_notes
     assert result.render_manifest["allocation_rule"] == "town-uniform-v1"
     assert result.render_manifest["allocation_inputs"]["loss.buildings"] == input_checksum
     assert result.render_manifest["allocation_inputs"]["shanghai.building.town"]
     assert result.render_manifest["allocation_inputs"]["shanghai.admin.town"]
+    page_text = await _page_text(renderer, spec, ".footer")
+    assert "模型分配，待复核" in page_text
 
 
 async def test_c_class_grid_missing_model_fails_closed(
@@ -630,3 +675,211 @@ async def test_c_class_grid_missing_model_fails_closed(
             service,
             "map.building_grid",
         )
+
+
+async def test_c_class_grid_rejects_all_zero_raster(
+    seeded_artifact_assessment,
+    session_factory,
+    production_renderer,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.town",
+        records=_town_records().records,
+        spatial_extent=(121.4, 31.1, 121.6, 31.4),
+    )
+    await _publish_asset(
+        session_factory,
+        "shanghai.building.town",
+        records=_building_town_records(),
+    )
+    await _write_building_grid_product(
+        seeded_artifact_assessment,
+        session_factory,
+        values=np.zeros((2, 2), dtype=np.float64),
+    )
+
+    package, _ = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    with pytest.raises(RequiredDependencyMissingError):
+        await _build_context(
+            seeded_artifact_assessment,
+            session_factory,
+            service,
+            "map.building_grid",
+        )
+
+
+async def test_c_class_grid_invalid_building_town_checksum_fails_closed(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.town",
+        records=_town_records().records,
+        spatial_extent=(121.4, 31.1, 121.6, 31.4),
+    )
+    version_id = await _publish_asset(
+        session_factory,
+        "shanghai.building.town",
+        records=_building_town_records(),
+    )
+    asset_item = FrozenAssetVersion(
+        asset_key="shanghai.building.town",
+        role="required",
+        resolution_status="bound",
+        asset_version_id=version_id,
+        checksum="0" * 64,
+        coverage={},
+    )
+    with pytest.raises(MapSourceResolutionError):
+        async with session_factory() as session:
+            await MapSourceResolver()._frozen_asset_version(
+                session,
+                asset_item,
+                "shanghai.building.town",
+            )
+
+
+async def test_c_class_grid_invalid_geometry_fails_closed(
+    seeded_artifact_assessment,
+    session_factory,
+    production_renderer,
+) -> None:
+    await _insert_published_vector_asset(
+        session_factory,
+        "shanghai.admin.town",
+        records=_town_records().records[:1],
+    )
+    await _insert_published_vector_asset(
+        session_factory,
+        "shanghai.building.town",
+        records=_building_town_records(),
+    )
+    await _write_building_grid_product(
+        seeded_artifact_assessment,
+        session_factory,
+    )
+
+    package, _ = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    with pytest.raises(RequiredDependencyMissingError):
+        await _build_context(
+            seeded_artifact_assessment,
+            session_factory,
+            service,
+            "map.building_grid",
+        )
+
+
+async def test_c_class_grid_loss_binding_mismatch_fails_closed(
+    seeded_artifact_assessment,
+    session_factory,
+    production_renderer,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.town",
+        records=_town_records().records,
+        spatial_extent=(121.4, 31.1, 121.6, 31.4),
+    )
+    await _publish_asset(
+        session_factory,
+        "shanghai.building.town",
+        records=_building_town_records(),
+    )
+    _, product_id = await _write_building_grid_product(
+        seeded_artifact_assessment,
+        session_factory,
+    )
+
+    package, _ = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    task_id, _ = await _freeze_grid_run(
+        seeded_artifact_assessment,
+        session_factory,
+        service,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(LossProduct)
+                .where(LossProduct.id == product_id)
+                .values(output_checksum="0" * 64)
+            )
+    with pytest.raises(RequiredDependencyMissingError):
+        async with session_factory() as session:
+            await service.build_map_context(session, task_id)
+
+
+def test_array_raster_source_requires_valid_georeference() -> None:
+    with pytest.raises(MapSourceResolutionError):
+        _array_raster_source(
+            [np.asarray([[1.0]], dtype=np.float64)],
+            {"srid": 32651, "width": 1, "height": 1},
+            source_key="shanghai.pga.raster",
+            identity=None,
+            checksum="a" * 64,
+            version="v1",
+        )
+
+
+def test_c_policy_validates_allocation_input_checksums() -> None:
+    def source(checksum: str, metadata: dict) -> dict:
+        return {"status": "bound", "checksum": checksum, "metadata": metadata}
+
+    good = MapDegradePolicy.evaluate(
+        "map.building_grid",
+        (),
+        {
+            "shanghai.admin.town": source("a" * 64, {}),
+            "shanghai.building.town": source("b" * 64, {}),
+            "product:loss.buildings": source(
+                "c" * 64,
+                {
+                    "spatialized_estimate": True,
+                    "allocation_rule": "town-uniform-v1",
+                    "input_checksum": "d" * 64,
+                    "allocation_inputs": {
+                        "loss.buildings": "d" * 64,
+                        "shanghai.building.town": "b" * 64,
+                        "shanghai.admin.town": "a" * 64,
+                    },
+                },
+            ),
+        },
+    )
+    assert good.status == "degraded"
+
+    bad = MapDegradePolicy.evaluate(
+        "map.building_grid",
+        (),
+        {
+            "shanghai.admin.town": source("a" * 64, {}),
+            "shanghai.building.town": source("b" * 64, {}),
+            "product:loss.buildings": source(
+                "c" * 64,
+                {
+                    "spatialized_estimate": True,
+                    "allocation_rule": "town-uniform-v1",
+                    "input_checksum": "d" * 64,
+                    "allocation_inputs": {
+                        "loss.buildings": "wrong",
+                        "shanghai.building.town": "b" * 64,
+                        "shanghai.admin.town": "a" * 64,
+                    },
+                },
+            ),
+        },
+    )
+    assert bad.status == "blocked"
