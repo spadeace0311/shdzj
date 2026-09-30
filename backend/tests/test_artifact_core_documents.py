@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from sqlalchemy import select
 from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
 from app.artifacts.context import ProductionContextService
 from app.artifacts.models import (
+    ArtifactTaskDependencyBinding,
     GeneratedArtifact,
     ProductionTask,
 )
@@ -26,7 +28,10 @@ from app.artifacts.renderers.docx_renderer import (
 )
 from app.artifacts.renderers.pptx_renderer import PptxRenderer
 from app.artifacts.storage import ArtifactStore
+from app.assessment.models import AssessmentTask
 from app.config import settings
+from app.intensity.models import IntensityFieldProduct
+from app.loss.models import LossProduct
 from tests.basemap_fixtures import make_in_memory_package
 
 
@@ -95,6 +100,17 @@ def _sha256_path(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+EXPECTED_PRODUCT_METADATA = {
+    "intensity.fusion": ("fusion-v1", "a" * 64),
+    "loss.buildings": ("buildings-v1", "b" * 64),
+    "loss.population": ("population-v1", "c" * 64),
+    "loss.casualties": ("casualties-v1", "d" * 64),
+    "loss.economic": ("economic-v1", "e" * 64),
+    "loss.resources": ("resources-v1", "f" * 64),
+    "loss.validate": ("validate-v1", "1" * 64),
+}
 
 
 def _map_bytes(marker: str | None = None) -> BytesIO:
@@ -178,6 +194,134 @@ def _generated_artifact(
     )
 
 
+async def _seed_assessment_products_and_bindings(
+    session,
+    seeded_artifact_assessment,
+    run,
+    tasks_by_key,
+) -> None:
+    now = datetime.now(UTC)
+    assessment_run_id = seeded_artifact_assessment.assessment_run_id
+
+    async def assessment_task(task_key: str, task_type: str) -> AssessmentTask:
+        existing = await session.scalar(
+            select(AssessmentTask).where(
+                AssessmentTask.run_id == assessment_run_id,
+                AssessmentTask.task_key == task_key,
+            )
+        )
+        if existing is not None:
+            return existing
+        task = AssessmentTask(
+            run_id=assessment_run_id,
+            task_key=task_key,
+            task_type=task_type,
+            component="decision-fixture",
+            sequence=1,
+            status="succeeded",
+            deadline_at=run.deadline_at,
+        )
+        session.add(task)
+        await session.flush()
+        return task
+
+    product_ids: dict[str, uuid.UUID] = {}
+    intensity_task = await assessment_task("intensity.fusion", "intensity")
+    intensity_checksum = EXPECTED_PRODUCT_METADATA["intensity.fusion"][1]
+    intensity = IntensityFieldProduct(
+        run_id=assessment_run_id,
+        task_id=intensity_task.id,
+        product_type="fusion",
+        status="complete",
+        algorithm_version=EXPECTED_PRODUCT_METADATA["intensity.fusion"][0],
+        parameter_version="parameters-v1",
+        strategy_version="strategy-v1",
+        grid_definition_version="grid-v1",
+        region_profile_version="region-v1",
+        input_fingerprint="a" * 64,
+        input_checksum="b" * 64,
+        output_checksum=intensity_checksum,
+        quality_grade="A",
+        coverage_ratio=1,
+        statistics={"summary": "烈度 V"},
+    )
+    session.add(intensity)
+    await session.flush()
+    product_ids["intensity.fusion"] = intensity.id
+
+    loss_products = (
+        ("loss.buildings", "building_damage", {
+            "total": 10000,
+            "slight": 1200,
+            "moderate": 300,
+            "severe": 80,
+        }),
+        ("loss.population", "population_impact", {
+            "resident": 120000,
+            "affected": 4300,
+        }),
+        ("loss.casualties", "casualties", {
+            "deaths": 18,
+            "injuries": 42,
+            "summary": "死亡 18 人，受伤 42 人",
+        }),
+        ("loss.economic", "economic_loss", {
+            "gdp": 560000,
+            "loss": 8800,
+        }),
+        ("loss.resources", "resource_demand", {
+            "summary": "救援力量需求 5 支",
+            "demand": "5",
+        }),
+        ("loss.validate", "validation", {
+            "summary": "评估结果通过校验",
+            "grade": "通过",
+        }),
+    )
+    for product_key, product_type, statistics in loss_products:
+        task = await assessment_task(product_key, "loss")
+        version, checksum = EXPECTED_PRODUCT_METADATA[product_key]
+        product = LossProduct(
+            run_id=assessment_run_id,
+            task_id=task.id,
+            product_type=product_type,
+            status="complete",
+            quality_grade="L1",
+            calibration_status="calibrated",
+            coverage_ratio=1,
+            partial_scope=False,
+            needs_review=False,
+            spatialized_estimate=False,
+            algorithm_version=version,
+            parameter_version="parameters-v1",
+            region_profile_version="region-v1",
+            input_fingerprint="a" * 64,
+            input_checksum="b" * 64,
+            output_checksum=checksum,
+            statistics=statistics,
+        )
+        session.add(product)
+        await session.flush()
+        product_ids[product_key] = product.id
+
+    rapid_report_task_id = tasks_by_key["doc.rapid_report"].id
+    for product_key, (version, checksum) in EXPECTED_PRODUCT_METADATA.items():
+        session.add(
+            ArtifactTaskDependencyBinding(
+                production_task_id=rapid_report_task_id,
+                dependency_kind="assessment_product",
+                dependency_key=product_key,
+                dependency_output_profile=None,
+                is_optional=False,
+                bound_entity_id=product_ids[product_key],
+                bound_version=version,
+                bound_checksum=checksum,
+                resolution_status="bound",
+                resolved_at=now,
+            )
+        )
+
+
 async def _production_document_context(
     seeded_artifact_assessment,
     production_context_service: ProductionContextService,
@@ -239,6 +383,12 @@ async def _production_document_context(
                 )
             ).all()
             tasks_by_key = {task.artifact_key: task for task in tasks}
+            await _seed_assessment_products_and_bindings(
+                session,
+                seeded_artifact_assessment,
+                run,
+                tasks_by_key,
+            )
             for key in decision_map_keys:
                 stored = _store_artifact(
                     store,
@@ -572,6 +722,12 @@ async def test_real_production_decision_report_renders_available_values(
         session_factory,
         "doc.decision_report",
     )
+    products = context.manifest["assessment"]["products"]
+    for product_key, (version, checksum) in EXPECTED_PRODUCT_METADATA.items():
+        assert products[product_key]["version"] == version
+        assert products[product_key]["checksum"] == checksum
+    assert products["loss.validate"]["summary"] == "评估结果通过校验"
+    assert products["loss.validate"]["checksum"] != products["loss.resources"]["checksum"]
     spec = build_core_document_spec(context, "doc.decision_report")
     result = await docx_renderer.render(
         spec,
@@ -597,6 +753,12 @@ async def test_real_production_deck_renders_available_values(
         session_factory,
         "deck.decision_report",
     )
+    products = context.manifest["assessment"]["products"]
+    for product_key, (version, checksum) in EXPECTED_PRODUCT_METADATA.items():
+        assert products[product_key]["version"] == version
+        assert products[product_key]["checksum"] == checksum
+    assert products["loss.validate"]["summary"] == "评估结果通过校验"
+    assert products["loss.validate"]["checksum"] != products["loss.resources"]["checksum"]
     spec = build_core_document_spec(context, "deck.decision_report")
     result = await pptx_renderer.render(
         spec,

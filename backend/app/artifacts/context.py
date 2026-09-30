@@ -662,13 +662,21 @@ class ProductionContextService:
                 .order_by(GeneratedArtifact.created_at.desc())
             )
         ).all()
+        run = await session.get(ProductionRun, production_run_id)
         for artifact in rows:
+            task = await session.get(
+                ProductionTask,
+                artifact.production_task_id,
+            )
+            if task is None or run is None:
+                continue
+            products = await self._task_assessment_products(
+                session,
+                task,
+                run,
+            )
             render_manifest = dict(artifact.render_manifest or {})
             control_fields = render_manifest.get("control_fields")
-            products = _decision_report_products_from_artifact(
-                artifact,
-                control_fields,
-            )
             if not products:
                 continue
             assessment = dict(manifest.get("assessment") or {})
@@ -690,6 +698,32 @@ class ProductionContextService:
         run: ProductionRun,
         manifest: dict[str, Any],
     ) -> dict[str, Any]:
+        products = await self._task_assessment_products(
+            session,
+            task,
+            run,
+        )
+        if products:
+            assessment = dict(manifest.get("assessment") or {})
+            assessment["products"] = products
+            manifest["assessment"] = assessment
+
+        asset_versions = _frozen_asset_map(manifest.get("assets", ()))
+        manifest.update(
+            await self._build_background_payload(
+                session,
+                run,
+                asset_versions,
+            )
+        )
+        return manifest
+
+    async def _task_assessment_products(
+        self,
+        session: AsyncSession,
+        task: ProductionTask,
+        run: ProductionRun,
+    ) -> dict[str, dict[str, Any]]:
         bindings = (
             await session.scalars(
                 select(ArtifactTaskDependencyBinding).where(
@@ -745,20 +779,7 @@ class ProductionContextService:
                 "checksum": product.output_checksum,
                 **dict(product.statistics or {}),
             }
-        if products:
-            assessment = dict(manifest.get("assessment") or {})
-            assessment["products"] = products
-            manifest["assessment"] = assessment
-
-        asset_versions = _frozen_asset_map(manifest.get("assets", ()))
-        manifest.update(
-            await self._build_background_payload(
-                session,
-                run,
-                asset_versions,
-            )
-        )
-        return manifest
+        return products
 
     async def _build_background_payload(
         self,
