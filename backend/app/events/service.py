@@ -1,5 +1,7 @@
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+import logging
+from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -18,6 +20,8 @@ from app.events.response_rules import (
 )
 from app.regions.domain import RegionContext
 from app.regions.repository import RegionRepository
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +168,18 @@ class EventService:
                 if (
                     result.is_new
                     and result.is_current
-                    and result.event_kind in {EventKind.FORMAL, EventKind.CORRECTION}
+                    and result.event_kind in {
+                        EventKind.FORMAL,
+                        EventKind.CORRECTION,
+                        EventKind.MANUAL,
+                        EventKind.TEST,
+                        EventKind.DRILL,
+                    }
                 ):
                     if response_input is not None:
-                        engine = ResponseRuleEngine.from_yaml(settings.response_rules_path)
+                        engine = ResponseRuleEngine.from_yaml(
+                            settings.response_rules_path
+                        )
                         suggestion = engine.suggest(response_input)
                         suggestion_payload = asdict(suggestion)
                         suggestion_payload["causes"] = list(suggestion.causes)
@@ -177,14 +189,25 @@ class EventService:
                             suggestion,
                             suggestion_payload,
                         )
-                    triggered_assessment = await self._repository.enqueue_assessment(
-                        session,
-                        event_id=result.event_id,
-                        revision_id=result.revision_id,
-                        revision_no=result.revision_no,
-                        trigger_reason=trigger_reason,
-                        created_at=normalized_received_at,
-                    )
+                    if _assessment_applicable(
+                        event,
+                        region_context,
+                        response_input,
+                    ):
+                        triggered_assessment = await self._repository.enqueue_assessment(
+                            session,
+                            event_id=result.event_id,
+                            revision_id=result.revision_id,
+                            revision_no=result.revision_no,
+                            trigger_reason=trigger_reason,
+                            created_at=normalized_received_at,
+                        )
+                    else:
+                        logger.warning(
+                            "assessment applicability rejected event_id=%s kind=%s",
+                            result.event_id,
+                            result.event_kind,
+                        )
 
                 (
                     institutional_level,
@@ -218,7 +241,13 @@ class EventService:
         event: NormalizedEvent,
         region_context: RegionContext | None,
     ) -> RegionContext | None:
-        if event.kind not in {EventKind.FORMAL, EventKind.CORRECTION}:
+        if event.kind not in {
+            EventKind.FORMAL,
+            EventKind.CORRECTION,
+            EventKind.MANUAL,
+            EventKind.TEST,
+            EventKind.DRILL,
+        }:
             return region_context
         if region_context is not None and region_context.boundary_version:
             return region_context
@@ -274,3 +303,40 @@ def _validate_provider_lane(provider: str, lane: str) -> None:
         raise ValueError("lane must be one of websocket, http")
     if lane not in _PROVIDER_LANE_RULES[provider]:
         raise ValueError(f"provider '{provider}' is not allowed with lane '{lane}'")
+
+
+def _assessment_applicable(
+    event: NormalizedEvent,
+    region_context: RegionContext | None,
+    response_input: ResponseInput | None,
+) -> bool:
+    if event.kind is EventKind.AUTO:
+        return False
+
+    inside_shanghai = (
+        region_context.inside_shanghai
+        if region_context is not None
+        else None
+    )
+    if inside_shanghai is None and response_input is not None:
+        inside_shanghai = response_input.inside_shanghai
+    distance = (
+        region_context.distance_to_boundary_km
+        if region_context is not None
+        else None
+    )
+    if distance is None and response_input is not None:
+        distance = response_input.distance_to_boundary_km
+
+    geographic_applicable = inside_shanghai is True or (
+        inside_shanghai is False
+        and distance is not None
+        and Decimal(str(distance)) <= Decimal("20")
+    )
+    magnitude_applicable = Decimal(str(event.magnitude)) >= Decimal("3.0")
+    intensity_applicable = (
+        response_input is None
+        or response_input.max_intensity is None
+        or Decimal(str(response_input.max_intensity)) >= Decimal("2.0")
+    )
+    return geographic_applicable and magnitude_applicable and intensity_applicable

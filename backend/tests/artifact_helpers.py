@@ -27,6 +27,8 @@ from app.artifacts.repository import (
     ArtifactQuality,
     CreateProductionRunCommand,
 )
+from app.artifacts.service import ArtifactProductionService
+from app.artifacts.workflow import ArtifactProductionWorkflowInput
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.config import settings
 from app.events.models import (
@@ -657,6 +659,42 @@ class ArtifactAssessmentFixture:
                     session,
                     self.full_run_command(production_mode=production_mode),
                 )
+
+    async def create_rebuild_run(
+        self,
+        artifact_key: str,
+        *,
+        output_profile: str = "a3v-professional",
+    ) -> object:
+        return await ArtifactProductionService(
+            session_factory=self._session_factory,
+            catalog=self.catalog,
+        ).create_rebuild_run(
+            event_id=self.event_id,
+            revision_id=self.revision_id,
+            artifact_key=artifact_key,
+            output_profile=output_profile,
+            requested_by="artifact-workflow-test",
+        )
+
+    def standalone_input(
+        self,
+        run: object,
+    ) -> ArtifactProductionWorkflowInput:
+        return ArtifactProductionWorkflowInput(
+            production_run_id=str(run.production_run_id),
+            assessment_run_id=str(self.assessment_run_id),
+            event_id=str(self.event_id),
+            revision_id=str(self.revision_id),
+            deadline_at=run.deadline_at.isoformat(),
+            catalog_version=self.catalog.catalog_version,
+            context_fingerprint="",
+            launch_mode="standalone",
+            generation_seq=1,
+            generation_scope=f"artifact:{run.required_outputs[0][0]}:"
+            f"{run.required_outputs[0][1]}",
+            required_outputs=run.required_outputs,
+        )
 
     async def create_correction_revision(
         self,

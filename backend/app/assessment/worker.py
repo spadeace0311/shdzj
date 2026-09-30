@@ -17,6 +17,8 @@ from app.assessment.temporal import (
     AssessmentWorkflow,
     AssessmentWorkflowInput,
 )
+from app.artifacts.worker import ArtifactActivities
+from app.artifacts.workflow import ArtifactProductionWorkflow
 from app.config import Settings, settings
 from app.db import SessionFactory
 
@@ -84,10 +86,11 @@ def build_worker(
     configured: Settings = settings,
 ) -> Worker:
     activities = AssessmentActivities(session_factory)
+    artifact_activities = ArtifactActivities(session_factory)
     return Worker(
         client,
         task_queue=configured.temporal_task_queue,
-        workflows=[AssessmentWorkflow],
+        workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
         activities=[
             activities.prepare_assessment,
             activities.run_intensity_model,
@@ -103,6 +106,15 @@ def build_worker(
             activities.observe_task_deadlines,
             activities.reconcile_assessment_timeouts,
             activities.finalize_assessment,
+            activities.mark_artifact_production_launched,
+            artifact_activities.prepare_artifact_production,
+            artifact_activities.wait_for_artifact_dependencies,
+            artifact_activities.render_map_artifact,
+            artifact_activities.compose_docx_artifact,
+            artifact_activities.compose_pptx_artifact,
+            artifact_activities.validate_artifact_production,
+            artifact_activities.publish_artifact_production,
+            artifact_activities.mark_production_deadline_exceeded,
         ],
         graceful_shutdown_timeout=timedelta(seconds=10),
     )

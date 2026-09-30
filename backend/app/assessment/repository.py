@@ -38,8 +38,11 @@ class AssessmentRepository:
         canonical = await session.get(EarthquakeEvent, event.id, with_for_update=True)
         if canonical is None:
             raise LookupError(f"event not found: {event.id}")
-        if canonical.t1_at is None:
-            raise ValueError("event T1 is required before assessment orchestration")
+        if canonical.current_revision_id != revision.id:
+            raise ValueError("assessment trigger revision must be current")
+        basis_at = revision.ingested_at
+        if basis_at is None:
+            raise ValueError("assessment revision ingested_at is required")
 
         await session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -64,8 +67,8 @@ class AssessmentRepository:
             institutional_level=revision.institutional_level,
             service_level=revision.service_level,
         )
-        basis_at = revision.ingested_at or canonical.t1_at
         deadline_at = basis_at + timedelta(seconds=300)
+        snapshot_t1 = canonical.t1_at.isoformat() if canonical.t1_at else None
         run = AssessmentRun(
             event_id=canonical.id,
             revision_id=revision.id,
@@ -83,7 +86,7 @@ class AssessmentRepository:
                 "event_id": str(canonical.id),
                 "revision_id": str(revision.id),
                 "revision_no": revision.revision_no,
-                "t1_at": canonical.t1_at.isoformat(),
+                "t1_at": snapshot_t1,
                 "response_rule_version": revision.response_rule_version,
                 "region_boundary_version": revision.region_boundary_version,
             },

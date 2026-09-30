@@ -88,9 +88,9 @@ _TASKS = (
         deadline_offset_seconds=220,
     ),
     PlannedAssessmentTask(
-        task_key="report.rapid_assessment",
-        task_type="report",
-        component="rapid_assessment_report",
+        task_key="artifact.production",
+        task_type="artifact",
+        component="artifact_production",
         priority=30,
         sequence=10,
         deadline_offset_seconds=240,
@@ -114,8 +114,17 @@ class AssessmentPlanBuilder:
         institutional_level: str | None,
         service_level: int | None,
     ) -> tuple[PlannedAssessmentTask, ...]:
-        if event_kind not in {EventKind.FORMAL, EventKind.CORRECTION}:
-            raise ValueError("assessment plans require a formal or correction event")
+        if event_kind not in {
+            EventKind.FORMAL,
+            EventKind.CORRECTION,
+            EventKind.MANUAL,
+            EventKind.TEST,
+            EventKind.DRILL,
+        }:
+            raise ValueError(
+                "assessment plans require a formal, correction, manual, test, "
+                "or drill event"
+            )
         if institutional_level is not None and not institutional_level.strip():
             raise ValueError("institutional_level must not be blank")
         if service_level is not None and not 1 <= service_level <= 4:

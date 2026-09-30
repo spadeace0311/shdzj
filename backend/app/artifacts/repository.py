@@ -1037,6 +1037,38 @@ class ArtifactProductionRepository:
         await session.flush()
         return task
 
+    async def cancel_task(
+        self,
+        session: AsyncSession,
+        task_id: uuid.UUID,
+        reason: str,
+    ) -> ProductionTask:
+        if not reason.strip():
+            raise ValueError("task cancellation reason must not be empty")
+        task, run = await self._lock_task(session, task_id)
+        if run.status in {"completed", "partial", "failed"}:
+            raise ValueError("terminal production run cannot cancel tasks")
+        if task.status in {
+            "succeeded",
+            "degraded",
+            "failed",
+            "timed_out",
+            "canceled",
+        }:
+            return task
+        now = datetime.now(UTC)
+        task.status = "canceled"
+        task.completed_at = now
+        task.last_error = reason[:2000]
+        task.result = {
+            **dict(task.result or {}),
+            "cancel_reason": reason[:2000],
+        }
+        task.updated_at = now
+        run.updated_at = now
+        await session.flush()
+        return task
+
     async def timeout_run(
         self,
         session: AsyncSession,

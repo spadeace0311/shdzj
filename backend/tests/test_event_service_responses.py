@@ -461,7 +461,14 @@ async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
     outcome = await service.ingest_with_response_suggestion(
         _payload(),
         _event(EventKind.FORMAL),
-        None,
+        ResponseInput(
+            magnitude=Decimal("5.2"),
+            depth_km=Decimal("12"),
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            deaths=None,
+            max_intensity=Decimal("6"),
+        ),
     )
 
     assert "enqueue_assessment" in events

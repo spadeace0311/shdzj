@@ -99,6 +99,54 @@ async def _persisted_assessment_trigger(session_factory):
     return event, revision, outbox
 
 
+@pytest.fixture
+async def seeded_manual_event_without_t1(session_factory):
+    event = NormalizedEvent(
+        kind=EventKind.MANUAL,
+        source="cenc",
+        source_event_id="CENC-MANUAL-ASSESSMENT-1",
+        origin_time=datetime(2026, 9, 26, 2, 0, tzinfo=UTC),
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.2"),
+        place="上海人工事件",
+        report_time=datetime(2026, 9, 26, 2, 2, tzinfo=UTC),
+    )
+    received_at = datetime(2026, 9, 26, 2, 3, tzinfo=UTC)
+    outcome = await EventService(session_factory).ingest_collected(
+        raw_payload={"EventID": event.source_event_id, "type": "manual"},
+        event=event,
+        provider="fan",
+        lane="websocket",
+        received_at=received_at,
+        response_input=None,
+        region_context=RegionContext(
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            boundary_version="test-2026.1",
+            computed_at=received_at,
+        ),
+    )
+    async with session_factory() as session:
+        canonical = await session.get(EarthquakeEvent, outcome.event_id)
+        revision = await session.get(EarthquakeRevision, outcome.revision_id)
+        outbox = await session.scalar(
+            select(EventLifecycleOutbox).where(
+                EventLifecycleOutbox.revision_id == outcome.revision_id,
+                EventLifecycleOutbox.trigger_type == "assessment.requested",
+            )
+        )
+    assert canonical is not None
+    assert revision is not None
+    assert outbox is not None
+    return type(
+        "SeededManualTrigger",
+        (),
+        {"event": canonical, "revision": revision, "outbox": outbox},
+    )()
+
+
 async def test_repository_creates_run_and_eleven_tasks_idempotently(session_factory) -> None:
     event, revision, outbox = await _persisted_assessment_trigger(session_factory)
     repository = AssessmentRepository()
@@ -193,3 +241,19 @@ async def test_repository_increments_run_number_for_each_trigger(session_factory
 
     assert first.run_no == 1
     assert second.run_no == 2
+
+
+async def test_manual_event_without_t1_creates_run_using_ingested_at(
+    session,
+    seeded_manual_event_without_t1,
+) -> None:
+    run = await AssessmentRepository().ensure_run_and_tasks(
+        session,
+        event=seeded_manual_event_without_t1.event,
+        revision=seeded_manual_event_without_t1.revision,
+        outbox=seeded_manual_event_without_t1.outbox,
+    )
+
+    assert run.t1_at is None
+    assert run.deadline_basis_at == seeded_manual_event_without_t1.revision.ingested_at
+    assert run.snapshot["t1_at"] is None

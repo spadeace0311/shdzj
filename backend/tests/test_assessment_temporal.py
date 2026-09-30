@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import os
 from uuid import UUID, uuid4
 
 import pytest
@@ -17,6 +18,8 @@ from app.assessment.temporal import (
     AssessmentWorkflowInput,
     FinalizeAssessmentInput,
 )
+from app.artifacts.worker import ArtifactActivities
+from app.artifacts.workflow import ArtifactProductionWorkflow
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
@@ -24,6 +27,22 @@ from app.events.response_rules import ResponseInput
 from app.events.service import EventService
 from app.loss.service import LossTaskOutcome
 from app.regions.domain import RegionContext
+
+_TEST_SERVER = os.environ.get("TEMPORAL_TEST_SERVER_EXECUTABLE")
+
+
+def _artifact_activities(session_factory):
+    artifacts = ArtifactActivities(session_factory)
+    return [
+        artifacts.prepare_artifact_production,
+        artifacts.wait_for_artifact_dependencies,
+        artifacts.render_map_artifact,
+        artifacts.compose_docx_artifact,
+        artifacts.compose_pptx_artifact,
+        artifacts.validate_artifact_production,
+        artifacts.publish_artifact_production,
+        artifacts.mark_production_deadline_exceeded,
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -222,11 +241,13 @@ async def _execute_loss_workflow(session_factory, loss_service):
         intensity_service_factory=lambda: _test_intensity_service(session_factory),
         loss_service_factory=lambda: loss_service,
     )
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-loss-failure-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -241,6 +262,8 @@ async def _execute_loss_workflow(session_factory, loss_service):
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             return await environment.client.execute_workflow(
@@ -259,11 +282,13 @@ async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> No
         loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -278,6 +303,8 @@ async def test_assessment_workflow_prepares_run_and_tasks(session_factory) -> No
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             result = await environment.client.execute_workflow(
@@ -312,11 +339,13 @@ async def test_assessment_workflow_executes_loss_tasks_and_skips_deferred(
         loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-intensity-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -331,6 +360,8 @@ async def test_assessment_workflow_executes_loss_tasks_and_skips_deferred(
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             result = await environment.client.execute_workflow(
@@ -364,7 +395,7 @@ async def test_assessment_workflow_executes_loss_tasks_and_skips_deferred(
     assert statuses["loss.economic"] == "succeeded"
     assert statuses["loss.resources"] == "succeeded"
     assert statuses["loss.validate"] == "succeeded"
-    assert statuses["report.rapid_assessment"] == "skipped"
+    assert statuses["artifact.production"] == "succeeded"
     assert statuses["workgroup.response_tasks"] == "skipped"
 
 
@@ -379,11 +410,13 @@ async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
     )
     failing_finalize = _FailingFinalizeActivity()
 
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-finalize-failure-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -398,6 +431,8 @@ async def test_finalize_completed_is_not_reclassified_after_finalize_failure(
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 failing_finalize.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             with pytest.raises(Exception):
@@ -457,11 +492,13 @@ async def test_deadline_marker_persists_without_canceling_workflow(
         loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-deadline-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -476,6 +513,8 @@ async def test_deadline_marker_persists_without_canceling_workflow(
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             result = await environment.client.execute_workflow(
@@ -505,11 +544,13 @@ async def test_instrument_failure_still_completes_model_only(
         loss_service_factory=lambda: _test_loss_service(session_factory),
     )
 
-    async with await WorkflowEnvironment.start_time_skipping() as environment:
+    async with await WorkflowEnvironment.start_time_skipping(
+        test_server_existing_path=_TEST_SERVER,
+    ) as environment:
         async with Worker(
             environment.client,
             task_queue="assessment-instrument-failure-test",
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -524,6 +565,8 @@ async def test_instrument_failure_still_completes_model_only(
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                *_artifact_activities(session_factory),
             ],
         ):
             result = await environment.client.execute_workflow(

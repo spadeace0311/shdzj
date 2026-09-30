@@ -84,7 +84,7 @@ class AssessmentRunStatusResponse(BaseModel):
     revision_id: str
     run_no: int
     status: AssessmentRunStatus
-    t1_at: datetime
+    t1_at: datetime | None
     deadline_at: datetime
     completed_task_count: int
     failed_task_count: int

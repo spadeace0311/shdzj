@@ -7,9 +7,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.workflow import ParentClosePolicy
+
+from app.artifacts.workflow import ArtifactProductionWorkflow, ArtifactProductionWorkflowInput
 
 if TYPE_CHECKING:
     from app.intensity.service import IntensityService
@@ -31,6 +35,8 @@ class PreparedAssessment:
     task_count: int
     deadline_at: datetime
     task_deadlines: tuple[datetime, ...]
+    production_run_id: str | None
+    artifact_workflow_input: ArtifactProductionWorkflowInput | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +67,7 @@ class AssessmentWorkflowResult:
     run_id: str
     task_count: int
     status: str
+    production_run_id: str | None = None
 
 
 @workflow.defn
@@ -77,6 +84,20 @@ class AssessmentWorkflow:
             retry_policy=_retry_policy(),
         )
         prepared = _as_prepared_assessment(prepared_payload)
+        artifact_child_handle = None
+        if prepared.artifact_workflow_input is not None:
+            artifact_child_handle = await workflow.start_child_workflow(
+                ArtifactProductionWorkflow.run,
+                prepared.artifact_workflow_input,
+                id=f"artifact-production:{prepared.production_run_id}",
+                parent_close_policy=ParentClosePolicy.ABANDON,
+            )
+            await workflow.execute_activity(
+                "mark_artifact_production_launched",
+                AssessmentRunActivityInput(prepared.run_id),
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=_retry_policy(),
+            )
         deadline_task = asyncio.create_task(self._mark_deadline_when_due(prepared))
         task_deadline_task = asyncio.create_task(
             self._observe_task_deadlines_when_due(prepared)
@@ -114,6 +135,11 @@ class AssessmentWorkflow:
                     start_to_close_timeout=timedelta(seconds=1800),
                     retry_policy=_retry_policy(),
                 )
+                if artifact_child_handle is not None:
+                    await self._signal_child(
+                        artifact_child_handle,
+                        ArtifactProductionWorkflow.intensity_ready,
+                    )
 
                 building_handle = workflow.start_activity(
                     "run_loss_buildings",
@@ -136,6 +162,11 @@ class AssessmentWorkflow:
                     outcome = "failed"
 
                 if outcome == "completed":
+                    if artifact_child_handle is not None:
+                        await self._signal_child(
+                            artifact_child_handle,
+                            ArtifactProductionWorkflow.loss_core_ready,
+                        )
                     casualty_handle = workflow.start_activity(
                         "run_loss_casualties",
                         IntensityActivityInput(prepared.run_id, "loss.casualties"),
@@ -172,8 +203,18 @@ class AssessmentWorkflow:
                         start_to_close_timeout=timedelta(seconds=1800),
                         retry_policy=_retry_policy(),
                     )
+                    if artifact_child_handle is not None:
+                        await self._signal_child(
+                            artifact_child_handle,
+                            ArtifactProductionWorkflow.loss_final_ready,
+                        )
             except ActivityError:
                 outcome = "failed"
+            if artifact_child_handle is not None and outcome == "failed":
+                await self._signal_child(
+                    artifact_child_handle,
+                    ArtifactProductionWorkflow.assessment_failed,
+                )
             return await self._finalize(prepared, outcome=outcome)
         finally:
             if not deadline_task.done():
@@ -185,6 +226,19 @@ class AssessmentWorkflow:
                     task_deadline_task,
                     return_exceptions=True,
                 )
+
+    async def _signal_child(
+        self,
+        child_handle: object,
+        signal_method: object,
+    ) -> None:
+        try:
+            await child_handle.signal(signal_method)
+        except ApplicationError as exc:
+            logger.warning(
+                "artifact child signal failed: %s",
+                exc,
+            )
 
     async def _mark_deadline_when_due(
         self,
@@ -233,6 +287,7 @@ class AssessmentWorkflow:
             run_id=prepared.run_id,
             task_count=prepared.task_count,
             status=outcome,
+            production_run_id=prepared.production_run_id,
         )
 
 
@@ -254,6 +309,14 @@ def _as_prepared_assessment(value: object) -> PreparedAssessment:
             _as_datetime(item)
             for item in value.get("task_deadlines", [])
         ),
+        production_run_id=(
+            str(value["production_run_id"])
+            if value.get("production_run_id") is not None
+            else None
+        ),
+        artifact_workflow_input=_as_artifact_workflow_input(
+            value.get("artifact_workflow_input")
+        ),
     )
 
 
@@ -263,6 +326,35 @@ def _as_datetime(value: object) -> datetime:
     if isinstance(value, str):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     raise TypeError("prepared assessment task deadline must be a timestamp")
+
+
+def _as_artifact_workflow_input(value: object) -> ArtifactProductionWorkflowInput | None:
+    if value is None or isinstance(value, ArtifactProductionWorkflowInput):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("artifact workflow input must be a mapping")
+    deadline = value.get("deadline_at")
+    if not isinstance(deadline, str):
+        deadline = str(deadline)
+    return ArtifactProductionWorkflowInput(
+        production_run_id=str(value["production_run_id"]),
+        assessment_run_id=(
+            str(value["assessment_run_id"])
+            if value.get("assessment_run_id") is not None
+            else None
+        ),
+        event_id=str(value["event_id"]),
+        revision_id=str(value["revision_id"]),
+        deadline_at=deadline,
+        catalog_version=str(value["catalog_version"]),
+        context_fingerprint=str(value["context_fingerprint"]),
+        launch_mode=str(value["launch_mode"]),
+        generation_seq=int(value["generation_seq"]),
+        generation_scope=str(value["generation_scope"]),
+        required_outputs=tuple(
+            (str(item[0]), str(item[1])) for item in value["required_outputs"]
+        ),
+    )
 
 
 def _retry_policy() -> RetryPolicy:
@@ -310,9 +402,18 @@ class AssessmentActivities:
         self,
         request: AssessmentWorkflowInput,
     ) -> PreparedAssessment:
+        from app.config import settings
         from app.assessment.repository import AssessmentRepository
+        from app.artifacts.catalog import load_catalog
+        from app.artifacts.repository import (
+            ArtifactProductionRepository,
+            CreateProductionRunCommand,
+        )
+        from app.events.models import EarthquakeRevision
 
         repository = AssessmentRepository()
+        production_run_id = None
+        artifact_workflow_input = None
         async with self._session_factory() as session:
             async with session.begin():
                 run = await repository.ensure_run_from_outbox(
@@ -327,12 +428,114 @@ class AssessmentActivities:
                     session,
                     run.id,
                 )
+                catalog = load_catalog(settings.artifact_catalog_path)
+                revision = await session.get(EarthquakeRevision, run.revision_id)
+                if revision is None:
+                    raise LookupError("assessment revision not found")
+                production_mode = {
+                    "formal": "live",
+                    "correction": "live",
+                    "manual": "manual",
+                    "test": "test",
+                    "drill": "drill",
+                    "replay": "replay",
+                }.get(revision.revision_kind)
+                if production_mode is None:
+                    raise ValueError(
+                        f"unsupported artifact production revision kind: "
+                        f"{revision.revision_kind}"
+                    )
+                repository = ArtifactProductionRepository(catalog)
+                production = await repository.create_run(
+                    session,
+                    CreateProductionRunCommand(
+                        assessment_run_id=run.id,
+                        event_id=run.event_id,
+                        revision_id=run.revision_id,
+                        revision_no=revision.revision_no,
+                        production_mode=production_mode,
+                        launch_mode="assessment_child",
+                        deadline_basis_at=run.deadline_basis_at,
+                        deadline_at=run.deadline_at,
+                        deadline_kind="event_deadline",
+                        catalog_version=catalog.catalog_version,
+                        generation_scope="full",
+                        required_outputs=catalog.full_required_outputs(),
+                        snapshot={
+                            "launch": "assessment_child",
+                            "event_id": str(run.event_id),
+                            "revision_id": str(run.revision_id),
+                            "revision_no": revision.revision_no,
+                            "assessment_run_id": str(run.id),
+                        },
+                        reuse_existing=True,
+                    ),
+                )
+                tasks = await repository.list_tasks(session, production.id)
+                production_run_id = str(production.id)
+                artifact_workflow_input = ArtifactProductionWorkflowInput(
+                    production_run_id=production_run_id,
+                    assessment_run_id=str(run.id),
+                    event_id=str(run.event_id),
+                    revision_id=str(run.revision_id),
+                    deadline_at=production.deadline_at.isoformat(),
+                    catalog_version=catalog.catalog_version,
+                    context_fingerprint="",
+                    launch_mode="assessment_child",
+                    generation_seq=1,
+                    generation_scope="full",
+                    required_outputs=tuple(
+                        (task.artifact_key, task.output_profile)
+                        for task in tasks
+                    ),
+                )
         return PreparedAssessment(
             run_id=str(run.id),
             task_count=task_count,
             deadline_at=run.deadline_at,
             task_deadlines=tuple(task_deadlines),
+            production_run_id=production_run_id,
+            artifact_workflow_input=artifact_workflow_input,
         )
+
+    @activity.defn(name="mark_artifact_production_launched")
+    async def mark_artifact_production_launched(
+        self,
+        request: AssessmentRunActivityInput,
+    ):
+        from app.assessment.models import AssessmentTask
+        from app.assessment.repository import AssessmentRepository
+
+        repository = AssessmentRepository()
+        async with self._session_factory() as session:
+            async with session.begin():
+                task = await session.scalar(
+                    select(AssessmentTask).where(
+                        AssessmentTask.run_id == request.run_id,
+                        AssessmentTask.task_key == "artifact.production",
+                    )
+                )
+                if task is None:
+                    return None
+                if task.status == "succeeded":
+                    return task.status
+                await repository.start_task(
+                    session,
+                    request.run_id,
+                    "artifact.production",
+                    "artifact-production-v1",
+                    "artifact-production-child-started",
+                )
+                await repository.complete_task(
+                    session,
+                    task.id,
+                    "artifact-production-child-started",
+                    {
+                        "production_run_id": None,
+                        "status": "launched",
+                    },
+                )
+                return task.status
 
     @activity.defn(name="run_intensity_model")
     async def run_intensity_model(self, request: IntensityActivityInput):
