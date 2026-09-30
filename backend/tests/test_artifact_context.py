@@ -48,6 +48,7 @@ async def _seed_document_data_asset(
     *,
     asset_key: str,
     properties: dict,
+    rows: list[dict] | None = None,
 ) -> uuid.UUID:
     try:
         definition = get_asset_definition(asset_key)
@@ -100,17 +101,33 @@ async def _seed_document_data_asset(
     )
     session.add(version)
     await session.flush()
-    session.add(
-        DataAssetRecord(
-            version_id=version.id,
-            row_number=1,
-            business_key=f"{asset_key}-1",
-            properties=properties,
-            geom=None,
+    record_rows = rows if rows is not None else [properties]
+    for row_number, record_properties in enumerate(record_rows, start=1):
+        session.add(
+            DataAssetRecord(
+                version_id=version.id,
+                row_number=row_number,
+                business_key=f"{asset_key}-{row_number}",
+                properties=dict(record_properties),
+                geom=None,
+            )
         )
-    )
     await session.flush()
     return version.id
+
+
+def _contract_document_properties(asset_key: str, **overrides) -> dict:
+    definition = get_asset_definition(asset_key)
+    properties = {}
+    for field in definition.contract.fields:
+        if field.python_type == "number":
+            properties[field.name] = 0.0
+        elif field.python_type == "integer":
+            properties[field.name] = 1
+        else:
+            properties[field.name] = "fixture"
+    properties.update(overrides)
+    return properties
 
 
 def _snapshot_asset_entry(asset_key: str, version_id: uuid.UUID) -> dict:
@@ -643,11 +660,15 @@ async def test_document_context_builds_persisted_background_payload(
     building_version = await _seed_document_data_asset(
         session,
         asset_key="shanghai.building.town",
-        properties={
-            "total": 10000,
-            "structure_type": "砖混 60%；框架 40%",
-            "coverage_quality": "完整覆盖",
-        },
+        properties=_contract_document_properties(
+            "shanghai.building.town",
+            TOTAL_AREA=10000,
+            HIGH_RISE=1000,
+            RCFRAME=3000,
+            BRICK_STRUCTURE=4000,
+            SINGLE_AREA=1000,
+            OTHER_STRUCTURE=1000,
+        ),
     )
     fault_version = await _seed_document_data_asset(
         session,
@@ -657,22 +678,26 @@ async def test_document_context_builds_persisted_background_payload(
     population_version = await _seed_document_data_asset(
         session,
         asset_key="shanghai.population.town",
-        properties={
-            "resident": 120000,
-            "floating": 18000,
-            "household": 52000,
-            "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
-        },
+        properties=_contract_document_properties(
+            "shanghai.population.town",
+            total=120000,
+            resident=120000,
+            floating=18000,
+            family=52000,
+            under14=21840,
+            over65=12240,
+        ),
     )
     economy_version = await _seed_document_data_asset(
         session,
         asset_key="shanghai.economy.county",
-        properties={
-            "gdp": 560000,
-            "primary": 12000,
-            "secondary": 220000,
-            "tertiary": 328000,
-        },
+        properties=_contract_document_properties(
+            "shanghai.economy.county",
+            gdp=560000,
+            industry_value=220000,
+            agri_value=12000,
+            service_value=328000,
+        ),
     )
     school_version = await _seed_document_data_asset(
         session,
@@ -764,18 +789,161 @@ async def test_document_context_builds_persisted_background_payload(
         "上海市及邻近行政区"
     )
     assert context.manifest["building_town"]["structure_type"] == (
-        "砖混 60%；框架 40%"
+        "高层 10.0%；框架 30.0%；砖混 40.0%；单层 10.0%；其他 10.0%"
     )
     assert context.manifest["building_town"]["coverage_quality"] == "完整覆盖"
+    assert context.manifest["building_town"]["town_totals"] == 10000
     assert context.manifest["faults"]["summary"] == "邻近断裂 3 条"
+    assert context.manifest["population_town"]["household"] == 52000
     assert context.manifest["population_town"]["age_structure"] == (
         "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%"
     )
     assert context.manifest["economy_county"]["primary"] == 12000
+    assert context.manifest["economy_county"]["secondary"] == 220000
+    assert context.manifest["economy_county"]["tertiary"] == 328000
     assert context.manifest["targets"]["school"] == "学校 1所"
     assert context.manifest["targets"]["hospital"] == "医院 1所"
     assert context.manifest["targets"]["rescue_team"] == "救援队伍 1支"
     assert context.manifest["targets"]["cultural_relic"] == "文物单位 1处"
+
+
+async def test_document_context_skips_invalid_persisted_asset_records(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+    snapshot = await session.scalar(
+        select(ProductionInputSnapshot).where(
+            ProductionInputSnapshot.production_run_id == run.id
+        )
+    )
+    assert snapshot is not None
+
+    building_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.building.town",
+        properties={},
+        rows=[
+            _contract_document_properties(
+                "shanghai.building.town",
+                TOTAL_AREA=100,
+                HIGH_RISE=None,
+                RCFRAME=20,
+                BRICK_STRUCTURE=30,
+                SINGLE_AREA=15,
+                OTHER_STRUCTURE=25,
+            ),
+            _contract_document_properties(
+                "shanghai.building.town",
+                TOTAL_AREA="invalid",
+                HIGH_RISE=None,
+                RCFRAME=0,
+                BRICK_STRUCTURE=0,
+                SINGLE_AREA=0,
+                OTHER_STRUCTURE=0,
+            ),
+        ],
+    )
+    population_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.population.town",
+        properties={},
+        rows=[
+            _contract_document_properties(
+                "shanghai.population.town",
+                total=1000,
+                resident=900,
+                floating=100,
+                family=400,
+                under14=100,
+                over65=200,
+            ),
+            _contract_document_properties(
+                "shanghai.population.town",
+                total=500,
+                resident="invalid",
+                floating=50,
+                family=200,
+                under14=50,
+                over65=100,
+            ),
+        ],
+    )
+    economy_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.economy.county",
+        properties={},
+        rows=[
+            _contract_document_properties(
+                "shanghai.economy.county",
+                gdp=1000,
+                industry_value=300,
+                agri_value=100,
+                service_value=600,
+            ),
+            _contract_document_properties(
+                "shanghai.economy.county",
+                gdp=500,
+                industry_value="invalid",
+                agri_value=100,
+                service_value=400,
+            ),
+        ],
+    )
+    assets = list(snapshot.manifest["assets"])
+    assets_by_key = {entry["asset_key"]: entry for entry in assets}
+    assets_by_key["shanghai.building.town"] = _snapshot_asset_entry(
+        "shanghai.building.town",
+        building_version,
+    )
+    assets_by_key["shanghai.population.town"] = _snapshot_asset_entry(
+        "shanghai.population.town",
+        population_version,
+    )
+    assets_by_key["shanghai.economy.county"] = _snapshot_asset_entry(
+        "shanghai.economy.county",
+        economy_version,
+    )
+    snapshot.manifest["assets"] = sorted(
+        assets_by_key.values(),
+        key=lambda item: item["asset_key"],
+    )
+    await session.flush()
+
+    document_task = await seeded_artifact_assessment.first_task(
+        run.id,
+        "doc.background",
+    )
+    context = await production_context_service.build_document_context(
+        session,
+        document_task.id,
+        "docx",
+    )
+
+    assert context.manifest["building_town"]["town_totals"] == 100
+    assert context.manifest["building_town"]["coverage_quality"] == (
+        "部分覆盖：1 条记录 TOTAL_AREA 无效；缺失可选字段 HIGH_RISE"
+    )
+    assert (
+        context.manifest["building_town"]["quality"]["TOTAL_AREA"]
+        == (
+            "shanghai.building.town.TOTAL_AREA 有 1 条无效记录"
+            "（shanghai.building.town-2），已按 1 条有效记录聚合"
+        )
+    )
+    assert context.manifest["population_town"]["resident"] == 900
+    assert context.manifest["population_town"]["household"] == 600
+    assert context.manifest["population_town"]["age_structure"] == (
+        "0-14岁 10.0%；15-64岁 70.0%；65岁及以上 20.0%"
+    )
+    assert context.manifest["economy_county"]["secondary"] == 300
+    assert context.manifest["economy_county"]["gdp"] == 1500
 
 
 async def test_missing_but_optional_asset_is_recorded_not_invented(

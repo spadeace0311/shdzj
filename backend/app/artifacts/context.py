@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from app.config import settings
 from app.data_assets.locks import lock_data_asset_catalog
 from app.data_assets.models import DataAssetSnapshot
 from app.data_assets.repository import DataAssetRepository
+from app.data_assets.registry import get_asset_definition
 from app.data_assets.required_registry import (
     load_production_required_asset_registry,
 )
@@ -688,12 +690,14 @@ class ProductionContextService:
         )
         economy_county = _background_economy_asset_payload(economy_records)
 
+        overview_source = "shanghai.admin.city"
         admin_records, _ = await self._frozen_records(
             session,
             asset_versions,
             "shanghai.admin.city",
         )
         if not admin_records:
+            overview_source = "shanghai.admin.town"
             admin_records, _ = await self._frozen_records(
                 session,
                 asset_versions,
@@ -702,6 +706,7 @@ class ProductionContextService:
         area_overview = _background_overview_payload(
             admin_records,
             targets,
+            source=overview_source,
         )
         return {
             "historical_earthquakes": historical,
@@ -976,15 +981,9 @@ def _background_spatial_payload(records: list[Any]) -> dict[str, Any]:
 def _background_overview_payload(
     admin_records: list[Any],
     targets: Mapping[str, str],
+    *,
+    source: str,
 ) -> dict[str, str]:
-    source = (
-        "shanghai.admin.city"
-        if any(
-            "shanghai.admin.city" in record.business_key
-            for record in admin_records
-        )
-        else "shanghai.admin.town"
-    )
     if not admin_records:
         return {
             "geography": f"数据不可用，待复核：{source}",
@@ -1009,34 +1008,161 @@ def _background_overview_payload(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _NumericFieldSummary:
+    value: float | None
+    valid_record_count: int = 0
+    missing_record_count: int = 0
+    invalid_business_keys: tuple[str, ...] = ()
+
+
+def _contract_field_required(asset_key: str, field_name: str) -> bool:
+    definition = get_asset_definition(asset_key)
+    for contract_field in definition.contract.fields:
+        if contract_field.name == field_name:
+            return contract_field.required
+    raise KeyError(f"unknown contract field: {asset_key}.{field_name}")
+
+
+def _numeric_summary(records: list[Any], field_name: str) -> _NumericFieldSummary:
+    total = 0.0
+    valid_count = 0
+    missing_count = 0
+    invalid_keys: list[str] = []
+    for record in records:
+        properties = record.properties or {}
+        if field_name not in properties:
+            missing_count += 1
+            continue
+        raw_value = properties[field_name]
+        if raw_value is None or raw_value == "":
+            missing_count += 1
+            continue
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_value = math.nan
+        if not math.isfinite(numeric_value):
+            invalid_keys.append(record.business_key or f"row-{record.row_number}")
+            continue
+        total += numeric_value
+        valid_count += 1
+    return _NumericFieldSummary(
+        value=total if valid_count else None,
+        valid_record_count=valid_count,
+        missing_record_count=missing_count,
+        invalid_business_keys=tuple(invalid_keys),
+    )
+
+
+def _sum_records(records: list[Any], key: str) -> float | None:
+    return _numeric_summary(records, key).value
+
+
+def _unavailable(source: str, field_name: str | None = None) -> str:
+    if field_name is None:
+        return f"数据不可用，待复核：{source}"
+    return f"数据不可用，待复核：{source}.{field_name}"
+
+
+def _quality_issues(
+    source: str,
+    summaries: Mapping[str, _NumericFieldSummary],
+) -> dict[str, str]:
+    issues: dict[str, str] = {}
+    for field_name, summary in summaries.items():
+        if not summary.invalid_business_keys:
+            continue
+        sample = "、".join(summary.invalid_business_keys[:3])
+        suffix = "等" if len(summary.invalid_business_keys) > 3 else ""
+        issues[field_name] = (
+            f"{source}.{field_name} 有 {len(summary.invalid_business_keys)} 条无效记录"
+            f"（{sample}{suffix}），已按 {summary.valid_record_count} 条有效记录聚合"
+        )
+    return issues
+
+
 def _background_building_payload(records: list[Any]) -> dict[str, Any]:
     source = "shanghai.building.town"
+    unavailable_payload = {
+        "town_totals": _unavailable(source),
+        "structure_type": _unavailable(source),
+        "coverage_quality": _unavailable(source),
+    }
     if not records:
-        return {
-            "town_totals": f"数据不可用，待复核：{source}",
-            "structure_type": f"数据不可用，待复核：{source}",
-            "coverage_quality": f"数据不可用，待复核：{source}",
-        }
-    properties = dict(records[0].properties or {})
-    totals = [
-        float(record.properties.get(key))
-        for record in records
-        for key in ("total", "building_count", "count")
-        if record.properties.get(key) is not None
-    ]
+        return unavailable_payload
+
+    total_area = _numeric_summary(records, "TOTAL_AREA")
+    structure_fields = (
+        ("HIGH_RISE", "高层"),
+        ("RCFRAME", "框架"),
+        ("BRICK_STRUCTURE", "砖混"),
+        ("SINGLE_AREA", "单层"),
+        ("OTHER_STRUCTURE", "其他"),
+    )
+    structure_summaries = {
+        field_name: _numeric_summary(records, field_name)
+        for field_name, _ in structure_fields
+    }
+    quality_summaries = {
+        "TOTAL_AREA": total_area,
+        **structure_summaries,
+    }
+
+    town_totals: Any = (
+        total_area.value
+        if total_area.value is not None
+        else _unavailable(source, "TOTAL_AREA")
+    )
+
+    structure_denominator = sum(
+        summary.value or 0.0 for summary in structure_summaries.values()
+    )
+    if structure_denominator > 0:
+        structure_type = "；".join(
+            f"{label} {(summary.value or 0.0) / structure_denominator * 100:.1f}%"
+            for (_, label), summary in zip(
+                structure_fields,
+                structure_summaries.values(),
+            )
+        )
+    else:
+        structure_type = _unavailable(source, "structure_type")
+
+    coverage_parts: list[str] = []
+    if total_area.missing_record_count:
+        coverage_parts.append(
+            f"{total_area.missing_record_count} 条记录缺失 TOTAL_AREA"
+        )
+    if total_area.invalid_business_keys:
+        coverage_parts.append(
+            f"{len(total_area.invalid_business_keys)} 条记录 TOTAL_AREA 无效"
+        )
+    for field_name, _ in structure_fields:
+        summary = structure_summaries[field_name]
+        if not summary.invalid_business_keys:
+            continue
+        coverage_parts.append(
+            f"{len(summary.invalid_business_keys)} 条记录 {field_name} 无效"
+        )
+    high_rise_summary = structure_summaries["HIGH_RISE"]
+    if (
+        high_rise_summary.value is None
+        and not high_rise_summary.invalid_business_keys
+        and not _contract_field_required(source, "HIGH_RISE")
+    ):
+        coverage_parts.append("缺失可选字段 HIGH_RISE")
+    coverage_quality = (
+        "完整覆盖"
+        if not coverage_parts
+        else "部分覆盖：" + "；".join(coverage_parts)
+    )
+
     return {
-        "town_totals": sum(totals) if totals else properties.get(
-            "town_totals",
-            f"数据不可用，待复核：{source}",
-        ),
-        "structure_type": properties.get(
-            "structure_type",
-            f"数据不可用，待复核：{source}.structure_type",
-        ),
-        "coverage_quality": properties.get(
-            "coverage_quality",
-            f"数据不可用，待复核：{source}.coverage_quality",
-        ),
+        "town_totals": town_totals,
+        "structure_type": structure_type,
+        "coverage_quality": coverage_quality,
+        "quality": _quality_issues(source, quality_summaries),
     }
 
 
@@ -1058,29 +1184,49 @@ def _background_population_asset_payload(records: list[Any]) -> dict[str, Any]:
     source = "shanghai.population.town"
     if not records:
         return {
-            "resident": f"数据不可用，待复核：{source}",
-            "floating": f"数据不可用，待复核：{source}",
-            "household": f"数据不可用，待复核：{source}",
-            "age_structure": f"数据不可用，待复核：{source}",
+            "resident": _unavailable(source),
+            "floating": _unavailable(source),
+            "household": _unavailable(source),
+            "age_structure": _unavailable(source),
         }
-    properties = dict(records[0].properties or {})
-    resident = _sum_records(records, "resident")
-    floating = _sum_records(records, "floating")
-    household = _sum_records(records, "household")
+    summaries = {
+        field_name: _numeric_summary(records, field_name)
+        for field_name in (
+            "total",
+            "resident",
+            "floating",
+            "family",
+            "under14",
+            "over65",
+        )
+    }
+    resident = summaries["resident"].value
+    floating = summaries["floating"].value
+    family = summaries["family"].value
+
+    age_structure = _unavailable(source, "age_structure")
+    total = summaries["total"].value
+    under14 = summaries["under14"].value
+    over65 = summaries["over65"].value
+    if (
+        total is not None
+        and under14 is not None
+        and over65 is not None
+        and total > 0
+    ):
+        middle = total - under14 - over65
+        if middle >= 0:
+            age_structure = (
+                f"0-14岁 {under14 / total * 100:.1f}%；"
+                f"15-64岁 {middle / total * 100:.1f}%；"
+                f"65岁及以上 {over65 / total * 100:.1f}%"
+            )
     return {
-        "resident": resident
-        if resident is not None
-        else properties.get("resident", f"数据不可用，待复核：{source}"),
-        "floating": floating
-        if floating is not None
-        else properties.get("floating", f"数据不可用，待复核：{source}"),
-        "household": household
-        if household is not None
-        else properties.get("household", f"数据不可用，待复核：{source}"),
-        "age_structure": properties.get(
-            "age_structure",
-            f"数据不可用，待复核：{source}.age_structure",
-        ),
+        "resident": resident if resident is not None else _unavailable(source, "resident"),
+        "floating": floating if floating is not None else _unavailable(source, "floating"),
+        "household": family if family is not None else _unavailable(source, "family"),
+        "age_structure": age_structure,
+        "quality": _quality_issues(source, summaries),
     }
 
 
@@ -1088,29 +1234,31 @@ def _background_economy_asset_payload(records: list[Any]) -> dict[str, Any]:
     source = "shanghai.economy.county"
     if not records:
         return {
-            "gdp": f"数据不可用，待复核：{source}",
-            "primary": f"数据不可用，待复核：{source}",
-            "secondary": f"数据不可用，待复核：{source}",
-            "tertiary": f"数据不可用，待复核：{source}",
+            "gdp": _unavailable(source),
+            "primary": _unavailable(source),
+            "secondary": _unavailable(source),
+            "tertiary": _unavailable(source),
         }
-    properties = dict(records[0].properties or {})
-    return {
-        key: _sum_records(records, key)
-        if _sum_records(records, key) is not None
-        else properties.get(key, f"数据不可用，待复核：{source}.{key}")
-        for key in ("gdp", "primary", "secondary", "tertiary")
+    mapping = (
+        ("gdp", "gdp"),
+        ("primary", "agri_value"),
+        ("secondary", "industry_value"),
+        ("tertiary", "service_value"),
+    )
+    summaries = {
+        field_name: _numeric_summary(records, field_name)
+        for _, field_name in mapping
     }
-
-
-def _sum_records(records: list[Any], key: str) -> float | None:
-    values: list[float] = []
-    for record in records:
-        value = (record.properties or {}).get(key)
-        try:
-            values.append(float(value))
-        except (TypeError, ValueError):
-            return None
-    return sum(values) if values else None
+    payload: dict[str, Any] = {}
+    for output_key, field_name in mapping:
+        summary = summaries[field_name]
+        payload[output_key] = (
+            summary.value
+            if summary.value is not None
+            else _unavailable(source, field_name)
+        )
+    payload["quality"] = _quality_issues(source, summaries)
+    return payload
 
 
 def _assessment_product_types(catalog: ArtifactCatalog) -> list[str]:
