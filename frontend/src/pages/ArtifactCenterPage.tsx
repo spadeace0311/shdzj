@@ -225,10 +225,12 @@ export function ArtifactCenterPage({
       ),
     [filters, versions],
   );
-  const selectedArtifact =
+  const selectedPublication =
     publications.find(
       (artifact) => artifact.artifact_id === selectedArtifactId,
-    ) ??
+    ) ?? null;
+  const selectedArtifact =
+    selectedPublication ??
     versions.find((artifact) => artifact.artifact_id === selectedArtifactId) ??
     null;
   const progress = useMemo(
@@ -311,10 +313,10 @@ export function ArtifactCenterPage({
             <button
               className="primary-button"
               type="button"
-              disabled={!selectedArtifact || pageStatus !== "ready"}
+              disabled={!selectedPublication || pageStatus !== "ready"}
               onClick={() => {
-                if (selectedArtifact) {
-                  setOverrideTarget(selectedArtifact);
+                if (selectedPublication) {
+                  setOverrideTarget(selectedPublication);
                 }
               }}
             >
