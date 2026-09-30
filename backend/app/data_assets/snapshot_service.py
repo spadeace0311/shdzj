@@ -8,7 +8,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assessment.models import AssessmentRun
-from app.config import settings
 from app.data_assets.locks import lock_data_asset_catalog
 from app.data_assets.models import DataAssetSnapshot, DataAssetVersion
 from app.data_assets.repository import (
@@ -18,7 +17,7 @@ from app.data_assets.repository import (
 )
 from app.data_assets.required_registry import (
     RequiredAssetRegistry,
-    load_required_asset_registry,
+    load_production_required_asset_registry,
 )
 
 
@@ -36,9 +35,7 @@ class DataAssetSnapshotService:
         registry: RequiredAssetRegistry | None = None,
         repository: DataAssetRepository | None = None,
     ) -> None:
-        self._registry = registry or load_required_asset_registry(
-            settings.data_asset_required_registry_path
-        )
+        self._registry = registry or load_production_required_asset_registry()
         self._repository = repository or DataAssetRepository()
 
     async def capture_required_assets(

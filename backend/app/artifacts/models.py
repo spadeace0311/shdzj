@@ -136,11 +136,11 @@ class ProductionInputSnapshotItem(Base):
         index=True,
     )
     asset_key: Mapped[str] = mapped_column(String(160))
-    asset_version_id: Mapped[uuid.UUID] = mapped_column(
+    asset_version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("data_asset_versions.id", ondelete="CASCADE"),
         index=True,
     )
-    checksum: Mapped[str] = mapped_column(String(64))
+    checksum: Mapped[str | None] = mapped_column(String(64))
     role: Mapped[str] = mapped_column(String(32))
     coverage: Mapped[dict] = mapped_column(JSONB)
     selected_for_render: Mapped[bool] = mapped_column(

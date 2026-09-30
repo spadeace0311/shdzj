@@ -120,11 +120,21 @@ async def test_artifact_tables_and_nullable_t1_exist() -> None:
                     if column["name"] == "t1_at"
                 )
             )
+            snapshot_item_columns = await connection.run_sync(
+                lambda sync: {
+                    column["name"]: column["nullable"]
+                    for column in inspect(sync).get_columns(
+                        "production_input_snapshot_items"
+                    )
+                }
+            )
     finally:
         await engine.dispose()
 
     assert ARTIFACT_TABLES <= tables
     assert t1_column["nullable"] is True
+    assert snapshot_item_columns["asset_version_id"] is True
+    assert snapshot_item_columns["checksum"] is True
 
 
 async def test_artifact_partial_unique_indexes_exist() -> None:

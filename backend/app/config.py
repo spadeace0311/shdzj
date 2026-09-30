@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     artifact_storage_root: str = "/var/lib/artifacts"
     artifact_template_root: str = "/config/artifacts/templates"
     artifact_catalog_path: str = "/config/artifacts/catalog.yaml"
+    artifact_font_path: str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
     artifact_max_override_bytes: int = 1_073_741_824
     artifact_render_concurrency: int = 4
     artifact_optional_dependency_reserve_seconds: int = 30
@@ -142,6 +143,7 @@ class Settings(BaseSettings):
             self.artifact_storage_root,
             self.artifact_template_root,
             self.artifact_catalog_path,
+            self.artifact_font_path,
         )
         for path in artifact_paths:
             if not path.strip():

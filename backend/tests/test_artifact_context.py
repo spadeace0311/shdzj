@@ -1,14 +1,26 @@
 import hashlib
+import uuid
 from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
 
+from app.artifacts.domain import DependencyKind
 from app.artifacts.context import ProductionContextService
-from app.artifacts.models import ArtifactTemplate, ArtifactTemplateVersion
+from app.artifacts.models import (
+    ArtifactTemplate,
+    ArtifactTemplateVersion,
+    ProductionInputSnapshotItem,
+)
 from app.artifacts.repository import ArtifactProductionRepository
 from app.assessment.models import AssessmentRun
+from app.config import settings
 from app.events.models import EarthquakeEvent
+from app.loss.region import load_region_loss_profile
+from tests.data_asset_helpers import (
+    _cleanup_fixture_data,
+    publish_new_population_version,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +82,17 @@ async def _seed_template_versions_and_context_methods(
                             published_at=datetime.now(UTC),
                         )
                     )
+                versions = (
+                    await session.scalars(
+                        select(ArtifactTemplateVersion)
+                        .where(
+                            ArtifactTemplateVersion.template_id == template.id
+                        )
+                        .order_by(ArtifactTemplateVersion.version)
+                    )
+                ).all()
+                for version in versions:
+                    version.status = "published" if version.version == "v1" else "retired"
 
     original_create_full_run = seeded_artifact_assessment.create_full_run
 
@@ -88,20 +111,83 @@ async def _seed_template_versions_and_context_methods(
                         EarthquakeEvent,
                         seeded_artifact_assessment.event_id,
                     )
-                    assessment = await session.get(
-                        AssessmentRun,
-                        seeded_artifact_assessment.assessment_run_id,
-                    )
                     event.t1_at = None
-                    assessment.t1_at = None
         return await original_create_full_run(
             revision_no=revision_no,
             production_mode=production_mode,
         )
 
+    async def publish_new_template_version(
+        template_key: str,
+        version: str,
+    ) -> ArtifactTemplateVersion:
+        async with session_factory() as session:
+            async with session.begin():
+                template = await session.scalar(
+                    select(ArtifactTemplate).where(
+                        ArtifactTemplate.template_key == template_key
+                    )
+                )
+                assert template is not None
+                existing = (
+                    await session.scalars(
+                        select(ArtifactTemplateVersion)
+                        .where(ArtifactTemplateVersion.template_id == template.id)
+                    )
+                ).all()
+                for item in existing:
+                    item.status = "retired"
+                existing_version = next(
+                    (
+                        item
+                        for item in existing
+                        if item.version == version
+                    ),
+                    None,
+                )
+                if existing_version is not None:
+                    existing_version.status = "published"
+                    existing_version.manifest = {"version": version}
+                    existing_version.checksum = hashlib.sha256(
+                        f"{template_key}:{version}".encode()
+                    ).hexdigest()
+                    existing_version.storage_path = (
+                        f"templates/{template_key}/{version}"
+                    )
+                    existing_version.published_at = datetime.now(UTC)
+                    await session.flush()
+                    return existing_version
+                published = ArtifactTemplateVersion(
+                    template_id=template.id,
+                    version=version,
+                    status="published",
+                    manifest={"version": version},
+                    checksum=hashlib.sha256(
+                        f"{template_key}:{version}".encode()
+                    ).hexdigest(),
+                    storage_path=f"templates/{template_key}/{version}",
+                    created_by="context-fixture",
+                    published_at=datetime.now(UTC),
+                )
+                session.add(published)
+                await session.flush()
+                return published
+
     seeded_artifact_assessment.create_full_run = create_full_run
-    seeded_artifact_assessment.publish_new_template_version = lambda *_: None
+    seeded_artifact_assessment.publish_new_template_version = (
+        publish_new_template_version
+    )
     yield
+
+
+@pytest.fixture
+async def published_population_version(session_factory) -> uuid.UUID:
+    version_id = await publish_new_population_version(
+        session_factory,
+        f"context-{uuid.uuid4()}",
+    )
+    yield version_id
+    await _cleanup_fixture_data(session_factory)
 
 
 async def test_static_context_is_deterministic_and_does_not_drift(
@@ -115,35 +201,85 @@ async def test_static_context_is_deterministic_and_does_not_drift(
         run.id,
         seeded_artifact_assessment.catalog,
     )
-    seeded_artifact_assessment.publish_new_template_version("map.epicenter", "v2")
+    await seeded_artifact_assessment.publish_new_template_version(
+        "map.epicenter",
+        "v2",
+    )
     second = await production_context_service.build_task_context(
         session,
         (await seeded_artifact_assessment.first_task(run.id)).id,
+    )
+    latest_template = await session.scalar(
+        select(ArtifactTemplateVersion)
+        .join(ArtifactTemplate, ArtifactTemplateVersion.template_id == ArtifactTemplate.id)
+        .where(
+            ArtifactTemplate.template_key == "map.epicenter",
+            ArtifactTemplateVersion.status == "published",
+        )
+        .order_by(ArtifactTemplateVersion.published_at.desc())
+        .limit(1)
     )
 
     assert len(first.catalog_version) == len("2026.09.30-professional-v1")
     assert second.context_fingerprint == first.context_fingerprint
     assert second.template_versions["map.epicenter"]["version"] == "v1"
+    assert latest_template is not None
+    assert latest_template.version == "v2"
 
 
 async def test_missing_but_optional_asset_is_recorded_not_invented(
     seeded_artifact_assessment,
     production_context_service,
-    session,
+    session_factory,
+    published_population_version,
 ) -> None:
     run = await seeded_artifact_assessment.create_full_run(
         missing_optional_assets={"shanghai.reservoir"},
     )
-    snapshot = await production_context_service.freeze_static_context(
-        session,
-        run.id,
-        seeded_artifact_assessment.catalog,
-    )
+    async with session_factory() as freeze_session:
+        async with freeze_session.begin():
+            snapshot = await production_context_service.freeze_static_context(
+                freeze_session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
 
-    item = snapshot.item("shanghai.reservoir")
-    assert item.resolution_status == "missing"
-    assert item.asset_version_id is None
-    assert item.checksum is None
+            item = snapshot.item("shanghai.reservoir")
+            assert item.resolution_status == "missing"
+            assert item.asset_version_id is None
+            assert item.checksum is None
+
+            items = (
+                await freeze_session.scalars(
+                    select(ProductionInputSnapshotItem).where(
+                        ProductionInputSnapshotItem.snapshot_id.in_(
+                            select(ProductionInputSnapshotItem.snapshot_id).where(
+                                ProductionInputSnapshotItem.asset_key
+                                == "shanghai.population.town"
+                            )
+                        )
+                    )
+                )
+            ).all()
+            by_key = {item.asset_key: item for item in items}
+            assert "shanghai.population.town" in by_key
+            assert "shanghai.reservoir" in by_key
+            assert (
+                by_key["shanghai.population.town"].asset_version_id
+                == published_population_version
+            )
+            assert by_key["shanghai.population.town"].checksum is not None
+            assert by_key["shanghai.reservoir"].asset_version_id is None
+            assert by_key["shanghai.reservoir"].checksum is None
+
+            manifest_by_key = {
+                entry["asset_key"]: entry for entry in snapshot.manifest["assets"]
+            }
+            assert (
+                manifest_by_key["shanghai.reservoir"]["asset_version_id"]
+                is None
+            )
+            assert manifest_by_key["shanghai.reservoir"]["checksum"] is None
 
 
 async def test_t1_none_is_serialized_as_null(
@@ -159,3 +295,65 @@ async def test_t1_none_is_serialized_as_null(
     )
 
     assert context.manifest["t1_at"] is None
+
+
+async def test_static_manifest_freezes_design_identity_fields(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+    session_factory,
+) -> None:
+    async with session_factory() as preparation_session:
+        async with preparation_session.begin():
+            assessment = await preparation_session.get(
+                AssessmentRun,
+                seeded_artifact_assessment.assessment_run_id,
+            )
+            assert assessment is not None
+            assessment.data_asset_snapshot_fingerprint = "d" * 64
+
+    run = await seeded_artifact_assessment.create_full_run()
+    context = await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+
+    expected_assessment_products = sorted(
+        {
+            dependency.key
+            for definition in seeded_artifact_assessment.catalog.definitions
+            for dependency in (
+                *definition.depends_on,
+                *definition.optional_depends_on,
+            )
+            if dependency.kind is DependencyKind.ASSESSMENT_PRODUCT
+        }
+    )
+    assert (
+        context.manifest["assessment"]["assessment_run_id"]
+        == str(seeded_artifact_assessment.assessment_run_id)
+    )
+    assert (
+        context.manifest["assessment"]["allowed_assessment_product_types"]
+        == expected_assessment_products
+    )
+    assert (
+        context.manifest["assessment"]["data_asset_snapshot_fingerprint"]
+        == "d" * 64
+    )
+
+    profile = load_region_loss_profile(settings.loss_region_profile_path)
+    assert context.manifest["loss"]["region_profile_version"] == profile.version
+    assert context.manifest["loss"]["model_versions"] == profile.default_model_versions
+    assert "parameter_package" in context.manifest["loss"]
+
+    assert context.manifest["fonts"]["version"] != "shanghai-artifact-fonts-v1"
+    assert len(context.manifest["fonts"]["checksum"]) == 64
+
+    templates = {
+        entry["template_key"]: entry for entry in context.manifest["templates"]
+    }
+    assert templates["map.epicenter"]["version"] == "v1"
+    assert len(templates["map.epicenter"]["checksum"]) == 64
+    assert templates["map.epicenter"]["kind"] == "map"

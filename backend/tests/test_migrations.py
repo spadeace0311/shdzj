@@ -14,7 +14,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0015_artifact_production"
+LATEST_REVISION = "0016_artifact_context_freeze"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -441,6 +441,26 @@ async def _artifact_tables_exist() -> bool:
     finally:
         await engine.dispose()
     return ARTIFACT_TABLES <= names
+
+
+async def _production_snapshot_item_identity_nullability() -> dict[str, bool]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync: {
+                    column["name"]: column["nullable"]
+                    for column in inspect(sync).get_columns(
+                        "production_input_snapshot_items"
+                    )
+                }
+            )
+    finally:
+        await engine.dispose()
+    return {
+        "asset_version_id": columns["asset_version_id"],
+        "checksum": columns["checksum"],
+    }
 
 
 async def _artifact_trigger_state() -> tuple[set[str], set[str]]:
@@ -926,5 +946,30 @@ async def test_0015_artifact_production_is_reversible() -> None:
         assert triggers.isdisjoint(expected_triggers)
         assert functions.isdisjoint(expected_functions)
         _set_revision(LATEST_REVISION)
+    finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0016_production_snapshot_item_nullable_identity_is_reversible() -> None:
+    previous_revision = "0015_artifact_production"
+    _set_revision(previous_revision)
+    before = await _production_snapshot_item_identity_nullability()
+    assert before == {
+        "asset_version_id": False,
+        "checksum": False,
+    }
+    try:
+        _set_revision(LATEST_REVISION)
+        upgraded = await _production_snapshot_item_identity_nullability()
+        assert upgraded == {
+            "asset_version_id": True,
+            "checksum": True,
+        }
+        _set_revision(previous_revision)
+        downgraded = await _production_snapshot_item_identity_nullability()
+        assert downgraded == {
+            "asset_version_id": False,
+            "checksum": False,
+        }
     finally:
         _set_revision(LATEST_REVISION)

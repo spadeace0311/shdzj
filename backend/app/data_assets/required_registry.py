@@ -3,6 +3,8 @@ from pathlib import Path
 
 import yaml
 
+from app.config import settings
+
 
 @dataclass(frozen=True, slots=True)
 class RequiredAssetRegistry:
@@ -43,6 +45,13 @@ def load_required_asset_registry(
         required,
         optional,
         artifact_assets,
+    )
+
+
+def load_production_required_asset_registry() -> RequiredAssetRegistry:
+    return load_required_asset_registry(
+        settings.data_asset_required_registry_path,
+        artifact_asset_catalog_path=settings.artifact_asset_catalog_path,
     )
 
 

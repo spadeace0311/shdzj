@@ -522,11 +522,13 @@ class ArtifactProductionRepository:
             snapshot_item = ProductionInputSnapshotItem(
                 snapshot_id=snapshot.id,
                 asset_key=str(item["asset_key"]),
-                asset_version_id=_coerce_uuid(
-                    item["asset_version_id"],
+                asset_version_id=_optional_uuid_value(
+                    item.get("asset_version_id"),
                     f"items[{index}].asset_version_id",
                 ),
-                checksum=str(item["checksum"]),
+                checksum=_optional_string_value(
+                    item.get("checksum"),
+                ),
                 role=str(item["role"]),
                 coverage=dict(item.get("coverage") or {}),
                 selected_for_render=bool(
@@ -1792,6 +1794,25 @@ def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:
         return uuid.UUID(str(value))
     except (TypeError, ValueError) as error:
         raise ValueError(f"{field_name} must be a UUID") from error
+
+
+def _optional_uuid_value(
+    value: object,
+    field_name: str,
+) -> uuid.UUID | None:
+    if value is None:
+        return None
+    return _coerce_uuid(value, field_name)
+
+
+def _optional_string_value(
+    value: object,
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def _validate_hex(value: str, field_name: str) -> None:

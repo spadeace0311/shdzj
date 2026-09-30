@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.artifacts.domain import ArtifactCatalog
+from app.artifacts.domain import ArtifactCatalog, DependencyKind
 from app.artifacts.models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
@@ -22,8 +25,10 @@ from app.artifacts.service import sha256_json
 from app.assessment.models import AssessmentRun
 from app.config import settings
 from app.data_assets.locks import lock_data_asset_catalog
+from app.data_assets.models import DataAssetSnapshot
 from app.data_assets.repository import DataAssetRepository
 from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.loss.region import load_region_loss_profile
 
 _RENDERER_VERSIONS = {
     "maplibre": "5.6.0",
@@ -32,7 +37,6 @@ _RENDERER_VERSIONS = {
     "python-pptx": "1.0.2",
 }
 _NAMING_VERSION = "artifact-name-v1"
-_FONT_BUNDLE_MANIFEST = {"bundle": "shanghai-artifact-fonts-v1"}
 _BASEMAP_KEYS = ("basemap.gaode.offline", "basemap.tianditu.offline")
 
 
@@ -158,6 +162,20 @@ class ProductionContextService:
             if assessment_run is not None
             else run.deadline_basis_at
         )
+        data_asset_snapshot_fingerprint = (
+            await self._data_asset_snapshot_fingerprint(
+                session,
+                assessment_run.id,
+            )
+            if assessment_run is not None
+            else None
+        )
+        loss_parameter_item = asset_versions["items"].get(
+            "shanghai.loss.parameters"
+        )
+        loss_profile = load_region_loss_profile(
+            settings.loss_region_profile_path
+        )
         manifest = {
             "catalog_version": catalog.catalog_version,
             "event": {
@@ -169,10 +187,35 @@ class ProductionContextService:
                 "deadline_basis_at": deadline_basis_at.isoformat(),
             },
             "t1_at": _isoformat(event.t1_at),
+            "assessment": {
+                "assessment_run_id": (
+                    str(assessment_run.id)
+                    if assessment_run is not None
+                    else None
+                ),
+                "algorithm_bundle_version": (
+                    assessment_run.algorithm_bundle_version
+                    if assessment_run is not None
+                    else None
+                ),
+                "allowed_assessment_product_types": (
+                    _assessment_product_types(catalog)
+                ),
+                "data_asset_snapshot_fingerprint": (
+                    data_asset_snapshot_fingerprint
+                ),
+            },
+            "loss": {
+                "region_profile_version": loss_profile.version,
+                "model_versions": dict(loss_profile.default_model_versions),
+                "parameter_package": _loss_parameter_manifest(
+                    loss_parameter_item
+                ),
+            },
             "assets": sorted_asset_versions,
             "templates": sorted_template_versions,
             "basemaps": basemap_manifest,
-            "fonts": _FONT_BUNDLE_MANIFEST,
+            "fonts": _font_bundle_manifest(),
             "renderer_versions": dict(_RENDERER_VERSIONS),
             "naming_version": _NAMING_VERSION,
         }
@@ -182,13 +225,12 @@ class ProductionContextService:
             {
                 "asset_key": item.asset_key,
                 "asset_version_id": item.asset_version_id,
-                "checksum": item.checksum or "",
+                "checksum": item.checksum,
                 "role": item.role,
                 "coverage": dict(item.coverage),
                 "selected_for_render": False,
             }
             for item in asset_versions["items"].values()
-            if item.asset_version_id is not None
         ]
         await self._repository.create_input_snapshot(
             session,
@@ -367,15 +409,125 @@ class ProductionContextService:
             if template.template_key not in latest:
                 latest[template.template_key] = {
                     "template_key": template.template_key,
+                    "kind": template.kind,
+                    "display_name": template.display_name,
                     "version": version.version,
                     "checksum": version.checksum,
                     "published_at": _isoformat(version.published_at),
                 }
         return list(latest.values())
 
+    async def _data_asset_snapshot_fingerprint(
+        self,
+        session: AsyncSession,
+        assessment_run_id: uuid.UUID,
+    ) -> str | None:
+        run = await session.get(AssessmentRun, assessment_run_id)
+        if run is None:
+            return None
+        if run.data_asset_snapshot_fingerprint is not None:
+            return run.data_asset_snapshot_fingerprint
+        snapshots = (
+            await session.scalars(
+                select(DataAssetSnapshot)
+                .where(DataAssetSnapshot.run_id == assessment_run_id)
+                .order_by(
+                    DataAssetSnapshot.asset_key,
+                    DataAssetSnapshot.role,
+                )
+            )
+        ).all()
+        if not snapshots:
+            return None
+        payload = [
+            {
+                "asset_key": snapshot.asset_key,
+                "version": snapshot.version,
+                "checksum": snapshot.checksum,
+                "role": snapshot.role,
+            }
+            for snapshot in snapshots
+        ]
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+
 
 def _isoformat(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _assessment_product_types(catalog: ArtifactCatalog) -> list[str]:
+    product_types = {
+        dependency.key
+        for definition in catalog.definitions
+        for dependency in (
+            *definition.depends_on,
+            *definition.optional_depends_on,
+        )
+        if dependency.kind is DependencyKind.ASSESSMENT_PRODUCT
+    }
+    return sorted(product_types)
+
+
+def _loss_parameter_manifest(
+    item: FrozenAssetVersion | None,
+) -> dict[str, Any]:
+    if item is None:
+        return {
+            "asset_key": "shanghai.loss.parameters",
+            "resolution_status": "missing",
+            "version": None,
+            "checksum": None,
+        }
+    return {
+        "asset_key": item.asset_key,
+        "resolution_status": item.resolution_status,
+        "version": item.version,
+        "checksum": item.checksum,
+    }
+
+
+def _font_bundle_manifest() -> dict[str, str]:
+    path = Path(settings.artifact_font_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"artifact font file does not exist: {path}"
+        )
+    return {
+        "family": "Noto Sans CJK SC",
+        "version": _font_version(path),
+        "checksum": _sha256_file(path),
+    }
+
+
+def _font_version(path: Path) -> str:
+    try:
+        from fontTools.ttLib import TTCollection
+
+        collection = TTCollection(str(path), lazy=True)
+        version = collection.fonts[0]["name"].getDebugName(5)
+        if version:
+            return version
+    except Exception:
+        pass
+    return path.name
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _coverage(version: object | None) -> dict[str, Any]:
