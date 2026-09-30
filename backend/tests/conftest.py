@@ -20,6 +20,11 @@ os.environ.setdefault(
 
 from app.db import SessionFactory  # noqa: E402
 
+from tests.artifact_helpers import (  # noqa: E402, F401
+    artifact_repository,
+    seeded_artifact_assessment,
+    session,
+)
 from tests.data_asset_helpers import (  # noqa: E402, F401
     candidate_factory,
     data_asset_client,
