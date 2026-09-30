@@ -164,7 +164,7 @@ artifacts:
     priority: 45
     depends_on: []
     optional_depends_on: []
-    required_assets: [shanghai.economy.county, shanghai.admin.city, basemap.gaode.offline]
+    required_assets: [shanghai.gdp.raster, shanghai.admin.city, basemap.gaode.offline]
     optional_assets: []
     template_key: map.gdp
     marker_policy: mode

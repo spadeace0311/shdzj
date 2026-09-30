@@ -352,11 +352,35 @@ class MapSpecBuilder:
         if revision_id is None:
             revision_id = event_id
 
-        layers = tuple(_coerce_layer(item) for item in getattr(context, "layers", ()))
-        if not layers and artifact_key == "map.epicenter":
-            layers = (_epicenter_layer(event),)
+        from app.artifacts.renderers.map_layers import (
+            MapLayerRegistry,
+            MapQualityPolicy,
+        )
+
+        if artifact_key in MapLayerRegistry.artifact_keys():
+            layers = MapLayerRegistry.build(artifact_key, context)
+        else:
+            layers = tuple(
+                _coerce_layer(item) for item in getattr(context, "layers", ())
+            )
+            if not layers and artifact_key == "map.epicenter":
+                layers = (_epicenter_layer(event),)
         for layer in layers:
             _validate_local_url(layer.url)
+        quality_value = (
+            MapQualityPolicy.evaluate(artifact_key, layers)
+            if artifact_key in MapLayerRegistry.artifact_keys()
+            else getattr(context, "quality", None)
+        )
+        legend = _collect_map_legend(
+            layers,
+            tuple(getattr(context, "legend", ())),
+        )
+        source_notes = _collect_map_source_notes(
+            tuple(str(item) for item in getattr(context, "source_notes", ())),
+            layers,
+            selected_basemap,
+        )
 
         spec = MapRenderSpec(
             artifact_key=artifact_key,
@@ -381,9 +405,9 @@ class MapSpecBuilder:
             ),
             base_style=str(base_style),
             layers=layers,
-            legend=tuple(getattr(context, "legend", ())),
-            source_notes=tuple(str(item) for item in getattr(context, "source_notes", ())),
-            quality=_coerce_quality(getattr(context, "quality", None)),
+            legend=legend,
+            source_notes=source_notes,
+            quality=_coerce_quality(quality_value),
             marker=getattr(context, "marker", None),
             output=MapOutput(
                 format=str(getattr(context, "output_format", "jpg")),
@@ -404,6 +428,42 @@ class MapSpecBuilder:
             context_fingerprint=str(context_fingerprint),
             input_fingerprint=str(input_fingerprint),
         )
+
+
+def _collect_map_legend(
+    layers: tuple[MapLayer, ...],
+    context_legend: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    entries: list[Any] = list(context_legend)
+    for layer in layers:
+        for entry in layer.metadata.get("legend", ()):
+            if entry not in entries:
+                entries.append(entry)
+    return tuple(entries)
+
+
+def _collect_map_source_notes(
+    context_notes: tuple[str, ...],
+    layers: tuple[MapLayer, ...],
+    selected_basemap: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    notes: list[str] = list(context_notes)
+    if selected_basemap:
+        provider = str(selected_basemap.get("provider") or "")
+        if provider:
+            notes.append(f"{provider} offline basemap")
+    for layer in layers:
+        source_key = str(layer.metadata.get("source_key") or "")
+        statement = layer.metadata.get("verified_empty_statement")
+        verified_empty = (
+            bool(layer.metadata.get("verified_empty"))
+            or layer.metadata.get("source_status") == "verified_empty"
+        )
+        if statement and verified_empty:
+            notes.append(str(statement))
+        elif layer.metadata.get("source_status") == "missing":
+            notes.append(f"{source_key} unavailable")
+    return tuple(dict.fromkeys(notes))
 
 
 def _epicenter_layer(event: Any) -> MapLayer:
@@ -912,6 +972,22 @@ background:#f7f5f0;font-family:"Noto Sans CJK SC","Microsoft YaHei",sans-serif;}
 .footer{{left:64px;right:64px;bottom:42px;display:flex;justify-content:space-between;
 gap:24px;font-size:18px;line-height:1.5;color:#33404d;}}
 .footer strong{{color:#a33327;}}
+.side{{right:64px;top:210px;width:330px;padding:18px 20px;background:rgba(247,245,240,.94);
+border:1px solid #c9c0b2;font-size:17px;line-height:1.45;color:#33404d;}}
+.side h2{{margin:0 0 10px;font-size:20px;color:#17202a;}}
+.legend-item{{display:flex;gap:10px;align-items:flex-start;padding:3px 0;}}
+.legend-swatch{{flex:0 0 18px;height:18px;margin-top:4px;border:1px solid #8d857a;}}
+.north{{left:64px;bottom:118px;width:44px;height:44px;}}
+.north-arrow{{width:0;height:0;border-left:15px solid transparent;border-right:15px solid transparent;
+border-bottom:34px solid #a33327;margin:0 auto;}}
+.north-label{{text-align:center;font-size:18px;font-weight:700;color:#a33327;margin-top:2px;}}
+.scale{{left:112px;bottom:132px;width:180px;color:#17202a;}}
+.scale-bar{{height:8px;border-left:2px solid #17202a;border-right:2px solid #17202a;
+background:linear-gradient(90deg,#17202a 0 50%,#ffffff 50% 100%);}}
+.scale-label{{font-size:15px;margin-top:5px;letter-spacing:0;}}
+.meta{{font-size:16px;color:#33404d;}}
+.meta .quality{{display:inline-block;margin-left:10px;padding:2px 8px;background:#a33327;
+color:#ffffff;font-weight:700;}}
 </style>
 </head>
 <body>
@@ -920,13 +996,29 @@ gap:24px;font-size:18px;line-height:1.5;color:#33404d;}}
 <h1>{_html(payload["title"])}</h1>
 <div class="summary">{_event_summary(payload)}</div>
 </div>
+<div class="chrome north">
+<div class="north-arrow"></div>
+<div class="north-label">N</div>
+</div>
+<div class="chrome scale">
+<div class="scale-bar"></div>
+<div class="scale-label">0 25 50 km</div>
+</div>
+{_legend_html(payload)}
 <div class="chrome footer">
 <span>{_html(" / ".join(payload["source_notes"]) or "offline data source")}</span>
-<span><strong>300 DPI</strong> A3V</span>
+<span class="meta">
+<strong>300 DPI</strong> A3V
+<span>生成时间 <span id="generated-at"></span></span>
+<span>版本 {_html(payload["template_version"])}</span>
+<span class="quality">{_html(str(payload["quality"].get("grade") or "A"))} 级</span>
+</span>
 </div>
 <script>
 (() => {{
   const payload = {payload_json};
+  const generatedAt = new Date().toLocaleString("zh-CN", {{hour12: false}});
+  document.getElementById("generated-at").textContent = generatedAt;
   const style = {{
     version: 8,
     name: "artifact-map",
@@ -1071,6 +1163,32 @@ def _html(value: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
+    )
+
+
+def _legend_html(payload: dict[str, Any]) -> str:
+    entries = payload.get("legend") or ()
+    if not entries:
+        return ""
+    rows: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        label = str(entry.get("label") or "")
+        value = str(entry.get("value") or "")
+        display = label if not value else f"{label} {value}"
+        rows.append(
+            '<div class="legend-item">'
+            '<span class="legend-swatch"></span>'
+            f"<span>{_html(display)}</span>"
+            "</div>"
+        )
+    if not rows:
+        return ""
+    return (
+        '<div class="chrome side"><h2>图例</h2>'
+        + "".join(rows)
+        + "</div>"
     )
 
 
