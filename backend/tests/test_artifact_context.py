@@ -6,6 +6,11 @@ import pytest
 from sqlalchemy import select
 
 from app.artifacts.domain import DependencyKind
+from app.artifacts.basemap import (
+    AllBasemapsUnavailableError,
+    MapViewportTileManifest,
+    VIEWPORT_RADII_KM,
+)
 from app.artifacts.context import ProductionContextService
 from app.artifacts.models import (
     ArtifactTemplate,
@@ -20,6 +25,7 @@ from app.data_assets.models import DataAsset, DataAssetVersion
 from app.data_assets.registry import get_asset_definition
 from app.events.models import EarthquakeEvent
 from app.loss.region import load_region_loss_profile
+from tests.basemap_fixtures import make_in_memory_package
 from tests.data_asset_helpers import (
     FIXTURE_ACTOR,
     _cleanup_fixture_data,
@@ -38,8 +44,24 @@ async def _dispose_engine_between_tests():
 
 @pytest.fixture
 def production_context_service() -> ProductionContextService:
+    manifests = tuple(
+        MapViewportTileManifest.build(
+            center_lon=121.5,
+            center_lat=31.2,
+            radius_km=radius_km,
+            output_width=settings.artifact_basemap_output_width,
+            output_height=settings.artifact_basemap_output_height,
+            zoom_levels=settings.artifact_basemap_zoom_levels,
+            padding=settings.artifact_basemap_buffer_pixels,
+        )
+        for radius_km in VIEWPORT_RADII_KM
+    )
     return ProductionContextService(
         repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(manifests, provider="gaode"),
+            "tianditu": make_in_memory_package(manifests, provider="tianditu"),
+        },
     )
 
 
@@ -468,3 +490,45 @@ async def test_loss_parameter_package_freezes_published_identity(
             assert persisted is not None
             assert persisted.asset_version_id == version.id
             assert persisted.checksum == version.checksum
+
+
+async def test_static_context_freezes_both_basemap_candidates_and_selection(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    context = await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+
+    basemaps = context.manifest["basemaps"]
+    assert context.selected_basemap is not None
+    assert context.selected_basemap.provider == "gaode"
+    assert basemaps["selected_basemap"]["provider"] == "gaode"
+    assert basemaps["gaode"]["provider"] == "gaode"
+    assert basemaps["gaode"]["version"] == "v1"
+    assert len(basemaps["gaode"]["checksum"]) == 64
+    assert basemaps["tianditu"]["provider"] == "tianditu"
+    assert basemaps["tianditu"]["version"] == "v1"
+    assert len(basemaps["tianditu"]["checksum"]) == 64
+
+
+async def test_static_context_fails_hard_when_basemap_is_required_but_missing(
+    seeded_artifact_assessment,
+    session,
+) -> None:
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={},
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+
+    with pytest.raises(AllBasemapsUnavailableError):
+        await service.freeze_static_context(
+            session,
+            run.id,
+            seeded_artifact_assessment.catalog,
+        )

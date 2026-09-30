@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.basemap import (
+    AllBasemapsUnavailableError,
     BasemapSelector,
     MapViewportTileManifest,
     OfflineBasemapPackage,
@@ -21,7 +22,7 @@ from app.artifacts.basemap import (
     VIEWPORT_RADII_KM,
     load_offline_basemap_packages,
 )
-from app.artifacts.domain import ArtifactCatalog, DependencyKind
+from app.artifacts.domain import ArtifactCatalog, ArtifactKind, DependencyKind
 from app.artifacts.models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
@@ -192,15 +193,27 @@ class ProductionContextService:
             if assessment_run is not None
             else run.deadline_basis_at
         )
+        offline_packages = self._offline_basemap_packages
+        if offline_packages is None:
+            offline_packages = load_offline_basemap_packages(
+                settings.artifact_basemap_root
+            )
+        requires_basemap = _run_requires_offline_basemap(
+            catalog,
+            run.required_outputs,
+        )
         selected_basemap_payload = self._select_basemap(
             basemap_viewport_manifests,
             observed_at=deadline_basis_at,
+            packages=offline_packages,
+            required=requires_basemap,
         )
         selected_basemap = _selected_basemap(selected_basemap_payload)
         basemap_manifest = _basemap_manifest(
             sorted_asset_versions,
             basemap_tile_manifests,
             selected_basemap_payload,
+            offline_packages,
         )
 
         data_asset_snapshot_fingerprint = (
@@ -350,13 +363,18 @@ class ProductionContextService:
         manifests: tuple[MapViewportTileManifest, ...],
         *,
         observed_at: datetime,
+        packages: Mapping[str, OfflineBasemapPackage],
+        required: bool,
     ) -> dict[str, Any] | None:
-        packages = self._offline_basemap_packages
-        if packages is None:
-            packages = load_offline_basemap_packages(settings.artifact_basemap_root)
         gaode = packages.get("gaode")
         tianditu = packages.get("tianditu")
         if gaode is None and tianditu is None:
+            if required:
+                raise AllBasemapsUnavailableError(
+                    "no offline basemap package is available",
+                    gaode_error="missing",
+                    tianditu_error="missing",
+                )
             return None
         if gaode is not None and tianditu is not None:
             return BasemapSelector().select(
@@ -384,6 +402,12 @@ class ProductionContextService:
                     "selection_reason": f"{provider} validated",
                     "provider_style_key": f"{provider}-local-v1",
                 }
+        if required:
+            raise AllBasemapsUnavailableError(
+                "no validated offline basemap is available",
+                gaode_error="missing" if gaode is None else "invalid",
+                tianditu_error="missing" if tianditu is None else "invalid",
+            )
         return None
 
     async def build_document_context(
@@ -675,16 +699,61 @@ def _basemap_manifest(
     asset_entries: Sequence[Mapping[str, Any]],
     tile_manifest_entries: Sequence[Mapping[str, Any]],
     selected_basemap: Mapping[str, Any] | None,
+    offline_packages: Mapping[str, OfflineBasemapPackage],
 ) -> dict[str, Any]:
     by_key = {item["asset_key"]: item for item in asset_entries}
+    gaode = offline_packages.get("gaode")
+    tianditu = offline_packages.get("tianditu")
     return {
-        "gaode": dict(by_key.get("basemap.gaode.offline", {})),
-        "tianditu": dict(by_key.get("basemap.tianditu.offline", {})),
+        "gaode": (
+            gaode.to_manifest_entry()
+            if gaode is not None
+            else dict(by_key.get("basemap.gaode.offline", {}))
+        ),
+        "tianditu": (
+            tianditu.to_manifest_entry()
+            if tianditu is not None
+            else dict(by_key.get("basemap.tianditu.offline", {}))
+        ),
         "manifests": [dict(entry) for entry in tile_manifest_entries],
         "selected_basemap": (
             dict(selected_basemap) if selected_basemap is not None else None
         ),
     }
+
+
+def _run_requires_offline_basemap(
+    catalog: ArtifactCatalog,
+    required_outputs: object,
+) -> bool:
+    if not isinstance(required_outputs, Sequence) or isinstance(
+        required_outputs,
+        (str, bytes),
+    ):
+        return False
+    output_keys = {
+        (
+            item["artifact_key"]
+            if isinstance(item, Mapping)
+            else item[0]
+        )
+        for item in required_outputs
+        if isinstance(item, (Mapping, Sequence))
+        and not isinstance(item, (str, bytes))
+        and (
+            isinstance(item.get("artifact_key"), str)
+            if isinstance(item, Mapping)
+            else item and isinstance(item[0], str)
+        )
+    }
+    for definition in catalog.definitions:
+        if definition.kind is not ArtifactKind.MAP:
+            continue
+        if definition.artifact_key not in output_keys:
+            continue
+        if any(key in definition.required_assets for key in _BASEMAP_KEYS):
+            return True
+    return False
 
 
 def _template_map(

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import UTC, datetime
-from io import BytesIO
 from math import asinh, pi, radians, tan
 from typing import Callable
 
 import pytest
-from PIL import Image
 
 from app.artifacts.basemap import (
     AllBasemapsUnavailableError,
@@ -15,13 +15,17 @@ from app.artifacts.basemap import (
     OfflineBasemapValidator,
     MapViewportTileManifest,
     TileKey,
+    load_offline_basemap_packages,
+)
+from tests.basemap_fixtures import (
+    make_in_memory_package,
+    png_tile_bytes,
+    write_basemap_package,
 )
 
 
 def _png_bytes() -> bytes:
-    buffer = BytesIO()
-    Image.new("RGB", (2, 2), color=(245, 246, 248)).save(buffer, format="PNG")
-    return buffer.getvalue()
+    return png_tile_bytes()
 
 
 def _make_package(
@@ -345,3 +349,243 @@ def test_selector_prefers_gaode_without_switching(
 
     assert selected.provider == "gaode"
     assert selected.selection_reason == "gaode validated"
+
+
+def _load_one_package(
+    root,
+    provider: str,
+    manifest: MapViewportTileManifest,
+) -> OfflineBasemapPackage:
+    packages = load_offline_basemap_packages(root)
+    assert provider in packages
+    return packages[provider]
+
+
+def test_loads_and_validates_real_mbtiles_package(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+
+    package = _load_one_package(tmp_path, "gaode", tile_manifest)
+    result = OfflineBasemapValidator().validate_package(
+        package,
+        [tile_manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert package.package_format == "mbtiles"
+    assert result.valid is True
+    assert result.sampled_decoded >= 200
+
+
+def test_loads_and_validates_real_pmtiles_package(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="tianditu",
+        package_format="pmtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+
+    package = _load_one_package(tmp_path, "tianditu", tile_manifest)
+    result = OfflineBasemapValidator().validate_package(
+        package,
+        [tile_manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert package.package_format == "pmtiles"
+    assert result.valid is True
+    assert result.sampled_decoded >= 200
+
+
+def test_missing_physical_tile_in_mbtiles_is_required_tile_missing(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    missing = tile_manifest.tiles[137]
+    connection = sqlite3.connect(tmp_path / "gaode" / "gaode.mbtiles")
+    try:
+        connection.execute(
+            "DELETE FROM tiles WHERE zoom_level = ? AND tile_column = ? "
+            "AND tile_row = ?",
+            (missing.z, missing.x, missing.y),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    package = _load_one_package(tmp_path, "gaode", tile_manifest)
+    result = OfflineBasemapValidator().validate_package(
+        package,
+        [tile_manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert result.valid is False
+    assert result.error_category == "required_tile_missing"
+    assert result.missing_tiles == ((missing.z, missing.x, missing.y),)
+
+
+def test_declared_count_mismatch_is_detected(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+        record_count=len(tile_manifest.tiles) + 1,
+    )
+
+    package = _load_one_package(tmp_path, "gaode", tile_manifest)
+    result = OfflineBasemapValidator().validate_package(
+        package,
+        [tile_manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert result.valid is False
+    assert result.error_category == "file_record_count_mismatch"
+
+
+def test_corrupt_tile_decode_is_structured_validation_result(
+    tile_manifest_factory: Callable[..., MapViewportTileManifest],
+) -> None:
+    manifest = tile_manifest_factory(
+        center=(121.5, 31.2),
+        radius_km=0.1,
+        output_width=256,
+        output_height=256,
+        zoom_levels=(12,),
+        padding=0,
+    )
+    package = make_in_memory_package(
+        (manifest,),
+        provider="gaode",
+        tile_bytes=b"not-a-real-png",
+    )
+
+    result = OfflineBasemapValidator().validate_package(
+        package,
+        [manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert result.valid is False
+    assert result.error_category == "tile_decode_failed"
+    assert result.tile_coordinates == manifest.tiles[0].to_tuple()
+
+
+def test_web_mercator_radius_uses_latitude_scale(
+    tile_manifest_factory: Callable[..., MapViewportTileManifest],
+) -> None:
+    equator = tile_manifest_factory(
+        center=(0.0, 0.0),
+        radius_km=10.0,
+        output_width=256,
+        output_height=256,
+        zoom_levels=(12,),
+        padding=0,
+    )
+    high_latitude = tile_manifest_factory(
+        center=(0.0, 80.0),
+        radius_km=10.0,
+        output_width=256,
+        output_height=256,
+        zoom_levels=(12,),
+        padding=0,
+    )
+
+    assert equator.mercator_radius_m < high_latitude.mercator_radius_m
+    assert high_latitude.mercator_radius_m > 10_000.0
+
+
+def test_loader_rejects_provider_identity_mismatch(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    manifest_path = tmp_path / "gaode" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["provider"] = "tianditu"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        load_offline_basemap_packages(tmp_path)
+
+
+def test_selector_validates_both_candidates_before_selection(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    write_basemap_package(
+        tmp_path,
+        provider="tianditu",
+        package_format="pmtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    packages = load_offline_basemap_packages(tmp_path)
+
+    selected = BasemapSelector().select(
+        packages["gaode"],
+        packages["tianditu"],
+        [tile_manifest],
+        observed_at=datetime(2026, 9, 30, tzinfo=UTC),
+    )
+
+    assert selected.provider == "gaode"
