@@ -75,7 +75,7 @@ class ArtifactTemplateVersion(Base):
     manifest: Mapped[dict] = mapped_column(JSONB)
     checksum: Mapped[str] = mapped_column(String(64))
     storage_path: Mapped[str] = mapped_column(Text)
-    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_by: Mapped[str | None] = mapped_column(String(64))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -410,6 +410,32 @@ class ArtifactTaskDependencyBinding(Base):
             "'canceled', 'omitted_after_wait')",
             name="ck_artifact_dependency_resolution_status",
         ),
+        CheckConstraint(
+            "(dependency_kind = 'assessment_product' "
+            "AND dependency_output_profile IS NULL) "
+            "OR (dependency_kind = 'artifact' "
+            "AND dependency_output_profile IS NOT NULL)",
+            name="ck_artifact_dependency_kind_profile",
+        ),
+        CheckConstraint(
+            "resolution_status != 'omitted_after_wait' OR is_optional",
+            name="ck_artifact_dependency_optional",
+        ),
+        CheckConstraint(
+            "resolution_status NOT IN ('bound', 'degraded') "
+            "OR (bound_entity_id IS NOT NULL "
+            "AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL)",
+            name="ck_artifact_dependency_bound_fields",
+        ),
+        CheckConstraint(
+            "resolution_status NOT IN "
+            "('failed', 'timed_out', 'canceled', 'omitted_after_wait') "
+            "OR (resolution_detail IS NOT NULL "
+            "AND resolution_detail != 'null'::jsonb "
+            "AND resolved_at IS NOT NULL)",
+            name="ck_artifact_dependency_terminal_detail",
+        ),
         Index(
             "uq_artifact_dependency_product",
             "production_task_id",
@@ -454,7 +480,7 @@ class ArtifactTaskDependencyBinding(Base):
     bound_version: Mapped[str | None] = mapped_column(String(128))
     bound_checksum: Mapped[str | None] = mapped_column(String(64))
     resolution_status: Mapped[str] = mapped_column(String(32))
-    resolution_detail: Mapped[dict | None] = mapped_column(JSONB)
+    resolution_detail: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -512,7 +538,7 @@ class GeneratedArtifact(Base):
     )
     artifact_key: Mapped[str] = mapped_column(String(160))
     output_profile: Mapped[str] = mapped_column(String(64))
-    artifact_version: Mapped[str] = mapped_column(String(128))
+    artifact_version: Mapped[int] = mapped_column(Integer)
     is_final: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -607,7 +633,7 @@ class ArtifactPublication(Base):
         ForeignKey("artifact_production_runs.id", ondelete="CASCADE"),
     )
     generation_seq: Mapped[int] = mapped_column(Integer)
-    published_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    published_by: Mapped[str | None] = mapped_column(String(64))
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     is_forced: Mapped[bool] = mapped_column(
         Boolean,
@@ -640,7 +666,7 @@ class ArtifactOverrideRequest(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    actor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    actor_id: Mapped[str] = mapped_column(String(64))
     endpoint: Mapped[str] = mapped_column(String(256))
     idempotency_key: Mapped[str] = mapped_column(String(128))
     request_fingerprint: Mapped[str] = mapped_column(String(64))

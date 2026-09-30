@@ -63,3 +63,14 @@ def test_runtime_secrets_are_secret_values() -> None:
     assert isinstance(configured.superadmin_initial_password, SecretStr)
     assert configured.jwt_secret.get_secret_value() == VALID_JWT_SECRET
     assert configured.superadmin_initial_password.get_secret_value() == VALID_SUPERADMIN_PASSWORD
+
+
+def test_artifact_template_root_default_matches_runtime_contract() -> None:
+    configured = Settings(
+        _env_file=None,
+        database_url=VALID_DATABASE_URL,
+        jwt_secret=VALID_JWT_SECRET,
+        superadmin_initial_password=VALID_SUPERADMIN_PASSWORD,
+    )
+
+    assert configured.artifact_template_root == "/config/artifacts/templates"

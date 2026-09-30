@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     data_asset_mdb_driver: str = "Microsoft Access Driver (*.mdb, *.accdb)"
     data_asset_worker_poll_seconds: float = 1.0
     artifact_storage_root: str = "/var/lib/artifacts"
-    artifact_template_root: str = "/config/artifact_templates"
+    artifact_template_root: str = "/config/artifacts/templates"
     artifact_catalog_path: str = "/config/artifacts/catalog.yaml"
     artifact_max_override_bytes: int = 1_073_741_824
     artifact_render_concurrency: int = 4

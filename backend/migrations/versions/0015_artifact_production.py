@@ -51,7 +51,7 @@ def upgrade() -> None:
         sa.Column("manifest", postgresql.JSONB(), nullable=False),
         sa.Column("checksum", sa.String(64), nullable=False),
         sa.Column("storage_path", sa.Text(), nullable=False),
-        sa.Column("created_by", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("created_by", sa.String(64), nullable=True),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "created_at",
@@ -413,6 +413,32 @@ def upgrade() -> None:
             "'canceled', 'omitted_after_wait')",
             name="ck_artifact_dependency_resolution_status",
         ),
+        sa.CheckConstraint(
+            "(dependency_kind = 'assessment_product' "
+            "AND dependency_output_profile IS NULL) "
+            "OR (dependency_kind = 'artifact' "
+            "AND dependency_output_profile IS NOT NULL)",
+            name="ck_artifact_dependency_kind_profile",
+        ),
+        sa.CheckConstraint(
+            "resolution_status != 'omitted_after_wait' OR is_optional",
+            name="ck_artifact_dependency_optional",
+        ),
+        sa.CheckConstraint(
+            "resolution_status NOT IN ('bound', 'degraded') "
+            "OR (bound_entity_id IS NOT NULL "
+            "AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL)",
+            name="ck_artifact_dependency_bound_fields",
+        ),
+        sa.CheckConstraint(
+            "resolution_status NOT IN "
+            "('failed', 'timed_out', 'canceled', 'omitted_after_wait') "
+            "OR (resolution_detail IS NOT NULL "
+            "AND resolution_detail != 'null'::jsonb "
+            "AND resolved_at IS NOT NULL)",
+            name="ck_artifact_dependency_terminal_detail",
+        ),
     )
     op.create_index(
         "uq_artifact_dependency_product",
@@ -438,7 +464,7 @@ def upgrade() -> None:
         sa.Column("revision_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("artifact_key", sa.String(160), nullable=False),
         sa.Column("output_profile", sa.String(64), nullable=False),
-        sa.Column("artifact_version", sa.String(128), nullable=False),
+        sa.Column("artifact_version", sa.Integer(), nullable=False),
         sa.Column("is_final", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("production_mode", sa.String(32), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),
@@ -543,7 +569,7 @@ def upgrade() -> None:
         sa.Column("artifact_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("production_run_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("generation_seq", sa.Integer(), nullable=False),
-        sa.Column("published_by", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("published_by", sa.String(64), nullable=True),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("is_forced", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("superseded_at", sa.DateTime(timezone=True), nullable=True),
@@ -594,7 +620,7 @@ def upgrade() -> None:
     op.create_table(
         "artifact_override_requests",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("actor_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("actor_id", sa.String(64), nullable=False),
         sa.Column("endpoint", sa.String(256), nullable=False),
         sa.Column("idempotency_key", sa.String(128), nullable=False),
         sa.Column("request_fingerprint", sa.String(64), nullable=False),
@@ -684,9 +710,55 @@ def upgrade() -> None:
         ["id"],
         ondelete="SET NULL",
     )
+    op.execute(
+        """
+        CREATE FUNCTION enforce_artifact_production_run_input_snapshot()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.input_snapshot_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1
+                FROM production_input_snapshots
+                WHERE id = NEW.input_snapshot_id
+                  AND production_run_id = NEW.id
+            ) THEN
+                RAISE EXCEPTION
+                    'input_snapshot % does not belong to production run %',
+                    NEW.input_snapshot_id,
+                    NEW.id
+                    USING ERRCODE = '23503';
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE CONSTRAINT TRIGGER
+            trg_artifact_production_runs_input_snapshot_match
+        AFTER INSERT OR UPDATE OF input_snapshot_id, id
+        ON artifact_production_runs
+        DEFERRABLE INITIALLY IMMEDIATE
+        FOR EACH ROW
+        EXECUTE FUNCTION enforce_artifact_production_run_input_snapshot()
+        """
+    )
 
 
 def downgrade() -> None:
+    op.execute(
+        """
+        DROP TRIGGER IF EXISTS
+            trg_artifact_production_runs_input_snapshot_match
+        ON artifact_production_runs
+        """
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS "
+        "enforce_artifact_production_run_input_snapshot()"
+    )
     op.drop_constraint(
         "fk_generated_artifacts_superseded_by",
         "generated_artifacts",
