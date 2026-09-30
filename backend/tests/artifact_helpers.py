@@ -488,6 +488,26 @@ class ArtifactAssessmentFixture:
                 "administration": "上海市及邻近行政区",
                 "key_risks": "人口密集区、重点目标、危险源与断裂带",
             },
+            "building_town": {
+                "town_totals": 10000,
+                "structure_type": "砖混 60%；框架 40%",
+                "coverage_quality": "完整覆盖",
+            },
+            "faults": {
+                "summary": "邻近断裂 3 条",
+            },
+            "population_town": {
+                "resident": 120000,
+                "floating": 18000,
+                "household": 52000,
+                "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
+            },
+            "economy_county": {
+                "gdp": 560000,
+                "primary": 12000,
+                "secondary": 220000,
+                "tertiary": 328000,
+            },
             "loss": {
                 "parameter_package": {
                     "version": "parameters-v1",

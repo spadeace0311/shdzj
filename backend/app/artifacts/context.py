@@ -640,25 +640,53 @@ class ProductionContextService:
         spatial = _background_spatial_payload(distance_records)
 
         target_definitions = (
-            ("shelter", "避难场所", "shanghai.shelter.emergency"),
-            ("school", "学校", "shanghai.education.school"),
-            ("hospital", "医院", "shanghai.health.hospital"),
-            ("hazard_source", "危险源", "shanghai.hazard_source"),
-            ("rescue_team", "救援队伍", "shanghai.rescue_team"),
-            ("cultural_relic", "文物单位", "shanghai.cultural_relic"),
-            ("key_target", "重点目标", "shanghai.key_target"),
+            ("shelter", "避难场所", "shanghai.shelter.emergency", "处"),
+            ("school", "学校", "shanghai.education.school", "所"),
+            ("hospital", "医院", "shanghai.health.hospital", "所"),
+            ("hazard_source", "危险源", "shanghai.hazard_source", "处"),
+            ("rescue_team", "救援队伍", "shanghai.rescue_team", "支"),
+            ("cultural_relic", "文物单位", "shanghai.cultural_relic", "处"),
+            ("key_target", "重点目标", "shanghai.key_target", "个"),
         )
         targets: dict[str, str] = {}
-        for key, label, asset_key in target_definitions:
+        for key, label, asset_key, unit in target_definitions:
             records, _ = await self._frozen_records(
                 session,
                 asset_versions,
                 asset_key,
             )
             if records:
-                targets[key] = f"{label} {len(records)} 处"
+                targets[key] = f"{label} {len(records)}{unit}"
             else:
                 targets[key] = f"数据不可用，待复核：{asset_key}"
+
+        building_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.building.town",
+        )
+        building_town = _background_building_payload(building_records)
+
+        fault_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.fault",
+        )
+        faults = _background_fault_payload(fault_records)
+
+        population_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.population.town",
+        )
+        population_town = _background_population_asset_payload(population_records)
+
+        economy_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.economy.county",
+        )
+        economy_county = _background_economy_asset_payload(economy_records)
 
         admin_records, _ = await self._frozen_records(
             session,
@@ -680,6 +708,10 @@ class ProductionContextService:
             "spatial_distances": spatial,
             "targets": targets,
             "area_overview": area_overview,
+            "building_town": building_town,
+            "faults": faults,
+            "population_town": population_town,
+            "economy_county": economy_county,
         }
 
     async def _frozen_records(
@@ -898,10 +930,13 @@ def _background_historical_payload(records: list[Any]) -> dict[str, Any]:
         }
     properties = dict(records[0].properties or {})
     return {
-        "radius_km": properties.get("radius_km", "数据不可用，待复核：radius_km"),
+        "radius_km": properties.get(
+            "radius_km",
+            f"数据不可用，待复核：{source}.radius_km",
+        ),
         "magnitude_threshold": properties.get(
             "magnitude_threshold",
-            "数据不可用，待复核：magnitude_threshold",
+            f"数据不可用，待复核：{source}.magnitude_threshold",
         ),
         "summary": properties.get("summary") or f"历史地震 {len(records)} 条",
         "disaster_summary": properties.get("disaster_summary")
@@ -942,7 +977,14 @@ def _background_overview_payload(
     admin_records: list[Any],
     targets: Mapping[str, str],
 ) -> dict[str, str]:
-    source = "shanghai.admin.city"
+    source = (
+        "shanghai.admin.city"
+        if any(
+            "shanghai.admin.city" in record.business_key
+            for record in admin_records
+        )
+        else "shanghai.admin.town"
+    )
     if not admin_records:
         return {
             "geography": f"数据不可用，待复核：{source}",
@@ -965,6 +1007,110 @@ def _background_overview_payload(
         ),
         "key_risks": str(key_risks),
     }
+
+
+def _background_building_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.building.town"
+    if not records:
+        return {
+            "town_totals": f"数据不可用，待复核：{source}",
+            "structure_type": f"数据不可用，待复核：{source}",
+            "coverage_quality": f"数据不可用，待复核：{source}",
+        }
+    properties = dict(records[0].properties or {})
+    totals = [
+        float(record.properties.get(key))
+        for record in records
+        for key in ("total", "building_count", "count")
+        if record.properties.get(key) is not None
+    ]
+    return {
+        "town_totals": sum(totals) if totals else properties.get(
+            "town_totals",
+            f"数据不可用，待复核：{source}",
+        ),
+        "structure_type": properties.get(
+            "structure_type",
+            f"数据不可用，待复核：{source}.structure_type",
+        ),
+        "coverage_quality": properties.get(
+            "coverage_quality",
+            f"数据不可用，待复核：{source}.coverage_quality",
+        ),
+    }
+
+
+def _background_fault_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.fault"
+    if not records:
+        return {
+            "summary": f"数据不可用，待复核：{source}",
+            "record_count": 0,
+        }
+    properties = dict(records[0].properties or {})
+    return {
+        "summary": properties.get("summary") or f"邻近断裂 {len(records)} 条",
+        "record_count": len(records),
+    }
+
+
+def _background_population_asset_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.population.town"
+    if not records:
+        return {
+            "resident": f"数据不可用，待复核：{source}",
+            "floating": f"数据不可用，待复核：{source}",
+            "household": f"数据不可用，待复核：{source}",
+            "age_structure": f"数据不可用，待复核：{source}",
+        }
+    properties = dict(records[0].properties or {})
+    resident = _sum_records(records, "resident")
+    floating = _sum_records(records, "floating")
+    household = _sum_records(records, "household")
+    return {
+        "resident": resident
+        if resident is not None
+        else properties.get("resident", f"数据不可用，待复核：{source}"),
+        "floating": floating
+        if floating is not None
+        else properties.get("floating", f"数据不可用，待复核：{source}"),
+        "household": household
+        if household is not None
+        else properties.get("household", f"数据不可用，待复核：{source}"),
+        "age_structure": properties.get(
+            "age_structure",
+            f"数据不可用，待复核：{source}.age_structure",
+        ),
+    }
+
+
+def _background_economy_asset_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.economy.county"
+    if not records:
+        return {
+            "gdp": f"数据不可用，待复核：{source}",
+            "primary": f"数据不可用，待复核：{source}",
+            "secondary": f"数据不可用，待复核：{source}",
+            "tertiary": f"数据不可用，待复核：{source}",
+        }
+    properties = dict(records[0].properties or {})
+    return {
+        key: _sum_records(records, key)
+        if _sum_records(records, key) is not None
+        else properties.get(key, f"数据不可用，待复核：{source}.{key}")
+        for key in ("gdp", "primary", "secondary", "tertiary")
+    }
+
+
+def _sum_records(records: list[Any], key: str) -> float | None:
+    values: list[float] = []
+    for record in records:
+        value = (record.properties or {}).get(key)
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return sum(values) if values else None
 
 
 def _assessment_product_types(catalog: ArtifactCatalog) -> list[str]:

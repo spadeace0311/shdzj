@@ -640,6 +640,60 @@ async def test_document_context_builds_persisted_background_payload(
             "key_risks": "人口密集区、重点目标、危险源与断裂带",
         },
     )
+    building_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.building.town",
+        properties={
+            "total": 10000,
+            "structure_type": "砖混 60%；框架 40%",
+            "coverage_quality": "完整覆盖",
+        },
+    )
+    fault_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.fault",
+        properties={"summary": "邻近断裂 3 条"},
+    )
+    population_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.population.town",
+        properties={
+            "resident": 120000,
+            "floating": 18000,
+            "household": 52000,
+            "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
+        },
+    )
+    economy_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.economy.county",
+        properties={
+            "gdp": 560000,
+            "primary": 12000,
+            "secondary": 220000,
+            "tertiary": 328000,
+        },
+    )
+    school_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.education.school",
+        properties={"NAME": "school-1"},
+    )
+    hospital_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.health.hospital",
+        properties={"NAME": "hospital-1"},
+    )
+    rescue_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.rescue_team",
+        properties={"NAME": "rescue-1"},
+    )
+    relic_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.cultural_relic",
+        properties={"NAME": "relic-1"},
+    )
     assets = list(snapshot.manifest["assets"])
     assets_by_key = {entry["asset_key"]: entry for entry in assets}
     assets_by_key["shanghai.historical.earthquakes"] = _snapshot_asset_entry(
@@ -653,6 +707,38 @@ async def test_document_context_builds_persisted_background_payload(
     assets_by_key["shanghai.admin.city"] = _snapshot_asset_entry(
         "shanghai.admin.city",
         admin_version,
+    )
+    assets_by_key["shanghai.building.town"] = _snapshot_asset_entry(
+        "shanghai.building.town",
+        building_version,
+    )
+    assets_by_key["shanghai.fault"] = _snapshot_asset_entry(
+        "shanghai.fault",
+        fault_version,
+    )
+    assets_by_key["shanghai.population.town"] = _snapshot_asset_entry(
+        "shanghai.population.town",
+        population_version,
+    )
+    assets_by_key["shanghai.economy.county"] = _snapshot_asset_entry(
+        "shanghai.economy.county",
+        economy_version,
+    )
+    assets_by_key["shanghai.education.school"] = _snapshot_asset_entry(
+        "shanghai.education.school",
+        school_version,
+    )
+    assets_by_key["shanghai.health.hospital"] = _snapshot_asset_entry(
+        "shanghai.health.hospital",
+        hospital_version,
+    )
+    assets_by_key["shanghai.rescue_team"] = _snapshot_asset_entry(
+        "shanghai.rescue_team",
+        rescue_version,
+    )
+    assets_by_key["shanghai.cultural_relic"] = _snapshot_asset_entry(
+        "shanghai.cultural_relic",
+        relic_version,
     )
     snapshot.manifest["assets"] = sorted(
         assets_by_key.values(),
@@ -677,6 +763,19 @@ async def test_document_context_builds_persisted_background_payload(
     assert context.manifest["area_overview"]["administration"] == (
         "上海市及邻近行政区"
     )
+    assert context.manifest["building_town"]["structure_type"] == (
+        "砖混 60%；框架 40%"
+    )
+    assert context.manifest["building_town"]["coverage_quality"] == "完整覆盖"
+    assert context.manifest["faults"]["summary"] == "邻近断裂 3 条"
+    assert context.manifest["population_town"]["age_structure"] == (
+        "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%"
+    )
+    assert context.manifest["economy_county"]["primary"] == 12000
+    assert context.manifest["targets"]["school"] == "学校 1所"
+    assert context.manifest["targets"]["hospital"] == "医院 1所"
+    assert context.manifest["targets"]["rescue_team"] == "救援队伍 1支"
+    assert context.manifest["targets"]["cultural_relic"] == "文物单位 1处"
 
 
 async def test_missing_but_optional_asset_is_recorded_not_invented(

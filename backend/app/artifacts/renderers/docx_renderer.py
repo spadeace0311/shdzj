@@ -217,6 +217,26 @@ def _catalog_control_values(
         if isinstance(manifest.get("area_overview"), Mapping)
         else {}
     )
+    building_town = (
+        dict(manifest["building_town"])
+        if isinstance(manifest.get("building_town"), Mapping)
+        else {}
+    )
+    faults = (
+        dict(manifest["faults"])
+        if isinstance(manifest.get("faults"), Mapping)
+        else {}
+    )
+    population_town = (
+        dict(manifest["population_town"])
+        if isinstance(manifest.get("population_town"), Mapping)
+        else {}
+    )
+    economy_county = (
+        dict(manifest["economy_county"])
+        if isinstance(manifest.get("economy_county"), Mapping)
+        else {}
+    )
     coordinate = (
         f"{float(event.get('longitude', 0.0)):.6f} E, "
         f"{float(event.get('latitude', 0.0)):.6f} N"
@@ -232,29 +252,55 @@ def _catalog_control_values(
     values.update(
         {
             "historical_earthquakes": _metric(historical, "summary"),
-            "nearby_faults": _asset_summary(asset_versions, "shanghai.fault"),
+            "nearby_faults": _metric(faults, "summary", source="shanghai.fault"),
             "geographic_notes": _metric(overview, "geography"),
-            "town_totals": _metric(buildings, "total", "town_totals"),
-            "structure_type": _metric(buildings, "structure_type", "structure_summary"),
+            "town_totals": _metric(
+                building_town,
+                "town_totals",
+                source="shanghai.building.town",
+            ),
+            "structure_type": _metric(
+                building_town,
+                "structure_type",
+                source="shanghai.building.town",
+            ),
             "damage_statistics": (
                 f"{_metric(buildings, 'slight')}/{_metric(buildings, 'moderate')}/"
                 f"{_metric(buildings, 'severe')}"
             ),
-            "coverage_quality": _asset_summary(
-                asset_versions,
-                "shanghai.building.town",
+            "coverage_quality": _metric(
+                building_town,
+                "coverage_quality",
+                source="shanghai.building.town",
             ),
-            "gdp": _metric(economy, "gdp", "total"),
+            "gdp": _metric(economy_county, "gdp", source="shanghai.economy.county"),
             "industry_structure": (
-                f"{_metric(economy, 'primary')}/{_metric(economy, 'secondary')}/"
-                f"{_metric(economy, 'tertiary')}"
+                f"{_metric(economy_county, 'primary', source='shanghai.economy.county')}/"
+                f"{_metric(economy_county, 'secondary', source='shanghai.economy.county')}/"
+                f"{_metric(economy_county, 'tertiary', source='shanghai.economy.county')}"
             ),
             "economic_loss": _metric(economy, "loss", "economic_loss"),
             "source_scenario": "loss.economic",
-            "resident_population": _metric(population, "resident"),
-            "floating_population": _metric(population, "floating"),
-            "household": _metric(population, "households"),
-            "age_structure": _metric(population, "age_structure"),
+            "resident_population": _metric(
+                population_town,
+                "resident",
+                source="shanghai.population.town",
+            ),
+            "floating_population": _metric(
+                population_town,
+                "floating",
+                source="shanghai.population.town",
+            ),
+            "household": _metric(
+                population_town,
+                "household",
+                source="shanghai.population.town",
+            ),
+            "age_structure": _metric(
+                population_town,
+                "age_structure",
+                source="shanghai.population.town",
+            ),
             "affected_population": _metric(population, "affected"),
             "shelter": _metric(targets, "shelter"),
             "school": _metric(targets, "school"),
@@ -596,6 +642,26 @@ def _background_sections(
         if isinstance(manifest.get("area_overview"), Mapping)
         else {}
     )
+    building_town = (
+        dict(manifest["building_town"])
+        if isinstance(manifest.get("building_town"), Mapping)
+        else {}
+    )
+    faults = (
+        dict(manifest["faults"])
+        if isinstance(manifest.get("faults"), Mapping)
+        else {}
+    )
+    population_town = (
+        dict(manifest["population_town"])
+        if isinstance(manifest.get("population_town"), Mapping)
+        else {}
+    )
+    economy_county = (
+        dict(manifest["economy_county"])
+        if isinstance(manifest.get("economy_county"), Mapping)
+        else {}
+    )
 
     if artifact_key == "doc.background":
         return (
@@ -632,7 +698,14 @@ def _background_sections(
             ),
             DocumentSection(
                 "邻近断裂",
-                (_asset_summary(asset_versions, "shanghai.fault"),),
+                (
+                    _metric(
+                        faults,
+                        "summary",
+                        source="shanghai.fault",
+                    ),
+                    _asset_summary(asset_versions, "shanghai.fault"),
+                ),
             ),
             DocumentSection(
                 "基础地理背景",
@@ -650,14 +723,21 @@ def _background_sections(
             DocumentSection(
                 "街镇房屋总量",
                 (
-                    f"房屋总量：{_metric(buildings, 'total', 'town_totals')}",
+                    (
+                        "房屋总量："
+                        f"{_metric(building_town, 'town_totals', source='shanghai.building.town')}"
+                    ),
                     _asset_summary(asset_versions, "shanghai.building.town"),
                 ),
             ),
             DocumentSection(
                 "结构类型",
                 (
-                    _metric(buildings, "structure_type", "structure_summary"),
+                    _metric(
+                        building_town,
+                        "structure_type",
+                        source="shanghai.building.town",
+                    ),
                     _asset_summary(asset_versions, "shanghai.building.town"),
                 ),
             ),
@@ -672,7 +752,11 @@ def _background_sections(
             DocumentSection(
                 "覆盖与质量",
                 (
-                    _asset_summary(asset_versions, "shanghai.building.town"),
+                    _metric(
+                        building_town,
+                        "coverage_quality",
+                        source="shanghai.building.town",
+                    ),
                     (
                         "评估产品版本："
                         f"{buildings.get('version') or '数据不可用，待复核'}"
@@ -682,13 +766,31 @@ def _background_sections(
         )
     if artifact_key == "doc.economy":
         return (
-            DocumentSection("GDP", (_metric(economy, "gdp", "total"),)),
+            DocumentSection(
+                "GDP",
+                (
+                    _metric(
+                        economy_county,
+                        "gdp",
+                        source="shanghai.economy.county",
+                    ),
+                ),
+            ),
             DocumentSection(
                 "产业结构",
                 (
-                    f"第一产业：{_metric(economy, 'primary')}",
-                    f"第二产业：{_metric(economy, 'secondary')}",
-                    f"第三产业：{_metric(economy, 'tertiary')}",
+                    (
+                        "第一产业："
+                        f"{_metric(economy_county, 'primary', source='shanghai.economy.county')}"
+                    ),
+                    (
+                        "第二产业："
+                        f"{_metric(economy_county, 'secondary', source='shanghai.economy.county')}"
+                    ),
+                    (
+                        "第三产业："
+                        f"{_metric(economy_county, 'tertiary', source='shanghai.economy.county')}"
+                    ),
                 ),
             ),
             DocumentSection("经济损失", (_metric(economy, "loss", "economic_loss"),)),
@@ -705,10 +807,46 @@ def _background_sections(
         )
     if artifact_key == "doc.population":
         return (
-            DocumentSection("常住人口", (_metric(population, "resident"),)),
-            DocumentSection("流动人口", (_metric(population, "floating"),)),
-            DocumentSection("家庭户", (_metric(population, "households"),)),
-            DocumentSection("年龄结构", (_metric(population, "age_structure"),)),
+            DocumentSection(
+                "常住人口",
+                (
+                    _metric(
+                        population_town,
+                        "resident",
+                        source="shanghai.population.town",
+                    ),
+                ),
+            ),
+            DocumentSection(
+                "流动人口",
+                (
+                    _metric(
+                        population_town,
+                        "floating",
+                        source="shanghai.population.town",
+                    ),
+                ),
+            ),
+            DocumentSection(
+                "家庭户",
+                (
+                    _metric(
+                        population_town,
+                        "household",
+                        source="shanghai.population.town",
+                    ),
+                ),
+            ),
+            DocumentSection(
+                "年龄结构",
+                (
+                    _metric(
+                        population_town,
+                        "age_structure",
+                        source="shanghai.population.town",
+                    ),
+                ),
+            ),
             DocumentSection("受灾人口", (_metric(population, "affected"),)),
         )
     if artifact_key == "doc.key_targets":
