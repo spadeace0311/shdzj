@@ -119,6 +119,164 @@ export interface CurrentUser {
   workgroup: string | null;
 }
 
+export type ArtifactGroup = "map" | "background" | "core";
+
+export type ArtifactStatus = "complete" | "degraded" | "failed";
+
+export type ArtifactPublicationMode =
+  | "automatic"
+  | "rebuild"
+  | "superadmin_override";
+
+export type ProductionRunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "canceled";
+
+export interface ArtifactSummary {
+  artifact_id: string;
+  artifact_key: string;
+  output_profile: string;
+  display_name: string;
+  artifact_version: number;
+  status: ArtifactStatus;
+  quality_grade: string;
+  needs_review: boolean;
+  production_mode: string;
+  publication_mode: ArtifactPublicationMode;
+  file_name: string;
+  format: string;
+  size_bytes: number;
+  generated_at: string;
+  download_url: string;
+  thumbnail_url: string | null;
+}
+
+export interface ProductionRun {
+  production_run_id: string;
+  assessment_run_id: string;
+  status: ProductionRunStatus;
+  production_mode: string;
+  launch_mode: string;
+  generation_seq: number;
+  generation_scope: string;
+  deadline_basis_at: string;
+  deadline_at: string;
+  required_output_count: number;
+  complete_count: number;
+  degraded_count: number;
+  failed_count: number;
+  timeout_count: number;
+  needs_review_count: number;
+  is_current: boolean;
+  artifacts: ArtifactSummary[];
+  context_fingerprint: string;
+  catalog_version: string;
+  template_versions: Record<string, string>;
+  data_asset_versions: Record<string, string>;
+  renderer_versions: Record<string, string>;
+  marker: string | null;
+}
+
+export interface ProductionFilters {
+  kind: "all" | ArtifactGroup;
+  status: "all" | ArtifactStatus;
+  quality_grade: "all" | string;
+  publication_mode: "all" | ArtifactPublicationMode;
+}
+
+export interface ArtifactOverrideInput {
+  file: File;
+  revision_id: string;
+  reason: string;
+  expected_current_artifact_id?: string;
+  idempotency_key: string;
+}
+
+export interface ArtifactOverrideResponse {
+  artifact_id: string;
+  production_run_id: string;
+  production_task_id: string;
+  artifact_publication_id: string;
+  status: string;
+  generation_seq: number;
+  file_name: string;
+  checksum: string;
+  size_bytes: number;
+  generated_at: string;
+  superseded_artifact_id: string | null;
+}
+
+export interface ArtifactProgressSummary {
+  productionRunId: string;
+  status: string;
+  completeCount: number;
+  degradedCount: number;
+  failedCount: number;
+  timeoutCount: number;
+  needsReviewCount: number;
+  requiredOutputCount: number;
+  mapCount: number;
+  backgroundDocumentCount: number;
+  coreDocumentCount: number;
+  progressText: string;
+}
+
+export type ArtifactPreviewState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; url: string }
+  | { status: "error"; message: string };
+
+export const BACKGROUND_DOC_KEYS = [
+  "doc.background",
+  "doc.housing",
+  "doc.economy",
+  "doc.population",
+  "doc.key_targets",
+  "doc.spatial_distances",
+  "doc.area_overview",
+  "doc.historical_catalog",
+] as const;
+
+export function artifactGroup(artifactKey: string): ArtifactGroup {
+  if (artifactKey.startsWith("map.")) {
+    return "map";
+  }
+  if ((BACKGROUND_DOC_KEYS as readonly string[]).includes(artifactKey)) {
+    return "background";
+  }
+  return "core";
+}
+
+export function matchesArtifactFilters(
+  artifact: ArtifactSummary,
+  filters: ProductionFilters,
+): boolean {
+  if (filters.kind !== "all" && artifactGroup(artifact.artifact_key) !== filters.kind) {
+    return false;
+  }
+  if (filters.status !== "all" && artifact.status !== filters.status) {
+    return false;
+  }
+  if (
+    filters.quality_grade !== "all" &&
+    artifact.quality_grade !== filters.quality_grade
+  ) {
+    return false;
+  }
+  if (
+    filters.publication_mode !== "all" &&
+    artifact.publication_mode !== filters.publication_mode
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export type DataAssetType = "vector" | "table" | "raster" | "parameter";
 
 export type DataAssetVersionStatus =
@@ -292,7 +450,7 @@ export interface AssessmentRunStatus {
   revision_id: string;
   run_no: number;
   status: AssessmentRunStatusValue;
-  t1_at: string;
+  t1_at: string | null;
   deadline_at: string;
   completed_task_count: number;
   failed_task_count: number;

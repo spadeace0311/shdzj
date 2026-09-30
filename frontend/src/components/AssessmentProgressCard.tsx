@@ -53,7 +53,11 @@ export function AssessmentProgressCard({ run }: AssessmentProgressCardProps) {
         </div>
         <div>
           <dt>T1</dt>
-          <dd>{formatDateTime(run.t1_at)}</dd>
+          <dd>
+            {run.t1_at
+              ? formatDateTime(run.t1_at)
+              : "不适用（人工/测试/演练）"}
+          </dd>
         </div>
         <div>
           <dt>截止时间</dt>
@@ -89,6 +93,9 @@ export function AssessmentProgressCard({ run }: AssessmentProgressCardProps) {
 }
 
 function formatDeadlineLabel(run: AssessmentRunStatus): string {
+  if (!run.t1_at) {
+    return "截止时限未知";
+  }
   const t1 = new Date(run.t1_at).getTime();
   const deadline = new Date(run.deadline_at).getTime();
   if (Number.isNaN(t1) || Number.isNaN(deadline) || deadline < t1) {

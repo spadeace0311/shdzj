@@ -1,4 +1,7 @@
 import type {
+  ArtifactOverrideInput,
+  ArtifactOverrideResponse,
+  ArtifactSummary,
   AssessmentRunStatus,
   CollectorStatus,
   CurrentUser,
@@ -16,9 +19,12 @@ import type {
   LossGridArtifact,
   LossResult,
   ManualEventInput,
+  ProductionFilters,
+  ProductionRun,
   TokenResponse,
   ValidationReport,
 } from "../types";
+import { matchesArtifactFilters } from "../types";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 
@@ -397,4 +403,127 @@ export async function rollbackDataAssetVersion(
       body: JSON.stringify({ reason }),
     },
   );
+}
+
+export async function getAssessmentProduction(
+  assessmentRunId: string,
+): Promise<ProductionRun> {
+  return requestJson<ProductionRun>(
+    `/api/v1/assessments/runs/${encodeURIComponent(assessmentRunId)}/production`,
+    {
+      headers: authenticatedHeaders("请先登录后查看成果"),
+    },
+  );
+}
+
+export async function getArtifactProductionRun(
+  productionRunId: string,
+): Promise<ProductionRun> {
+  return requestJson<ProductionRun>(
+    `/api/v1/artifact-production-runs/${encodeURIComponent(productionRunId)}`,
+    {
+      headers: authenticatedHeaders("请先登录后查看成果"),
+    },
+  );
+}
+
+function filterArtifacts(
+  artifacts: ArtifactSummary[],
+  filters: ProductionFilters,
+): ArtifactSummary[] {
+  return artifacts.filter((artifact) =>
+    matchesArtifactFilters(artifact, filters),
+  );
+}
+
+export async function listEventArtifacts(
+  eventId: string,
+  filters: ProductionFilters,
+): Promise<ArtifactSummary[]> {
+  const artifacts = await requestJson<ArtifactSummary[]>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/artifacts`,
+    {
+      headers: authenticatedHeaders("请先登录后查看成果"),
+    },
+  );
+  return filterArtifacts(artifacts, filters);
+}
+
+export async function getArtifactVersions(
+  eventId: string,
+): Promise<ArtifactSummary[]> {
+  return requestJson<ArtifactSummary[]>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/artifact-versions`,
+    {
+      headers: authenticatedHeaders("请先登录后查看成果"),
+    },
+  );
+}
+
+export async function rebuildArtifact(
+  eventId: string,
+  artifactKey: string,
+  outputProfile: string,
+  reason: string,
+): Promise<ProductionRun> {
+  return requestJson<ProductionRun>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/artifacts/${encodeURIComponent(
+      artifactKey,
+    )}/rebuild?output_profile=${encodeURIComponent(outputProfile)}`,
+    {
+      method: "POST",
+      headers: {
+        ...authenticatedHeaders("请先登录后重生成成果"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ reason }),
+    },
+    null,
+  );
+}
+
+export async function overrideArtifact(
+  eventId: string,
+  artifactKey: string,
+  input: ArtifactOverrideInput,
+): Promise<ArtifactOverrideResponse> {
+  const body = new FormData();
+  body.set("file", input.file);
+  body.set("revision_id", input.revision_id);
+  body.set("reason", input.reason);
+  if (input.expected_current_artifact_id) {
+    body.set("expected_current_artifact_id", input.expected_current_artifact_id);
+  }
+
+  return requestJson<ArtifactOverrideResponse>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/artifacts/${encodeURIComponent(
+      artifactKey,
+    )}/override`,
+    {
+      method: "POST",
+      headers: {
+        ...authenticatedHeaders("请先登录后覆盖成果"),
+        "Idempotency-Key": input.idempotency_key,
+      },
+      body,
+    },
+    null,
+  );
+}
+
+export async function fetchArtifactBlob(
+  artifactId: string,
+  kind: "download" | "thumbnail",
+): Promise<Blob> {
+  const response = await fetchWithTimeout(
+    `/api/v1/artifacts/${encodeURIComponent(artifactId)}/${kind}`,
+    {
+      headers: authenticatedHeaders("请先登录后查看成果"),
+    },
+    null,
+  );
+  if (!response.ok) {
+    throw new ApiError(await parseError(response), response.status);
+  }
+  return response.blob();
 }

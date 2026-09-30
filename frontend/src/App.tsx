@@ -2,6 +2,7 @@ import { useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
 
 import { clearAccessToken, getCurrentUser } from "./api/client";
+import { ArtifactCenterRoute } from "./pages/ArtifactCenterPage";
 import { CollectorStatusPage } from "./pages/CollectorStatusPage";
 import { DataAssetsPage } from "./pages/DataAssetsPage";
 import { EventDetailPage } from "./pages/EventDetailPage";
@@ -12,9 +13,14 @@ import { ManualEventPage } from "./pages/ManualEventPage";
 interface ConsoleShellProps {
   onLogout: () => void;
   userRole: string;
+  userWorkgroup: string | null;
 }
 
-function ConsoleShell({ onLogout, userRole }: ConsoleShellProps) {
+function ConsoleShell({
+  onLogout,
+  userRole,
+  userWorkgroup,
+}: ConsoleShellProps) {
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -66,6 +72,13 @@ function ConsoleShell({ onLogout, userRole }: ConsoleShellProps) {
             >
               数据资产
             </NavLink>
+            <NavLink
+              to="/artifacts"
+              aria-label="成果中心导航"
+              className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
+            >
+              成果中心
+            </NavLink>
           </nav>
           <div className="sidebar-note">
             <p>当前工作区</p>
@@ -83,6 +96,24 @@ function ConsoleShell({ onLogout, userRole }: ConsoleShellProps) {
               path="/data-assets"
               element={<DataAssetsPage userRole={userRole} />}
             />
+            <Route
+              path="/artifacts"
+              element={
+                <ArtifactCenterRoute
+                  userRole={userRole}
+                  workgroup={userWorkgroup}
+                />
+              }
+            />
+            <Route
+              path="/artifacts/:eventId"
+              element={
+                <ArtifactCenterRoute
+                  userRole={userRole}
+                  workgroup={userWorkgroup}
+                />
+              }
+            />
           </Routes>
         </main>
       </div>
@@ -93,10 +124,12 @@ function ConsoleShell({ onLogout, userRole }: ConsoleShellProps) {
 export default function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [userRole, setUserRole] = useState("");
+  const [userWorkgroup, setUserWorkgroup] = useState<string | null>(null);
 
   function handleLogout() {
     clearAccessToken();
     setUserRole("");
+    setUserWorkgroup(null);
     setAuthenticated(false);
   }
 
@@ -104,10 +137,12 @@ export default function App() {
     try {
       const currentUser = await getCurrentUser();
       setUserRole(currentUser.role);
+      setUserWorkgroup(currentUser.workgroup);
       setAuthenticated(true);
     } catch {
       clearAccessToken();
       setUserRole("");
+      setUserWorkgroup(null);
       setAuthenticated(false);
     }
   }
@@ -118,7 +153,11 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      <ConsoleShell onLogout={handleLogout} userRole={userRole} />
+      <ConsoleShell
+        onLogout={handleLogout}
+        userRole={userRole}
+        userWorkgroup={userWorkgroup}
+      />
     </BrowserRouter>
   );
 }

@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { ApiError, getCurrentAssessment, getEvent, getLossAssessment } from "../api/client";
+import {
+  ApiError,
+  getAssessmentProduction,
+  getCurrentAssessment,
+  getEvent,
+  getLossAssessment,
+} from "../api/client";
 import { AssessmentProgressCard } from "../components/AssessmentProgressCard";
+import {
+  ArtifactProgressCard,
+  buildArtifactProgressSummary,
+} from "../components/ArtifactProgressCard";
 import { LossAssessmentPanel } from "../components/LossAssessmentPanel";
 import { ResponseSuggestionCard } from "../components/ResponseSuggestionCard";
 import {
@@ -18,6 +28,7 @@ import {
   type AssessmentRunStatus,
   type EventDetail,
   type LossResult,
+  type ProductionRun,
 } from "../types";
 
 type DetailStatus = "loading" | "ready" | "error";
@@ -31,6 +42,7 @@ export function EventDetailPage() {
   const { eventId = "" } = useParams();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [assessment, setAssessment] = useState<AssessmentRunStatus | null>(null);
+  const [production, setProduction] = useState<ProductionRun | null>(null);
   const [status, setStatus] = useState<DetailStatus>("loading");
   const [lossState, setLossState] = useState<LossLoadState>({ status: "idle" });
   const lossRequestRef = useRef(0);
@@ -68,6 +80,30 @@ export function EventDetailPage() {
     };
   }, [eventId]);
 
+  const assessmentRunId = assessment?.run_id;
+
+  useEffect(() => {
+    if (!assessmentRunId) {
+      setProduction(null);
+      return;
+    }
+    let active = true;
+    void getAssessmentProduction(assessmentRunId)
+      .then((result) => {
+        if (active) {
+          setProduction(result);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setProduction(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [assessmentRunId]);
+
   const loadLoss = useCallback(async (runId: string) => {
     const requestId = ++lossRequestRef.current;
     setLossState({ status: "loading" });
@@ -88,7 +124,6 @@ export function EventDetailPage() {
     }
   }, []);
 
-  const assessmentRunId = assessment?.run_id;
   const fusedIntensityRunId =
     assessment?.intensity?.run_id ?? assessmentRunId;
   const fusedIntensityProductId = assessment?.intensity?.products.find(
@@ -109,6 +144,7 @@ export function EventDetailPage() {
   const suggestion = event?.response_suggestion;
   const causes =
     suggestion && Array.isArray(suggestion.causes) ? suggestion.causes : [];
+  const artifactProgress = buildArtifactProgressSummary(production);
 
   return (
     <section className="page-section" aria-labelledby="detail-title">
@@ -119,6 +155,12 @@ export function EventDetailPage() {
         </div>
         <Link className="text-button" to="/">
           返回事件列表
+        </Link>
+        <Link
+          className="primary-button"
+          to={`/artifacts/${eventId}`}
+        >
+          成果中心
         </Link>
       </header>
 
@@ -207,6 +249,9 @@ export function EventDetailPage() {
           </section>
 
           <AssessmentProgressCard run={assessment} />
+          {artifactProgress ? (
+            <ArtifactProgressCard production={artifactProgress} />
+          ) : null}
 
           {lossState.status === "loading" ? (
             <div className="state-panel">
