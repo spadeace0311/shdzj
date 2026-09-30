@@ -143,6 +143,14 @@ class DocumentRenderContext:
     context_fingerprint: str
     template_versions: Mapping[str, Mapping[str, Any]]
     asset_versions: Mapping[str, FrozenAssetVersion]
+    manifest: Mapping[str, Any] = field(default_factory=dict)
+    production_mode: str = "live"
+    marker: str | None = None
+    artifact_paths: Mapping[str, Path] = field(default_factory=dict)
+
+    @property
+    def artifacts(self) -> Mapping[str, FrozenAssetVersion]:
+        return self.asset_versions
 
 
 class ProductionContextService:
@@ -511,6 +519,9 @@ class ProductionContextService:
             context_fingerprint=snapshot.context_fingerprint,
             template_versions=_template_map(manifest.get("templates", ())),
             asset_versions=_frozen_asset_map(manifest.get("assets", ())),
+            manifest=manifest,
+            production_mode=run.production_mode,
+            marker=_mode_marker(run.production_mode),
         )
 
     async def _load_task_snapshot(

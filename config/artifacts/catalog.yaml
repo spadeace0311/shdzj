@@ -528,6 +528,16 @@ artifacts:
     required_assets: []
     optional_assets: [shanghai.historical.earthquakes, shanghai.fault]
     template_key: doc.background
+    template_package: background-template
+    control_fields:
+      - event
+      - place
+      - origin_time
+      - coordinate
+      - depth
+      - historical_earthquakes
+      - nearby_faults
+      - geographic_notes
     marker_policy: mode
     failure_policy: degrade
     quality_policy: background
@@ -548,6 +558,12 @@ artifacts:
     required_assets: [shanghai.building.town]
     optional_assets: []
     template_key: doc.housing
+    template_package: background-template
+    control_fields:
+      - town_totals
+      - structure_type
+      - damage_statistics
+      - coverage_quality
     marker_policy: mode
     failure_policy: block
     quality_policy: background
@@ -566,6 +582,12 @@ artifacts:
     required_assets: [shanghai.economy.county]
     optional_assets: []
     template_key: doc.economy
+    template_package: background-template
+    control_fields:
+      - gdp
+      - industry_structure
+      - economic_loss
+      - source_scenario
     marker_policy: mode
     failure_policy: block
     quality_policy: background
@@ -584,6 +606,13 @@ artifacts:
     required_assets: [shanghai.population.town]
     optional_assets: []
     template_key: doc.population
+    template_package: background-template
+    control_fields:
+      - resident_population
+      - floating_population
+      - household
+      - age_structure
+      - affected_population
     marker_policy: mode
     failure_policy: block
     quality_policy: background
@@ -608,6 +637,15 @@ artifacts:
       - shanghai.cultural_relic
       - shanghai.key_target
     template_key: doc.key_targets
+    template_package: background-template
+    control_fields:
+      - shelter
+      - school
+      - hospital
+      - hazard_source
+      - rescue_team
+      - cultural_relic
+      - key_target_list
     marker_policy: mode
     failure_policy: degrade
     quality_policy: background
@@ -626,6 +664,14 @@ artifacts:
     required_assets: [shanghai.distance.reference_points]
     optional_assets: [shanghai.road.network, shanghai.fault]
     template_key: doc.spatial_distances
+    template_package: background-template
+    control_fields:
+      - city_distance
+      - county_distance
+      - town_distance
+      - major_city_distance
+      - key_target_distance
+      - fault_distance
     marker_policy: mode
     failure_policy: degrade
     quality_policy: background
@@ -650,6 +696,15 @@ artifacts:
     required_assets: []
     optional_assets: []
     template_key: doc.area_overview
+    template_package: background-template
+    control_fields:
+      - geography
+      - administration
+      - intensity
+      - population
+      - buildings
+      - economy
+      - key_risks
     marker_policy: mode
     failure_policy: block
     quality_policy: background
@@ -667,6 +722,13 @@ artifacts:
     required_assets: [shanghai.historical.earthquakes]
     optional_assets: []
     template_key: doc.historical_catalog
+    template_package: background-template
+    control_fields:
+      - radius
+      - magnitude_threshold
+      - historical_earthquake_catalog
+      - disaster_earthquake_catalog
+      - statistics
     marker_policy: mode
     failure_policy: block
     quality_policy: background

@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 from geoalchemy2.elements import WKTElement
+from PIL import Image, ImageDraw
 from sqlalchemy import delete, select
 
 from app.artifacts.catalog import load_catalog
+from app.artifacts.context import DocumentRenderContext, FrozenAssetVersion
 from app.artifacts.domain import ArtifactCatalog
 from app.artifacts.models import (
     ArtifactTaskDependencyBinding,
@@ -38,6 +40,17 @@ from app.intensity.models import IntensityFieldProduct
 
 def _checksum(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +161,16 @@ def _fixture_resolved_sources(artifact_key: str) -> dict:
             "metadata": {"verified_empty": False},
         }
     return sources
+
+
+def _write_document_fixture_image(path: Path, marker: str | None) -> None:
+    image = Image.new("RGB", (800, 600), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((30, 30, 770, 570), outline=(20, 30, 40), width=4)
+    draw.line((30, 300, 770, 300), fill=(150, 30, 30), width=3)
+    draw.ellipse((330, 230, 470, 370), fill=(180, 50, 40))
+    draw.text((45, 45), marker or "震中位置", fill=(20, 30, 40))
+    image.save(path, format="JPEG", dpi=(96, 96), quality=92)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +345,152 @@ class ArtifactAssessmentFixture:
             base_style=base_style or selected_basemap.provider_style_key,
             production_mode="live",
             resolved_sources=resolved_sources,
+        )
+
+    async def document_context(
+        self,
+        artifact_key: str,
+        *,
+        production_mode: str = "live",
+        t1_at: datetime | None = None,
+    ) -> DocumentRenderContext:
+        definition = self.catalog.get(artifact_key, "a3v-professional")
+        marker = {
+            "live": None,
+            "manual": None,
+            "test": "【测试】",
+            "drill": "【演练】",
+            "replay": "【测试回放】",
+        }[production_mode]
+        template_checksum = _checksum("background-template-v1")
+        template_versions = {
+            "background-template": {
+                "template_key": "background-template",
+                "kind": "docx",
+                "display_name": "背景文档模板",
+                "version": "v1",
+                "checksum": template_checksum,
+                "published_at": self.deadline_basis_at.isoformat(),
+            }
+        }
+
+        required_asset_keys = set(definition.required_assets)
+        optional_asset_keys = set(definition.optional_assets)
+        artifact_paths: dict[str, Path] = {}
+        asset_versions: dict[str, FrozenAssetVersion] = {}
+        for asset_key in sorted(required_asset_keys | optional_asset_keys):
+            asset_versions[asset_key] = FrozenAssetVersion(
+                asset_key=asset_key,
+                role="required" if asset_key in required_asset_keys else "optional",
+                resolution_status="bound",
+                asset_version_id=uuid.uuid4(),
+                checksum=_checksum(f"{asset_key}-v1"),
+                coverage={"status": "complete"},
+                version="v1",
+            )
+        map_root = Path(settings.artifact_storage_root) / "document-fixtures"
+        map_root.mkdir(parents=True, exist_ok=True)
+        map_path = map_root / "epicenter.jpg"
+        _write_document_fixture_image(map_path, marker)
+        artifact_paths["map.epicenter"] = map_path
+        map_checksum = _sha256_file(map_path)
+        asset_versions["map.epicenter"] = FrozenAssetVersion(
+            asset_key="map.epicenter",
+            role="artifact",
+            resolution_status="bound",
+            asset_version_id=uuid.uuid4(),
+            checksum=map_checksum,
+            coverage={"status": "complete"},
+            version="v1",
+        )
+
+        event = {
+            "event_id": str(self.event_id),
+            "revision_id": str(self.revision_id),
+            "revision_no": 1,
+            "event_kind": "formal",
+            "place": "artifact fixture event",
+            "magnitude": 5.2,
+            "origin_time": (self.deadline_basis_at - timedelta(minutes=2)).isoformat(),
+            "longitude": 121.5,
+            "latitude": 31.2,
+            "depth_km": 10.0,
+            "t1_at": t1_at.isoformat() if t1_at is not None else None,
+        }
+        manifest = {
+            "event": event,
+            "t1_at": event["t1_at"],
+            "assessment": {
+                "assessment_run_id": str(self.assessment_run_id),
+                "data_asset_snapshot_fingerprint": _checksum("data-snapshot-v1"),
+                "products": {
+                    "intensity.fusion": {
+                        "version": "fusion-v1",
+                        "checksum": _checksum("fusion-v1"),
+                        "summary": "烈度 V",
+                    },
+                    "loss.buildings": {
+                        "version": "buildings-v1",
+                        "checksum": _checksum("buildings-v1"),
+                        "total": 10000,
+                        "slight": 1200,
+                        "moderate": 300,
+                        "severe": 80,
+                    },
+                    "loss.population": {
+                        "version": "population-v1",
+                        "checksum": _checksum("population-v1"),
+                        "resident": 120000,
+                        "floating": 18000,
+                        "households": 52000,
+                        "affected": 4300,
+                    },
+                    "loss.economic": {
+                        "version": "economic-v1",
+                        "checksum": _checksum("economic-v1"),
+                        "gdp": 560000,
+                        "primary": 12000,
+                        "secondary": 220000,
+                        "tertiary": 328000,
+                        "loss": 8800,
+                    },
+                },
+            },
+            "loss": {
+                "parameter_package": {
+                    "version": "parameters-v1",
+                    "checksum": _checksum("parameters-v1"),
+                }
+            },
+            "templates": [template_versions["background-template"]],
+            "assets": [
+                {
+                    "asset_key": key,
+                    "role": item.role,
+                    "resolution_status": item.resolution_status,
+                    "checksum": item.checksum,
+                    "version": item.version,
+                    "coverage": item.coverage,
+                }
+                for key, item in sorted(asset_versions.items())
+            ],
+        }
+        context_fingerprint = _checksum(
+            f"document-context-{artifact_key}-{self.event_id}"
+        )
+        return DocumentRenderContext(
+            production_task_id=uuid.uuid4(),
+            production_run_id=uuid.uuid4(),
+            artifact_key=artifact_key,
+            output_profile=definition.output_profile,
+            document_type=definition.kind.value,
+            context_fingerprint=context_fingerprint,
+            template_versions=template_versions,
+            asset_versions=asset_versions,
+            manifest=manifest,
+            production_mode=production_mode,
+            marker=marker,
+            artifact_paths=artifact_paths,
         )
 
     async def create_full_run(

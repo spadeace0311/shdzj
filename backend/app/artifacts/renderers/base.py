@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -47,6 +48,8 @@ class RenderResult:
     non_empty_ratio: float = 0.0
     size_bytes: int = 0
     generated_at: datetime | None = field(default=None)
+    page_count: int | None = None
+    control_fields: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.width <= 0:
@@ -63,3 +66,5 @@ class RenderResult:
             raise ValueError("non_empty_ratio must be between zero and one")
         if self.size_bytes < 0:
             raise ValueError("render size_bytes must not be negative")
+        if self.page_count is not None and self.page_count <= 0:
+            raise ValueError("render page_count must be positive when provided")
