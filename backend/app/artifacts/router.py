@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from uuid import UUID
@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy
+from temporalio.exceptions import TemporalError
 
 from app.artifacts.catalog import load_catalog
 from app.artifacts.models import (
@@ -32,6 +33,7 @@ from app.artifacts.models import (
     ProductionTask,
 )
 from app.artifacts.permissions import can_rebuild_artifacts
+from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.schemas import (
     ArtifactRebuildRequest,
     ArtifactSummaryResponse,
@@ -274,6 +276,21 @@ def _map_artifact_read_error(error: Exception) -> HTTPException:
     raise error
 
 
+async def _fail_workflow_start(
+    production_run_id: UUID,
+    summary: str,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await ArtifactProductionRepository().finalize_run_with_failure(
+                session,
+                production_run_id,
+                datetime.now(UTC),
+                "workflow_start_failed",
+                summary,
+            )
+
+
 @router.get(
     "/assessments/runs/{assessment_run_id}/production",
     response_model=ProductionRunResponse,
@@ -441,7 +458,7 @@ async def download_artifact(
                 )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (SQLAlchemyError, OSError) as exc:
+    except (SQLAlchemyError, OSError, ValueError) as exc:
         raise HTTPException(
             status_code=503,
             detail="artifact storage is unavailable",
@@ -474,7 +491,7 @@ async def get_artifact_thumbnail(
                 )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (SQLAlchemyError, OSError) as exc:
+    except (SQLAlchemyError, OSError, ValueError) as exc:
         raise HTTPException(
             status_code=503,
             detail="artifact storage is unavailable",
@@ -498,6 +515,7 @@ async def rebuild_artifact(
     if not can_rebuild_artifacts(current_user):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     try:
+        revision_id: UUID | None = None
         async with SessionFactory() as session:
             async with session.begin():
                 event = await session.get(EarthquakeEvent, event_id)
@@ -506,6 +524,16 @@ async def rebuild_artifact(
                 revision_id = event.current_revision_id
                 if revision_id is None:
                     raise LookupError("artifact_revision_not_found")
+                parent = await ArtifactProductionRepository().get_current_full_run(
+                    session,
+                    event_id=event.id,
+                    revision_id=revision_id,
+                )
+                if parent is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="artifact rebuild requires current full production run",
+                    )
 
         prepared = await service.create_rebuild_run(
             event_id=event_id,
@@ -520,8 +548,20 @@ async def rebuild_artifact(
                 run = await session.get(ProductionRun, prepared.production_run_id)
                 if run is None:
                     raise LookupError("artifact_production_run_not_found")
-                await starter.start(_workflow_input(run))
-                return await _production_run_response(session, run)
+        try:
+            await starter.start(_workflow_input(run))
+        except (TemporalError, OSError) as exc:
+            await _fail_workflow_start(run.id, str(exc))
+            raise HTTPException(
+                status_code=503,
+                detail="artifact workflow is unavailable",
+            ) from exc
+        async with SessionFactory() as session:
+            async with session.begin():
+                started_run = await session.get(ProductionRun, run.id)
+                if started_run is None:
+                    raise LookupError("artifact_production_run_not_found")
+                return await _production_run_response(session, started_run)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -576,6 +616,12 @@ async def override_artifact(
             status_code=422,
             detail=f"{exc.error_category}: {exc.summary}",
         ) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (SQLAlchemyError, OSError) as exc:
         raise HTTPException(
             status_code=503,
