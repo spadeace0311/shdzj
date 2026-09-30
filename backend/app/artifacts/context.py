@@ -65,6 +65,23 @@ class FrozenAssetVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class MapRenderEvent:
+    id: uuid.UUID
+    revision_id: uuid.UUID
+    place: str
+    magnitude: float
+    origin_time: datetime | None
+    longitude: float
+    latitude: float
+    depth_km: float
+
+
+@dataclass(frozen=True, slots=True)
+class MapRenderRevision:
+    id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
 class StaticProductionContext:
     production_run_id: uuid.UUID
     region_id: str
@@ -103,6 +120,15 @@ class MapRenderContext:
     basemap_manifest: Mapping[str, Any]
     asset_versions: Mapping[str, FrozenAssetVersion]
     selected_basemap: SelectedBasemap | None
+    event: MapRenderEvent | None = None
+    revision: MapRenderRevision | None = None
+    display_name: str = ""
+    layers: tuple[Any, ...] = ()
+    legend: tuple[Any, ...] = ()
+    source_notes: tuple[str, ...] = ()
+    quality: Mapping[str, Any] | None = None
+    marker: str | None = None
+    output_format: str = "jpg"
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +376,24 @@ class ProductionContextService:
         )
         manifest = dict(snapshot.manifest)
         basemap_manifest = dict(manifest.get("basemaps", ()))
+        event_payload = manifest.get("event")
+        if not isinstance(event_payload, Mapping):
+            raise ValueError("production input snapshot must contain a frozen event")
+        event_id = uuid.UUID(str(event_payload["event_id"]))
+        revision_id = uuid.UUID(str(event_payload["revision_id"]))
+        origin_time = _optional_datetime(event_payload.get("origin_time"))
+        catalog = ArtifactCatalog.load(settings.artifact_catalog_path)
+        definition = catalog.get(task.artifact_key, task.output_profile)
+        event = MapRenderEvent(
+            id=event_id,
+            revision_id=revision_id,
+            place=str(event_payload.get("place") or ""),
+            magnitude=float(event_payload["magnitude"]),
+            origin_time=origin_time,
+            longitude=float(event_payload["longitude"]),
+            latitude=float(event_payload["latitude"]),
+            depth_km=float(event_payload["depth_km"]),
+        )
         return MapRenderContext(
             production_task_id=task.id,
             production_run_id=run.id,
@@ -361,6 +405,16 @@ class ProductionContextService:
             selected_basemap=_selected_basemap(
                 basemap_manifest.get("selected_basemap")
             ),
+            event=event,
+            revision=MapRenderRevision(id=revision_id),
+            display_name=definition.display_name,
+            source_notes=("offline validated basemap",),
+            quality={
+                "grade": definition.quality_policy,
+                "needs_review": False,
+                "missing_assets": [],
+            },
+            output_format=definition.format,
         )
 
     def _select_basemap(
@@ -844,3 +898,11 @@ def _optional_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))

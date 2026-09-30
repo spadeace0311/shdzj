@@ -352,6 +352,8 @@ class MapSpecBuilder:
             revision_id = event_id
 
         layers = tuple(_coerce_layer(item) for item in getattr(context, "layers", ()))
+        if not layers and artifact_key == "map.epicenter":
+            layers = (_epicenter_layer(event),)
         for layer in layers:
             _validate_local_url(layer.url)
 
@@ -403,6 +405,38 @@ class MapSpecBuilder:
         )
 
 
+def _epicenter_layer(event: Any) -> MapLayer:
+    longitude = float(getattr(event, "longitude", 0.0))
+    latitude = float(getattr(event, "latitude", 0.0))
+    feature = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [longitude, latitude],
+                },
+                "properties": {"kind": "epicenter"},
+            }
+        ],
+    }
+    return MapLayer(
+        id="epicenter",
+        url="local://event-point",
+        source={"type": "geojson", "data": feature},
+        style={
+            "type": "circle",
+            "paint": {
+                "circle-radius": 10,
+                "circle-color": "#b3261e",
+                "circle-stroke-color": "#ffffff",
+                "circle-stroke-width": 2,
+            },
+        },
+    )
+
+
 def _catalog_display_name(artifact_key: str) -> str:
     from app.artifacts.catalog import load_catalog
 
@@ -428,9 +462,18 @@ class LocalAssetRegistry:
             maplibre_root or os.getenv("MAPLIBRE_STATIC_ROOT", "/opt/maplibre/assets")
         )
         self._artifact_root = Path(artifact_root or settings.artifact_storage_root).resolve()
-        self._basemap_root = Path(basemap_root or settings.artifact_basemap_root).resolve()
+        self._configured_basemap_root = (
+            Path(basemap_root).resolve() if basemap_root is not None else None
+        )
+        self._basemap_root = self._resolve_basemap_root()
         self._base_style_bytes = b""
         self._packages: dict[str, Any] = {}
+
+    def _resolve_basemap_root(self) -> Path:
+        return (
+            self._configured_basemap_root
+            or Path(settings.artifact_basemap_root).resolve()
+        )
 
     def preload(self) -> None:
         if not (self._maplibre_root / "maplibre-gl.js").is_file():
@@ -449,8 +492,52 @@ class LocalAssetRegistry:
             )
         self._base_style_bytes = self._base_style_path.read_bytes()
         json.loads(self._base_style_bytes.decode("utf-8"))
+        self._basemap_root = self._resolve_basemap_root()
         packages, _ = load_offline_basemap_candidates(self._basemap_root)
         self._packages = packages
+
+    def selected_basemap_package(
+        self,
+        selected: Mapping[str, Any] | None,
+    ) -> Any:
+        if selected is None:
+            raise LocalAssetMissingError(
+                "selected offline basemap metadata is required"
+            )
+        provider = selected.get("provider")
+        if not isinstance(provider, str):
+            raise LocalAssetMissingError("selected basemap provider is missing")
+        package = self._packages.get(provider)
+        if package is None:
+            raise LocalAssetMissingError(
+                f"selected offline basemap package is missing: {provider}"
+            )
+        package_id = selected.get("package_id")
+        version = selected.get("version")
+        if package_id and package.package_id != package_id:
+            raise LocalAssetMissingError(
+                f"selected basemap package identity mismatch: "
+                f"expected {package_id}, loaded {package.package_id}"
+            )
+        if version and package.version != version:
+            raise LocalAssetMissingError(
+                f"selected basemap package version mismatch: "
+                f"expected {version}, loaded {package.version}"
+            )
+        return package
+
+    def basemap_source(self, package: Any) -> dict[str, Any]:
+        return {
+            "type": "raster",
+            "tiles": [
+                f"local://basemap/{package.provider}/"
+                "{z}/{x}/{y}."
+                f"{package.format}"
+            ],
+            "tileSize": 256,
+            "minzoom": min(package.zoom_levels),
+            "maxzoom": max(package.zoom_levels),
+        }
 
     def resolve(self, request_path: str) -> tuple[bytes, str] | None:
         path = request_path.lstrip("/")
@@ -550,21 +637,46 @@ class BrowserPool:
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            self._context = await self._browser.new_context(
-                viewport={"width": 1587, "height": 1123},
-                device_scale_factor=3,
-                locale="zh-CN",
-                color_scheme="light",
-            )
-            self._started = True
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1587, "height": 1123},
+                    device_scale_factor=3,
+                    locale="zh-CN",
+                    color_scheme="light",
+                )
+                self._started = True
+            except Exception:
+                if self._context is not None:
+                    await self._context.close()
+                if self._browser is not None:
+                    await self._browser.close()
+                if self._playwright is not None:
+                    await self._playwright.stop()
+                self._context = None
+                self._browser = None
+                self._playwright = None
+                raise
+
+    def reload_assets(self) -> None:
+        self._assets.preload()
+
+    def require_selected_basemap(
+        self,
+        selected: Mapping[str, Any] | None,
+    ) -> Any:
+        return self._assets.selected_basemap_package(selected)
+
+    def basemap_source(self, selected: Mapping[str, Any] | None) -> dict[str, Any]:
+        package = self.require_selected_basemap(selected)
+        return self._assets.basemap_source(package)
 
     async def reserve_slot(self, priority: int = 100) -> str:
         if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
@@ -659,12 +771,17 @@ class MapRenderer:
 
     async def render(self, spec: MapRenderSpec, output_path: Path) -> RenderResult:
         _validate_spec(spec)
+        self._browser_pool.reload_assets()
+        basemap_source = self._browser_pool.basemap_source(spec.selected_basemap)
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         slot = await self._browser_pool.acquire_page(priority=100)
         try:
             page = slot.page
-            await page.set_content(self._renderer_html(spec), wait_until="load")
+            await page.set_content(
+                self._renderer_html(spec, basemap_source),
+                wait_until="load",
+            )
             await page.wait_for_function(
                 "() => window.__artifactMapReady === true",
                 timeout=30_000,
@@ -716,7 +833,12 @@ class MapRenderer:
                 dpi=spec.output.dpi,
                 checksum=checksum,
                 quality=spec.quality,
-                task_status="succeeded",
+                task_status=(
+                    "degraded"
+                    if spec.quality.needs_review
+                    or spec.quality.degradation_reasons
+                    else "succeeded"
+                ),
                 file_name=target.name,
                 render_manifest=manifest,
                 non_empty_ratio=non_empty_ratio,
@@ -725,8 +847,13 @@ class MapRenderer:
         finally:
             await self._browser_pool.release_slot(slot.token)
 
-    def _renderer_html(self, spec: MapRenderSpec) -> str:
+    def _renderer_html(
+        self,
+        spec: MapRenderSpec,
+        basemap_source: Mapping[str, Any],
+    ) -> str:
         payload = spec.to_dict()
+        payload["basemap_source"] = dict(basemap_source)
         payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
         return f"""<!doctype html>
 <html lang="zh-CN">
@@ -768,6 +895,14 @@ gap:24px;font-size:18px;line-height:1.5;color:#33404d;}}
     layers: [{{id: "background", type: "background",
       paint: {{"background-color": "#f7f5f0"}}}}]
   }};
+  if (payload.basemap_source) {{
+    style.sources["offline-basemap"] = payload.basemap_source;
+    style.layers.push({{
+      id: "offline-basemap",
+      type: "raster",
+      source: "offline-basemap"
+    }});
+  }}
   for (const layer of payload.layers || []) {{
     const sourceKey = layer.source_key || layer.id;
     if (layer.source && Object.keys(layer.source).length) {{
@@ -790,6 +925,18 @@ gap:24px;font-size:18px;line-height:1.5;color:#33404d;}}
       return {{url}};
     }}
   }});
+  const center = payload.viewport.center;
+  const centerLatRadians = center[1] * Math.PI / 180;
+  const longitudeRadius = payload.viewport.radius_km /
+    (111.32 * Math.max(0.2, Math.cos(centerLatRadians)));
+  const latitudeRadius = payload.viewport.radius_km / 110.574;
+  map.fitBounds(
+    [
+      [center[0] - longitudeRadius, center[1] - latitudeRadius],
+      [center[0] + longitudeRadius, center[1] + latitudeRadius]
+    ],
+    {{padding: payload.viewport.padding, duration: 0}}
+  );
   window.__artifactMapReady = false;
   map.on("load", async () => {{
     if (!map.loaded()) {{
@@ -814,11 +961,33 @@ def _validate_spec(spec: MapRenderSpec) -> None:
         raise ValueError("map output must use 300 DPI")
     for layer in spec.layers:
         _validate_local_url(layer.url)
-        if "data" in layer.source:
-            _validate_local_url(str(layer.source["data"]))
-        tiles = layer.source.get("tiles", ())
-        for tile_url in tiles:
-            _validate_local_url(str(tile_url))
+        _validate_resource_mapping(layer.source)
+        _validate_resource_mapping(layer.style)
+
+
+_RESOURCE_KEYS = {"url", "tiles", "data", "sprite", "glyphs"}
+
+
+def _validate_resource_mapping(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in _RESOURCE_KEYS:
+                _validate_resource_value(item)
+            else:
+                _validate_resource_mapping(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_resource_mapping(item)
+
+
+def _validate_resource_value(value: Any) -> None:
+    if isinstance(value, str):
+        _validate_local_url(value)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_resource_value(item)
 
 
 def _normalize_output(path: Path, *, format: str, dpi: int) -> float:
@@ -844,11 +1013,13 @@ def _image_dimensions(path: Path) -> tuple[int, int]:
 
 
 def _non_empty_pixel_ratio(image: Image.Image) -> float:
-    grayscale = np.asarray(image.convert("L"), dtype=np.uint8)
-    if grayscale.size == 0:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.size == 0:
         return 0.0
-    non_empty = grayscale < 250
-    return float(np.mean(non_empty))
+    background = np.array([247, 245, 240], dtype=np.int16)
+    channel_delta = np.abs(rgb.astype(np.int16) - background)
+    non_background = np.max(channel_delta, axis=2) > 20
+    return float(np.mean(non_background))
 
 
 def _html(value: str) -> str:
