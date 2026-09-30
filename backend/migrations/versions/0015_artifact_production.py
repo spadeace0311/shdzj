@@ -425,17 +425,21 @@ def upgrade() -> None:
             name="ck_artifact_dependency_optional",
         ),
         sa.CheckConstraint(
-            "resolution_status NOT IN ('bound', 'degraded') "
-            "OR (bound_entity_id IS NOT NULL "
-            "AND bound_version IS NOT NULL "
-            "AND bound_checksum IS NOT NULL)",
+            "((bound_entity_id IS NULL AND bound_version IS NULL "
+            "AND bound_checksum IS NULL) "
+            "OR (bound_entity_id IS NOT NULL AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL)) "
+            "AND (resolution_status NOT IN ('bound', 'degraded') "
+            "OR (bound_entity_id IS NOT NULL AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL))",
             name="ck_artifact_dependency_bound_fields",
         ),
         sa.CheckConstraint(
             "resolution_status NOT IN "
             "('failed', 'timed_out', 'canceled', 'omitted_after_wait') "
             "OR (resolution_detail IS NOT NULL "
-            "AND resolution_detail != 'null'::jsonb "
+            "AND jsonb_typeof(resolution_detail) = 'object' "
+            "AND resolution_detail != '{}'::jsonb "
             "AND resolved_at IS NOT NULL)",
             name="ck_artifact_dependency_terminal_detail",
         ),
@@ -745,9 +749,213 @@ def upgrade() -> None:
         EXECUTE FUNCTION enforce_artifact_production_run_input_snapshot()
         """
     )
+    op.execute(
+        """
+        CREATE FUNCTION enforce_artifact_production_snapshot_immutable()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            RAISE EXCEPTION
+                'production_input_snapshots rows are immutable'
+                USING ERRCODE = '23514';
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_production_input_snapshots_immutable
+        BEFORE UPDATE ON production_input_snapshots
+        FOR EACH ROW
+        EXECUTE FUNCTION enforce_artifact_production_snapshot_immutable()
+        """
+    )
+    op.execute(
+        """
+        CREATE FUNCTION enforce_artifact_production_snapshot_item_immutable()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            RAISE EXCEPTION
+                'production_input_snapshot_items rows are immutable'
+                USING ERRCODE = '23514';
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_production_input_snapshot_items_immutable
+        BEFORE UPDATE ON production_input_snapshot_items
+        FOR EACH ROW
+        EXECUTE FUNCTION enforce_artifact_production_snapshot_item_immutable()
+        """
+    )
+    op.execute(
+        """
+        CREATE FUNCTION enforce_artifact_task_dependency_reference()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        DECLARE
+            expected_product_type text;
+        BEGIN
+            IF NEW.bound_entity_id IS NULL THEN
+                RETURN NEW;
+            END IF;
+
+            IF NEW.dependency_kind = 'assessment_product' THEN
+                expected_product_type := CASE NEW.dependency_key
+                    WHEN 'intensity.fusion' THEN 'fusion'
+                    WHEN 'loss.buildings' THEN 'building_damage'
+                    WHEN 'loss.population' THEN 'population_impact'
+                    WHEN 'loss.casualties' THEN 'casualties'
+                    WHEN 'loss.economic' THEN 'economic_loss'
+                    WHEN 'loss.resources' THEN 'resource_demand'
+                    WHEN 'loss.validate' THEN 'validation'
+                    ELSE NULL
+                END;
+
+                IF expected_product_type IS NULL THEN
+                    RAISE EXCEPTION
+                        'unsupported assessment product dependency %',
+                        NEW.dependency_key
+                        USING ERRCODE = '23514';
+                END IF;
+
+                IF NEW.dependency_key = 'intensity.fusion' THEN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM artifact_production_tasks AS production_task
+                        JOIN artifact_production_runs AS production_run
+                          ON production_run.id =
+                             production_task.production_run_id
+                        JOIN intensity_field_products AS product
+                          ON product.run_id =
+                             production_run.assessment_run_id
+                        WHERE production_task.id = NEW.production_task_id
+                          AND product.id = NEW.bound_entity_id
+                          AND product.product_type = expected_product_type
+                          AND product.output_checksum = NEW.bound_checksum
+                          AND product.algorithm_version = NEW.bound_version
+                    ) THEN
+                        RAISE EXCEPTION
+                            'assessment product binding % does not match '
+                            'dependency %',
+                            NEW.bound_entity_id,
+                            NEW.dependency_key
+                            USING ERRCODE = '23514';
+                    END IF;
+                ELSE
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM artifact_production_tasks AS production_task
+                        JOIN artifact_production_runs AS production_run
+                          ON production_run.id =
+                             production_task.production_run_id
+                        JOIN loss_products AS product
+                          ON product.run_id =
+                             production_run.assessment_run_id
+                        WHERE production_task.id = NEW.production_task_id
+                          AND product.id = NEW.bound_entity_id
+                          AND product.product_type = expected_product_type
+                          AND product.output_checksum = NEW.bound_checksum
+                          AND product.algorithm_version = NEW.bound_version
+                    ) THEN
+                        RAISE EXCEPTION
+                            'assessment product binding % does not match '
+                            'dependency %',
+                            NEW.bound_entity_id,
+                            NEW.dependency_key
+                            USING ERRCODE = '23514';
+                    END IF;
+                END IF;
+            ELSIF NEW.dependency_kind = 'artifact' THEN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM artifact_production_tasks AS production_task
+                    JOIN artifact_production_runs AS production_run
+                      ON production_run.id =
+                         production_task.production_run_id
+                    JOIN generated_artifacts AS artifact
+                      ON artifact.id = NEW.bound_entity_id
+                    WHERE production_task.id = NEW.production_task_id
+                      AND artifact.event_id = production_run.event_id
+                      AND artifact.revision_id = production_run.revision_id
+                      AND artifact.artifact_key = NEW.dependency_key
+                      AND artifact.output_profile =
+                          NEW.dependency_output_profile
+                      AND artifact.artifact_version::text =
+                          NEW.bound_version
+                      AND artifact.checksum = NEW.bound_checksum
+                ) THEN
+                    RAISE EXCEPTION
+                        'artifact binding % does not match dependency %',
+                        NEW.bound_entity_id,
+                        NEW.dependency_key
+                        USING ERRCODE = '23514';
+                END IF;
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER trg_artifact_task_dependency_binding_reference
+        BEFORE INSERT OR UPDATE OF
+            production_task_id,
+            dependency_kind,
+            dependency_key,
+            dependency_output_profile,
+            bound_entity_id,
+            bound_version,
+            bound_checksum
+        ON artifact_task_dependency_bindings
+        FOR EACH ROW
+        EXECUTE FUNCTION enforce_artifact_task_dependency_reference()
+        """
+    )
 
 
 def downgrade() -> None:
+    op.execute(
+        """
+        DROP TRIGGER IF EXISTS
+            trg_artifact_task_dependency_binding_reference
+        ON artifact_task_dependency_bindings
+        """
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS "
+        "enforce_artifact_task_dependency_reference()"
+    )
+    op.execute(
+        """
+        DROP TRIGGER IF EXISTS
+            trg_production_input_snapshot_items_immutable
+        ON production_input_snapshot_items
+        """
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS "
+        "enforce_artifact_production_snapshot_item_immutable()"
+    )
+    op.execute(
+        """
+        DROP TRIGGER IF EXISTS
+            trg_production_input_snapshots_immutable
+        ON production_input_snapshots
+        """
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS "
+        "enforce_artifact_production_snapshot_immutable()"
+    )
     op.execute(
         """
         DROP TRIGGER IF EXISTS

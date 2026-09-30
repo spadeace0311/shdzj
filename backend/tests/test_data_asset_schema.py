@@ -120,10 +120,16 @@ async def _data_asset_schema_state() -> dict[str, object]:
                     await connection.execute(
                         text(
                             """
-                            SELECT pg_get_constraintdef(oid)
-                            FROM pg_constraint
-                            WHERE conrelid = 'data_asset_snapshots'::regclass
-                              AND conname = 'uq_data_asset_snapshots_run_region_asset'
+                            SELECT pg_get_constraintdef(constraint_record.oid)
+                            FROM pg_constraint AS constraint_record
+                            JOIN pg_class AS target
+                              ON target.oid = constraint_record.conrelid
+                            JOIN pg_namespace AS target_schema
+                              ON target_schema.oid = target.relnamespace
+                            WHERE target_schema.nspname = current_schema()
+                              AND target.relname = 'data_asset_snapshots'
+                              AND constraint_record.conname =
+                                  'uq_data_asset_snapshots_run_region_asset'
                             """
                         )
                     )
@@ -137,10 +143,16 @@ async def _data_asset_schema_state() -> dict[str, object]:
                     await connection.execute(
                         text(
                             """
-                            SELECT pg_get_constraintdef(oid)
-                            FROM pg_constraint
-                            WHERE conrelid = 'data_asset_versions'::regclass
-                              AND conname = 'ck_data_asset_versions_status'
+                            SELECT pg_get_constraintdef(constraint_record.oid)
+                            FROM pg_constraint AS constraint_record
+                            JOIN pg_class AS target
+                              ON target.oid = constraint_record.conrelid
+                            JOIN pg_namespace AS target_schema
+                              ON target_schema.oid = target.relnamespace
+                            WHERE target_schema.nspname = current_schema()
+                              AND target.relname = 'data_asset_versions'
+                              AND constraint_record.conname =
+                                  'ck_data_asset_versions_status'
                             """
                         )
                     )

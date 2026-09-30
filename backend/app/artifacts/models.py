@@ -422,17 +422,21 @@ class ArtifactTaskDependencyBinding(Base):
             name="ck_artifact_dependency_optional",
         ),
         CheckConstraint(
-            "resolution_status NOT IN ('bound', 'degraded') "
-            "OR (bound_entity_id IS NOT NULL "
-            "AND bound_version IS NOT NULL "
-            "AND bound_checksum IS NOT NULL)",
+            "((bound_entity_id IS NULL AND bound_version IS NULL "
+            "AND bound_checksum IS NULL) "
+            "OR (bound_entity_id IS NOT NULL AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL)) "
+            "AND (resolution_status NOT IN ('bound', 'degraded') "
+            "OR (bound_entity_id IS NOT NULL AND bound_version IS NOT NULL "
+            "AND bound_checksum IS NOT NULL))",
             name="ck_artifact_dependency_bound_fields",
         ),
         CheckConstraint(
             "resolution_status NOT IN "
             "('failed', 'timed_out', 'canceled', 'omitted_after_wait') "
             "OR (resolution_detail IS NOT NULL "
-            "AND resolution_detail != 'null'::jsonb "
+            "AND jsonb_typeof(resolution_detail) = 'object' "
+            "AND resolution_detail != '{}'::jsonb "
             "AND resolved_at IS NOT NULL)",
             name="ck_artifact_dependency_terminal_detail",
         ),

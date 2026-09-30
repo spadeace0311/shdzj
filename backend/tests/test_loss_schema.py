@@ -380,15 +380,22 @@ async def test_loss_tables_and_constraints_exist() -> None:
                 await connection.execute(
                     text(
                         """
-                        SELECT conname, pg_get_constraintdef(oid) AS definition
-                        FROM pg_constraint
-                        WHERE conrelid IN (
-                            'loss_model_definitions'::regclass,
-                            'loss_parameter_sets'::regclass,
-                            'loss_products'::regclass,
-                            'loss_metric_values'::regclass,
-                            'loss_product_rasters'::regclass
-                        )
+                        SELECT
+                            constraint_record.conname,
+                            pg_get_constraintdef(constraint_record.oid) AS definition
+                        FROM pg_constraint AS constraint_record
+                        JOIN pg_class AS target
+                          ON target.oid = constraint_record.conrelid
+                        JOIN pg_namespace AS target_schema
+                          ON target_schema.oid = target.relnamespace
+                        WHERE target_schema.nspname = current_schema()
+                          AND target.relname IN (
+                              'loss_model_definitions',
+                              'loss_parameter_sets',
+                              'loss_products',
+                              'loss_metric_values',
+                              'loss_product_rasters'
+                          )
                         """
                     )
                 )
@@ -425,12 +432,20 @@ async def test_loss_product_uses_known_status_and_quality_values() -> None:
                 await connection.execute(
                     text(
                         """
-                        SELECT conname, pg_get_constraintdef(oid) AS definition
-                        FROM pg_constraint
-                        WHERE conname IN (
-                            'ck_loss_product_status_value',
-                            'ck_loss_product_quality_value'
-                        )
+                        SELECT
+                            constraint_record.conname,
+                            pg_get_constraintdef(constraint_record.oid) AS definition
+                        FROM pg_constraint AS constraint_record
+                        JOIN pg_class AS target
+                          ON target.oid = constraint_record.conrelid
+                        JOIN pg_namespace AS target_schema
+                          ON target_schema.oid = target.relnamespace
+                        WHERE target_schema.nspname = current_schema()
+                          AND target.relname = 'loss_products'
+                          AND constraint_record.conname IN (
+                              'ck_loss_product_status_value',
+                              'ck_loss_product_quality_value'
+                          )
                         """
                     )
                 )

@@ -443,6 +443,70 @@ async def _artifact_tables_exist() -> bool:
     return ARTIFACT_TABLES <= names
 
 
+async def _artifact_trigger_state() -> tuple[set[str], set[str]]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            trigger_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT trigger_record.tgname
+                            FROM pg_trigger AS trigger_record
+                            JOIN pg_class AS target
+                              ON target.oid = trigger_record.tgrelid
+                            JOIN pg_namespace AS target_schema
+                              ON target_schema.oid = target.relnamespace
+                            WHERE NOT trigger_record.tgisinternal
+                              AND target_schema.nspname = current_schema()
+                              AND target.relname = ANY(
+                                  CAST(:artifact_tables AS text[])
+                              )
+                            """
+                        ),
+                        {"artifact_tables": sorted(ARTIFACT_TABLES)},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            function_rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT routine_record.proname
+                            FROM pg_proc AS routine_record
+                            JOIN pg_namespace AS routine_schema
+                              ON routine_schema.oid = routine_record.pronamespace
+                            WHERE routine_schema.nspname = current_schema()
+                              AND routine_record.proname = ANY(
+                                  CAST(:function_names AS text[])
+                              )
+                            """
+                        ),
+                        {
+                            "function_names": [
+                                "enforce_artifact_production_run_input_snapshot",
+                                "enforce_artifact_production_snapshot_immutable",
+                                "enforce_artifact_production_snapshot_item_immutable",
+                                "enforce_artifact_task_dependency_reference",
+                            ]
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        await engine.dispose()
+    return (
+        {row["tgname"] for row in trigger_rows},
+        {row["proname"] for row in function_rows},
+    )
+
+
 async def _intensity_schema_state() -> dict[str, object]:
     tables = (
         "assessment_runs",
@@ -468,12 +532,21 @@ async def _intensity_schema_state() -> dict[str, object]:
                         text(
                             """
                             SELECT
-                                conrelid::regclass::text AS table_name,
-                                pg_get_constraintdef(oid) AS definition
-                            FROM pg_constraint
-                            WHERE contype = 'f'
-                            """
-                        )
+                                target.relname AS table_name,
+                                pg_get_constraintdef(constraint_record.oid) AS definition
+                            FROM pg_constraint AS constraint_record
+                            JOIN pg_class AS target
+                              ON target.oid = constraint_record.conrelid
+                            JOIN pg_namespace AS target_schema
+                              ON target_schema.oid = target.relnamespace
+                            WHERE constraint_record.contype = 'f'
+                              AND target_schema.nspname = current_schema()
+                              AND target.relname = ANY(
+                                  CAST(:tables AS text[])
+                              )
+                            """,
+                        ),
+                        {"tables": list(tables)},
                     )
                 )
                 .mappings()
@@ -485,13 +558,22 @@ async def _intensity_schema_state() -> dict[str, object]:
                         text(
                             """
                             SELECT
-                                conname,
-                                conrelid::regclass::text AS table_name,
-                                pg_get_constraintdef(oid) AS definition
-                            FROM pg_constraint
-                            WHERE contype = 'u'
-                            """
-                        )
+                                constraint_record.conname,
+                                target.relname AS table_name,
+                                pg_get_constraintdef(constraint_record.oid) AS definition
+                            FROM pg_constraint AS constraint_record
+                            JOIN pg_class AS target
+                              ON target.oid = constraint_record.conrelid
+                            JOIN pg_namespace AS target_schema
+                              ON target_schema.oid = target.relnamespace
+                            WHERE constraint_record.contype = 'u'
+                              AND target_schema.nspname = current_schema()
+                              AND target.relname = ANY(
+                                  CAST(:tables AS text[])
+                              )
+                            """,
+                        ),
+                        {"tables": list(tables)},
                     )
                 )
                 .mappings()
@@ -818,13 +900,31 @@ async def test_0014_loss_assessment_is_reversible() -> None:
 
 
 async def test_0015_artifact_production_is_reversible() -> None:
+    expected_triggers = {
+        "trg_artifact_production_runs_input_snapshot_match",
+        "trg_production_input_snapshots_immutable",
+        "trg_production_input_snapshot_items_immutable",
+        "trg_artifact_task_dependency_binding_reference",
+    }
+    expected_functions = {
+        "enforce_artifact_production_run_input_snapshot",
+        "enforce_artifact_production_snapshot_immutable",
+        "enforce_artifact_production_snapshot_item_immutable",
+        "enforce_artifact_task_dependency_reference",
+    }
     _set_revision(ARTIFACT_PREVIOUS_REVISION)
     assert await _artifact_tables_exist() is False
     try:
         _set_revision(LATEST_REVISION)
         assert await _artifact_tables_exist() is True
+        triggers, functions = await _artifact_trigger_state()
+        assert expected_triggers <= triggers
+        assert expected_functions <= functions
         _set_revision(ARTIFACT_PREVIOUS_REVISION)
         assert await _artifact_tables_exist() is False
+        triggers, functions = await _artifact_trigger_state()
+        assert triggers.isdisjoint(expected_triggers)
+        assert functions.isdisjoint(expected_functions)
         _set_revision(LATEST_REVISION)
     finally:
         _set_revision(LATEST_REVISION)

@@ -11,6 +11,9 @@ from sqlalchemy.orm import configure_mappers
 import app.assessment.models  # noqa: F401
 import app.data_assets.models  # noqa: F401
 import app.events.models  # noqa: F401
+import app.intensity.models  # noqa: F401
+import app.loss.models  # noqa: F401
+from app.assessment.models import AssessmentRun, AssessmentTask
 from app.artifacts.models import (
     ArtifactOverrideRequest,
     ArtifactPublication,
@@ -19,11 +22,20 @@ from app.artifacts.models import (
     ArtifactTemplateVersion,
     GeneratedArtifact,
     ProductionInputSnapshot,
+    ProductionInputSnapshotItem,
     ProductionRun,
     ProductionTask,
 )
 from app.config import settings
-from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.data_assets.models import DataAsset, DataAssetVersion
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
+from app.intensity.models import IntensityFieldProduct
+from app.loss.models import LossProduct
 from geoalchemy2.elements import WKTElement
 
 ARTIFACT_TABLES = {
@@ -142,6 +154,8 @@ async def test_artifact_partial_unique_indexes_exist() -> None:
 
     definitions = {row["indexname"]: row["indexdef"] for row in rows}
     assert set(definitions) == ARTIFACT_PARTIAL_UNIQUE_INDEXES
+    for definition in definitions.values():
+        assert "CREATE UNIQUE INDEX" in definition
     assert "WHERE" in definitions["uq_artifact_run_current_scope"]
     assert "is_current" in definitions["uq_artifact_run_current_scope"]
     assert "superseded_at IS NULL" in definitions["uq_artifact_publication_current"]
@@ -188,22 +202,44 @@ async def test_artifact_schema_contains_full_plan_contract() -> None:
                 await connection.execute(
                     text(
                         """
-                        SELECT conname, pg_get_constraintdef(oid) AS definition
-                        FROM pg_constraint
-                        WHERE contype = 'u'
+                        SELECT
+                            constraint_record.conname,
+                            pg_get_constraintdef(constraint_record.oid) AS definition
+                        FROM pg_constraint AS constraint_record
+                        JOIN pg_class AS target
+                          ON target.oid = constraint_record.conrelid
+                        JOIN pg_namespace AS target_schema
+                          ON target_schema.oid = target.relnamespace
+                        WHERE constraint_record.contype = 'u'
+                          AND target_schema.nspname = current_schema()
+                          AND target.relname = ANY(
+                              CAST(:artifact_tables AS text[])
+                          )
                         """
-                    )
+                    ),
+                    {"artifact_tables": sorted(ARTIFACT_TABLES)},
                 )
             ).mappings()
             check_rows = (
                 await connection.execute(
                     text(
                         """
-                        SELECT conname, pg_get_constraintdef(oid) AS definition
-                        FROM pg_constraint
-                        WHERE contype = 'c'
+                        SELECT
+                            constraint_record.conname,
+                            pg_get_constraintdef(constraint_record.oid) AS definition
+                        FROM pg_constraint AS constraint_record
+                        JOIN pg_class AS target
+                          ON target.oid = constraint_record.conrelid
+                        JOIN pg_namespace AS target_schema
+                          ON target_schema.oid = target.relnamespace
+                        WHERE constraint_record.contype = 'c'
+                          AND target_schema.nspname = current_schema()
+                          AND target.relname = ANY(
+                              CAST(:artifact_tables AS text[])
+                          )
                         """
-                    )
+                    ),
+                    {"artifact_tables": sorted(ARTIFACT_TABLES)},
                 )
             ).mappings()
             default_rows = (
@@ -213,19 +249,34 @@ async def test_artifact_schema_contains_full_plan_contract() -> None:
                         SELECT table_name, column_name, column_default
                         FROM information_schema.columns
                         WHERE table_schema = current_schema()
+                          AND table_name = ANY(
+                              CAST(:artifact_tables AS text[])
+                          )
                         """
-                    )
+                    ),
+                    {"artifact_tables": sorted(ARTIFACT_TABLES)},
                 )
             ).mappings()
             foreign_key_rows = (
                 await connection.execute(
                     text(
                         """
-                        SELECT conname, pg_get_constraintdef(oid) AS definition
-                        FROM pg_constraint
-                        WHERE contype = 'f'
+                        SELECT
+                            constraint_record.conname,
+                            pg_get_constraintdef(constraint_record.oid) AS definition
+                        FROM pg_constraint AS constraint_record
+                        JOIN pg_class AS target
+                          ON target.oid = constraint_record.conrelid
+                        JOIN pg_namespace AS target_schema
+                          ON target_schema.oid = target.relnamespace
+                        WHERE constraint_record.contype = 'f'
+                          AND target_schema.nspname = current_schema()
+                          AND target.relname = ANY(
+                              CAST(:artifact_tables AS text[])
+                          )
                         """
-                    )
+                    ),
+                    {"artifact_tables": sorted(ARTIFACT_TABLES)},
                 )
             ).mappings()
             jsonb_rows = (
@@ -292,7 +343,22 @@ async def test_artifact_schema_contains_full_plan_contract() -> None:
     assert "bound_checksum IS NOT NULL" in check_constraints[
         "ck_artifact_dependency_bound_fields"
     ]
+    assert "bound_entity_id IS NULL" in check_constraints[
+        "ck_artifact_dependency_bound_fields"
+    ]
+    assert "bound_version IS NULL" in check_constraints[
+        "ck_artifact_dependency_bound_fields"
+    ]
+    assert "bound_checksum IS NULL" in check_constraints[
+        "ck_artifact_dependency_bound_fields"
+    ]
     assert "resolution_detail IS NOT NULL" in check_constraints[
+        "ck_artifact_dependency_terminal_detail"
+    ]
+    assert "jsonb_typeof(resolution_detail)" in check_constraints[
+        "ck_artifact_dependency_terminal_detail"
+    ]
+    assert "'{}'::jsonb" in check_constraints[
         "ck_artifact_dependency_terminal_detail"
     ]
     assert "resolved_at IS NOT NULL" in check_constraints[
@@ -456,6 +522,119 @@ async def _create_task(
     return task
 
 
+async def _create_assessment_run(
+    session,
+    *,
+    event_id: uuid.UUID,
+    revision_id: uuid.UUID,
+) -> AssessmentRun:
+    now = datetime.now(UTC)
+    outbox = EventLifecycleOutbox(
+        event_id=event_id,
+        revision_id=revision_id,
+        trigger_type=f"artifact-schema-{uuid.uuid4()}",
+        trigger_reason="live",
+        payload={},
+        status="pending",
+    )
+    session.add(outbox)
+    await session.flush()
+
+    assessment_run = AssessmentRun(
+        event_id=event_id,
+        revision_id=revision_id,
+        outbox_id=outbox.id,
+        run_no=1,
+        trigger_reason="live",
+        deadline_at=now + timedelta(seconds=300),
+        snapshot={},
+        report_ingested_at=now,
+        deadline_basis_at=now,
+    )
+    session.add(assessment_run)
+    await session.flush()
+    return assessment_run
+
+
+async def _create_assessment_task(
+    session,
+    *,
+    assessment_run: AssessmentRun,
+) -> AssessmentTask:
+    task = AssessmentTask(
+        run_id=assessment_run.id,
+        task_key="intensity.fusion",
+        task_type="intensity",
+        component="intensity",
+        sequence=1,
+        deadline_at=assessment_run.deadline_at,
+    )
+    session.add(task)
+    await session.flush()
+    return task
+
+
+async def _create_intensity_product(
+    session,
+    *,
+    assessment_run: AssessmentRun,
+    assessment_task: AssessmentTask,
+    version: str,
+    checksum: str,
+) -> IntensityFieldProduct:
+    product = IntensityFieldProduct(
+        run_id=assessment_run.id,
+        task_id=assessment_task.id,
+        product_type="fusion",
+        status="succeeded",
+        algorithm_version=version,
+        parameter_version="parameter-v1",
+        grid_definition_version="grid-v1",
+        region_profile_version="region-v1",
+        input_fingerprint="a" * 64,
+        input_checksum="b" * 64,
+        output_checksum=checksum,
+        coverage_ratio=1,
+        statistics={},
+    )
+    session.add(product)
+    await session.flush()
+    return product
+
+
+async def _create_loss_product(
+    session,
+    *,
+    assessment_run: AssessmentRun,
+    assessment_task: AssessmentTask,
+    product_type: str,
+    version: str,
+    checksum: str,
+) -> LossProduct:
+    product = LossProduct(
+        run_id=assessment_run.id,
+        task_id=assessment_task.id,
+        product_type=product_type,
+        status="complete",
+        quality_grade="L1",
+        calibration_status="calibrated",
+        coverage_ratio=1,
+        partial_scope=False,
+        needs_review=False,
+        spatialized_estimate=True,
+        algorithm_version=version,
+        parameter_version="parameter-v1",
+        region_profile_version="region-v1",
+        input_fingerprint="c" * 64,
+        input_checksum="d" * 64,
+        output_checksum=checksum,
+        statistics={},
+    )
+    session.add(product)
+    await session.flush()
+    return product
+
+
 async def _create_artifact(
     session,
     *,
@@ -521,6 +700,208 @@ async def test_generated_artifact_integer_versions_are_writable() -> None:
 
         assert first.artifact_version == 1
         assert second.artifact_version == 2
+
+
+async def test_generated_artifact_final_task_index_is_unique() -> None:
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        task = await _create_task(session, run=run)
+        await _create_artifact(
+            session,
+            run=run,
+            task=task,
+            event_id=event_id,
+            revision_id=revision_id,
+            version=1,
+            is_final=True,
+        )
+
+        with pytest.raises(IntegrityError, match="uq_generated_artifact_final_task"):
+            async with session.begin_nested():
+                await _create_artifact(
+                    session,
+                    run=run,
+                    task=task,
+                    event_id=event_id,
+                    revision_id=revision_id,
+                    version=2,
+                    is_final=True,
+                )
+
+
+async def test_production_input_snapshot_rejects_reverse_ownership_update() -> None:
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        first_run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        second_run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=2,
+        )
+        snapshot = ProductionInputSnapshot(
+            production_run_id=first_run.id,
+            context_fingerprint="e" * 64,
+            region_id="shanghai",
+            manifest={},
+        )
+        session.add(snapshot)
+        await session.flush()
+
+        with pytest.raises(IntegrityError, match="immutable"):
+            async with session.begin_nested():
+                await session.execute(
+                    text(
+                        """
+                        UPDATE production_input_snapshots
+                        SET production_run_id = :production_run_id
+                        WHERE id = :snapshot_id
+                        """
+                    ),
+                    {
+                        "production_run_id": second_run.id,
+                        "snapshot_id": snapshot.id,
+                    },
+                )
+
+
+async def test_production_input_snapshot_identity_fields_are_immutable() -> None:
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        snapshot = ProductionInputSnapshot(
+            production_run_id=run.id,
+            context_fingerprint="f" * 64,
+            region_id="shanghai",
+            manifest={},
+        )
+        session.add(snapshot)
+        await session.flush()
+
+        for statement in (
+            """
+            UPDATE production_input_snapshots
+            SET context_fingerprint = repeat('1', 64)
+            WHERE id = :snapshot_id
+            """,
+            """
+            UPDATE production_input_snapshots
+            SET region_id = 'beijing'
+            WHERE id = :snapshot_id
+            """,
+            """
+            UPDATE production_input_snapshots
+            SET manifest = '{"changed": true}'::jsonb
+            WHERE id = :snapshot_id
+            """,
+        ):
+            with pytest.raises(IntegrityError, match="immutable"):
+                async with session.begin_nested():
+                    await session.execute(
+                        text(statement),
+                        {"snapshot_id": snapshot.id},
+                    )
+
+
+async def test_production_input_snapshot_items_are_immutable_and_cascadable() -> None:
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        asset = DataAsset(
+            asset_key="artifact.snapshot.fixture",
+            region_id="shanghai",
+            name="Artifact snapshot fixture",
+            data_type="vector",
+            spatial_granularity="town",
+            responsibility_unit="test",
+            update_interval_days=1,
+            is_core=False,
+            contract={},
+        )
+        session.add(asset)
+        await session.flush()
+        asset_version = DataAssetVersion(
+            asset_id=asset.id,
+            version="1",
+            source_uri="memory://artifact-snapshot-fixture",
+            schema_summary={},
+        )
+        session.add(asset_version)
+        await session.flush()
+        snapshot = ProductionInputSnapshot(
+            production_run_id=run.id,
+            context_fingerprint="2" * 64,
+            region_id="shanghai",
+            manifest={},
+        )
+        session.add(snapshot)
+        await session.flush()
+        item = ProductionInputSnapshotItem(
+            snapshot_id=snapshot.id,
+            asset_key=asset.asset_key,
+            asset_version_id=asset_version.id,
+            checksum="3" * 64,
+            role="render",
+            coverage={},
+            selected_for_render=True,
+        )
+        session.add(item)
+        await session.flush()
+
+        with pytest.raises(IntegrityError, match="immutable"):
+            async with session.begin_nested():
+                await session.execute(
+                    text(
+                        """
+                        UPDATE production_input_snapshot_items
+                        SET selected_for_render = false
+                        WHERE id = :item_id
+                        """
+                    ),
+                    {"item_id": item.id},
+                )
+
+        await session.execute(
+            text(
+                """
+                DELETE FROM production_input_snapshots
+                WHERE id = :snapshot_id
+                """
+            ),
+            {"snapshot_id": snapshot.id},
+        )
+        item_count = await session.scalar(
+            text(
+                """
+                SELECT count(*)
+                FROM production_input_snapshot_items
+                WHERE id = :item_id
+                """
+            ),
+            {"item_id": item.id},
+        )
+        assert item_count == 0
 
 
 async def test_artifact_identity_contract_accepts_username_strings() -> None:
@@ -656,6 +1037,22 @@ async def test_production_run_rejects_snapshot_owned_by_another_run(
             "is_optional": True,
             "resolved_at": None,
         },
+        {
+            "resolution_status": "failed",
+            "bound_version": None,
+            "resolution_detail": {"reason": "dependency failed"},
+            "resolved_at": datetime.now(UTC),
+        },
+        {
+            "resolution_status": "failed",
+            "resolution_detail": {},
+            "resolved_at": datetime.now(UTC),
+        },
+        {
+            "resolution_status": "canceled",
+            "resolution_detail": [],
+            "resolved_at": datetime.now(UTC),
+        },
     ),
 )
 async def test_dependency_binding_rejects_illegal_combinations(
@@ -692,8 +1089,94 @@ async def test_dependency_binding_rejects_illegal_combinations(
                 await session.flush()
 
 
-async def test_dependency_binding_accepts_valid_terminal_combinations(
+async def test_dependency_binding_accepts_real_assessment_product_references(
 ) -> None:
+    now = datetime.now(UTC)
+    assessment_dependencies = {
+        "intensity.fusion": "intensity",
+        "loss.buildings": "loss",
+        "loss.population": "loss",
+        "loss.casualties": "loss",
+        "loss.economic": "loss",
+        "loss.resources": "loss",
+        "loss.validate": "loss",
+    }
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        assessment_run = await _create_assessment_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+        )
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        run.assessment_run_id = assessment_run.id
+        await session.flush()
+        task = await _create_task(session, run=run)
+        assessment_task = await _create_assessment_task(
+            session,
+            assessment_run=assessment_run,
+        )
+
+        bindings = []
+        for index, (dependency_key, product_family) in enumerate(
+            assessment_dependencies.items()
+        ):
+            version = f"{dependency_key}-v1"
+            checksum = f"{index + 1:064x}"
+            if product_family == "intensity":
+                product_id = (
+                    await _create_intensity_product(
+                        session,
+                        assessment_run=assessment_run,
+                        assessment_task=assessment_task,
+                        version=version,
+                        checksum=checksum,
+                    )
+                ).id
+            else:
+                product_type = {
+                    "loss.buildings": "building_damage",
+                    "loss.population": "population_impact",
+                    "loss.casualties": "casualties",
+                    "loss.economic": "economic_loss",
+                    "loss.resources": "resource_demand",
+                    "loss.validate": "validation",
+                }[dependency_key]
+                product_id = (
+                    await _create_loss_product(
+                        session,
+                        assessment_run=assessment_run,
+                        assessment_task=assessment_task,
+                        product_type=product_type,
+                        version=version,
+                        checksum=checksum,
+                    )
+                ).id
+            bindings.append(
+                ArtifactTaskDependencyBinding(
+                    production_task_id=task.id,
+                    dependency_kind="assessment_product",
+                    dependency_key=dependency_key,
+                    is_optional=False,
+                    bound_entity_id=product_id,
+                    bound_version=version,
+                    bound_checksum=checksum,
+                    resolution_status="bound",
+                    resolution_detail={"source": "assessment"},
+                    resolved_at=now,
+                )
+            )
+
+        session.add_all(bindings)
+        await session.flush()
+
+
+async def test_dependency_binding_accepts_real_artifact_reference() -> None:
     now = datetime.now(UTC)
     async with _rolled_back_session() as session:
         event_id, revision_id = await _create_event_graph(session)
@@ -704,30 +1187,233 @@ async def test_dependency_binding_accepts_valid_terminal_combinations(
             generation_seq=1,
         )
         task = await _create_task(session, run=run)
-        session.add_all(
-            [
-                ArtifactTaskDependencyBinding(
-                    production_task_id=task.id,
-                    dependency_kind="assessment_product",
-                    dependency_key="intensity.summary",
-                    is_optional=False,
-                    bound_entity_id=uuid.uuid4(),
-                    bound_version="1",
-                    bound_checksum="e" * 64,
-                    resolution_status="bound",
-                    resolution_detail={"source": "assessment"},
-                    resolved_at=now,
-                ),
-                ArtifactTaskDependencyBinding(
-                    production_task_id=task.id,
-                    dependency_kind="artifact",
-                    dependency_key="map.intensity",
-                    dependency_output_profile="a3v-professional",
-                    is_optional=True,
-                    resolution_status="omitted_after_wait",
-                    resolution_detail={"reason": "optional dependency unavailable"},
-                    resolved_at=now,
-                ),
-            ]
+        artifact = await _create_artifact(
+            session,
+            run=run,
+            task=task,
+            event_id=event_id,
+            revision_id=revision_id,
+            version=1,
         )
+        binding = ArtifactTaskDependencyBinding(
+            production_task_id=task.id,
+            dependency_kind="artifact",
+            dependency_key=artifact.artifact_key,
+            dependency_output_profile=artifact.output_profile,
+            is_optional=False,
+            bound_entity_id=artifact.id,
+            bound_version=str(artifact.artifact_version),
+            bound_checksum=artifact.checksum,
+            resolution_status="bound",
+            resolution_detail={"source": "generated_artifact"},
+            resolved_at=now,
+        )
+        session.add(binding)
+        await session.flush()
+
+
+async def test_dependency_binding_rejects_invalid_assessment_references() -> None:
+    now = datetime.now(UTC)
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        assessment_run = await _create_assessment_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+        )
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        run.assessment_run_id = assessment_run.id
+        await session.flush()
+        task = await _create_task(session, run=run)
+        assessment_task = await _create_assessment_task(
+            session,
+            assessment_run=assessment_run,
+        )
+        product = await _create_intensity_product(
+            session,
+            assessment_run=assessment_run,
+            assessment_task=assessment_task,
+            version="fusion-v1",
+            checksum="a" * 64,
+        )
+        base_values: dict[str, object] = {
+            "production_task_id": task.id,
+            "dependency_kind": "assessment_product",
+            "dependency_key": "intensity.fusion",
+            "is_optional": False,
+            "bound_entity_id": product.id,
+            "bound_version": product.algorithm_version,
+            "bound_checksum": product.output_checksum,
+            "resolution_status": "bound",
+            "resolution_detail": {"source": "assessment"},
+            "resolved_at": now,
+        }
+
+        for overrides in (
+            {"bound_entity_id": uuid.uuid4()},
+            {"bound_checksum": "b" * 64},
+            {"bound_version": "fusion-v2"},
+            {"dependency_key": "assessment.unsupported"},
+        ):
+            values = base_values | overrides
+            with pytest.raises(IntegrityError):
+                async with session.begin_nested():
+                    session.add(ArtifactTaskDependencyBinding(**values))
+                    await session.flush()
+
+
+async def test_dependency_binding_rejects_cross_run_assessment_product() -> None:
+    now = datetime.now(UTC)
+    async with _rolled_back_session() as session:
+        first_event_id, first_revision_id = await _create_event_graph(session)
+        first_assessment_run = await _create_assessment_run(
+            session,
+            event_id=first_event_id,
+            revision_id=first_revision_id,
+        )
+        first_assessment_task = await _create_assessment_task(
+            session,
+            assessment_run=first_assessment_run,
+        )
+        product = await _create_intensity_product(
+            session,
+            assessment_run=first_assessment_run,
+            assessment_task=first_assessment_task,
+            version="fusion-v1",
+            checksum="c" * 64,
+        )
+
+        second_event_id, second_revision_id = await _create_event_graph(session)
+        second_assessment_run = await _create_assessment_run(
+            session,
+            event_id=second_event_id,
+            revision_id=second_revision_id,
+        )
+        second_run = await _create_run(
+            session,
+            event_id=second_event_id,
+            revision_id=second_revision_id,
+            generation_seq=1,
+        )
+        second_run.assessment_run_id = second_assessment_run.id
+        await session.flush()
+        second_task = await _create_task(session, run=second_run)
+
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                session.add(
+                    ArtifactTaskDependencyBinding(
+                        production_task_id=second_task.id,
+                        dependency_kind="assessment_product",
+                        dependency_key="intensity.fusion",
+                        is_optional=False,
+                        bound_entity_id=product.id,
+                        bound_version=product.algorithm_version,
+                        bound_checksum=product.output_checksum,
+                        resolution_status="bound",
+                        resolution_detail={"source": "assessment"},
+                        resolved_at=now,
+                    )
+                )
+                await session.flush()
+
+
+async def test_dependency_binding_rejects_invalid_artifact_references() -> None:
+    now = datetime.now(UTC)
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        task = await _create_task(session, run=run)
+        artifact = await _create_artifact(
+            session,
+            run=run,
+            task=task,
+            event_id=event_id,
+            revision_id=revision_id,
+            version=1,
+        )
+        base_values: dict[str, object] = {
+            "production_task_id": task.id,
+            "dependency_kind": "artifact",
+            "dependency_key": artifact.artifact_key,
+            "dependency_output_profile": artifact.output_profile,
+            "is_optional": False,
+            "bound_entity_id": artifact.id,
+            "bound_version": str(artifact.artifact_version),
+            "bound_checksum": artifact.checksum,
+            "resolution_status": "bound",
+            "resolution_detail": {"source": "generated_artifact"},
+            "resolved_at": now,
+        }
+
+        for overrides in (
+            {"bound_entity_id": uuid.uuid4()},
+            {"bound_checksum": "e" * 64},
+            {"bound_version": "2"},
+            {"dependency_key": "map.other"},
+            {"dependency_output_profile": "other-profile"},
+        ):
+            values = base_values | overrides
+            with pytest.raises(IntegrityError):
+                async with session.begin_nested():
+                    session.add(ArtifactTaskDependencyBinding(**values))
+                    await session.flush()
+
+        second_event_id, second_revision_id = await _create_event_graph(session)
+        second_run = await _create_run(
+            session,
+            event_id=second_event_id,
+            revision_id=second_revision_id,
+            generation_seq=1,
+        )
+        second_task = await _create_task(session, run=second_run)
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                session.add(
+                    ArtifactTaskDependencyBinding(
+                        **(
+                            base_values
+                            | {
+                                "production_task_id": second_task.id,
+                                "dependency_key": artifact.artifact_key,
+                                "dependency_output_profile": artifact.output_profile,
+                            }
+                        )
+                    )
+                )
+                await session.flush()
+
+
+async def test_dependency_binding_accepts_terminal_without_binding() -> None:
+    now = datetime.now(UTC)
+    async with _rolled_back_session() as session:
+        event_id, revision_id = await _create_event_graph(session)
+        run = await _create_run(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            generation_seq=1,
+        )
+        task = await _create_task(session, run=run)
+        binding = ArtifactTaskDependencyBinding(
+            production_task_id=task.id,
+            dependency_kind="artifact",
+            dependency_key="map.intensity",
+            dependency_output_profile="a3v-professional",
+            is_optional=True,
+            resolution_status="omitted_after_wait",
+            resolution_detail={"reason": "optional dependency unavailable"},
+            resolved_at=now,
+        )
+        session.add(binding)
         await session.flush()
