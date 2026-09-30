@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.artifacts.catalog import load_catalog
@@ -484,6 +484,7 @@ class ArtifactOverrideService:
         file_name = _upload_file_name(upload, definition)
         staged: Path | None = None
         stored: StoredArtifactFile | None = None
+        claim: ArtifactOverrideRequest | None = None
         committed = False
         try:
             _rewind_upload(upload)
@@ -551,11 +552,61 @@ class ArtifactOverrideService:
             )
             committed = True
             return response
+        except IdempotencyConflictError as error:
+            if claim is not None:
+                await self._persist_failure(
+                    claim.id,
+                    claim.lease_generation,
+                    error_category="conflict",
+                    summary=str(error),
+                    error_type="IdempotencyConflictError",
+                    response_status=409,
+                )
+            raise
+        except ArtifactOverrideLeaseError as error:
+            if claim is not None:
+                await self._persist_failure(
+                    claim.id,
+                    claim.lease_generation,
+                    error_category="conflict",
+                    summary=str(error),
+                    error_type="ArtifactOverrideLeaseError",
+                    response_status=409,
+                )
+            raise
         finally:
             if staged is not None:
                 staged.unlink(missing_ok=True)
             if stored is not None and not committed:
-                self._store.delete_unreferenced(stored)
+                await self._delete_if_unreferenced(stored)
+
+    async def _delete_if_unreferenced(
+        self,
+        stored: StoredArtifactFile,
+    ) -> None:
+        if await self._is_storage_path_referenced(stored.relative_path):
+            return
+        self._store.delete_unreferenced(stored)
+
+    async def _is_storage_path_referenced(self, relative_path: str) -> bool:
+        async with self._session_factory() as session:
+            artifact_count = await session.scalar(
+                select(func.count())
+                .select_from(GeneratedArtifact)
+                .where(GeneratedArtifact.storage_path == relative_path)
+            )
+            publication_count = await session.scalar(
+                select(func.count())
+                .select_from(ArtifactPublication)
+                .where(
+                    ArtifactPublication.artifact_id.in_(
+                        select(GeneratedArtifact.id).where(
+                            GeneratedArtifact.storage_path == relative_path
+                        )
+                    )
+                )
+            )
+        return bool(artifact_count) or bool(publication_count)
 
     async def _load_context(
         self,
@@ -682,6 +733,12 @@ class ArtifactOverrideService:
                             row.lease_expires_at is None
                             or row.lease_expires_at <= now
                         ):
+                            recovered = await self._recover_committed_record(
+                                session,
+                                row,
+                            )
+                            if recovered is not None:
+                                return recovered
                             renewed = await self._renew_expired_lease(
                                 session,
                                 row,
@@ -692,6 +749,47 @@ class ArtifactOverrideService:
             if datetime.now(UTC) >= deadline:
                 raise RuntimeError("override request is still processing")
             await asyncio.sleep(self._poll_interval)
+
+    async def _recover_committed_record(
+        self,
+        session: object,
+        row: ArtifactOverrideRequest,
+    ) -> ArtifactOverrideRequest | None:
+        if row.production_run_id is None or row.artifact_id is None:
+            return None
+        artifact = await session.get(GeneratedArtifact, row.artifact_id)
+        publication = await session.scalar(
+            select(ArtifactPublication)
+            .where(
+                ArtifactPublication.artifact_id == row.artifact_id,
+                ArtifactPublication.production_run_id == row.production_run_id,
+            )
+            .order_by(ArtifactPublication.published_at.desc())
+            .limit(1)
+        )
+        run = await session.get(ProductionRun, row.production_run_id)
+        if artifact is None or publication is None or run is None:
+            return None
+        response = ArtifactOverrideResponse(
+            artifact_id=artifact.id,
+            production_run_id=run.id,
+            production_task_id=artifact.production_task_id,
+            artifact_publication_id=publication.id,
+            status=run.status,
+            generation_seq=run.generation_seq,
+            file_name=artifact.file_name,
+            checksum=artifact.checksum,
+            size_bytes=artifact.size_bytes,
+            generated_at=artifact.generated_at,
+        )
+        row.status = "succeeded"
+        row.response_status = 200
+        row.response_body = response.to_body()
+        row.production_run_id = run.id
+        row.artifact_id = artifact.id
+        row.completed_at = datetime.now(UTC)
+        await session.flush()
+        return row
 
     async def _renew_expired_lease(
         self,
@@ -734,6 +832,25 @@ class ArtifactOverrideService:
         lease_generation: int,
         validation: ValidationResult,
     ) -> None:
+        await self._persist_failure(
+            request_id,
+            lease_generation,
+            error_category=validation.error_category or "validation_failed",
+            summary=validation.summary,
+            error_type="ArtifactOverrideValidationError",
+            response_status=422,
+        )
+
+    async def _persist_failure(
+        self,
+        request_id: uuid.UUID,
+        lease_generation: int,
+        *,
+        error_category: str,
+        summary: str,
+        error_type: str,
+        response_status: int,
+    ) -> None:
         async with self._session_factory() as session:
             async with session.begin():
                 row = await session.get(
@@ -748,10 +865,11 @@ class ArtifactOverrideService:
                 if row.lease_generation != lease_generation:
                     return
                 row.status = "failed"
-                row.response_status = 422
+                row.response_status = response_status
                 row.response_body = {
-                    "error_category": validation.error_category,
-                    "summary": validation.summary,
+                    "error_category": error_category,
+                    "summary": summary,
+                    "error_type": error_type,
                 }
                 row.completed_at = datetime.now(UTC)
 
@@ -976,9 +1094,17 @@ def _sha256_path(path: Path) -> str:
 
 def _override_failure(row: ArtifactOverrideRequest) -> ArtifactOverrideValidationError:
     body = dict(row.response_body or {})
+    error_type = str(body.get("error_type") or "")
+    summary = str(body.get("summary") or "artifact override request failed")
+    if error_type in {
+        "IdempotencyConflictError",
+        "ArtifactOverrideLeaseError",
+        "conflict",
+    }:
+        raise IdempotencyConflictError(summary)
     return ArtifactOverrideValidationError(
         error_category=str(body.get("error_category") or "validation_failed"),
-        summary=str(body.get("summary") or "artifact override request failed"),
+        summary=summary,
     )
 
 

@@ -95,9 +95,17 @@ class ArtifactValidator:
                 production_mode=mode,
             )
         if definition.kind == ArtifactKind.DOCX:
-            return self._validate_docx(source, checksum=checksum)
+            return self._validate_docx(
+                source,
+                checksum=checksum,
+                production_mode=mode,
+            )
         if definition.kind == ArtifactKind.PPTX:
-            return self._validate_pptx(source, checksum=checksum)
+            return self._validate_pptx(
+                source,
+                checksum=checksum,
+                production_mode=mode,
+            )
         return _invalid("format_mismatch", "unsupported artifact kind")
 
     def _validate_map(
@@ -116,7 +124,7 @@ class ArtifactValidator:
                 actual_format = image.format
                 width, height = image.size
                 dpi = image.info.get("dpi")
-                marker_text = _image_marker_text(path, image)
+                marker_text = _image_marker_text(image)
                 non_empty_ratio = _non_empty_pixel_ratio(image)
         except (UnidentifiedImageError, OSError, ValueError) as error:
             return _invalid(
@@ -153,10 +161,10 @@ class ArtifactValidator:
                 dimensions=(width, height),
             )
         if production_mode in {"test", "drill", "replay"}:
-            if not _contains_marker(marker_text):
+            if not _has_required_marker(marker_text, production_mode):
                 return _invalid(
                     "marker_missing",
-                    "test, drill, or replay map must include a visible or metadata marker",
+                    "test, drill, or replay map must include the exact metadata marker",
                     checksum=checksum,
                     dimensions=(width, height),
                 )
@@ -172,6 +180,7 @@ class ArtifactValidator:
         path: Path,
         *,
         checksum: str,
+        production_mode: str,
     ) -> ValidationResult:
         try:
             from docx import Document
@@ -190,6 +199,14 @@ class ArtifactValidator:
                 "DOCX contains unresolved placeholder markers",
                 checksum=checksum,
             )
+        if production_mode in {"test", "drill", "replay"} and not (
+            _has_required_marker(text, production_mode)
+        ):
+            return _invalid(
+                "marker_missing",
+                "DOCX must include the exact mode marker in its body",
+                checksum=checksum,
+            )
         return ValidationResult(
             valid=True,
             summary="DOCX opened and contains no unresolved placeholders",
@@ -202,6 +219,7 @@ class ArtifactValidator:
         path: Path,
         *,
         checksum: str,
+        production_mode: str,
     ) -> ValidationResult:
         try:
             from pptx import Presentation
@@ -219,6 +237,15 @@ class ArtifactValidator:
             return _invalid(
                 "unresolved_placeholder",
                 "PPTX contains unresolved placeholder markers",
+                checksum=checksum,
+                page_count=page_count,
+            )
+        if production_mode in {"test", "drill", "replay"} and not (
+            _has_required_marker(text, production_mode)
+        ):
+            return _invalid(
+                "marker_missing",
+                "PPTX must include the exact mode marker in its body",
                 checksum=checksum,
                 page_count=page_count,
             )
@@ -270,25 +297,39 @@ def _non_empty_pixel_ratio(image: Image.Image) -> float:
     return float(np.mean(non_empty)) if non_empty.size else 0.0
 
 
-def _image_marker_text(path: Path, image: Image.Image) -> str:
-    pieces: list[str] = [path.name]
+def _image_marker_text(image: Image.Image) -> str:
+    pieces: list[str] = []
     info = image.info or {}
     for key in ("comment", "Comment", "description", "Description"):
         value = info.get(key)
         if value:
-            pieces.append(str(value))
+            pieces.append(_metadata_text(value))
     try:
         exif = image.getexif()
         if exif:
             for value in exif.values():
-                pieces.append(str(value))
+                pieces.append(_metadata_text(value))
     except Exception:
         pass
     return "\n".join(pieces)
 
 
-def _contains_marker(text: str) -> bool:
-    return any(marker in text for marker in ("测试", "演练", "测试回放"))
+def _required_marker(production_mode: str) -> str:
+    return {
+        "test": "【测试】",
+        "drill": "【演练】",
+        "replay": "【测试回放】",
+    }[production_mode]
+
+
+def _has_required_marker(text: str, production_mode: str) -> bool:
+    return _required_marker(production_mode) in text
+
+
+def _metadata_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _docx_text(document: Any) -> str:

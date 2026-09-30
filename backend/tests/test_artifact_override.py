@@ -23,6 +23,7 @@ from app.artifacts.service import (
     IdempotencyConflictError,
     sha256_json,
 )
+from app.artifacts.storage import ArtifactStore
 from app.db import engine
 
 
@@ -228,6 +229,185 @@ async def test_expected_current_artifact_id_mismatch_does_not_publish(
 
     assert current is not None
     assert current.artifact_id == published.id
+
+
+async def test_same_bytes_failure_preserves_current_publication_file(
+    artifact_override_service,
+    seeded_event,
+    session_factory,
+    tmp_path,
+) -> None:
+    first = await artifact_override_service.override(
+        actor_id="admin-id",
+        event_id=seeded_event.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        revision_id=seeded_event.current_revision_id,
+        reason="首次覆盖",
+        expected_current_artifact_id=None,
+        idempotency_key="00000000-0000-0000-0000-000000000007",
+        upload=io.BytesIO(_VALID_JPEG_BYTES),
+    )
+
+    async with session_factory() as session:
+        artifact = await session.get(GeneratedArtifact, first.artifact_id)
+        assert artifact is not None
+        storage_path = artifact.storage_path
+
+    stored_path = ArtifactStore(
+        tmp_path / "artifacts",
+        max_override_bytes=1024 * 1024,
+    ).resolve(storage_path)
+    assert stored_path.exists()
+
+    with pytest.raises(IdempotencyConflictError):
+        await artifact_override_service.override(
+            actor_id="admin-id",
+            event_id=seeded_event.id,
+            artifact_key="map.epicenter",
+            output_profile="a3v-professional",
+            revision_id=seeded_event.current_revision_id,
+            reason="相同字节但错误预期",
+            expected_current_artifact_id=uuid.uuid4(),
+            idempotency_key="00000000-0000-0000-0000-000000000008",
+            upload=io.BytesIO(_VALID_JPEG_BYTES),
+        )
+
+    assert stored_path.exists()
+    async with session_factory() as session:
+        current = await session.scalar(
+            select(ArtifactPublication).where(
+                ArtifactPublication.event_id == seeded_event.id,
+                ArtifactPublication.artifact_key == "map.epicenter",
+                ArtifactPublication.output_profile == "a3v-professional",
+                ArtifactPublication.production_mode == "live",
+                ArtifactPublication.superseded_at.is_(None),
+            )
+        )
+    assert current is not None
+    assert current.artifact_id == first.artifact_id
+
+
+async def test_expired_processing_with_committed_records_recovers_without_new_run(
+    artifact_override_service,
+    seeded_event,
+    session_factory,
+) -> None:
+    idempotency_key = "00000000-0000-0000-0000-000000000009"
+    first = await artifact_override_service.override(
+        actor_id="admin-id",
+        event_id=seeded_event.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        revision_id=seeded_event.current_revision_id,
+        reason="已提交租约恢复",
+        expected_current_artifact_id=None,
+        idempotency_key=idempotency_key,
+        upload=io.BytesIO(_VALID_JPEG_BYTES),
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            request = await session.scalar(
+                select(ArtifactOverrideRequest).where(
+                    ArtifactOverrideRequest.actor_id == "admin-id",
+                    ArtifactOverrideRequest.endpoint
+                    == ArtifactOverrideService.endpoint_for(
+                        seeded_event.id,
+                        "map.epicenter",
+                        "a3v-professional",
+                    ),
+                    ArtifactOverrideRequest.idempotency_key == idempotency_key,
+                )
+            )
+            assert request is not None
+            request.status = "processing"
+            request.lease_expires_at = now - timedelta(seconds=1)
+            request.lease_generation = 1
+            request.response_body = None
+
+    recovered = await artifact_override_service.override(
+        actor_id="admin-id",
+        event_id=seeded_event.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        revision_id=seeded_event.current_revision_id,
+        reason="已提交租约恢复",
+        expected_current_artifact_id=None,
+        idempotency_key=idempotency_key,
+        upload=io.BytesIO(_VALID_JPEG_BYTES),
+    )
+
+    async with session_factory() as session:
+        run_count = await session.scalar(
+            select(func.count())
+            .select_from(ProductionRun)
+            .where(ProductionRun.event_id == seeded_event.id)
+        )
+        request = await session.scalar(
+            select(ArtifactOverrideRequest).where(
+                ArtifactOverrideRequest.actor_id == "admin-id",
+                ArtifactOverrideRequest.endpoint
+                == ArtifactOverrideService.endpoint_for(
+                    seeded_event.id,
+                    "map.epicenter",
+                    "a3v-professional",
+                ),
+                ArtifactOverrideRequest.idempotency_key == idempotency_key,
+            )
+        )
+
+    assert recovered.artifact_id == first.artifact_id
+    assert recovered.production_run_id == first.production_run_id
+    assert run_count == 1
+    assert request is not None
+    assert request.status == "succeeded"
+
+
+async def test_expected_current_conflict_is_persisted_for_retry(
+    artifact_override_service,
+    seeded_artifact_assessment,
+    seeded_event,
+    session_factory,
+) -> None:
+    await seeded_artifact_assessment.published_artifact(
+        "map.epicenter",
+        version=1,
+    )
+    idempotency_key = "00000000-0000-0000-0000-000000000010"
+    kwargs = {
+        "actor_id": "admin-id",
+        "event_id": seeded_event.id,
+        "artifact_key": "map.epicenter",
+        "output_profile": "a3v-professional",
+        "revision_id": seeded_event.current_revision_id,
+        "reason": "错误预期",
+        "expected_current_artifact_id": uuid.uuid4(),
+        "idempotency_key": idempotency_key,
+        "upload": io.BytesIO(_VALID_JPEG_BYTES),
+    }
+
+    with pytest.raises(IdempotencyConflictError):
+        await artifact_override_service.override(**kwargs)
+    async with session_factory() as session:
+        request = await session.scalar(
+            select(ArtifactOverrideRequest).where(
+                ArtifactOverrideRequest.actor_id == "admin-id",
+                ArtifactOverrideRequest.endpoint
+                == ArtifactOverrideService.endpoint_for(
+                    seeded_event.id,
+                    "map.epicenter",
+                    "a3v-professional",
+                ),
+                ArtifactOverrideRequest.idempotency_key == idempotency_key,
+            )
+        )
+    assert request is not None
+    assert request.status == "failed"
+    assert request.response_body["error_type"] == "IdempotencyConflictError"
+
+    with pytest.raises(IdempotencyConflictError):
+        await artifact_override_service.override(**kwargs)
 
 
 async def test_expired_processing_request_is_recovered(
