@@ -356,6 +356,7 @@ class OfflineBasemapPackage:
     source_statement: str = "offline"
     package_format: str = "directory"
     index_file: str | None = None
+    tile_scheme: str = "xyz"
     tile_count: int | None = None
     file_count: int | None = None
     record_count: int | None = None
@@ -394,6 +395,8 @@ class OfflineBasemapPackage:
             raise ValueError(f"unsupported package format: {self.package_format}")
         if self.package_format != "directory" and not self.index_file:
             raise ValueError("mbtiles and pmtiles packages require an index_file")
+        if self.tile_scheme not in {"xyz", "tms"}:
+            raise ValueError("tile_scheme must be xyz or tms")
         if self.format != self.format.lower():
             raise ValueError("tile format must be lowercase")
 
@@ -467,6 +470,7 @@ class OfflineBasemapPackage:
             "source_statement": self.source_statement,
             "package_format": self.package_format,
             "index_file": self.index_file,
+            "tile_scheme": self.tile_scheme,
             "tile_count": self.tile_count,
             "file_count": self.file_count,
             "record_count": self.record_count,
@@ -628,8 +632,9 @@ def _pmtiles_tileid_to_zxy(tile_id: int) -> tuple[int, int, int]:
 
 
 class _MBTilesTileStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, tile_scheme: str = "tms") -> None:
         self._path = path
+        self._tile_scheme = tile_scheme
         connection = sqlite3.connect(str(path))
         try:
             rows = connection.execute(
@@ -640,7 +645,16 @@ class _MBTilesTileStore:
         except Exception:
             connection.close()
             raise
-        self._tiles = tuple(TileKey(*row) for row in rows)
+        self._tiles = tuple(
+            TileKey(
+                row[0],
+                row[1],
+                row[2]
+                if self._tile_scheme == "xyz"
+                else (1 << row[0]) - 1 - row[2],
+            )
+            for row in rows
+        )
 
     @property
     def tile_count(self) -> int:
@@ -658,10 +672,11 @@ class _MBTilesTileStore:
         return self._tiles
 
     def read_tile(self, key: TileKey) -> bytes:
+        tile_row = key.y if self._tile_scheme == "xyz" else (1 << key.z) - 1 - key.y
         row = self._connection.execute(
             "SELECT tile_data FROM tiles "
             "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
-            (key.z, key.x, key.y),
+            (key.z, key.x, tile_row),
         ).fetchone()
         if row is None:
             raise KeyError(key.to_tuple())
@@ -882,6 +897,16 @@ def _validate_package_manifest(payload: Mapping[str, Any], provider: str) -> dic
     tile_format = str(
         payload.get("tile_format", payload.get("format", "png"))
     ).lower()
+    tile_scheme = str(
+        payload.get(
+            "tile_scheme",
+            "tms" if package_format == "mbtiles" else "xyz",
+        )
+    )
+    if tile_scheme not in {"xyz", "tms"}:
+        raise ValueError("tile_scheme must be xyz or tms")
+    if package_format != "mbtiles" and tile_scheme != "xyz":
+        raise ValueError("tile_scheme=tms is only valid for mbtiles packages")
     index_file = payload.get("index_file")
     if package_format != "directory":
         if not isinstance(index_file, str) or not index_file:
@@ -911,6 +936,7 @@ def _validate_package_manifest(payload: Mapping[str, Any], provider: str) -> dic
         "source_statement": source_statement,
         "package_format": package_format,
         "index_file": index_file if package_format != "directory" else None,
+        "tile_scheme": tile_scheme,
         "tile_count": _manifest_int(
             payload.get("tile_count"),
             "tile_count",
@@ -933,80 +959,115 @@ def _validate_package_manifest(payload: Mapping[str, Any], provider: str) -> dic
     }
 
 
+def _load_provider_package(
+    root_path: Path,
+    provider: str,
+) -> OfflineBasemapPackage | None:
+    provider_dir = root_path / provider
+    manifest_path = provider_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{manifest_path} must contain a JSON object")
+    meta = _validate_package_manifest(payload, provider)
+
+    tile_store: OfflineTileStore | None = None
+    files: dict[TileKey, bytes] = {}
+    if meta["package_format"] == "directory":
+        tiles = meta["tiles"]
+        for tile in tiles:
+            tile_path = (
+                provider_dir
+                / "tiles"
+                / str(tile.z)
+                / str(tile.x)
+                / f"{tile.y}.{meta['tile_format']}"
+            )
+            if not tile_path.is_file():
+                raise FileNotFoundError(
+                    f"offline basemap tile file is missing: {tile_path}"
+                )
+            files[tile] = tile_path.read_bytes()
+    elif meta["package_format"] == "mbtiles":
+        index_path = provider_dir / meta["index_file"]
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"offline basemap MBTiles file is missing: {index_path}"
+            )
+        tile_store = _MBTilesTileStore(
+            index_path,
+            tile_scheme=meta["tile_scheme"],
+        )
+    elif meta["package_format"] == "pmtiles":
+        index_path = provider_dir / meta["index_file"]
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"offline basemap PMTiles file is missing: {index_path}"
+            )
+        tile_store = _PMTilesTileStore(index_path)
+    else:
+        raise ValueError(f"unsupported package format: {meta['package_format']}")
+
+    tiles = tile_store.tile_keys() if tile_store is not None else meta["tiles"]
+    return OfflineBasemapPackage(
+        provider=meta["provider"],
+        package_id=meta["package_id"],
+        version=meta["version"],
+        checksum=meta["checksum"],
+        generated_at=meta["generated_at"],
+        max_age_days=meta["max_age_days"],
+        coverage_bounds=meta["coverage_bounds"],
+        zoom_levels=meta["zoom_levels"],
+        tiles=tiles,
+        files=files,
+        format=meta["tile_format"],
+        source_statement=meta["source_statement"],
+        package_format=meta["package_format"],
+        index_file=meta["index_file"],
+        tile_scheme=meta["tile_scheme"],
+        tile_count=meta["tile_count"] or len(tiles),
+        file_count=meta["file_count"] or tile_store.file_count
+        if tile_store is not None
+        else len(files),
+        record_count=meta["record_count"] or tile_store.record_count
+        if tile_store is not None
+        else len(tiles),
+        tile_store=tile_store,
+    )
+
+
 def load_offline_basemap_packages(root: str | Path) -> dict[str, OfflineBasemapPackage]:
     packages: dict[str, OfflineBasemapPackage] = {}
     root_path = Path(root)
     for provider in ("gaode", "tianditu"):
-        provider_dir = root_path / provider
-        manifest_path = provider_dir / "manifest.json"
-        if not manifest_path.is_file():
-            continue
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, Mapping):
-            raise ValueError(f"{manifest_path} must contain a JSON object")
-        meta = _validate_package_manifest(payload, provider)
-
-        tile_store: OfflineTileStore | None = None
-        files: dict[TileKey, bytes] = {}
-        if meta["package_format"] == "directory":
-            tiles = meta["tiles"]
-            for tile in tiles:
-                tile_path = (
-                    provider_dir
-                    / "tiles"
-                    / str(tile.z)
-                    / str(tile.x)
-                    / f"{tile.y}.{meta['tile_format']}"
-                )
-                if not tile_path.is_file():
-                    raise FileNotFoundError(
-                        f"offline basemap tile file is missing: {tile_path}"
-                    )
-                files[tile] = tile_path.read_bytes()
-        elif meta["package_format"] == "mbtiles":
-            index_path = provider_dir / meta["index_file"]
-            if not index_path.is_file():
-                raise FileNotFoundError(
-                    f"offline basemap MBTiles file is missing: {index_path}"
-                )
-            tile_store = _MBTilesTileStore(index_path)
-        elif meta["package_format"] == "pmtiles":
-            index_path = provider_dir / meta["index_file"]
-            if not index_path.is_file():
-                raise FileNotFoundError(
-                    f"offline basemap PMTiles file is missing: {index_path}"
-                )
-            tile_store = _PMTilesTileStore(index_path)
-        else:
-            raise ValueError(f"unsupported package format: {meta['package_format']}")
-
-        tiles = tile_store.tile_keys() if tile_store is not None else meta["tiles"]
-        package = OfflineBasemapPackage(
-            provider=meta["provider"],
-            package_id=meta["package_id"],
-            version=meta["version"],
-            checksum=meta["checksum"],
-            generated_at=meta["generated_at"],
-            max_age_days=meta["max_age_days"],
-            coverage_bounds=meta["coverage_bounds"],
-            zoom_levels=meta["zoom_levels"],
-            tiles=tiles,
-            files=files,
-            format=meta["tile_format"],
-            source_statement=meta["source_statement"],
-            package_format=meta["package_format"],
-            index_file=meta["index_file"],
-            tile_count=meta["tile_count"] or len(tiles),
-            file_count=meta["file_count"] or tile_store.file_count
-            if tile_store is not None
-            else len(files),
-            record_count=meta["record_count"] or tile_store.record_count
-            if tile_store is not None
-            else len(tiles),
-            tile_store=tile_store,
-        )
-        packages[provider] = package
+        package = _load_provider_package(root_path, provider)
+        if package is not None:
+            packages[provider] = package
     return packages
+
+
+def load_offline_basemap_candidates(
+    root: str | Path,
+) -> tuple[dict[str, OfflineBasemapPackage], dict[str, BasemapValidationResult]]:
+    packages: dict[str, OfflineBasemapPackage] = {}
+    failures: dict[str, BasemapValidationResult] = {}
+    root_path = Path(root)
+    for provider in ("gaode", "tianditu"):
+        try:
+            package = _load_provider_package(root_path, provider)
+        except Exception as error:
+            failures[provider] = BasemapValidationResult(
+                provider=provider,
+                package_id="",
+                valid=False,
+                error_category="package_load_failed",
+                error_message=str(error),
+            )
+            continue
+        if package is not None:
+            packages[provider] = package
+    return packages, failures
 
 
 @dataclass(frozen=True, slots=True)
@@ -1168,10 +1229,14 @@ class AllBasemapsUnavailableError(RuntimeError):
         *,
         gaode_error: str | None = None,
         tianditu_error: str | None = None,
+        gaode_failure: BasemapValidationResult | None = None,
+        tianditu_failure: BasemapValidationResult | None = None,
     ) -> None:
         super().__init__(message)
         self.gaode_error = gaode_error
         self.tianditu_error = tianditu_error
+        self.gaode_failure = gaode_failure
+        self.tianditu_failure = tianditu_failure
 
 
 class BasemapSelector:
@@ -1219,4 +1284,6 @@ class BasemapSelector:
             f"tianditu={tianditu_result.error_category}",
             gaode_error=gaode_result.error_category,
             tianditu_error=tianditu_result.error_category,
+            gaode_failure=gaode_result,
+            tianditu_failure=tianditu_result,
         )

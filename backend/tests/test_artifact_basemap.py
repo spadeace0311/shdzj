@@ -435,7 +435,7 @@ def test_missing_physical_tile_in_mbtiles_is_required_tile_missing(
         connection.execute(
             "DELETE FROM tiles WHERE zoom_level = ? AND tile_column = ? "
             "AND tile_row = ?",
-            (missing.z, missing.x, missing.y),
+            (missing.z, missing.x, (1 << missing.z) - 1 - missing.y),
         )
         connection.commit()
     finally:
@@ -589,3 +589,68 @@ def test_selector_validates_both_candidates_before_selection(
     )
 
     assert selected.provider == "gaode"
+
+
+def test_mbtiles_default_tms_rows_are_converted_to_xyz(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+        tile_scheme="tms",
+    )
+
+    package = _load_one_package(tmp_path, "gaode", tile_manifest)
+
+    assert set(package.tiles) == set(tile_manifest.tiles)
+
+
+def test_mbtiles_xyz_override_keeps_direct_rows(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+        tile_scheme="xyz",
+    )
+
+    package = _load_one_package(tmp_path, "gaode", tile_manifest)
+
+    assert set(package.tiles) == set(tile_manifest.tiles)
+
+
+def test_mbtiles_rejects_unknown_tile_scheme(
+    tmp_path,
+    tile_manifest: MapViewportTileManifest,
+) -> None:
+    write_basemap_package(
+        tmp_path,
+        provider="gaode",
+        package_format="mbtiles",
+        tiles=tile_manifest.tiles,
+        zoom_levels=tile_manifest.zoom_levels,
+        coverage_bounds=tile_manifest.union_bounds_3857(),
+        tile_bytes=_png_bytes(),
+        generated_at=datetime(2026, 9, 29, tzinfo=UTC),
+    )
+    manifest_path = tmp_path / "gaode" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["tile_scheme"] = "bogus"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tile_scheme"):
+        load_offline_basemap_packages(tmp_path)

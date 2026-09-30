@@ -14,13 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.basemap import (
     AllBasemapsUnavailableError,
-    BasemapSelector,
+    BasemapValidationResult,
     MapViewportTileManifest,
     OfflineBasemapPackage,
     OfflineBasemapValidator,
     SelectedBasemap,
     VIEWPORT_RADII_KM,
-    load_offline_basemap_packages,
+    load_offline_basemap_candidates,
 )
 from app.artifacts.domain import ArtifactCatalog, ArtifactKind, DependencyKind
 from app.artifacts.models import (
@@ -193,19 +193,24 @@ class ProductionContextService:
             if assessment_run is not None
             else run.deadline_basis_at
         )
-        offline_packages = self._offline_basemap_packages
-        if offline_packages is None:
-            offline_packages = load_offline_basemap_packages(
-                settings.artifact_basemap_root
-            )
         requires_basemap = _run_requires_offline_basemap(
             catalog,
             run.required_outputs,
         )
+        offline_packages = self._offline_basemap_packages
+        offline_failures: dict[str, BasemapValidationResult] = {}
+        if offline_packages is None:
+            if requires_basemap:
+                offline_packages, offline_failures = load_offline_basemap_candidates(
+                    settings.artifact_basemap_root
+                )
+            else:
+                offline_packages = {}
         selected_basemap_payload = self._select_basemap(
             basemap_viewport_manifests,
             observed_at=deadline_basis_at,
             packages=offline_packages,
+            failures=offline_failures,
             required=requires_basemap,
         )
         selected_basemap = _selected_basemap(selected_basemap_payload)
@@ -364,49 +369,51 @@ class ProductionContextService:
         *,
         observed_at: datetime,
         packages: Mapping[str, OfflineBasemapPackage],
+        failures: Mapping[str, BasemapValidationResult],
         required: bool,
     ) -> dict[str, Any] | None:
         gaode = packages.get("gaode")
         tianditu = packages.get("tianditu")
-        if gaode is None and tianditu is None:
-            if required:
-                raise AllBasemapsUnavailableError(
-                    "no offline basemap package is available",
-                    gaode_error="missing",
-                    tianditu_error="missing",
-                )
-            return None
-        if gaode is not None and tianditu is not None:
-            return BasemapSelector().select(
-                gaode,
-                tianditu,
-                manifests,
-                observed_at=observed_at,
+        gaode_result = _basemap_candidate_result(
+            "gaode",
+            gaode,
+            failures.get("gaode"),
+            manifests,
+            observed_at=observed_at,
+        )
+        tianditu_result = _basemap_candidate_result(
+            "tianditu",
+            tianditu,
+            failures.get("tianditu"),
+            manifests,
+            observed_at=observed_at,
+        )
+        if gaode_result.valid:
+            return SelectedBasemap(
+                provider=gaode.provider,
+                package_id=gaode.package_id,
+                version=gaode.version,
+                checksum=gaode.checksum,
+                selection_reason="gaode validated",
             ).to_dict()
-
-        validator = OfflineBasemapValidator()
-        for provider, package in (("gaode", gaode), ("tianditu", tianditu)):
-            if package is None:
-                continue
-            result = validator.validate_package(
-                package,
-                manifests,
-                observed_at=observed_at,
-            )
-            if result.valid:
-                return {
-                    "provider": package.provider,
-                    "package_id": package.package_id,
-                    "version": package.version,
-                    "checksum": package.checksum,
-                    "selection_reason": f"{provider} validated",
-                    "provider_style_key": f"{provider}-local-v1",
-                }
+        if tianditu_result.valid:
+            return SelectedBasemap(
+                provider=tianditu.provider,
+                package_id=tianditu.package_id,
+                version=tianditu.version,
+                checksum=tianditu.checksum,
+                selection_reason=(
+                    f"gaode invalid: {gaode_result.error_category}; "
+                    "tianditu validated"
+                ),
+            ).to_dict()
         if required:
             raise AllBasemapsUnavailableError(
                 "no validated offline basemap is available",
-                gaode_error="missing" if gaode is None else "invalid",
-                tianditu_error="missing" if tianditu is None else "invalid",
+                gaode_error=gaode_result.error_category,
+                tianditu_error=tianditu_result.error_category,
+                gaode_failure=gaode_result,
+                tianditu_failure=tianditu_result,
             )
         return None
 
@@ -670,6 +677,31 @@ def _basemap_tile_manifest_entries(
     return sorted(
         entries,
         key=lambda item: (item["viewport_radius_km"], item["zoom_level"]),
+    )
+
+
+def _basemap_candidate_result(
+    provider: str,
+    package: OfflineBasemapPackage | None,
+    failure: BasemapValidationResult | None,
+    manifests: Sequence[MapViewportTileManifest],
+    *,
+    observed_at: datetime,
+) -> BasemapValidationResult:
+    if failure is not None:
+        return failure
+    if package is None:
+        return BasemapValidationResult(
+            provider=provider,
+            package_id="",
+            valid=False,
+            error_category="package_missing",
+            error_message="offline basemap package is missing",
+        )
+    return OfflineBasemapValidator().validate_package(
+        package,
+        manifests,
+        observed_at=observed_at,
     )
 
 

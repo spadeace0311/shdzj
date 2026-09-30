@@ -73,6 +73,7 @@ def manifest_payload(
     source_statement: str,
     package_format: str,
     index_file: str | None,
+    tile_scheme: str,
     tile_count: int,
     file_count: int,
     record_count: int,
@@ -90,6 +91,7 @@ def manifest_payload(
         "source_statement": source_statement,
         "package_format": package_format,
         "index_file": index_file,
+        "tile_scheme": tile_scheme,
         "tile_count": tile_count,
         "file_count": file_count,
         "record_count": record_count,
@@ -141,6 +143,8 @@ def write_mbtiles(
     path: Path,
     tiles: tuple[TileKey, ...],
     tile_bytes: bytes,
+    *,
+    tile_scheme: str = "tms",
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
@@ -158,7 +162,14 @@ def write_mbtiles(
             "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) "
             "VALUES (?, ?, ?, ?)",
             [
-                (tile.z, tile.x, tile.y, tile_bytes)
+                (
+                    tile.z,
+                    tile.x,
+                    tile.y
+                    if tile_scheme == "xyz"
+                    else (1 << tile.z) - 1 - tile.y,
+                    tile_bytes,
+                )
                 for tile in sorted(tiles)
             ],
         )
@@ -284,6 +295,7 @@ def write_basemap_package(
     generated_at: datetime,
     package_id: str | None = None,
     version: str = "v1",
+    tile_scheme: str | None = None,
     tile_count: int | None = None,
     file_count: int | None = None,
     record_count: int | None = None,
@@ -291,6 +303,9 @@ def write_basemap_package(
     provider_dir = root / provider
     provider_dir.mkdir(parents=True, exist_ok=True)
     resolved_package_id = package_id or f"{provider}-offline-v1"
+    resolved_tile_scheme = tile_scheme or (
+        "xyz" if package_format == "pmtiles" else "tms"
+    )
     actual_tile_count = tile_count if tile_count is not None else len(tiles)
     actual_record_count = record_count if record_count is not None else len(tiles)
     index_file = f"{provider}.{package_format}"
@@ -300,6 +315,7 @@ def write_basemap_package(
             provider_dir / index_file,
             tiles,
             tile_bytes,
+            tile_scheme=resolved_tile_scheme,
         )
     elif package_format == "pmtiles":
         actual_file_count = file_count if file_count is not None else 1
@@ -323,6 +339,7 @@ def write_basemap_package(
         source_statement=f"{provider} offline basemap fixture",
         package_format=package_format,
         index_file=index_file,
+        tile_scheme=resolved_tile_scheme,
         tile_count=actual_tile_count,
         file_count=actual_file_count,
         record_count=actual_record_count,

@@ -25,7 +25,12 @@ from app.data_assets.models import DataAsset, DataAssetVersion
 from app.data_assets.registry import get_asset_definition
 from app.events.models import EarthquakeEvent
 from app.loss.region import load_region_loss_profile
-from tests.basemap_fixtures import make_in_memory_package
+from tests.basemap_fixtures import (
+    make_in_memory_package,
+    png_tile_bytes,
+    union_bounds_3857,
+    write_basemap_package,
+)
 from tests.data_asset_helpers import (
     FIXTURE_ACTOR,
     _cleanup_fixture_data,
@@ -63,6 +68,52 @@ def production_context_service() -> ProductionContextService:
             "tianditu": make_in_memory_package(manifests, provider="tianditu"),
         },
     )
+
+
+def _settings_manifests() -> tuple[MapViewportTileManifest, ...]:
+    return tuple(
+        MapViewportTileManifest.build(
+            center_lon=121.5,
+            center_lat=31.2,
+            radius_km=radius_km,
+            output_width=settings.artifact_basemap_output_width,
+            output_height=settings.artifact_basemap_output_height,
+            zoom_levels=settings.artifact_basemap_zoom_levels,
+            padding=settings.artifact_basemap_buffer_pixels,
+        )
+        for radius_km in VIEWPORT_RADII_KM
+    )
+
+
+def _write_context_package(
+    root,
+    *,
+    provider: str,
+    package_format: str = "mbtiles",
+    tile_scheme: str = "tms",
+) -> tuple[MapViewportTileManifest, ...]:
+    manifests = _settings_manifests()
+    tiles = tuple(
+        sorted(
+            {
+                tile
+                for manifest in manifests
+                for tile in manifest.tiles
+            }
+        )
+    )
+    write_basemap_package(
+        root,
+        provider=provider,
+        package_format=package_format,
+        tiles=tiles,
+        zoom_levels=tuple(sorted({tile.z for tile in tiles})),
+        coverage_bounds=union_bounds_3857(tiles),
+        tile_bytes=png_tile_bytes(),
+        generated_at=datetime.now(UTC),
+        tile_scheme=tile_scheme,
+    )
+    return manifests
 
 
 @pytest.fixture(autouse=True)
@@ -532,3 +583,86 @@ async def test_static_context_fails_hard_when_basemap_is_required_but_missing(
             run.id,
             seeded_artifact_assessment.catalog,
         )
+
+
+async def test_map_fallback_accepts_valid_gaode_when_tianditu_is_broken(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _write_context_package(tmp_path, provider="gaode")
+    _write_context_package(tmp_path, provider="tianditu")
+    (tmp_path / "tianditu" / "tianditu.mbtiles").unlink()
+    monkeypatch.setattr(settings, "artifact_basemap_root", str(tmp_path))
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    async with session_factory() as freeze_session:
+        async with freeze_session.begin():
+            context = await service.freeze_static_context(
+                freeze_session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+
+    assert context.selected_basemap is not None
+    assert context.selected_basemap.provider == "gaode"
+
+
+async def test_map_fallback_uses_tianditu_when_gaode_is_broken(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _write_context_package(tmp_path, provider="gaode")
+    _write_context_package(tmp_path, provider="tianditu")
+    (tmp_path / "gaode" / "gaode.mbtiles").unlink()
+    monkeypatch.setattr(settings, "artifact_basemap_root", str(tmp_path))
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    async with session_factory() as freeze_session:
+        async with freeze_session.begin():
+            context = await service.freeze_static_context(
+                freeze_session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+
+    assert context.selected_basemap is not None
+    assert context.selected_basemap.provider == "tianditu"
+
+
+async def test_non_map_run_does_not_touch_broken_basemap_packages(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider_dir = tmp_path / "gaode"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "manifest.json").write_text("{bad-json", encoding="utf-8")
+    monkeypatch.setattr(settings, "artifact_basemap_root", str(tmp_path))
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+    )
+    async with session_factory() as create_session:
+        async with create_session.begin():
+            run = await ArtifactProductionRepository().create_run(
+                create_session,
+                seeded_artifact_assessment.rebuild_command("doc.background"),
+            )
+            context = await service.freeze_static_context(
+                create_session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+
+    assert context.selected_basemap is None
