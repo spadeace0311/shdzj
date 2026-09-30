@@ -11,6 +11,7 @@ from typing import Any
 from pptx import Presentation
 from pptx.util import Inches
 
+from app.artifacts.catalog import load_catalog
 from app.artifacts.domain import ArtifactNameContext, ProductionMode
 from app.artifacts.naming import build_artifact_file_name
 from app.artifacts.renderers.base import RenderResult
@@ -58,7 +59,7 @@ class PptxRenderer:
         )
 
         presentation = Presentation(str(spec.template_path))
-        self._validate_template(presentation)
+        self._validate_template(presentation, spec)
 
         values = dict(spec.control_fields)
         values["file_name"] = file_name
@@ -123,7 +124,11 @@ class PptxRenderer:
             control_fields=dict(spec.control_fields),
         )
 
-    def _validate_template(self, presentation: Any) -> None:
+    def _validate_template(
+        self,
+        presentation: Any,
+        spec: DocumentRenderSpec,
+    ) -> None:
         if len(presentation.slides) != len(DECISION_TEMPLATE_SLIDES):
             raise ValueError(
                 "decision template must contain exactly "
@@ -154,6 +159,21 @@ class PptxRenderer:
                 raise ValueError(
                     f"decision template image slots for {layout_key!r} are invalid"
                 )
+        definition = load_catalog(
+            settings.artifact_catalog_path
+        ).get(spec.artifact_key, "a3v-professional")
+        template_text = _presentation_text(presentation)
+        missing = [
+            field
+            for field in definition.control_fields
+            if not field.startswith("image:")
+            and f"{{{{{field}}}}}" not in template_text
+        ]
+        if missing:
+            raise ValueError(
+                "decision template is missing declared text placeholders: "
+                + ", ".join(missing)
+            )
 
     def _replace_text_placeholders(
         self,
@@ -276,6 +296,15 @@ def _remove_shape(shape: Any) -> None:
     parent = shape._element.getparent()
     if parent is not None:
         parent.remove(shape._element)
+
+
+def _presentation_text(presentation: Any) -> str:
+    return "\n".join(
+        shape.text_frame.text
+        for slide in presentation.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
 
 
 def _sha256_path(path: Path) -> str:

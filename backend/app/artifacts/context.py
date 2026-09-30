@@ -164,6 +164,89 @@ class DocumentRenderContext:
         return 8
 
 
+def _decision_report_products_from_artifact(
+    artifact: Any,
+    control_fields: object,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(control_fields, Mapping):
+        return {}
+    fields = dict(control_fields)
+    source_versions = str(fields.get("source_versions") or "")
+    products: dict[str, dict[str, Any]] = {}
+    for product_key, field_key in (
+        ("intensity.fusion", "intensity"),
+        ("loss.buildings", "buildings"),
+        ("loss.population", "population"),
+        ("loss.casualties", "casualties"),
+        ("loss.economic", "economy"),
+        ("loss.resources", "resources"),
+        ("loss.validate", "resources"),
+    ):
+        summary = fields.get(field_key)
+        if summary is None:
+            continue
+        payload: dict[str, Any] = {
+            "version": _source_version(source_versions, product_key)
+            or str(artifact.artifact_version),
+            "checksum": artifact.checksum,
+            "summary": summary,
+        }
+        if product_key == "intensity.fusion":
+            payload["grade"] = summary
+        elif product_key == "loss.buildings":
+            payload.update({"total": summary, "severe": summary})
+        elif product_key == "loss.population":
+            payload.update({"affected": summary, "resident": summary})
+        elif product_key == "loss.casualties":
+            payload.update({"deaths": summary, "injuries": summary})
+        elif product_key == "loss.economic":
+            payload.update({"loss": summary, "gdp": summary})
+        elif product_key == "loss.resources":
+            payload["demand"] = summary
+        elif product_key == "loss.validate":
+            payload["grade"] = summary
+        products[product_key] = payload
+    return products
+
+
+def _source_version(source_versions: str, product_key: str) -> str | None:
+    prefix = f"{product_key}: 版本 "
+    for line in source_versions.splitlines():
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix):].split(" /", 1)[0].strip()
+        if value:
+            return value
+    return None
+
+
+def _merge_decision_background_fields(
+    manifest: dict[str, Any],
+    control_fields: object,
+) -> dict[str, Any]:
+    if not isinstance(control_fields, Mapping):
+        return manifest
+    fields = dict(control_fields)
+    targets = dict(manifest.get("targets") or {})
+    if fields.get("key_targets") is not None:
+        targets["key_target"] = fields["key_targets"]
+        manifest["targets"] = targets
+    faults = dict(manifest.get("faults") or {})
+    if fields.get("faults") is not None:
+        faults["summary"] = fields["faults"]
+        manifest["faults"] = faults
+    spatial = dict(manifest.get("spatial_distances") or {})
+    for field_key, spatial_key in (
+        ("city_distance", "city_distance"),
+        ("fault_distance", "fault_distance"),
+    ):
+        if fields.get(field_key) is not None:
+            spatial[spatial_key] = fields[field_key]
+    if spatial:
+        manifest["spatial_distances"] = spatial
+    return manifest
+
+
 class ProductionContextService:
     def __init__(
         self,
@@ -531,6 +614,12 @@ class ProductionContextService:
             session,
             run.id,
         )
+        manifest = await self._merge_decision_report_products(
+            session,
+            run.id,
+            manifest,
+            task.artifact_key,
+        )
         asset_versions = _frozen_asset_map(manifest.get("assets", ()))
         asset_versions.update(generated_assets)
         return DocumentRenderContext(
@@ -547,6 +636,52 @@ class ProductionContextService:
             marker=_mode_marker(run.production_mode),
             artifact_paths=artifact_paths,
         )
+
+    async def _merge_decision_report_products(
+        self,
+        session: AsyncSession,
+        production_run_id: uuid.UUID,
+        manifest: dict[str, Any],
+        artifact_key: str,
+    ) -> dict[str, Any]:
+        if artifact_key not in {
+            "doc.decision_report",
+            "deck.decision_report",
+        }:
+            return manifest
+        rows = (
+            await session.scalars(
+                select(GeneratedArtifact)
+                .where(
+                    GeneratedArtifact.production_run_id == production_run_id,
+                    GeneratedArtifact.is_final.is_(True),
+                    GeneratedArtifact.artifact_key.in_(
+                        ("doc.rapid_brief", "doc.rapid_report")
+                    ),
+                )
+                .order_by(GeneratedArtifact.created_at.desc())
+            )
+        ).all()
+        for artifact in rows:
+            render_manifest = dict(artifact.render_manifest or {})
+            control_fields = render_manifest.get("control_fields")
+            products = _decision_report_products_from_artifact(
+                artifact,
+                control_fields,
+            )
+            if not products:
+                continue
+            assessment = dict(manifest.get("assessment") or {})
+            current_products = dict(assessment.get("products") or {})
+            current_products.update(products)
+            assessment["products"] = current_products
+            manifest["assessment"] = assessment
+            manifest = _merge_decision_background_fields(
+                manifest,
+                control_fields,
+            )
+            break
+        return manifest
 
     async def _merge_task_document_manifest(
         self,

@@ -43,6 +43,15 @@ CORE_DOC_KEYS = {
     "doc.decision_report",
     "deck.decision_report",
 }
+CORE_ASSESSMENT_PRODUCT_KEYS = (
+    "intensity.fusion",
+    "loss.buildings",
+    "loss.population",
+    "loss.casualties",
+    "loss.economic",
+    "loss.resources",
+    "loss.validate",
+)
 DECISION_DECK_MAP_KEYS = (
     "map.intensity",
     "map.economic_loss",
@@ -575,6 +584,8 @@ def build_core_document_spec(
     hard_product_keys, hard_artifact_keys, optional_artifact_keys = (
         _core_dependency_keys(definition)
     )
+    if artifact_key in {"doc.decision_report", "deck.decision_report"}:
+        hard_product_keys = CORE_ASSESSMENT_PRODUCT_KEYS
     if artifact_key == "deck.decision_report":
         required_map_keys = DECISION_DECK_MAP_KEYS
         artifact_dependency_keys = (
@@ -600,7 +611,7 @@ def build_core_document_spec(
         if not _artifact_available(context, key)
     ]
     degradation_reasons = [
-        _dependency_review_label(key)
+        _dependency_review_label(key, catalog)
         for key in (
             missing_products
             + missing_required_artifacts
@@ -609,9 +620,7 @@ def build_core_document_spec(
     ]
     needs_review = bool(degradation_reasons)
 
-    if definition.failure_policy == "block" and (
-        missing_products or missing_required_artifacts
-    ):
+    if missing_products or missing_required_artifacts:
         first_missing = (missing_products + missing_required_artifacts)[0]
         raise FileNotFoundError(
             f"required core document dependency unavailable: {first_missing}"
@@ -672,6 +681,7 @@ def build_core_document_spec(
         artifact_key,
         required_map_keys,
         optional_artifact_keys,
+        catalog,
     )
 
     return DocumentRenderSpec(
@@ -740,11 +750,10 @@ def _artifact_available(
     return True
 
 
-def _dependency_review_label(key: str) -> str:
+def _dependency_review_label(key: str, catalog: Any) -> str:
     if key in _OPTIONAL_ARTIFACT_REVIEW_LABELS:
         return _OPTIONAL_ARTIFACT_REVIEW_LABELS[key]
     if key.startswith("map."):
-        catalog = load_catalog(settings.artifact_catalog_path)
         display_name = catalog.get(key, "a3v-professional").display_name
         compact = (
             display_name
@@ -1097,8 +1106,8 @@ def _core_images(
     artifact_key: str,
     required_map_keys: Sequence[str],
     optional_map_keys: Sequence[str],
+    catalog: Any,
 ) -> tuple[DocumentImage, ...]:
-    catalog = load_catalog(settings.artifact_catalog_path)
     keys: tuple[str, ...]
     if artifact_key == "deck.decision_report":
         keys = DECISION_DECK_MAP_KEYS

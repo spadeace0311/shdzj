@@ -355,6 +355,7 @@ class ArtifactAssessmentFixture:
         t1_at: datetime | None = None,
         failed_optional_artifacts: set[str] | None = None,
         missing_artifact_keys: set[str] | None = None,
+        failed_products: set[str] | None = None,
     ) -> DocumentRenderContext:
         definition = self.catalog.get(artifact_key, "a3v-professional")
         marker = {
@@ -366,6 +367,7 @@ class ArtifactAssessmentFixture:
         }[production_mode]
         failed_optional_artifacts = set(failed_optional_artifacts or ())
         missing_artifact_keys = set(missing_artifact_keys or ())
+        failed_products = set(failed_products or ())
         background_checksum = _sha256_file(
             Path(settings.artifact_template_root) / "background-template.docx"
         )
@@ -490,63 +492,67 @@ class ArtifactAssessmentFixture:
             "depth_km": 10.0,
             "t1_at": t1_at.isoformat() if t1_at is not None else None,
         }
+        assessment_products = {
+            "intensity.fusion": {
+                "version": "fusion-v1",
+                "checksum": _checksum("fusion-v1"),
+                "summary": "烈度 V",
+            },
+            "loss.buildings": {
+                "version": "buildings-v1",
+                "checksum": _checksum("buildings-v1"),
+                "total": 10000,
+                "slight": 1200,
+                "moderate": 300,
+                "severe": 80,
+            },
+            "loss.population": {
+                "version": "population-v1",
+                "checksum": _checksum("population-v1"),
+                "resident": 120000,
+                "floating": 18000,
+                "households": 52000,
+                "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
+                "affected": 4300,
+            },
+            "loss.economic": {
+                "version": "economic-v1",
+                "checksum": _checksum("economic-v1"),
+                "gdp": 560000,
+                "primary": 12000,
+                "secondary": 220000,
+                "tertiary": 328000,
+                "loss": 8800,
+            },
+            "loss.casualties": {
+                "version": "casualties-v1",
+                "checksum": _checksum("casualties-v1"),
+                "deaths": 18,
+                "injuries": 42,
+                "summary": "死亡 18 人，受伤 42 人",
+            },
+            "loss.resources": {
+                "version": "resources-v1",
+                "checksum": _checksum("resources-v1"),
+                "summary": "救援力量需求 5 支",
+            },
+            "loss.validate": {
+                "version": "validate-v1",
+                "checksum": _checksum("validate-v1"),
+                "grade": "通过",
+                "summary": "评估结果通过校验",
+            },
+        }
+        for product_key in failed_products:
+            assessment_products.pop(product_key, None)
+
         manifest = {
             "event": event,
             "t1_at": event["t1_at"],
             "assessment": {
                 "assessment_run_id": str(self.assessment_run_id),
                 "data_asset_snapshot_fingerprint": _checksum("data-snapshot-v1"),
-                "products": {
-                    "intensity.fusion": {
-                        "version": "fusion-v1",
-                        "checksum": _checksum("fusion-v1"),
-                        "summary": "烈度 V",
-                    },
-                    "loss.buildings": {
-                        "version": "buildings-v1",
-                        "checksum": _checksum("buildings-v1"),
-                        "total": 10000,
-                        "slight": 1200,
-                        "moderate": 300,
-                        "severe": 80,
-                    },
-                    "loss.population": {
-                        "version": "population-v1",
-                        "checksum": _checksum("population-v1"),
-                        "resident": 120000,
-                        "floating": 18000,
-                        "households": 52000,
-                        "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
-                        "affected": 4300,
-                    },
-                    "loss.economic": {
-                        "version": "economic-v1",
-                        "checksum": _checksum("economic-v1"),
-                        "gdp": 560000,
-                        "primary": 12000,
-                        "secondary": 220000,
-                        "tertiary": 328000,
-                        "loss": 8800,
-                    },
-                    "loss.casualties": {
-                        "version": "casualties-v1",
-                        "checksum": _checksum("casualties-v1"),
-                        "deaths": 18,
-                        "injuries": 42,
-                        "summary": "死亡 18 人，受伤 42 人",
-                    },
-                    "loss.resources": {
-                        "version": "resources-v1",
-                        "checksum": _checksum("resources-v1"),
-                        "summary": "救援力量需求 5 支",
-                    },
-                    "loss.validate": {
-                        "version": "validate-v1",
-                        "checksum": _checksum("validate-v1"),
-                        "grade": "通过",
-                        "summary": "评估结果通过校验",
-                    },
-                },
+                "products": assessment_products,
             },
             "historical_earthquakes": {
                 "radius_km": 50,

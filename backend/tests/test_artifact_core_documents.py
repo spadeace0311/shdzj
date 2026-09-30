@@ -2,20 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
+from dataclasses import replace
+from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from docx import Document
+from PIL import Image, ImageDraw
 from pptx import Presentation
+from sqlalchemy import select
 
 from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
 from app.artifacts.context import ProductionContextService
+from app.artifacts.models import (
+    GeneratedArtifact,
+    ProductionTask,
+)
 from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.renderers.docx_renderer import (
     DocxRenderer,
     build_core_document_spec,
 )
 from app.artifacts.renderers.pptx_renderer import PptxRenderer
+from app.artifacts.storage import ArtifactStore
 from app.config import settings
 from tests.basemap_fixtures import make_in_memory_package
 
@@ -85,6 +95,214 @@ def _sha256_path(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _map_bytes(marker: str | None = None) -> BytesIO:
+    image = Image.new("RGB", (640, 360), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((30, 30, 610, 330), outline=(20, 30, 40), width=3)
+    draw.text((45, 45), marker or "map", fill=(20, 30, 40))
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    buffer.seek(0)
+    return buffer
+
+
+def _docx_bytes(label: str) -> BytesIO:
+    document = Document()
+    document.add_paragraph(f"{label} production artifact")
+    buffer = BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def _store_artifact(
+    store: ArtifactStore,
+    *,
+    artifact_key: str,
+    file_format: str,
+    marker: str | None = None,
+):
+    if file_format == "jpg":
+        stream = _map_bytes(marker)
+        file_name = f"{artifact_key}.jpg"
+    else:
+        stream = _docx_bytes(artifact_key)
+        file_name = f"{artifact_key}.docx"
+    return store.store_immutable_stream(stream, file_name=file_name)
+
+
+def _generated_artifact(
+    *,
+    run_id,
+    task_id,
+    event_id,
+    revision_id,
+    artifact_key: str,
+    stored,
+    file_format: str,
+    render_manifest=None,
+):
+    now = datetime.now(UTC)
+    return GeneratedArtifact(
+        production_run_id=run_id,
+        production_task_id=task_id,
+        event_id=event_id,
+        revision_id=revision_id,
+        artifact_key=artifact_key,
+        output_profile="a3v-professional",
+        artifact_version=1,
+        is_final=True,
+        production_mode="live",
+        status="complete",
+        quality_grade="core",
+        needs_review=False,
+        publication_mode="automatic",
+        generation_reason=None,
+        marker=None,
+        file_name=stored.relative_path.rsplit("/", 1)[-1],
+        format=file_format,
+        storage_path=stored.relative_path,
+        checksum=stored.checksum,
+        size_bytes=stored.size_bytes,
+        width=640 if file_format == "jpg" else None,
+        height=360 if file_format == "jpg" else None,
+        page_count=None,
+        template_snapshot=None,
+        data_snapshot=None,
+        render_manifest=render_manifest,
+        generated_at=now,
+        published_at=now,
+        superseded_by_id=None,
+    )
+
+
+async def _production_document_context(
+    seeded_artifact_assessment,
+    production_context_service: ProductionContextService,
+    session_factory,
+    artifact_key: str,
+):
+    run = await seeded_artifact_assessment.create_full_run()
+    async with session_factory() as session:
+        async with session.begin():
+            await production_context_service.freeze_static_context(
+                session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+
+    store = ArtifactStore(settings.artifact_storage_root)
+    decision_map_keys = (
+        "map.intensity",
+        "map.economic_loss",
+        "map.rescue_demand",
+        "map.deaths",
+        "map.injuries",
+        "map.buried",
+        "map.material_demand",
+        "map.active_faults",
+        "map.key_targets",
+        "map.building_damage",
+        "map.epicenter",
+        "map.city_distances",
+    )
+    rapid_report_control_fields = {
+        "intensity": "烈度 V",
+        "population": "4300",
+        "buildings": "10000",
+        "economy": "8800",
+        "resources": "救援力量需求 5 支",
+        "casualties": "死亡 18 人，受伤 42 人",
+        "key_targets": "重点目标 64 处",
+        "faults": "邻近断裂 3 条",
+        "city_distance": "8.6",
+        "fault_distance": "21.7",
+        "source_versions": (
+            "intensity.fusion: 版本 fusion-v1 / "
+            "loss.buildings: 版本 buildings-v1 / "
+            "loss.population: 版本 population-v1 / "
+            "loss.casualties: 版本 casualties-v1 / "
+            "loss.economic: 版本 economic-v1 / "
+            "loss.resources: 版本 resources-v1"
+        ),
+    }
+
+    async with session_factory() as session:
+        async with session.begin():
+            tasks = (
+                await session.scalars(
+                    select(ProductionTask).where(
+                        ProductionTask.production_run_id == run.id
+                    )
+                )
+            ).all()
+            tasks_by_key = {task.artifact_key: task for task in tasks}
+            for key in decision_map_keys:
+                stored = _store_artifact(
+                    store,
+                    artifact_key=key,
+                    file_format="jpg",
+                )
+                session.add(
+                    _generated_artifact(
+                        run_id=run.id,
+                        task_id=tasks_by_key[key].id,
+                        event_id=seeded_artifact_assessment.event_id,
+                        revision_id=seeded_artifact_assessment.revision_id,
+                        artifact_key=key,
+                        stored=stored,
+                        file_format="jpg",
+                    )
+                )
+
+            rapid_report = _store_artifact(
+                store,
+                artifact_key="doc.rapid_report",
+                file_format="docx",
+            )
+            session.add(
+                _generated_artifact(
+                    run_id=run.id,
+                    task_id=tasks_by_key["doc.rapid_report"].id,
+                    event_id=seeded_artifact_assessment.event_id,
+                    revision_id=seeded_artifact_assessment.revision_id,
+                    artifact_key="doc.rapid_report",
+                    stored=rapid_report,
+                    file_format="docx",
+                    render_manifest={
+                        "control_fields": rapid_report_control_fields,
+                    },
+                )
+            )
+
+            for key in ("doc.rapid_brief", "doc.decision_report"):
+                stored = _store_artifact(
+                    store,
+                    artifact_key=key,
+                    file_format="docx",
+                )
+                session.add(
+                    _generated_artifact(
+                        run_id=run.id,
+                        task_id=tasks_by_key[key].id,
+                        event_id=seeded_artifact_assessment.event_id,
+                        revision_id=seeded_artifact_assessment.revision_id,
+                        artifact_key=key,
+                        stored=stored,
+                        file_format="docx",
+                    )
+                )
+
+    async with session_factory() as session:
+        async with session.begin():
+            task = tasks_by_key[artifact_key]
+            return await production_context_service.build_document_context(
+                session,
+                task.id,
+                "pptx" if artifact_key == "deck.decision_report" else "docx",
+            )
 
 
 async def test_rapid_brief_contains_t1_not_applicable_for_manual_event(
@@ -179,6 +397,40 @@ async def test_pptx_fails_when_hard_map_dependency_is_missing(
         )
 
 
+async def test_rapid_report_fails_when_hard_map_dependency_is_missing(
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context(
+        "doc.rapid_report",
+        missing_artifact_keys={"map.epicenter"},
+    )
+
+    with pytest.raises(FileNotFoundError, match="map.epicenter"):
+        await docx_renderer.render(
+            build_core_document_spec(context, "doc.rapid_report"),
+            tmp_path / "report.docx",
+        )
+
+
+async def test_rapid_report_fails_when_required_product_is_missing(
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context(
+        "doc.rapid_report",
+        failed_products={"loss.casualties"},
+    )
+
+    with pytest.raises(FileNotFoundError, match="loss.casualties"):
+        await docx_renderer.render(
+            build_core_document_spec(context, "doc.rapid_report"),
+            tmp_path / "report.docx",
+        )
+
+
 async def test_pptx_manifest_tracks_images_and_checksums(
     seeded_artifact_assessment,
     pptx_renderer: PptxRenderer,
@@ -194,6 +446,34 @@ async def test_pptx_manifest_tracks_images_and_checksums(
     for key, checksum in result.render_manifest["image_checksums"].items():
         path = Path(result.render_manifest["image_paths"][key])
         assert _sha256_path(path) == checksum
+
+
+async def test_pptx_rejects_template_missing_declared_placeholder(
+    seeded_artifact_assessment,
+    pptx_renderer: PptxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context("deck.decision_report")
+    spec = build_core_document_spec(context, "deck.decision_report")
+    committed = Path(settings.artifact_template_root) / "decision-template.pptx"
+    modified = tmp_path / "missing-placeholder.pptx"
+    presentation = Presentation(str(committed))
+    for slide in presentation.slides:
+        for shape in list(slide.shapes):
+            if shape.has_text_frame and "{{event_facts}}" in shape.text_frame.text:
+                shape._element.getparent().remove(shape._element)
+    presentation.save(modified)
+    spec = replace(
+        spec,
+        template_path=modified,
+        template_checksum=_sha256_path(modified),
+    )
+
+    with pytest.raises(ValueError, match="event_facts"):
+        await pptx_renderer.render(
+            spec,
+            tmp_path / "bad.pptx",
+        )
 
 
 @pytest.mark.parametrize(
@@ -231,8 +511,10 @@ def test_decision_template_is_deterministic_and_has_no_linked_media(tmp_path: Pa
 
     first = build_decision_template(tmp_path / "first")
     second = build_decision_template(tmp_path / "second")
+    committed = Path(settings.artifact_template_root) / "decision-template.pptx"
 
     assert _sha256_path(first) == _sha256_path(second)
+    assert _sha256_path(first) == _sha256_path(committed)
     presentation = Presentation(first)
     assert len(presentation.slides) == 8
     assert round(presentation.slide_width.cm) == 34
@@ -271,8 +553,59 @@ async def test_real_production_context_resolves_core_document_inputs(
                 "docx",
             )
 
-    spec = build_core_document_spec(context, "doc.rapid_report")
-    assert spec.artifact_key == "doc.rapid_report"
-    assert spec.template_version == "v1"
-    assert spec.template_path.name == "background-template.docx"
-    assert spec.quality.grade == "core"
+    assert context.artifact_key == "doc.rapid_report"
+    assert context.artifact_paths == {}
+    with pytest.raises(FileNotFoundError, match="intensity.fusion"):
+        build_core_document_spec(context, "doc.rapid_report")
+
+
+async def test_real_production_decision_report_renders_available_values(
+    seeded_artifact_assessment,
+    production_context_service,
+    session_factory,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await _production_document_context(
+        seeded_artifact_assessment,
+        production_context_service,
+        session_factory,
+        "doc.decision_report",
+    )
+    spec = build_core_document_spec(context, "doc.decision_report")
+    result = await docx_renderer.render(
+        spec,
+        tmp_path / "decision.docx",
+    )
+    text = _docx_text(result.path)
+
+    assert result.task_status == "succeeded"
+    assert spec.quality.needs_review is False
+    assert "数据不可用，待复核" not in text
+
+
+async def test_real_production_deck_renders_available_values(
+    seeded_artifact_assessment,
+    production_context_service,
+    session_factory,
+    pptx_renderer: PptxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await _production_document_context(
+        seeded_artifact_assessment,
+        production_context_service,
+        session_factory,
+        "deck.decision_report",
+    )
+    spec = build_core_document_spec(context, "deck.decision_report")
+    result = await pptx_renderer.render(
+        spec,
+        tmp_path / "decision.pptx",
+    )
+    presentation = Presentation(result.path)
+    all_text = _pptx_text(result.path)
+
+    assert len(presentation.slides) == context.pptx_slide_count
+    assert spec.quality.needs_review is False
+    assert "数据不可用，待复核" not in all_text
+    assert result.render_manifest["unresolved_placeholder_count"] == 0
