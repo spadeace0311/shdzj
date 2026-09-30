@@ -25,7 +25,11 @@ from app.artifacts.repository import (
     ArtifactProductionRepository,
     ArtifactQuality,
 )
-from app.artifacts.renderers.base import RenderQuality
+from app.artifacts.renderers.base import (
+    LocalAssetMissingError,
+    RemoteAssetForbiddenError,
+    RenderResult,
+)
 from app.artifacts.renderers.docx_renderer import (
     DocxRenderer,
     build_background_document_spec,
@@ -42,10 +46,12 @@ from app.artifacts.storage import ArtifactStore
 from app.artifacts.validation import ArtifactValidator
 from app.artifacts.workflow import (
     ArtifactDependencyWaitInput,
+    ArtifactProductionDeadlineInput,
     ArtifactProductionWorkflow,
     ArtifactProductionWorkflowInput,
     ArtifactPublicationInput,
     ArtifactTaskActivityInput,
+    ArtifactTerminalizationInput,
     ArtifactValidationInput,
 )
 from app.config import Settings, settings
@@ -195,7 +201,7 @@ class ArtifactActivities:
                             output_profile=task.output_profile,
                             context_fingerprint=run.context_fingerprint or "",
                             input_fingerprint=task.input_fingerprint or "",
-                            deadline_at=task.deadline_at,
+                            deadline_at=task.deadline_at.isoformat(),
                         )
 
                     if task.status in {"succeeded", "degraded"}:
@@ -210,7 +216,8 @@ class ArtifactActivities:
                             output_profile=task.output_profile,
                             context_fingerprint=run.context_fingerprint or "",
                             input_fingerprint=task.input_fingerprint,
-                            deadline_at=task.deadline_at,
+                            deadline_at=task.deadline_at.isoformat(),
+                            already_completed=True,
                         )
 
                     if task.status in {
@@ -253,24 +260,30 @@ class ArtifactActivities:
 
     @activity.defn(name="render_map_artifact")
     async def render_map_artifact(self, request: ArtifactTaskActivityInput):
-        pool: Any = None
+        pool: _TrackingBrowserPool | None = None
         staged: Path | None = None
         try:
             pool = _TrackingBrowserPool()
             renderer = MapRenderer(pool)
-            staged, official_name = await self._render_map(request, renderer)
+            staged, official_name, render_result = await self._render_map(
+                request,
+                renderer,
+            )
             stored = self._artifact_store.store_immutable(
                 staged,
                 file_name=official_name,
             )
-            await self._commit_rendered_artifact(
-                request,
-                stored.file_name,
-                stored.relative_path,
-                stored.checksum,
-                stored.size_bytes,
-                _render_quality(renderer),
-            )
+            try:
+                await self._commit_rendered_artifact(
+                    request,
+                    stored.file_name,
+                    stored.relative_path,
+                    stored.checksum,
+                    stored.size_bytes,
+                    render_result,
+                )
+            finally:
+                staged.unlink(missing_ok=True)
             return {
                 "production_run_id": request.production_run_id,
                 "production_task_id": request.production_task_id,
@@ -285,18 +298,22 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._cancel_task(request)
             raise
-        except BaseException:
+        except BaseException as exc:
             if pool is not None:
                 await pool.cancel_all()
             if staged is not None:
                 staged.unlink(missing_ok=True)
-            raise
+            await self._fail_task_with_error(request, exc)
+            raise _typed_application_error(exc) from exc
+        finally:
+            if pool is not None:
+                await pool.close()
 
     @activity.defn(name="compose_docx_artifact")
     async def compose_docx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
         try:
-            staged, official_name = await self._render_document(
+            staged, official_name, render_result = await self._render_document(
                 request,
                 ArtifactKind.DOCX,
             )
@@ -304,13 +321,17 @@ class ArtifactActivities:
                 staged,
                 file_name=official_name,
             )
-            await self._commit_rendered_artifact(
-                request,
-                stored.file_name,
-                stored.relative_path,
-                stored.checksum,
-                stored.size_bytes,
-            )
+            try:
+                await self._commit_rendered_artifact(
+                    request,
+                    stored.file_name,
+                    stored.relative_path,
+                    stored.checksum,
+                    stored.size_bytes,
+                    render_result,
+                )
+            finally:
+                staged.unlink(missing_ok=True)
             return {
                 "production_run_id": request.production_run_id,
                 "production_task_id": request.production_task_id,
@@ -323,16 +344,17 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._cancel_task(request)
             raise
-        except BaseException:
+        except BaseException as exc:
             if staged is not None:
                 staged.unlink(missing_ok=True)
-            raise
+            await self._fail_task_with_error(request, exc)
+            raise _typed_application_error(exc) from exc
 
     @activity.defn(name="compose_pptx_artifact")
     async def compose_pptx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
         try:
-            staged, official_name = await self._render_document(
+            staged, official_name, render_result = await self._render_document(
                 request,
                 ArtifactKind.PPTX,
             )
@@ -340,13 +362,17 @@ class ArtifactActivities:
                 staged,
                 file_name=official_name,
             )
-            await self._commit_rendered_artifact(
-                request,
-                stored.file_name,
-                stored.relative_path,
-                stored.checksum,
-                stored.size_bytes,
-            )
+            try:
+                await self._commit_rendered_artifact(
+                    request,
+                    stored.file_name,
+                    stored.relative_path,
+                    stored.checksum,
+                    stored.size_bytes,
+                    render_result,
+                )
+            finally:
+                staged.unlink(missing_ok=True)
             return {
                 "production_run_id": request.production_run_id,
                 "production_task_id": request.production_task_id,
@@ -359,10 +385,11 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._cancel_task(request)
             raise
-        except BaseException:
+        except BaseException as exc:
             if staged is not None:
                 staged.unlink(missing_ok=True)
-            raise
+            await self._fail_task_with_error(request, exc)
+            raise _typed_application_error(exc) from exc
 
     @activity.defn(name="validate_artifact_production")
     async def validate_artifact_production(
@@ -384,24 +411,38 @@ class ArtifactActivities:
                         )
                     )
                 ).all()
-                for artifact_row in artifacts:
-                    path = self._artifact_store.resolve(
-                        artifact_row.storage_path
-                    )
-                    definition = load_catalog(
-                        settings.artifact_catalog_path
-                    ).get(artifact_row.artifact_key, artifact_row.output_profile)
-                    result = self._artifact_validator.validate(
-                        path,
-                        definition,
-                        artifact_row.production_mode,
-                    )
-                    if not result.valid:
-                        raise ApplicationError(
-                            result.summary,
-                            type=result.error_category or "validation_failed",
-                            non_retryable=True,
+                try:
+                    for artifact_row in artifacts:
+                        path = self._artifact_store.resolve(
+                            artifact_row.storage_path
                         )
+                        definition = load_catalog(
+                            settings.artifact_catalog_path
+                        ).get(artifact_row.artifact_key, artifact_row.output_profile)
+                        result = self._artifact_validator.validate(
+                            path,
+                            definition,
+                            artifact_row.production_mode,
+                        )
+                        if not result.valid:
+                            raise ApplicationError(
+                                result.summary,
+                                type=result.error_category or "validation_failed",
+                                non_retryable=True,
+                            )
+                except ApplicationError as exc:
+                    await repository.finalize_run_with_failure(
+                        session,
+                        run.id,
+                        observed,
+                        exc.type or "validation_failed",
+                        str(exc),
+                    )
+                    raise ApplicationError(
+                        str(exc),
+                        type=exc.type or "validation_failed",
+                        non_retryable=True,
+                    ) from exc
                 finalized = await repository.finalize_run(
                     session,
                     run.id,
@@ -476,22 +517,101 @@ class ArtifactActivities:
     @activity.defn(name="mark_production_deadline_exceeded")
     async def mark_production_deadline_exceeded(
         self,
-        request: ArtifactProductionWorkflowInput,
+        request: ArtifactProductionDeadlineInput,
     ):
         repository = ArtifactProductionRepository()
+        observed = _as_utc(request.observed_at, "observed_at")
         async with self._session_factory() as session:
             async with session.begin():
                 return await repository.timeout_run(
                     session,
                     request.production_run_id,
-                    datetime.now(UTC),
+                    observed,
                 )
+
+    @activity.defn(name="terminalize_artifact_production")
+    async def terminalize_artifact_production(
+        self,
+        request: ArtifactTerminalizationInput,
+    ):
+        repository = ArtifactProductionRepository()
+        observed = _as_utc(request.observed_at, "observed_at")
+        if request.reason == "assessment_failed":
+            status = "failed"
+            category = "assessment_unavailable"
+        elif request.reason == "deadline":
+            status = "timed_out"
+            category = "deadline_exceeded"
+        else:
+            status = "failed"
+            category = "production_failed"
+        async with self._session_factory() as session:
+            async with session.begin():
+                run = await repository.terminalize_unfinished_tasks(
+                    session,
+                    request.production_run_id,
+                    observed,
+                    status=status,
+                    category=category,
+                    summary=request.summary,
+                )
+                if run.status not in {
+                    "completed",
+                    "partial",
+                    "failed",
+                    "canceled",
+                }:
+                    await repository.finalize_run(
+                        session,
+                        run.id,
+                        observed,
+                    )
+                tasks = await repository.list_tasks(session, run.id)
+                return {
+                    "status": run.status,
+                    "completed_count": sum(
+                        task.status in {"succeeded", "degraded"}
+                        for task in tasks
+                    ),
+                    "failed_count": sum(
+                        task.status in {"failed", "timed_out", "canceled"}
+                        for task in tasks
+                    ),
+                }
+
+    @activity.defn(name="cancel_artifact_production")
+    async def cancel_artifact_production(
+        self,
+        request: ArtifactTerminalizationInput,
+    ):
+        repository = ArtifactProductionRepository()
+        observed = _as_utc(request.observed_at, "observed_at")
+        async with self._session_factory() as session:
+            async with session.begin():
+                run = await repository.cancel_run(
+                    session,
+                    request.production_run_id,
+                    observed,
+                    request.summary or request.reason,
+                )
+                tasks = await repository.list_tasks(session, run.id)
+                return {
+                    "status": run.status,
+                    "completed_count": sum(
+                        task.status in {"succeeded", "degraded"}
+                        for task in tasks
+                    ),
+                    "failed_count": sum(
+                        task.status in {"failed", "timed_out", "canceled"}
+                        for task in tasks
+                    ),
+                }
 
     async def _render_map(
         self,
         request: ArtifactTaskActivityInput,
         renderer: MapRenderer,
-    ) -> tuple[Path, str]:
+    ) -> tuple[Path, str, RenderResult]:
         async with self._session_factory() as session:
             context = await self._context.build_map_context(
                 session,
@@ -507,13 +627,13 @@ class ArtifactActivities:
         Path(name).unlink(missing_ok=True)
         output = Path(name)
         result = await renderer.render(spec, output)
-        return result.path, result.file_name
+        return result.path, result.file_name, result
 
     async def _render_document(
         self,
         request: ArtifactTaskActivityInput,
         kind: ArtifactKind,
-    ) -> tuple[Path, str]:
+    ) -> tuple[Path, str, RenderResult]:
         async with self._session_factory() as session:
             context = await self._context.build_document_context(
                 session,
@@ -543,7 +663,7 @@ class ArtifactActivities:
             else DocxRenderer()
         )
         result = await renderer.render(spec, output)
-        return result.path, result.file_name
+        return result.path, result.file_name, result
 
     async def _commit_rendered_artifact(
         self,
@@ -552,9 +672,10 @@ class ArtifactActivities:
         storage_path: str,
         checksum: str,
         size_bytes: int,
-        quality: RenderQuality | None = None,
+        render_result: RenderResult,
     ) -> None:
-        quality = quality or RenderQuality(grade="A")
+        quality = render_result.quality
+        marker = render_result.render_manifest.get("marker")
         result = ArtifactGenerationResult(
             file_name=file_name,
             format=Path(file_name).suffix.lstrip("."),
@@ -566,7 +687,17 @@ class ArtifactActivities:
                 needs_review=quality.needs_review,
                 degradation_reasons=quality.degradation_reasons,
             ),
-            generated_at=datetime.now(UTC),
+            marker={"marker": marker} if marker is not None else None,
+            width=(
+                render_result.width if render_result.width > 0 else None
+            ),
+            height=(
+                render_result.height if render_result.height > 0 else None
+            ),
+            page_count=render_result.page_count,
+            render_manifest=render_result.render_manifest,
+            generated_at=render_result.generated_at or datetime.now(UTC),
+            task_status=render_result.task_status,
         )
         async with self._session_factory() as session:
             async with session.begin():
@@ -574,7 +705,7 @@ class ArtifactActivities:
                     session,
                     request.production_task_id,
                     result,
-                    "degraded" if quality.needs_review else "succeeded",
+                    render_result.task_status,
                 )
 
     async def _cancel_task(self, request: ArtifactTaskActivityInput) -> None:
@@ -585,6 +716,24 @@ class ArtifactActivities:
                     request.production_task_id,
                     "artifact activity canceled",
                 )
+
+    async def _fail_task_with_error(
+        self,
+        request: ArtifactTaskActivityInput,
+        error: BaseException,
+    ) -> None:
+        category, summary = _error_category_and_summary(error)
+        async with self._session_factory() as session:
+            async with session.begin():
+                try:
+                    await ArtifactProductionRepository().fail_task(
+                        session,
+                        request.production_task_id,
+                        category,
+                        summary,
+                    )
+                except ValueError:
+                    pass
 
 
 def _phase_groups_from_tasks(
@@ -658,8 +807,27 @@ def _as_utc(value: datetime | str, field: str) -> datetime:
     return value.astimezone(UTC)
 
 
-def _render_quality(renderer: MapRenderer) -> RenderQuality:
-    return RenderQuality(grade="A")
+def _error_category_and_summary(error: BaseException) -> tuple[str, str]:
+    if isinstance(error, LocalAssetMissingError):
+        return "local_asset_missing", str(error)[:2000]
+    if isinstance(error, RemoteAssetForbiddenError):
+        return "remote_asset_forbidden", str(error)[:2000]
+    if isinstance(error, ValueError):
+        return "invalid_render_input", str(error)[:2000]
+    if isinstance(error, LookupError):
+        return "artifact_dependency_unavailable", str(error)[:2000]
+    return "artifact_render_failed", str(error)[:2000]
+
+
+def _typed_application_error(error: BaseException) -> ApplicationError:
+    if isinstance(error, ApplicationError):
+        return error
+    category, summary = _error_category_and_summary(error)
+    return ApplicationError(
+        summary,
+        type=category,
+        non_retryable=True,
+    )
 
 
 class _TrackingBrowserPool(BrowserPool):
@@ -700,6 +868,8 @@ def build_artifact_worker(
             activities.compose_pptx_artifact,
             activities.validate_artifact_production,
             activities.publish_artifact_production,
+            activities.terminalize_artifact_production,
+            activities.cancel_artifact_production,
             activities.mark_production_deadline_exceeded,
         ],
         graceful_shutdown_timeout=timedelta(seconds=10),

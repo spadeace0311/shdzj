@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class ArtifactProductionWorkflowInput:
     production_run_id: str
-    assessment_run_id: str | None
+    assessment_run_id: str
     event_id: str
     revision_id: str
     deadline_at: str
@@ -26,6 +26,11 @@ class ArtifactProductionWorkflowInput:
     generation_seq: int
     generation_scope: str
     required_outputs: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        # Temporal's default dataclass converter does not serialize datetime.
+        # deadline_at deliberately uses an ISO-8601 string with a timezone.
+        datetime.fromisoformat(self.deadline_at.replace("Z", "+00:00"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,7 @@ class ArtifactTaskActivityInput:
     context_fingerprint: str
     input_fingerprint: str
     deadline_at: str
+    already_completed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +75,20 @@ class ArtifactPublicationInput:
     observed_at: str
     published_by: str | None = None
     forced: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactProductionDeadlineInput:
+    production_run_id: str
+    observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactTerminalizationInput:
+    production_run_id: str
+    observed_at: str
+    reason: str
+    summary: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +115,7 @@ class ArtifactProductionWorkflow:
         self._cancel_reason: str | None = None
         self._completed_count = 0
         self._failed_count = 0
+        self._phase_tasks: list[asyncio.Task] = []
 
     @workflow.signal
     async def intensity_ready(self) -> None:
@@ -115,6 +136,9 @@ class ArtifactProductionWorkflow:
     @workflow.signal
     async def cancel_requested(self, reason: str) -> None:
         self._cancel_reason = reason or "cancel_requested"
+        for task in self._phase_tasks:
+            if not task.done():
+                task.cancel()
 
     @workflow.query
     def status(self) -> str:
@@ -143,14 +167,64 @@ class ArtifactProductionWorkflow:
         )
         try:
             if prepared.launch_mode == "standalone":
-                outputs = request.required_outputs
-                await self._run_outputs(outputs, prepared)
+                await self._run_outputs(request.required_outputs, prepared)
             else:
                 await self._run_assessment_child(prepared)
 
             observed_at = workflow.now()
             if observed_at >= prepared.deadline_at:
                 self._deadline_exceeded_at = observed_at.isoformat()
+            early_reason = self._early_reason(prepared)
+            if early_reason == "cancel":
+                cancellation = await workflow.execute_activity(
+                    "cancel_artifact_production",
+                    ArtifactTerminalizationInput(
+                        production_run_id=prepared.production_run_id,
+                        observed_at=observed_at.isoformat(),
+                        reason="cancel_requested",
+                        summary=self._cancel_reason or "cancel_requested",
+                    ),
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=_retry_policy(),
+                )
+                return self._result(
+                    request,
+                    prepared,
+                    status=str(_mapping_value(cancellation, "status", "canceled")),
+                )
+            if early_reason in {"assessment_failed", "deadline"}:
+                terminal = await workflow.execute_activity(
+                    "terminalize_artifact_production",
+                    ArtifactTerminalizationInput(
+                        production_run_id=prepared.production_run_id,
+                        observed_at=observed_at.isoformat(),
+                        reason=early_reason,
+                        summary=(
+                            "assessment unavailable"
+                            if early_reason == "assessment_failed"
+                            else "production deadline exceeded"
+                        ),
+                    ),
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=_retry_policy(),
+                )
+                terminal_status = str(
+                    _mapping_value(terminal, "status", "failed")
+                )
+                await workflow.execute_activity(
+                    "publish_artifact_production",
+                    ArtifactPublicationInput(
+                        production_run_id=prepared.production_run_id,
+                        observed_at=observed_at.isoformat(),
+                    ),
+                    start_to_close_timeout=timedelta(seconds=120),
+                    retry_policy=_retry_policy(),
+                )
+                return self._result(
+                    request,
+                    prepared,
+                    status=terminal_status,
+                )
             validation = await workflow.execute_activity(
                 "validate_artifact_production",
                 ArtifactValidationInput(
@@ -177,14 +251,7 @@ class ArtifactProductionWorkflow:
             self._failed_count = int(
                 _mapping_value(validation or publication, "failed_count", 0)
             )
-            return ArtifactProductionWorkflowResult(
-                production_run_id=prepared.production_run_id,
-                status=self._status,
-                completed_count=self._completed_count,
-                failed_count=self._failed_count,
-                required_outputs=request.required_outputs,
-                deadline_exceeded_at=self._deadline_exceeded_at,
-            )
+            return self._result(request, prepared, status=self._status)
         finally:
             if not deadline_task.done():
                 deadline_task.cancel()
@@ -198,6 +265,7 @@ class ArtifactProductionWorkflow:
             self._run_outputs(prepared.background_outputs, prepared)
         )
         pending = [background_task]
+        self._phase_tasks = pending.copy()
 
         try:
             await self._wait_for_signal(
@@ -210,6 +278,7 @@ class ArtifactProductionWorkflow:
                         self._run_outputs(prepared.intensity_outputs, prepared)
                     )
                 )
+                self._phase_tasks = pending.copy()
 
             await self._wait_for_signal(
                 prepared,
@@ -221,6 +290,7 @@ class ArtifactProductionWorkflow:
                         self._run_outputs(prepared.loss_core_outputs, prepared)
                     )
                 )
+                self._phase_tasks = pending.copy()
 
             await self._wait_for_signal(
                 prepared,
@@ -232,6 +302,7 @@ class ArtifactProductionWorkflow:
                         self._run_outputs(prepared.loss_final_outputs, prepared)
                     )
                 )
+                self._phase_tasks = pending.copy()
 
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
@@ -239,6 +310,32 @@ class ArtifactProductionWorkflow:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+    def _early_reason(self, prepared: ArtifactProductionPrepared) -> str | None:
+        if self._cancel_reason is not None:
+            return "cancel"
+        if self._assessment_failed:
+            return "assessment_failed"
+        if workflow.now() >= prepared.deadline_at:
+            return "deadline"
+        return None
+
+    def _result(
+        self,
+        request: ArtifactProductionWorkflowInput,
+        prepared: ArtifactProductionPrepared,
+        *,
+        status: str,
+    ) -> ArtifactProductionWorkflowResult:
+        self._status = status
+        return ArtifactProductionWorkflowResult(
+            production_run_id=prepared.production_run_id,
+            status=status,
+            completed_count=self._completed_count,
+            failed_count=self._failed_count,
+            required_outputs=request.required_outputs,
+            deadline_exceeded_at=self._deadline_exceeded_at,
+        )
 
     async def _wait_for_signal(
         self,
@@ -275,11 +372,15 @@ class ArtifactProductionWorkflow:
         outputs: tuple[tuple[str, str], ...],
         prepared: ArtifactProductionPrepared,
     ) -> None:
-        results = await asyncio.gather(
-            *(
+        tasks = [
+            asyncio.create_task(
                 self._run_output(artifact_key, output_profile, prepared)
-                for artifact_key, output_profile in outputs
-            ),
+            )
+            for artifact_key, output_profile in outputs
+        ]
+        self._phase_tasks.extend(tasks)
+        results = await asyncio.gather(
+            *tasks,
             return_exceptions=True,
         )
         for result in results:
@@ -306,6 +407,8 @@ class ArtifactProductionWorkflow:
             retry_policy=_retry_policy(),
         )
         task_input = _as_task_input(wait_payload)
+        if task_input.already_completed:
+            return
         if not _task_ready(task_input):
             raise ApplicationError(
                 "artifact dependencies are not ready",
@@ -348,18 +451,9 @@ class ArtifactProductionWorkflow:
         self._deadline_exceeded_at = workflow.now().isoformat()
         await workflow.execute_activity(
             "mark_production_deadline_exceeded",
-            ArtifactProductionWorkflowInput(
+            ArtifactProductionDeadlineInput(
                 production_run_id=prepared.production_run_id,
-                assessment_run_id=None,
-                event_id="",
-                revision_id="",
-                deadline_at=prepared.deadline_at.isoformat(),
-                catalog_version="",
-                context_fingerprint=prepared.context_fingerprint,
-                launch_mode=prepared.launch_mode,
-                generation_seq=0,
-                generation_scope="",
-                required_outputs=(),
+                observed_at=self._deadline_exceeded_at,
             ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=_retry_policy(),
@@ -400,6 +494,7 @@ def _as_task_input(value: object) -> ArtifactTaskActivityInput:
         context_fingerprint=str(value["context_fingerprint"]),
         input_fingerprint=str(value["input_fingerprint"]),
         deadline_at=deadline,
+        already_completed=bool(value.get("already_completed", False)),
     )
 
 
@@ -411,6 +506,10 @@ def _as_prepared(value: object) -> ArtifactProductionPrepared:
     deadline = value.get("deadline_at")
     if isinstance(deadline, str):
         deadline = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+    elif isinstance(deadline, datetime):
+        deadline = deadline
+    else:
+        raise TypeError("prepared artifact deadline must be a timestamp")
     return ArtifactProductionPrepared(
         production_run_id=str(value["production_run_id"]),
         deadline_at=deadline,

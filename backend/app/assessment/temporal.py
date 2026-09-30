@@ -122,6 +122,11 @@ class AssessmentWorkflow:
             )
 
             if isinstance(model_result, BaseException):
+                if artifact_child_handle is not None:
+                    await self._signal_child(
+                        artifact_child_handle,
+                        ArtifactProductionWorkflow.assessment_failed,
+                    )
                 return await self._finalize(
                     prepared,
                     outcome="failed",
@@ -234,7 +239,7 @@ class AssessmentWorkflow:
     ) -> None:
         try:
             await child_handle.signal(signal_method)
-        except ApplicationError as exc:
+        except Exception as exc:
             logger.warning(
                 "artifact child signal failed: %s",
                 exc,
@@ -338,11 +343,7 @@ def _as_artifact_workflow_input(value: object) -> ArtifactProductionWorkflowInpu
         deadline = str(deadline)
     return ArtifactProductionWorkflowInput(
         production_run_id=str(value["production_run_id"]),
-        assessment_run_id=(
-            str(value["assessment_run_id"])
-            if value.get("assessment_run_id") is not None
-            else None
-        ),
+        assessment_run_id=str(value["assessment_run_id"]),
         event_id=str(value["event_id"]),
         revision_id=str(value["revision_id"]),
         deadline_at=deadline,
@@ -504,9 +505,7 @@ class AssessmentActivities:
         request: AssessmentRunActivityInput,
     ):
         from app.assessment.models import AssessmentTask
-        from app.assessment.repository import AssessmentRepository
 
-        repository = AssessmentRepository()
         async with self._session_factory() as session:
             async with session.begin():
                 task = await session.scalar(
@@ -519,22 +518,15 @@ class AssessmentActivities:
                     return None
                 if task.status == "succeeded":
                     return task.status
-                await repository.start_task(
-                    session,
-                    request.run_id,
-                    "artifact.production",
-                    "artifact-production-v1",
-                    "artifact-production-child-started",
-                )
-                await repository.complete_task(
-                    session,
-                    task.id,
-                    "artifact-production-child-started",
-                    {
-                        "production_run_id": None,
-                        "status": "launched",
-                    },
-                )
+                now = datetime.now(UTC)
+                task.status = "succeeded"
+                task.completed_at = now
+                task.attempt_count = max(task.attempt_count, 1)
+                task.result = {
+                    "production_run_id": None,
+                    "status": "launched",
+                }
+                task.last_error = None
                 return task.status
 
     @activity.defn(name="run_intensity_model")

@@ -1069,6 +1069,108 @@ class ArtifactProductionRepository:
         await session.flush()
         return task
 
+    async def terminalize_unfinished_tasks(
+        self,
+        session: AsyncSession,
+        production_run_id: uuid.UUID,
+        observed_at: datetime,
+        *,
+        status: str,
+        category: str,
+        summary: str,
+    ) -> ProductionRun:
+        if status not in {"failed", "canceled", "timed_out"}:
+            raise ValueError("terminal task status must be failed, canceled, or timed_out")
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        run = await self._lock_run(session, production_run_id)
+        if run.status in {"completed", "partial", "failed", "canceled"}:
+            return run
+        tasks = (
+            await session.scalars(
+                select(ProductionTask)
+                .where(
+                    ProductionTask.production_run_id == run.id,
+                    ProductionTask.status.in_(("pending", "ready", "running")),
+                )
+                .order_by(ProductionTask.sequence, ProductionTask.id)
+                .with_for_update()
+            )
+        ).all()
+        for task in tasks:
+            task.status = status
+            task.completed_at = observed_at
+            task.last_error = summary[:2000]
+            task.result = {
+                **dict(task.result or {}),
+                "terminal_reason": category[:64],
+                "terminal_summary": summary[:2000],
+            }
+            if observed_at > task.deadline_at and task.deadline_exceeded_at is None:
+                task.deadline_exceeded_at = observed_at
+            task.updated_at = observed_at
+        if observed_at > run.deadline_at and run.deadline_exceeded_at is None:
+            run.deadline_exceeded_at = observed_at
+        run.updated_at = observed_at
+        await session.flush()
+        return run
+
+    async def cancel_run(
+        self,
+        session: AsyncSession,
+        production_run_id: uuid.UUID,
+        observed_at: datetime,
+        reason: str,
+    ) -> ProductionRun:
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        run = await self._lock_run(session, production_run_id)
+        if run.status in {"completed", "partial", "failed", "canceled"}:
+            return run
+        await self.terminalize_unfinished_tasks(
+            session,
+            run.id,
+            observed_at,
+            status="canceled",
+            category="cancel_requested",
+            summary=reason,
+        )
+        run = await self._lock_run(session, production_run_id)
+        run.status = "canceled"
+        run.cancel_requested_at = observed_at
+        run.cancel_reason = reason[:2000]
+        run.completed_at = observed_at
+        run.final_input_fingerprint = _final_fingerprint(
+            await self.list_tasks(session, run.id)
+        )
+        run.updated_at = observed_at
+        await session.flush()
+        return run
+
+    async def finalize_run_with_failure(
+        self,
+        session: AsyncSession,
+        production_run_id: uuid.UUID,
+        observed_at: datetime,
+        error_category: str,
+        summary: str,
+    ) -> ProductionRun:
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        run = await self._lock_run(session, production_run_id)
+        if run.status in {"completed", "partial", "failed", "canceled"}:
+            return run
+        tasks = await self.list_tasks(session, run.id)
+        successful = [
+            task
+            for task in tasks
+            if task.status in {"succeeded", "degraded"}
+        ]
+        run.status = "partial" if successful else "failed"
+        run.completed_at = observed_at
+        run.last_error = summary[:2000]
+        run.final_input_fingerprint = _final_fingerprint(tasks)
+        run.updated_at = observed_at
+        await session.flush()
+        return run
+
     async def timeout_run(
         self,
         session: AsyncSession,

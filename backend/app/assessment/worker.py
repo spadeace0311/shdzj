@@ -114,6 +114,8 @@ def build_worker(
             artifact_activities.compose_pptx_artifact,
             artifact_activities.validate_artifact_production,
             artifact_activities.publish_artifact_production,
+            artifact_activities.terminalize_artifact_production,
+            artifact_activities.cancel_artifact_production,
             artifact_activities.mark_production_deadline_exceeded,
         ],
         graceful_shutdown_timeout=timedelta(seconds=10),

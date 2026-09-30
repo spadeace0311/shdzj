@@ -41,6 +41,8 @@ def _artifact_activities(session_factory):
         artifacts.compose_pptx_artifact,
         artifacts.validate_artifact_production,
         artifacts.publish_artifact_production,
+        artifacts.terminalize_artifact_production,
+        artifacts.cancel_artifact_production,
         artifacts.mark_production_deadline_exceeded,
     ]
 
