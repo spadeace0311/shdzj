@@ -267,7 +267,7 @@ Add these exact dependencies to `backend/pyproject.toml`:
 
 Add `artifact_storage_root`, `artifact_template_root`, `artifact_catalog_path`, `artifact_max_override_bytes`, `artifact_render_concurrency`, `artifact_optional_dependency_reserve_seconds`, and `artifact_browser_pool_size` to `Settings`. Validate all paths are non-empty, override size is positive, render concurrency is between 1 and 6, browser pool size is between 1 and 8, and reserve seconds is positive and less than 300.
 
-Add a named `artifact-data` volume mounted at `/var/lib/artifacts` to `api`, `temporal-worker`, and the new artifact worker. Keep the default render concurrency at 4 and browser pool size at 2 so Z440 does not oversubscribe. Add the new non-secret variables to `.env.example`, import `app.artifacts.models` in `backend/migrations/env.py`, and extend `backend/Dockerfile` with Chromium, Chinese fonts, MapLibre static assets, and the libraries required by Playwright, Matplotlib, python-docx, and python-pptx.
+Add a named `artifact-data` volume and mount it at `/var/lib/artifacts` on the existing `api` and `temporal-worker` services. Do not declare the artifact worker service in Task 1 because its module is created in Task 12; Task 12 adds that service. Keep the default render concurrency at 4 and browser pool size at 2 so Z440 does not oversubscribe. Add the new non-secret variables to `.env.example`, import `app.artifacts.models` in `backend/migrations/env.py`, and extend `backend/Dockerfile` with Chromium, Chinese fonts, MapLibre static assets, and the libraries required by Playwright, Matplotlib, python-docx, and python-pptx.
 
 - [ ] **Step 4: Implement migration 0015 and the ORM models**
 
