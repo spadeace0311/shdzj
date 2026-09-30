@@ -1,0 +1,18 @@
+{
+  "version": 8,
+  "name": "artifact-map-base-v1",
+  "metadata": {
+    "template_version": "artifact-map-template-v1",
+    "offline_only": true
+  },
+  "sources": {},
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#f7f5f0"
+      }
+    }
+  ]
+}

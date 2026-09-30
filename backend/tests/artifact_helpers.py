@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from geoalchemy2.elements import WKTElement
@@ -36,6 +38,39 @@ from app.intensity.models import IntensityFieldProduct
 
 def _checksum(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class MapEventFixture:
+    id: uuid.UUID
+    place: str
+    magnitude: Decimal
+    origin_time: datetime
+    longitude: Decimal
+    latitude: Decimal
+    depth_km: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class MapRevisionFixture:
+    id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class MapRenderFixtureContext:
+    artifact_key: str
+    display_name: str
+    output_profile: str
+    context_fingerprint: str
+    selected_basemap: object
+    event: MapEventFixture
+    revision: MapRevisionFixture
+    layers: tuple[object, ...]
+    legend: tuple[object, ...]
+    source_notes: tuple[str, ...]
+    quality: object
+    marker: str | None
+    base_style: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +171,77 @@ class ArtifactAssessmentFixture:
             artifact_key,
             output_profile=output_profile,
             **overrides,
+        )
+
+    async def map_context(
+        self,
+        artifact_key: str,
+        *,
+        base_style: str | None = None,
+    ) -> MapRenderFixtureContext:
+        from app.artifacts.basemap import SelectedBasemap
+        from app.artifacts.renderers.base import RenderQuality
+        from app.artifacts.renderers.map_renderer import MapLayer
+
+        definition = self.catalog.get(artifact_key, "a3v-professional")
+        selected_basemap = SelectedBasemap(
+            provider="gaode",
+            package_id="gaode-offline-v1",
+            version="v1",
+            checksum="a" * 64,
+            selection_reason="gaode validated",
+        )
+        fixture_source = Path(
+            "/app/tests/fixtures/artifact_maps/epicenter.geojson"
+        )
+        fixture_target = (
+            Path(settings.artifact_storage_root)
+            / "artifact_maps"
+            / "epicenter.geojson"
+        )
+        fixture_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(fixture_source, fixture_target)
+        layer = MapLayer(
+            id="epicenter",
+            url="local://artifact_maps/epicenter.geojson",
+            source={
+                "type": "geojson",
+                "data": "local://artifact_maps/epicenter.geojson",
+            },
+            style={
+                "type": "circle",
+                "paint": {
+                    "circle-radius": 10,
+                    "circle-color": "#b3261e",
+                    "circle-stroke-color": "#ffffff",
+                    "circle-stroke-width": 2,
+                },
+            },
+        )
+        return MapRenderFixtureContext(
+            artifact_key=artifact_key,
+            display_name=definition.display_name,
+            output_profile=definition.output_profile,
+            context_fingerprint=_checksum(
+                f"map-context-{artifact_key}-{self.event_id}"
+            ),
+            selected_basemap=selected_basemap,
+            event=MapEventFixture(
+                id=self.event_id,
+                place="artifact fixture event",
+                magnitude=Decimal("5.2"),
+                origin_time=self.deadline_basis_at - timedelta(minutes=2),
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+            ),
+            revision=MapRevisionFixture(id=self.revision_id),
+            layers=(layer,),
+            legend=(),
+            source_notes=("offline gaode basemap",),
+            quality=RenderQuality(grade=definition.quality_policy),
+            marker=None,
+            base_style=base_style or selected_basemap.provider_style_key,
         )
 
     async def create_full_run(
