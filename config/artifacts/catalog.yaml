@@ -1,0 +1,804 @@
+catalog_version: "2026.09.30-professional-v1"
+
+artifacts:
+  map.shelter_emergency:
+    display_name: 城区疏散场地分布图
+    kind: map
+    legacy_code: M01
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 60
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.shelter.emergency]
+    template_key: map.shelter_emergency
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.intensity:
+    display_name: 地震影响场分布图
+    kind: map
+    legacy_code: M02
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: intensity.fusion}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.intensity
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.economic_loss:
+    display_name: 经济损失预估专题图
+    kind: map
+    legacy_code: M03
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.economic}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.economic_loss
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.rescue_demand:
+    display_name: 救援力量需求专题图
+    kind: map
+    legacy_code: M04
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.resources}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.rescue_demand
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.deaths:
+    display_name: 人员死亡预估分布图
+    kind: map
+    legacy_code: M05
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.casualties}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.deaths
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.injuries:
+    display_name: 人员受伤预估分布图
+    kind: map
+    legacy_code: M06
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.casualties}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.injuries
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.buried:
+    display_name: 人员压埋预估分布图
+    kind: map
+    legacy_code: M07
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.casualties}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.buried
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.material_demand:
+    display_name: 物资需求预估专题图
+    kind: map
+    legacy_code: M08
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.resources}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.material_demand
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.gdp:
+    display_name: 震区 GDP 图
+    kind: map
+    legacy_code: M09
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.economy.county, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.gdp
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.pga_zoning:
+    display_name: 震区地震动峰值加速度区划图
+    kind: map
+    legacy_code: M10
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.pga.raster]
+    template_key: map.pga_zoning
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.transport:
+    display_name: 震区交通图
+    kind: map
+    legacy_code: M11
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.road.network]
+    template_key: map.transport
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+    degrade_conditions: [optional_asset_missing]
+
+  map.historical_earthquakes:
+    display_name: 震区历史地震分布图
+    kind: map
+    legacy_code: M12
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.historical.earthquakes, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.historical_earthquakes
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.population:
+    display_name: 震区人口分布图
+    kind: map
+    legacy_code: M13
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.town, shanghai.population.town, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.population
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.reservoirs:
+    display_name: 震区水库分布图
+    kind: map
+    legacy_code: M14
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.reservoir]
+    template_key: map.reservoirs
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.hazard_sources:
+    display_name: 震区危险源分布图
+    kind: map
+    legacy_code: M15
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.hazard_source, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.hazard_sources
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.schools:
+    display_name: 震区学校分布图
+    kind: map
+    legacy_code: M16
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.education.school, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.schools
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.hospitals:
+    display_name: 震区医院分布图
+    kind: map
+    legacy_code: M17
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.health.hospital, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.hospitals
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.metro:
+    display_name: 震中附近地铁分布图
+    kind: map
+    legacy_code: M18
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.metro]
+    template_key: map.metro
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.seismic_stations:
+    display_name: 震中附近地震台站分布图
+    kind: map
+    legacy_code: M19
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.seismic_station]
+    template_key: map.seismic_stations
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.active_faults:
+    display_name: 震中附近活动断裂图
+    kind: map
+    legacy_code: M20
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.fault, shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.active_faults
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.building_damage:
+    display_name: 震中附近建筑物分布图
+    kind: map
+    legacy_code: M21
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 50
+    depends_on:
+      - {kind: assessment_product, key: loss.buildings}
+    optional_depends_on: []
+    required_assets: [shanghai.admin.town, shanghai.building.town, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.building_damage
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.building_grid:
+    display_name: 震中附近建筑物公里格网分布图
+    kind: map
+    legacy_code: M22
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 55
+    depends_on:
+      - {kind: assessment_product, key: loss.buildings}
+    optional_depends_on: []
+    required_assets:
+      - shanghai.admin.town
+      - shanghai.building.town
+      - basemap.gaode.offline
+      - spatial_allocation_rule
+    optional_assets: []
+    template_key: map.building_grid
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: C
+    degrade_conditions: [spatialized_estimate]
+
+  map.rescue_teams:
+    display_name: 震中附近救援队伍分布图
+    kind: map
+    legacy_code: M23
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.rescue_team]
+    template_key: map.rescue_teams
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.cultural_relics:
+    display_name: 震中附近文物单位分布图
+    kind: map
+    legacy_code: M24
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: [shanghai.cultural_relic]
+    template_key: map.cultural_relics
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: B
+    degrade_conditions: [missing_optional_asset]
+
+  map.key_targets:
+    display_name: 震中附近重要目标分布图
+    kind: map
+    legacy_code: M25
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets:
+      - shanghai.key_target
+      - shanghai.lifeline
+      - shanghai.admin.city
+      - basemap.gaode.offline
+    optional_assets: []
+    template_key: map.key_targets
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.epicenter:
+    display_name: 震中位置分布图
+    kind: map
+    legacy_code: M26
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 10
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.admin.city, basemap.gaode.offline]
+    optional_assets: []
+    template_key: map.epicenter
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  map.city_distances:
+    display_name: 震中与主要城市距离分布图
+    kind: map
+    legacy_code: M27
+    output_profile: a3v-professional
+    format: jpg
+    dimensions: [4761, 3369]
+    dpi: 300
+    priority: 20
+    depends_on: []
+    optional_depends_on: []
+    required_assets:
+      - shanghai.admin.city
+      - shanghai.distance.reference_points
+      - basemap.gaode.offline
+    optional_assets: []
+    template_key: map.city_distances
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: A
+
+  doc.background:
+    display_name: 地震背景信息
+    kind: docx
+    legacy_code: D01
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 30
+    depends_on: []
+    optional_depends_on: []
+    required_assets: []
+    optional_assets: [shanghai.historical.earthquakes, shanghai.fault]
+    template_key: doc.background
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: background
+    degrade_conditions: [missing_optional_asset]
+
+  doc.housing:
+    display_name: 震区房屋统计
+    kind: docx
+    legacy_code: D02
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 40
+    depends_on:
+      - {kind: assessment_product, key: loss.buildings}
+      - {kind: assessment_product, key: loss.population}
+    optional_depends_on: []
+    required_assets: [shanghai.building.town]
+    optional_assets: []
+    template_key: doc.housing
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: background
+
+  doc.economy:
+    display_name: 震区经济信息
+    kind: docx
+    legacy_code: D03
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 40
+    depends_on:
+      - {kind: assessment_product, key: loss.economic}
+    optional_depends_on: []
+    required_assets: [shanghai.economy.county]
+    optional_assets: []
+    template_key: doc.economy
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: background
+
+  doc.population:
+    display_name: 震区人口信息
+    kind: docx
+    legacy_code: D04
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 40
+    depends_on:
+      - {kind: assessment_product, key: loss.population}
+    optional_depends_on: []
+    required_assets: [shanghai.population.town]
+    optional_assets: []
+    template_key: doc.population
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: background
+
+  doc.key_targets:
+    display_name: 重点目标信息
+    kind: docx
+    legacy_code: D05
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: []
+    optional_assets:
+      - shanghai.shelter.emergency
+      - shanghai.education.school
+      - shanghai.health.hospital
+      - shanghai.hazard_source
+      - shanghai.rescue_team
+      - shanghai.cultural_relic
+      - shanghai.key_target
+    template_key: doc.key_targets
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: background
+    degrade_conditions: [missing_optional_asset]
+
+  doc.spatial_distances:
+    display_name: 震中空间距离分布
+    kind: docx
+    legacy_code: D06
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 45
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.distance.reference_points]
+    optional_assets: [shanghai.road.network, shanghai.fault]
+    template_key: doc.spatial_distances
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: background
+    degrade_conditions: [missing_optional_asset]
+
+  doc.area_overview:
+    display_name: 震区基本情况
+    kind: docx
+    legacy_code: D07
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 80
+    depends_on:
+      - {kind: artifact, key: doc.background, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.housing, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.economy, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.population, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.key_targets, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.spatial_distances, output_profile: a3v-professional}
+    optional_depends_on: []
+    required_assets: []
+    optional_assets: []
+    template_key: doc.area_overview
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: background
+
+  doc.historical_catalog:
+    display_name: 历史及灾害地震目录
+    kind: docx
+    legacy_code: D08
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 30
+    depends_on: []
+    optional_depends_on: []
+    required_assets: [shanghai.historical.earthquakes]
+    optional_assets: []
+    template_key: doc.historical_catalog
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: background
+
+  doc.rapid_brief:
+    display_name: 地震灾害快速评估简报
+    kind: docx
+    legacy_code: D09
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 90
+    depends_on:
+      - {kind: assessment_product, key: intensity.fusion}
+      - {kind: assessment_product, key: loss.buildings}
+      - {kind: assessment_product, key: loss.population}
+      - {kind: assessment_product, key: loss.casualties}
+      - {kind: assessment_product, key: loss.economic}
+      - {kind: assessment_product, key: loss.resources}
+      - {kind: assessment_product, key: loss.validate}
+      - {kind: artifact, key: map.intensity, output_profile: a3v-professional}
+      - {kind: artifact, key: map.deaths, output_profile: a3v-professional}
+      - {kind: artifact, key: map.injuries, output_profile: a3v-professional}
+      - {kind: artifact, key: map.population, output_profile: a3v-professional}
+      - {kind: artifact, key: map.building_damage, output_profile: a3v-professional}
+      - {kind: artifact, key: map.epicenter, output_profile: a3v-professional}
+    optional_depends_on: []
+    required_assets: []
+    optional_assets: []
+    template_key: doc.rapid_brief
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: core
+
+  doc.rapid_report:
+    display_name: 地震灾害快速评估专报
+    kind: docx
+    legacy_code: D10
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 100
+    depends_on:
+      - {kind: artifact, key: doc.background, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.housing, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.economy, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.population, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.key_targets, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.spatial_distances, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.area_overview, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.historical_catalog, output_profile: a3v-professional}
+      - {kind: artifact, key: map.intensity, output_profile: a3v-professional}
+      - {kind: artifact, key: map.economic_loss, output_profile: a3v-professional}
+      - {kind: artifact, key: map.rescue_demand, output_profile: a3v-professional}
+      - {kind: artifact, key: map.deaths, output_profile: a3v-professional}
+      - {kind: artifact, key: map.injuries, output_profile: a3v-professional}
+      - {kind: artifact, key: map.buried, output_profile: a3v-professional}
+      - {kind: artifact, key: map.material_demand, output_profile: a3v-professional}
+      - {kind: artifact, key: map.gdp, output_profile: a3v-professional}
+      - {kind: artifact, key: map.transport, output_profile: a3v-professional}
+      - {kind: artifact, key: map.historical_earthquakes, output_profile: a3v-professional}
+      - {kind: artifact, key: map.population, output_profile: a3v-professional}
+      - {kind: artifact, key: map.hazard_sources, output_profile: a3v-professional}
+      - {kind: artifact, key: map.schools, output_profile: a3v-professional}
+      - {kind: artifact, key: map.hospitals, output_profile: a3v-professional}
+      - {kind: artifact, key: map.active_faults, output_profile: a3v-professional}
+      - {kind: artifact, key: map.building_damage, output_profile: a3v-professional}
+      - {kind: artifact, key: map.key_targets, output_profile: a3v-professional}
+      - {kind: artifact, key: map.epicenter, output_profile: a3v-professional}
+      - {kind: artifact, key: map.city_distances, output_profile: a3v-professional}
+    optional_depends_on:
+      - {kind: artifact, key: map.shelter_emergency, output_profile: a3v-professional}
+      - {kind: artifact, key: map.pga_zoning, output_profile: a3v-professional}
+      - {kind: artifact, key: map.reservoirs, output_profile: a3v-professional}
+      - {kind: artifact, key: map.metro, output_profile: a3v-professional}
+      - {kind: artifact, key: map.seismic_stations, output_profile: a3v-professional}
+      - {kind: artifact, key: map.rescue_teams, output_profile: a3v-professional}
+      - {kind: artifact, key: map.cultural_relics, output_profile: a3v-professional}
+      - {kind: artifact, key: map.building_grid, output_profile: a3v-professional}
+    required_assets: []
+    optional_assets: []
+    template_key: doc.rapid_report
+    marker_policy: mode
+    failure_policy: degrade
+    quality_policy: core
+    degrade_conditions: [optional_dependency_unavailable]
+
+  doc.decision_report:
+    display_name: 辅助决策报告
+    kind: docx
+    legacy_code: D11
+    output_profile: a3v-professional
+    format: docx
+    page_size: A4
+    priority: 110
+    depends_on:
+      - {kind: artifact, key: doc.rapid_brief, output_profile: a3v-professional}
+      - {kind: artifact, key: doc.rapid_report, output_profile: a3v-professional}
+      - {kind: artifact, key: map.intensity, output_profile: a3v-professional}
+      - {kind: artifact, key: map.economic_loss, output_profile: a3v-professional}
+      - {kind: artifact, key: map.rescue_demand, output_profile: a3v-professional}
+      - {kind: artifact, key: map.deaths, output_profile: a3v-professional}
+      - {kind: artifact, key: map.injuries, output_profile: a3v-professional}
+      - {kind: artifact, key: map.buried, output_profile: a3v-professional}
+      - {kind: artifact, key: map.material_demand, output_profile: a3v-professional}
+      - {kind: artifact, key: map.active_faults, output_profile: a3v-professional}
+      - {kind: artifact, key: map.key_targets, output_profile: a3v-professional}
+      - {kind: artifact, key: map.epicenter, output_profile: a3v-professional}
+      - {kind: artifact, key: map.city_distances, output_profile: a3v-professional}
+    optional_depends_on: []
+    required_assets: []
+    optional_assets: []
+    template_key: doc.decision_report
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: core
+
+  deck.decision_report:
+    display_name: 辅助决策报告
+    kind: pptx
+    legacy_code: D12
+    output_profile: a3v-professional
+    format: pptx
+    page_size: "16:9"
+    priority: 120
+    depends_on:
+      - {kind: artifact, key: doc.decision_report, output_profile: a3v-professional}
+    optional_depends_on: []
+    required_assets: []
+    optional_assets: []
+    template_key: deck.decision_report
+    marker_policy: mode
+    failure_policy: block
+    quality_policy: core
