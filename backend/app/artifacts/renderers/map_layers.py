@@ -144,7 +144,7 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "economic-loss-town",
             legend=(_legend("经济损失", "万元"),),
             attribute_bindings=(
-                _binding("economic_loss", metric_key="economic_loss"),
+                _binding("economic_loss", metric_key="total_loss_yuan"),
             ),
         ),
     ),
@@ -156,7 +156,7 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "rescue-demand-town",
             legend=(_legend("救援力量需求"),),
             attribute_bindings=(
-                _binding("rescue_teams", metric_key="rescue_teams"),
+                _binding("rescue_teams", metric_key="rescue_team.quantity"),
             ),
         ),
     ),
@@ -298,7 +298,10 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "building-damage-town",
             legend=(_legend("房屋破坏"),),
             attribute_bindings=(
-                _binding("damaged_buildings", metric_key="damaged_buildings"),
+                _binding(
+                    "damaged_buildings",
+                    metric_key="severe_or_collapsed_area_m2",
+                ),
             ),
         ),
         _definition(
@@ -590,6 +593,12 @@ def _content_quality_reasons(source_key: str, layer: Any) -> tuple[str, ...]:
         return ()
     reasons: list[str] = []
     placeholders = {"available", "TBD", "TODO", "待补充", "稍后补充"}
+    metadata = _metadata(layer)
+    bound_properties = {
+        str(binding.get("property_name") or binding.get("field") or "")
+        for binding in metadata.get("attribute_bindings", ())
+        if isinstance(binding, Mapping)
+    }
     for feature in features:
         if not isinstance(feature, Mapping):
             continue
@@ -597,14 +606,24 @@ def _content_quality_reasons(source_key: str, layer: Any) -> tuple[str, ...]:
         if not isinstance(properties, Mapping):
             continue
         value_status = str(properties.get("value_status") or "")
-        if value_status in {"unavailable", "not_applicable"}:
-            numeric_values = [
-                value
-                for value in properties.values()
-                if isinstance(value, (int, float))
+        if value_status == "rounded_to_zero":
+            reasons.append(f"{source_key} contains a rounded-to-zero substitution")
+        for property_name in bound_properties:
+            value = properties.get(property_name)
+            if (
+                value_status in {"unavailable", "not_applicable"}
+                and value is not None
+            ):
+                reasons.append(
+                    f"{source_key} contains a value for unavailable metric "
+                    f"{property_name}"
+                )
+            if (
+                value_status == "available"
+                and isinstance(value, (int, float))
                 and not isinstance(value, bool)
-            ]
-            if any(value == 0 for value in numeric_values):
+                and value == 0
+            ):
                 reasons.append(f"{source_key} contains an unexpected zero substitution")
         for key, value in properties.items():
             if key == "value_status":
