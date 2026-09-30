@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+from PIL import Image
 from sqlalchemy import select
 
 from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
-from app.artifacts.renderers.map_layers import MapLayerRegistry, MapQualityPolicy
+from app.artifacts.context import ProductionContextService
+from app.artifacts.renderers.map_layers import (
+    MapLayerRegistry,
+    MapQualityPolicy,
+    MapSourceUnavailableError,
+)
 from app.artifacts.renderers.map_renderer import BrowserPool, MapRenderer, MapSpecBuilder
 from app.artifacts.repository import ArtifactProductionRepository
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.config import settings
 from app.db import engine
+from app.data_assets.models import DataAssetVersion
+from app.data_assets.raster_importer import GeoTiffAssetImporter
+from app.data_assets.raster_repository import save_raster_version
 from app.loss.models import LossProduct
 from tests.basemap_fixtures import make_in_memory_package, png_tile_bytes
+from tests.data_asset_helpers import publish_new_population_version
 
 
 A_CLASS_ARTIFACTS = (
@@ -173,27 +186,237 @@ async def _prepare_product_dependencies(fixture, artifact_key: str):
     return task
 
 
-@pytest.mark.parametrize("artifact_key", A_CLASS_ARTIFACTS)
-async def test_a_class_artifacts_are_rendered_with_required_layers(
-    artifact_key,
-    seeded_artifact_assessment,
-    map_renderer,
-    tmp_path,
-) -> None:
-    context = await seeded_artifact_assessment.map_context(artifact_key)
-    layers = MapLayerRegistry.build(artifact_key, context)
-    quality = MapQualityPolicy.evaluate(artifact_key, layers)
-    spec = MapSpecBuilder().build(context)
-    result = await map_renderer.render(spec, tmp_path / f"{artifact_key}.jpg")
+def _raster_source(source_key: str, tmp_path: Path) -> dict:
+    target_dir = Path(settings.artifact_storage_root) / "artifact_maps"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"{source_key}-fixture.png"
+    Image.new("L", (8, 8), 90).save(target_dir / file_name, format="PNG")
+    return {
+        "source_key": source_key,
+        "kind": "raster",
+        "status": "bound",
+        "url": f"local://artifact_maps/{file_name}",
+        "source": {
+            "type": "image",
+            "url": f"local://artifact_maps/{file_name}",
+            "coordinates": [
+                [121.0, 31.5],
+                [122.0, 31.5],
+                [122.0, 30.8],
+                [121.0, 30.8],
+            ],
+        },
+        "style": {"type": "raster", "paint": {"raster-opacity": 0.8}},
+        "checksum": None,
+        "feature_count": 1,
+        "metadata": {"verified_empty": False},
+    }
 
-    assert layers
+
+def _verified_empty_source(source_key: str) -> dict:
+    return {
+        "source_key": source_key,
+        "kind": "vector",
+        "status": "verified_empty",
+        "url": f"local://inline/{source_key}",
+        "source": {"type": "geojson", "data": {"type": "FeatureCollection", "features": []}},
+        "style": {
+            "type": "line",
+            "paint": {"line-color": "#b3261e", "line-width": 3},
+        },
+        "checksum": None,
+        "feature_count": 0,
+        "metadata": {"verified_empty": True},
+    }
+
+
+async def test_registry_rejects_missing_required_resolved_source(
+    seeded_artifact_assessment,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.gdp")
+    context = replace(context, resolved_sources={})
+
+    with pytest.raises(MapSourceUnavailableError):
+        MapLayerRegistry.build("map.gdp", context)
+
+
+def test_registry_builds_real_raster_source(tmp_path):
+    sources = {
+        definition.source_key: _raster_source(definition.source_key, tmp_path)
+        for definition in MapLayerRegistry.definitions("map.gdp")
+    }
+    layers = MapLayerRegistry.build(
+        "map.gdp",
+        type("Context", (), {"resolved_sources": sources})(),
+    )
+
+    raster_layer = next(layer for layer in layers if layer.id == "gdp-raster")
+    assert raster_layer.type == "raster"
+    assert raster_layer.source["type"] == "image"
+    assert raster_layer.url.startswith("local://artifact_maps/")
+
+
+async def test_active_fault_verified_empty_is_allowed(
+    seeded_artifact_assessment,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.active_faults")
+    sources = {
+        definition.source_key: _verified_empty_source(definition.source_key)
+        for definition in MapLayerRegistry.definitions("map.active_faults")
+    }
+    context = replace(context, resolved_sources=sources)
+    layers = MapLayerRegistry.build("map.active_faults", context)
+    quality = MapQualityPolicy.evaluate("map.active_faults", layers)
+    spec = MapSpecBuilder().build(context)
+
     assert quality.grade == "A"
     assert quality.needs_review is False
-    assert result.width == 4761
-    assert result.height == 3369
-    assert result.quality.grade == "A"
-    assert result.quality.needs_review is False
-    assert result.render_manifest["base_provider"] in {"gaode", "tianditu"}
+    assert "检索范围内无活动断裂记录" in spec.source_notes
+
+
+def test_quality_policy_detects_placeholder_and_unexpected_zero() -> None:
+    layer = type(
+        "Layer",
+        (),
+        {
+            "source_key": "product:loss.economic",
+            "metadata": {"source_status": "bound"},
+            "source": {
+                "type": "geojson",
+                "data": {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "geometry": {"type": "Point", "coordinates": [121.5, 31.2]},
+                            "properties": {
+                                "economic_loss": 0,
+                                "value_status": "unavailable",
+                            },
+                        },
+                        {
+                            "type": "Feature",
+                            "geometry": {"type": "Point", "coordinates": [121.5, 31.2]},
+                            "properties": {"name": "TBD"},
+                        },
+                    ],
+                },
+            },
+        },
+    )()
+    quality = MapQualityPolicy.evaluate("map.economic_loss", (layer,))
+
+    assert quality.needs_review is True
+    assert any("unexpected zero" in reason for reason in quality.degradation_reasons)
+    assert any("placeholder" in reason for reason in quality.degradation_reasons)
+
+
+async def test_production_mode_marker_is_rendered_and_named(
+    seeded_artifact_assessment,
+    map_renderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    context = replace(
+        context,
+        production_mode="test",
+        marker="【测试】",
+    )
+    result = await map_renderer.render(
+        MapSpecBuilder().build(context),
+        tmp_path / "test-epicenter.jpg",
+    )
+
+    assert result.file_name.startswith("【测试】")
+    assert result.render_manifest["marker"] == "【测试】"
+    with Image.open(result.path) as image:
+        marker_text = image.info.get("comment", b"").decode("utf-8")
+    assert marker_text == "【测试】"
+
+
+async def test_production_population_context_resolves_published_vector(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await publish_new_population_version(session_factory, f"maps-a-{id(seeded_artifact_assessment)}")
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.population")
+
+    async with session_factory() as session:
+        async with session.begin():
+            await service.freeze_static_context(
+                session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+            context = await service.build_map_context(session, task.id)
+
+    layers = MapLayerRegistry.build("map.population", context)
+    population_layer = next(
+        layer for layer in layers if layer.id == "population-town"
+    )
+    features = population_layer.source["data"]["features"]
+    assert features
+    assert features[0]["properties"]["total"] == 100
+    assert population_layer.metadata["source_checksum"]
+
+
+async def test_production_gdp_context_resolves_published_raster(
+    seeded_artifact_assessment,
+    seeded_imported_version,
+    session_factory,
+) -> None:
+    descriptor = GeoTiffAssetImporter().load(
+        seeded_imported_version.source_path,
+        seeded_imported_version.definition,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await save_raster_version(
+                session,
+                seeded_imported_version.version_id,
+                seeded_imported_version.source_path,
+                descriptor,
+            )
+            version = await session.get(
+                DataAssetVersion,
+                seeded_imported_version.version_id,
+            )
+            assert version is not None
+            version.status = "validated"
+            await session.flush()
+            version.status = "published"
+            version.published_at = datetime.now(UTC)
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.gdp")
+    async with session_factory() as session:
+        async with session.begin():
+            await service.freeze_static_context(
+                session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+            context = await service.build_map_context(session, task.id)
+
+    layers = MapLayerRegistry.build("map.gdp", context)
+    raster_layer = next(layer for layer in layers if layer.id == "gdp-raster")
+    assert raster_layer.type == "raster"
+    assert raster_layer.source["type"] == "image"
 
 
 @pytest.mark.parametrize(

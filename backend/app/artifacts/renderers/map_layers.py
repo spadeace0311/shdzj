@@ -34,6 +34,10 @@ _TRANSPORT_OPTIONAL_ROAD = "shanghai.road.network"
 _ACTIVE_FAULT_EMPTY_STATEMENT = "检索范围内无活动断裂记录"
 
 
+class MapSourceUnavailableError(RuntimeError):
+    """Raised when a required map source is missing or invalid."""
+
+
 @dataclass(frozen=True, slots=True)
 class AttributeBinding:
     field: str
@@ -355,146 +359,35 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
 }
 
 
-def _coordinate(context: Any, attribute: str, default: float) -> float:
-    event = getattr(context, "event", None)
-    value = getattr(event, attribute, None)
-    if value is None:
-        value = default
-    return float(value)
-
-
-def _feature_collection(definition: LayerDefinition, context: Any) -> dict[str, Any]:
-    longitude = _coordinate(context, "longitude", 121.5)
-    latitude = _coordinate(context, "latitude", 31.2)
-    geometry_type = definition.geometry_type
-    if geometry_type in {"point", "multipoint"}:
-        geometry = {
-            "type": "Point",
-            "coordinates": [longitude, latitude],
-        }
-    elif geometry_type in {"line", "multiline"}:
-        geometry = {
-            "type": "LineString",
-            "coordinates": [
-                [longitude - 0.08, latitude - 0.04],
-                [longitude, latitude + 0.04],
-                [longitude + 0.08, latitude - 0.02],
-            ],
-        }
-    else:
-        geometry = {
-            "type": "Polygon",
-            "coordinates": [
-                [
-                    [longitude - 0.12, latitude - 0.08],
-                    [longitude + 0.12, latitude - 0.08],
-                    [longitude + 0.12, latitude + 0.08],
-                    [longitude - 0.12, latitude + 0.08],
-                    [longitude - 0.12, latitude - 0.08],
-                ]
-            ],
-        }
-    properties: dict[str, Any] = {
-        "layer_id": definition.layer_id,
-        "source_key": definition.source_key,
-        "style_id": definition.style_id,
-    }
-    for binding in definition.attribute_bindings:
-        properties[binding.property_name or binding.field] = binding.value_status
-    return {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "geometry": geometry,
-                "properties": properties,
-            }
-        ],
-    }
-
-
-def _style_for(definition: LayerDefinition) -> dict[str, Any]:
-    if definition.geometry_type in {"line", "multiline"}:
-        return {
-            "type": "line",
-            "paint": {
-                "line-color": "#b3261e",
-                "line-width": 3,
-                "line-opacity": 0.9,
-            },
-        }
-    if definition.geometry_type in {"point", "multipoint"}:
-        return {
-            "type": "circle",
-            "paint": {
-                "circle-radius": 8,
-                "circle-color": "#c5523f",
-                "circle-stroke-color": "#ffffff",
-                "circle-stroke-width": 2,
-            },
-        }
-    return {
-        "type": "fill",
-        "paint": {
-            "fill-color": "#c77b3b",
-            "fill-opacity": 0.42,
-        },
-    }
-
-
-def _asset_versions(context: Any) -> Mapping[str, Any]:
-    value = getattr(context, "asset_versions", None)
-    return value if isinstance(value, Mapping) else {}
-
-
-def _asset_status(context: Any, source_key: str) -> str:
-    asset_versions = _asset_versions(context)
-    if not asset_versions:
-        return "bound"
-    item = asset_versions.get(source_key)
-    if item is None:
-        return "missing"
-    status = getattr(item, "resolution_status", None)
-    if status in {"bound", "missing"}:
-        return str(status)
-    return "bound"
-
-
-def _product_status(context: Any, source_key: str) -> str:
-    product_key = source_key.removeprefix("product:")
-    bindings = getattr(context, "dependency_bindings", None)
-    if bindings:
-        for binding in bindings:
-            if getattr(binding, "dependency_key", None) != product_key:
-                continue
-            if getattr(binding, "dependency_kind", None) != "assessment_product":
-                continue
-            status = getattr(binding, "resolution_status", None)
-            if status in {"bound", "degraded"}:
-                return str(status)
-        return "missing"
-    for attribute in ("product_values", "evaluation_products"):
-        values = getattr(context, attribute, None)
-        if isinstance(values, Mapping) and product_key in values:
-            return "bound"
-    return "bound" if not bindings else "missing"
-
-
-def _source_status(context: Any, source_key: str) -> str:
-    if source_key == "event":
-        return "bound"
-    if source_key.startswith("product:"):
-        return _product_status(context, source_key)
-    return _asset_status(context, source_key)
-
-
 def _to_map_layer(
     definition: LayerDefinition,
     context: Any,
 ) -> Any:
     from app.artifacts.renderers.map_renderer import MapLayer
 
-    source_status = _source_status(context, definition.source_key)
+    resolved_sources = getattr(context, "resolved_sources", None)
+    if not isinstance(resolved_sources, Mapping):
+        raise MapSourceUnavailableError(
+            f"A-class map source resolution is required for {definition.source_key}"
+        )
+    source = resolved_sources.get(definition.source_key)
+    if source is None:
+        if definition.optional:
+            return _missing_map_layer(definition)
+        raise MapSourceUnavailableError(
+            f"required map source is unavailable: {definition.source_key}"
+        )
+    source_status = str(
+        source.get("status", "missing")
+        if isinstance(source, Mapping)
+        else getattr(source, "status", "missing")
+    )
+    if source_status == "missing":
+        if definition.optional:
+            return _missing_map_layer(definition)
+        raise MapSourceUnavailableError(
+            f"required map source is unavailable: {definition.source_key}"
+        )
     metadata = {
         "layer_id": definition.layer_id,
         "source_key": definition.source_key,
@@ -509,19 +402,85 @@ def _to_map_layer(
         "source_status": source_status,
         "data_kind": definition.data_kind,
         "verified_empty_statement": definition.verified_empty_statement,
-        "verified_empty": False,
+        "verified_empty": source_status == "verified_empty",
+        "source_checksum": (
+            source.get("checksum")
+            if isinstance(source, Mapping)
+            else getattr(source, "checksum", None)
+        ),
+        "feature_count": (
+            source.get("feature_count", 0)
+            if isinstance(source, Mapping)
+            else getattr(source, "feature_count", 0)
+        ),
     }
+    source_kind = (
+        source.get("kind")
+        if isinstance(source, Mapping)
+        else getattr(source, "kind", None)
+    )
+    source_url = (
+        source.get("url")
+        if isinstance(source, Mapping)
+        else getattr(source, "url", None)
+    )
+    source_payload = (
+        source.get("source")
+        if isinstance(source, Mapping)
+        else getattr(source, "source", None)
+    )
+    source_style = (
+        source.get("style")
+        if isinstance(source, Mapping)
+        else getattr(source, "style", None)
+    )
+    source_type = "raster" if source_kind == "raster" else "geojson"
+    return MapLayer(
+        id=definition.layer_id,
+        url=str(source_url or f"local://inline/{definition.layer_id}"),
+        type=source_type,
+        source=dict(source_payload or {}),
+        style=dict(source_style or {}),
+        source_key=definition.source_key,
+        metadata=metadata,
+    )
+
+
+def _missing_map_layer(definition: LayerDefinition) -> Any:
+    from app.artifacts.renderers.map_renderer import MapLayer
+
     return MapLayer(
         id=definition.layer_id,
         url=f"local://inline/{definition.layer_id}",
         type="geojson",
         source={
             "type": "geojson",
-            "data": _feature_collection(definition, context),
+            "data": {"type": "FeatureCollection", "features": []},
         },
-        style=_style_for(definition),
+        style={
+            "type": "line"
+            if definition.geometry_type in {"line", "multiline"}
+            else "circle"
+            if definition.geometry_type in {"point", "multipoint"}
+            else "fill",
+            "paint": {},
+        },
         source_key=definition.source_key,
-        metadata=metadata,
+        metadata={
+            "layer_id": definition.layer_id,
+            "source_key": definition.source_key,
+            "geometry_type": definition.geometry_type,
+            "style_id": definition.style_id,
+            "legend": [dict(item) for item in definition.legend],
+            "minimum_zoom": definition.minimum_zoom,
+            "attribute_bindings": [
+                item.to_dict() for item in definition.attribute_bindings
+            ],
+            "optional": True,
+            "source_status": "missing",
+            "data_kind": definition.data_kind,
+            "verified_empty": False,
+        },
     )
 
 
@@ -595,6 +554,7 @@ class MapQualityPolicy:
                 reasons.append(f"{source_key} contains placeholder text")
             if metadata.get("unexpected_zero"):
                 reasons.append(f"{source_key} contains an unexpected zero substitution")
+            reasons.extend(_content_quality_reasons(source_key, layer))
             if source_status != "missing":
                 continue
             if (
@@ -616,3 +576,40 @@ class MapQualityPolicy:
             needs_review=bool(reasons),
             degradation_reasons=tuple(dict.fromkeys(reasons)),
         )
+
+
+def _content_quality_reasons(source_key: str, layer: Any) -> tuple[str, ...]:
+    source = getattr(layer, "source", None)
+    if not isinstance(source, Mapping):
+        return ()
+    data = source.get("data")
+    if not isinstance(data, Mapping):
+        return ()
+    features = data.get("features")
+    if not isinstance(features, list):
+        return ()
+    reasons: list[str] = []
+    placeholders = {"available", "TBD", "TODO", "待补充", "稍后补充"}
+    for feature in features:
+        if not isinstance(feature, Mapping):
+            continue
+        properties = feature.get("properties")
+        if not isinstance(properties, Mapping):
+            continue
+        value_status = str(properties.get("value_status") or "")
+        if value_status in {"unavailable", "not_applicable"}:
+            numeric_values = [
+                value
+                for value in properties.values()
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ]
+            if any(value == 0 for value in numeric_values):
+                reasons.append(f"{source_key} contains an unexpected zero substitution")
+        for key, value in properties.items():
+            if key == "value_status":
+                continue
+            if isinstance(value, str) and value in placeholders:
+                reasons.append(f"{source_key} contains placeholder text")
+                break
+    return tuple(dict.fromkeys(reasons))

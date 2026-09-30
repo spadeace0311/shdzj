@@ -1,9 +1,11 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from PIL import Image
+from sqlalchemy import select
 
 from app.artifacts.basemap import (
     MapViewportTileManifest,
@@ -14,6 +16,10 @@ from app.artifacts.context import MapRenderContext, ProductionContextService
 from app.artifacts.repository import ArtifactProductionRepository
 from app.config import settings
 from app.db import engine
+from app.data_assets.domain import NormalizedRecord, NormalizedTableData
+from app.data_assets.import_jobs import QueueImportRequest, queue_import_job
+from app.data_assets.registry import get_asset_definition
+from app.data_assets.service import DataAssetService
 from app.artifacts.renderers.map_renderer import (
     BrowserPool,
     MapLayer,
@@ -87,6 +93,79 @@ def _write_real_basemap_package(root: Path) -> None:
     )
 
 
+async def _publish_admin_city(session_factory) -> None:
+    definition = get_asset_definition("shanghai.admin.city")
+    async with session_factory() as session:
+        async with session.begin():
+            from app.data_assets.models import DataAsset, DataAssetVersion
+
+            existing = await session.scalar(
+                select(DataAssetVersion)
+                .join(DataAsset, DataAssetVersion.asset_id == DataAsset.id)
+                .where(
+                    DataAsset.asset_key == definition.asset_key,
+                    DataAsset.region_id == definition.region_id,
+                    DataAssetVersion.status == "published",
+                )
+            )
+            if existing is not None:
+                return
+            job = await queue_import_job(
+                session,
+                QueueImportRequest(
+                    asset_key=definition.asset_key,
+                    version=f"admin-city-{uuid4()}",
+                    source_uri="https://example.gov.invalid/admin-city",
+                    license_name=None,
+                    acquired_at=None,
+                    valid_from=None,
+                    valid_to=None,
+                    change_note="map renderer admin city fixture",
+                    file_name="admin-city",
+                    file_format="geojson",
+                    file_size_bytes=1,
+                    checksum="a" * 64,
+                    relative_path="fixture/admin-city",
+                    requested_by="map-renderer-fixture",
+                ),
+            )
+            normalized = NormalizedTableData(
+                columns=("name",),
+                records=(
+                    NormalizedRecord(
+                        row_number=1,
+                        business_key="shanghai",
+                        properties={"name": "Shanghai"},
+                        geometry_wkt=(
+                            "MULTIPOLYGON (((121.2 30.9, 121.8 30.9, "
+                            "121.8 31.5, 121.2 31.5, 121.2 30.9)))"
+                        ),
+                    ),
+                ),
+                source_crs="EPSG:4326",
+                spatial_extent=(121.2, 30.9, 121.8, 31.5),
+            )
+            await DataAssetService().populate_candidate_version(
+                session,
+                job.asset_version_id,
+                normalized,
+                {
+                    "importer": "geojson",
+                    "record_count": normalized.record_count,
+                    "source_crs": normalized.source_crs,
+                },
+            )
+            version = await session.get(DataAssetVersion, job.asset_version_id)
+            if version is None:
+                raise LookupError("admin city candidate version not found")
+            version.status = "validated"
+            version.validated_at = datetime.now(UTC)
+            await session.flush()
+            version.status = "published"
+            version.reviewed_by = "map-renderer-fixture"
+            version.published_at = datetime.now(UTC)
+
+
 def _pixel_fraction(path: Path, predicate) -> float:
     with Image.open(path).convert("RGB") as image:
         pixels = list(image.getdata())
@@ -158,6 +237,7 @@ async def test_formal_context_renders_real_offline_basemap_and_epicenter(
     )
     run = await seeded_artifact_assessment.create_full_run()
     task = await seeded_artifact_assessment.first_task(run.id, "map.epicenter")
+    await _publish_admin_city(session_factory)
 
     async with session_factory() as session:
         async with session.begin():

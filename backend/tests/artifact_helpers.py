@@ -71,6 +71,83 @@ class MapRenderFixtureContext:
     quality: object
     marker: str | None
     base_style: str
+    production_mode: str
+    resolved_sources: object
+
+
+def _fixture_resolved_sources(artifact_key: str) -> dict:
+    from app.artifacts.renderers.map_layers import MapLayerRegistry
+
+    sources = {}
+    for definition in MapLayerRegistry.definitions(artifact_key):
+        if definition.source_key == "event":
+            feature = {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [121.5, 31.2]},
+                "properties": {
+                    "magnitude": 5.2,
+                    "depth_km": 10.0,
+                    "value_status": "available",
+                },
+            }
+            style = {
+                "type": "circle",
+                "paint": {
+                    "circle-radius": 10,
+                    "circle-color": "#b3261e",
+                    "circle-stroke-color": "#ffffff",
+                    "circle-stroke-width": 2,
+                },
+            }
+        elif definition.geometry_type in {"line", "multiline"}:
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[121.42, 31.16], [121.5, 31.2], [121.58, 31.24]],
+                },
+                "properties": {"value_status": "available"},
+            }
+            style = {
+                "type": "line",
+                "paint": {"line-color": "#b3261e", "line-width": 3},
+            }
+        else:
+            feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [121.38, 31.1],
+                            [121.62, 31.1],
+                            [121.62, 31.3],
+                            [121.38, 31.3],
+                            [121.38, 31.1],
+                        ]
+                    ],
+                },
+                "properties": {"value_status": "available"},
+            }
+            style = {
+                "type": "fill",
+                "paint": {"fill-color": "#c77b3b", "fill-opacity": 0.42},
+            }
+        sources[definition.source_key] = {
+            "source_key": definition.source_key,
+            "kind": "vector",
+            "status": "bound",
+            "url": f"local://inline/{definition.source_key}",
+            "source": {
+                "type": "geojson",
+                "data": {"type": "FeatureCollection", "features": [feature]},
+            },
+            "style": style,
+            "checksum": None,
+            "feature_count": 1,
+            "metadata": {"verified_empty": False},
+        }
+    return sources
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +295,7 @@ class ArtifactAssessmentFixture:
                 },
             },
         )
+        resolved_sources = _fixture_resolved_sources(artifact_key)
         return MapRenderFixtureContext(
             artifact_key=artifact_key,
             display_name=definition.display_name,
@@ -242,6 +320,8 @@ class ArtifactAssessmentFixture:
             quality=RenderQuality(grade=definition.quality_policy),
             marker=None,
             base_style=base_style or selected_basemap.provider_style_key,
+            production_mode="live",
+            resolved_sources=resolved_sources,
         )
 
     async def create_full_run(

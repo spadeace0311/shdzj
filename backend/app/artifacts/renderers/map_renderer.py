@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -179,6 +179,7 @@ class MapRenderSpec:
     source_notes: tuple[str, ...] = ()
     quality: RenderQuality = field(default_factory=RenderQuality)
     marker: str | None = None
+    production_mode: str = "live"
     context_fingerprint: str = ""
     input_fingerprint: str = ""
     template_version: str = "artifact-map-template-v1"
@@ -197,6 +198,7 @@ class MapRenderSpec:
             "source_notes": list(self.source_notes),
             "quality": self.quality.to_dict(),
             "marker": self.marker,
+            "production_mode": self.production_mode,
             "output": self.output.to_dict(),
             "context_fingerprint": self.context_fingerprint,
             "input_fingerprint": self.input_fingerprint,
@@ -220,6 +222,7 @@ class MapRenderSpec:
             "base_package_version": basemap.get("version"),
             "base_package_checksum": basemap.get("checksum"),
             "base_style": self.base_style,
+            "marker": self.marker,
             "layer_versions": {
                 layer.id: str(layer.metadata.get("version", "v1"))
                 for layer in self.layers
@@ -409,6 +412,7 @@ class MapSpecBuilder:
             source_notes=source_notes,
             quality=_coerce_quality(quality_value),
             marker=getattr(context, "marker", None),
+            production_mode=str(getattr(context, "production_mode", "live")),
             output=MapOutput(
                 format=str(getattr(context, "output_format", "jpg")),
                 width=4761,
@@ -633,10 +637,17 @@ class LocalAssetRegistry:
             return (self._maplibre_root / path).read_bytes(), content_type
 
         if path.startswith("artifact_maps/"):
+            content_type = (
+                "image/png"
+                if path.lower().endswith(".png")
+                else "image/jpeg"
+                if path.lower().endswith((".jpg", ".jpeg"))
+                else "application/geo+json"
+            )
             return _read_within_root(
                 self._artifact_root,
                 path,
-                "application/geo+json",
+                content_type,
             )
 
         if path.startswith("basemap/"):
@@ -897,6 +908,7 @@ class MapRenderer:
                 target,
                 format=spec.output.format,
                 dpi=spec.output.dpi,
+                marker=spec.marker,
             )
             width, height = _image_dimensions(target)
             if (width, height) != (spec.output.width, spec.output.height):
@@ -938,7 +950,7 @@ class MapRenderer:
                     or spec.quality.degradation_reasons
                     else "succeeded"
                 ),
-                file_name=target.name,
+                file_name=_official_file_name(spec),
                 render_manifest=manifest,
                 non_empty_ratio=non_empty_ratio,
                 size_bytes=target.stat().st_size,
@@ -988,10 +1000,13 @@ background:linear-gradient(90deg,#17202a 0 50%,#ffffff 50% 100%);}}
 .meta{{font-size:16px;color:#33404d;}}
 .meta .quality{{display:inline-block;margin-left:10px;padding:2px 8px;background:#a33327;
 color:#ffffff;font-weight:700;}}
+.mode-marker{{position:absolute;left:64px;top:154px;z-index:6;padding:6px 12px;
+background:#b3261e;color:#ffffff;font-size:22px;font-weight:700;}}
 </style>
 </head>
 <body>
 <div id="map"></div>
+{_mode_marker_html(payload)}
 <div class="chrome title">
 <h1>{_html(payload["title"])}</h1>
 <div class="summary">{_event_summary(payload)}</div>
@@ -1011,7 +1026,7 @@ color:#ffffff;font-weight:700;}}
 <strong>300 DPI</strong> A3V
 <span>生成时间 <span id="generated-at"></span></span>
 <span>版本 {_html(payload["template_version"])}</span>
-<span class="quality">{_html(str(payload["quality"].get("grade") or "A"))} 级</span>
+<span class="quality">{_quality_marker_html(payload)}</span>
 </span>
 </div>
 <script>
@@ -1124,7 +1139,13 @@ def _validate_resource_value(value: Any) -> None:
             _validate_resource_value(item)
 
 
-def _normalize_output(path: Path, *, format: str, dpi: int) -> float:
+def _normalize_output(
+    path: Path,
+    *,
+    format: str,
+    dpi: int,
+    marker: str | None = None,
+) -> float:
     with Image.open(path) as image:
         image.load()
         non_empty = _non_empty_pixel_ratio(image)
@@ -1135,6 +1156,8 @@ def _normalize_output(path: Path, *, format: str, dpi: int) -> float:
         }
         if image_format == "JPEG":
             save_kwargs["quality"] = 92
+        if marker:
+            image.info["comment"] = marker.encode("utf-8")
         temporary = path.with_name(f".{path.name}.dpi")
         image.save(temporary, **save_kwargs)
         os.replace(temporary, path)
@@ -1192,9 +1215,44 @@ def _legend_html(payload: dict[str, Any]) -> str:
     )
 
 
+def _mode_marker_html(payload: dict[str, Any]) -> str:
+    marker = payload.get("marker")
+    if not marker:
+        return ""
+    return f'<div class="mode-marker">{_html(str(marker))}</div>'
+
+
+def _quality_marker_html(payload: dict[str, Any]) -> str:
+    quality = payload.get("quality") or {}
+    grade = str(quality.get("grade") or "A")
+    needs_review = bool(
+        quality.get("needs_review")
+        or quality.get("degradation_reasons")
+    )
+    suffix = " 待复核" if needs_review else ""
+    return _html(f"{grade} 级{suffix}")
+
+
 def _event_summary(payload: dict[str, Any]) -> str:
     event = payload.get("event") or {}
     return (
         f"longitude {event.get('longitude')}, latitude {event.get('latitude')}, "
         f"magnitude {event.get('magnitude')}, depth {event.get('depth_km')} km"
+    )
+
+
+def _official_file_name(spec: MapRenderSpec) -> str:
+    from app.artifacts.domain import ArtifactNameContext, ProductionMode
+    from app.artifacts.naming import build_artifact_file_name
+
+    return build_artifact_file_name(
+        ArtifactNameContext(
+            place=spec.event.place or "未命名震中",
+            magnitude=spec.event.magnitude,
+            display_name=spec.title,
+            version=1,
+            generated_at=datetime.now(UTC),
+            production_mode=ProductionMode(spec.production_mode),
+        ),
+        extension=spec.output.format,
     )

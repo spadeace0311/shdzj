@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -129,6 +129,8 @@ class MapRenderContext:
     quality: Mapping[str, Any] | None = None
     marker: str | None = None
     output_format: str = "jpg"
+    production_mode: str = "live"
+    resolved_sources: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +396,21 @@ class ProductionContextService:
             latitude=float(event_payload["latitude"]),
             depth_km=float(event_payload["depth_km"]),
         )
+        asset_versions = _frozen_asset_map(manifest.get("assets", ()))
+        resolved_sources: Mapping[str, Any] = {}
+        from app.artifacts.renderers.map_layers import MapLayerRegistry
+        from app.artifacts.renderers.map_sources import MapSourceResolver
+
+        if task.artifact_key in MapLayerRegistry.artifact_keys():
+            resolved_sources = await MapSourceResolver(
+                self._data_asset_repository
+            ).resolve(
+                session,
+                task=task,
+                run=run,
+                event=event,
+                asset_versions=asset_versions,
+            )
         return MapRenderContext(
             production_task_id=task.id,
             production_run_id=run.id,
@@ -401,7 +418,7 @@ class ProductionContextService:
             output_profile=task.output_profile,
             context_fingerprint=snapshot.context_fingerprint,
             basemap_manifest=basemap_manifest,
-            asset_versions=_frozen_asset_map(manifest.get("assets", ())),
+            asset_versions=asset_versions,
             selected_basemap=_selected_basemap(
                 basemap_manifest.get("selected_basemap")
             ),
@@ -415,6 +432,9 @@ class ProductionContextService:
                 "missing_assets": [],
             },
             output_format=definition.format,
+            production_mode=run.production_mode,
+            marker=_mode_marker(run.production_mode),
+            resolved_sources=resolved_sources,
         )
 
     def _select_basemap(
@@ -906,3 +926,13 @@ def _optional_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _mode_marker(production_mode: str) -> str | None:
+    return {
+        "live": None,
+        "manual": None,
+        "test": "【测试】",
+        "drill": "【演练】",
+        "replay": "【测试回放】",
+    }.get(production_mode)

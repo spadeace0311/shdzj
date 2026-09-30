@@ -1,0 +1,596 @@
+from __future__ import annotations
+
+import math
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PIL import Image
+from pyproj import CRS, Transformer
+from rasterio.io import MemoryFile
+from rasterio.transform import from_origin
+from shapely import wkt as shapely_wkt
+from shapely.geometry import Point, shape
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.artifacts.models import ArtifactTaskDependencyBinding, ProductionRun, ProductionTask
+from app.artifacts.renderers.map_layers import LayerDefinition, MapLayerRegistry
+from app.config import settings
+from app.data_assets.raster_repository import load_raster_version
+from app.data_assets.repository import AssetRecord, DataAssetRepository
+from app.intensity.repository import IntensityRepository
+from app.loss.domain import LossProductType
+from app.loss.models import LossMetricValue, LossProduct
+from app.loss.repository import LossRepository
+
+
+class MapSourceResolutionError(RuntimeError):
+    """Raised when a production map source cannot be resolved safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedMapSource:
+    source_key: str
+    kind: str
+    status: str
+    url: str
+    source: dict[str, Any]
+    style: dict[str, Any]
+    checksum: str | None
+    feature_count: int
+    metadata: dict[str, Any]
+
+
+_LOSS_PRODUCT_TYPES = {
+    "loss.buildings": LossProductType.BUILDING_DAMAGE,
+    "loss.population": LossProductType.POPULATION_IMPACT,
+    "loss.casualties": LossProductType.CASUALTIES,
+    "loss.economic": LossProductType.ECONOMIC_LOSS,
+    "loss.resources": LossProductType.RESOURCE_DEMAND,
+}
+
+_PRODUCT_METRICS = {
+    "loss.economic": "economic_loss",
+    "loss.resources": "rescue_teams",
+    "loss.casualties": "casualties",
+    "loss.buildings": "damaged_buildings",
+}
+
+
+def _haversine_km(left: Point, right: Point) -> float:
+    lon1, lat1 = math.radians(left.x), math.radians(left.y)
+    lon2, lat2 = math.radians(right.x), math.radians(right.y)
+    delta_lon = lon2 - lon1
+    delta_lat = lat2 - lat1
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    return 6371.0088 * 2 * math.asin(math.sqrt(value))
+
+
+def _within_radius(geometry: Any, event: Any, radius_km: float) -> bool:
+    if geometry is None:
+        return False
+    event_point = Point(
+        float(getattr(event, "longitude")),
+        float(getattr(event, "latitude")),
+    )
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        return _haversine_km(geometry.representative_point(), event_point) <= radius_km
+    return _haversine_km(geometry.representative_point(), event_point) <= radius_km
+
+
+def _feature_from_record(record: AssetRecord) -> dict[str, Any] | None:
+    if not record.geometry_wkt:
+        return None
+    geometry = shapely_wkt.loads(record.geometry_wkt)
+    return {
+        "type": "Feature",
+        "geometry": geometry.__geo_interface__,
+        "properties": dict(record.properties or {}),
+    }
+
+
+def _vector_source(
+    source_key: str,
+    features: list[dict[str, Any]],
+    *,
+    checksum: str | None,
+    style: dict[str, Any],
+    status: str = "bound",
+) -> ResolvedMapSource:
+    return ResolvedMapSource(
+        source_key=source_key,
+        kind="vector",
+        status=status,
+        url=f"local://inline/{source_key}",
+        source={
+            "type": "geojson",
+            "data": {
+                "type": "FeatureCollection",
+                "features": features,
+            },
+        },
+        style=style,
+        checksum=checksum,
+        feature_count=len(features),
+        metadata={"verified_empty": status == "verified_empty"},
+    )
+
+
+def _write_png(
+    values: np.ndarray,
+    *,
+    source_key: str,
+    identity: uuid.UUID | None,
+) -> tuple[str, np.ndarray]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        minimum = 0.0
+        maximum = 1.0
+    else:
+        minimum = float(np.nanmin(finite))
+        maximum = float(np.nanmax(finite))
+    spread = maximum - minimum
+    if spread <= 0:
+        normalized = np.full(values.shape, 128, dtype=np.uint8)
+    else:
+        normalized = np.clip(
+            ((values - minimum) / spread) * 255,
+            0,
+            255,
+        ).astype(np.uint8)
+    image = Image.fromarray(normalized, mode="L")
+    safe_key = "".join(character if character.isalnum() else "-" for character in source_key)
+    suffix = identity.hex[:12] if identity is not None else uuid.uuid4().hex[:12]
+    file_name = f"{safe_key}-{suffix}.png"
+    target_dir = Path(settings.artifact_storage_root) / "artifact_maps"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    image.save(target_dir / file_name, format="PNG")
+    return f"local://artifact_maps/{file_name}", values
+
+
+def _dataset_raster_source(
+    payload: bytes,
+    *,
+    source_key: str,
+    identity: uuid.UUID | None,
+    checksum: str | None,
+) -> ResolvedMapSource:
+    with MemoryFile(payload).open() as dataset:
+        values = dataset.read(1).astype(np.float64)
+        nodata = dataset.nodata
+        if nodata is not None:
+            values = np.where(values == nodata, np.nan, values)
+        url, _ = _write_png(values, source_key=source_key, identity=identity)
+        bounds = dataset.bounds
+        if dataset.crs is None or CRS.from_user_input(dataset.crs).to_epsg() == 4326:
+            west, south, east, north = bounds
+        else:
+            west, south, east, north = Transformer.from_crs(
+                dataset.crs,
+                "EPSG:4326",
+                always_xy=True,
+            ).transform_bounds(*bounds)
+    return ResolvedMapSource(
+        source_key=source_key,
+        kind="raster",
+        status="bound",
+        url=url,
+        source={
+            "type": "image",
+            "url": url,
+            "coordinates": [
+                [west, north],
+                [east, north],
+                [east, south],
+                [west, south],
+            ],
+        },
+        style={"type": "raster", "paint": {"raster-opacity": 0.82}},
+        checksum=checksum,
+        feature_count=1,
+        metadata={"verified_empty": False},
+    )
+
+
+def _array_raster_source(
+    bands: list[np.ndarray],
+    metadata: dict[str, Any],
+    *,
+    source_key: str,
+    identity: uuid.UUID | None,
+    checksum: str | None,
+) -> ResolvedMapSource:
+    if not bands:
+        raise MapSourceResolutionError(f"{source_key} has no raster bands")
+    array = np.asarray(bands[0], dtype=np.float64)
+    srid = int(metadata.get("srid") or 4326)
+    width = int(metadata.get("width") or array.shape[1])
+    height = int(metadata.get("height") or array.shape[0])
+    resolution = float(metadata.get("resolution_m") or 1000.0)
+    origin_x = float(metadata.get("origin_x") or 0.0)
+    origin_y = float(metadata.get("origin_y") or 0.0)
+    transform = from_origin(origin_x, origin_y, resolution, resolution)
+    with MemoryFile() as memory:
+        with memory.open(
+            driver="GTiff",
+            width=width,
+            height=height,
+            count=1,
+            dtype="float64",
+            crs=CRS.from_epsg(srid),
+            transform=transform,
+            nodata=np.nan,
+        ) as target:
+            target.write(array, 1)
+        return _dataset_raster_source(
+            memory.read(),
+            source_key=source_key,
+            identity=identity,
+            checksum=checksum,
+        )
+
+
+async def _loss_metric_features(
+    session: AsyncSession,
+    product: LossProduct,
+    metric_key: str,
+    town_records: list[AssetRecord],
+    event: Any,
+) -> tuple[list[dict[str, Any]], str]:
+    rows = (
+        (
+            await session.scalars(
+                select(LossMetricValue).where(
+                    LossMetricValue.product_id == product.id,
+                    LossMetricValue.value_type == "central",
+                )
+            )
+        )
+    ).all()
+    by_area = {str(row.area_code): row for row in rows}
+    features: list[dict[str, Any]] = []
+    for record in town_records:
+        feature = _feature_from_record(record)
+        if feature is None:
+            continue
+        row = by_area.get(str(record.business_key))
+        if row is None:
+            continue
+        numeric_value = (
+            None if row.numeric_value is None else float(row.numeric_value)
+        )
+        feature["properties"][metric_key] = numeric_value
+        feature["properties"]["value_status"] = row.value_status
+        feature["properties"]["product_checksum"] = product.output_checksum
+        features.append(feature)
+    status = "verified_empty" if not features else "bound"
+    return features, status
+
+
+class MapSourceResolver:
+    def __init__(self, data_asset_repository: DataAssetRepository | None = None) -> None:
+        self._data_asset_repository = data_asset_repository or DataAssetRepository()
+
+    async def resolve(
+        self,
+        session: AsyncSession,
+        *,
+        task: ProductionTask,
+        run: ProductionRun,
+        event: Any,
+        asset_versions: Any,
+    ) -> dict[str, ResolvedMapSource]:
+        from app.artifacts.catalog import load_catalog
+
+        load_catalog(settings.artifact_catalog_path)
+        resolved: dict[str, ResolvedMapSource] = {}
+
+        bindings = (
+            await session.scalars(
+                select(ArtifactTaskDependencyBinding).where(
+                    ArtifactTaskDependencyBinding.production_task_id == task.id
+                )
+            )
+        ).all()
+        bindings_by_key = {item.dependency_key: item for item in bindings}
+
+        town_asset = asset_versions.get("shanghai.admin.town")
+        town_records: list[AssetRecord] = []
+        if town_asset is not None and town_asset.resolution_status == "bound":
+            town_records = await self._data_asset_repository.list_records(
+                session,
+                town_asset.asset_version_id,
+            )
+
+        for layer_definition in MapLayerRegistry.definitions(task.artifact_key):
+            source_key = layer_definition.source_key
+            if source_key == "event":
+                resolved[source_key] = self._event_source(source_key, event)
+                continue
+            if source_key.startswith("product:"):
+                product_key = source_key.removeprefix("product:")
+                binding = bindings_by_key.get(product_key)
+                if binding is None or binding.resolution_status not in {"bound", "degraded"}:
+                    raise MapSourceResolutionError(
+                        f"required assessment product {product_key} is unavailable"
+                    )
+                resolved[source_key] = await self._product_source(
+                    session,
+                    source_key=source_key,
+                    product_key=product_key,
+                    binding=binding,
+                    run=run,
+                    town_records=town_records,
+                    layer_definition=layer_definition,
+                    event=event,
+                )
+                continue
+
+            item = asset_versions.get(source_key)
+            if item is None or item.resolution_status != "bound":
+                if layer_definition.optional:
+                    resolved[source_key] = self._unavailable_source(
+                        source_key,
+                        layer_definition,
+                    )
+                    continue
+                raise MapSourceResolutionError(
+                    f"required asset {source_key} is unavailable"
+                )
+            resolved[source_key] = await self._asset_source(
+                session,
+                source_key=source_key,
+                asset_item=item,
+                layer_definition=layer_definition,
+                event=event,
+                town_records=town_records,
+            )
+
+        return resolved
+
+    def _event_source(self, source_key: str, event: Any) -> ResolvedMapSource:
+        feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    float(getattr(event, "longitude")),
+                    float(getattr(event, "latitude")),
+                ],
+            },
+            "properties": {
+                "magnitude": float(getattr(event, "magnitude")),
+                "depth_km": float(getattr(event, "depth_km")),
+                "value_status": "available",
+            },
+        }
+        return _vector_source(
+            source_key,
+            [feature],
+            checksum=None,
+            style={
+                "type": "circle",
+                "paint": {
+                    "circle-radius": 10,
+                    "circle-color": "#b3261e",
+                    "circle-stroke-color": "#ffffff",
+                    "circle-stroke-width": 2,
+                },
+            },
+        )
+
+    async def _asset_source(
+        self,
+        session: AsyncSession,
+        *,
+        source_key: str,
+        asset_item: Any,
+        layer_definition: LayerDefinition,
+        event: Any,
+        town_records: list[AssetRecord],
+    ) -> ResolvedMapSource:
+        version = await self._data_asset_repository.get_published_version(
+            session,
+            asset_key=source_key,
+            region_id=settings.data_asset_region_id,
+        )
+        if version is None:
+            raise MapSourceResolutionError(f"required asset {source_key} is unavailable")
+        if layer_definition.data_kind == "raster":
+            payload, _ = await load_raster_version(session, version.id)
+            return _dataset_raster_source(
+                payload,
+                source_key=source_key,
+                identity=version.id,
+                checksum=version.checksum,
+            )
+        records = await self._data_asset_repository.list_records(session, version.id)
+        records = self._join_geometry_records(
+            source_key,
+            records,
+            town_records,
+        )
+        radius_filter = layer_definition.source_key in {
+            "shanghai.fault",
+            "shanghai.historical.earthquakes",
+            "shanghai.hazard_source",
+            "shanghai.key_target",
+            "shanghai.distance.reference_points",
+        }
+        features = [
+            feature
+            for record in records
+            if (
+                feature := _feature_from_record(record)
+            )
+            is not None
+            and (
+                not radius_filter
+                or _within_radius(
+                    shape(feature["geometry"]),
+                    event,
+                    50,
+                )
+            )
+        ]
+        if source_key == "shanghai.distance.reference_points":
+            features = self._with_distances(features, event)
+        status = "verified_empty" if not features else "bound"
+        return _vector_source(
+            source_key,
+            features,
+            checksum=version.checksum,
+            style=_style_for_definition(layer_definition),
+            status=status,
+        )
+
+    def _join_geometry_records(
+        self,
+        source_key: str,
+        records: list[AssetRecord],
+        town_records: list[AssetRecord],
+    ) -> list[AssetRecord]:
+        if any(record.geometry_wkt for record in records):
+            return records
+        if source_key not in {"shanghai.population.town", "shanghai.building.town"}:
+            return records
+        town_by_key = {record.business_key: record for record in town_records}
+        joined: list[AssetRecord] = []
+        for record in records:
+            town = town_by_key.get(record.business_key)
+            if town is None or not town.geometry_wkt:
+                continue
+            joined.append(
+                AssetRecord(
+                    row_number=record.row_number,
+                    business_key=record.business_key,
+                    properties=dict(record.properties or {}),
+                    geometry_wkt=town.geometry_wkt,
+                )
+            )
+        return joined
+
+    async def _product_source(
+        self,
+        session: AsyncSession,
+        *,
+        source_key: str,
+        product_key: str,
+        binding: ArtifactTaskDependencyBinding,
+        run: ProductionRun,
+        town_records: list[AssetRecord],
+        layer_definition: LayerDefinition,
+        event: Any,
+    ) -> ResolvedMapSource:
+        if product_key == "intensity.fusion":
+            bands, metadata = await IntensityRepository().load_raster(
+                session,
+                binding.bound_entity_id,
+            )
+            return _array_raster_source(
+                bands,
+                metadata,
+                source_key=source_key,
+                identity=binding.bound_entity_id,
+                checksum=binding.bound_checksum,
+            )
+
+        product_type = _LOSS_PRODUCT_TYPES.get(product_key)
+        if product_type is None:
+            raise MapSourceResolutionError(
+                f"unsupported assessment product source: {product_key}"
+            )
+        product = await LossRepository().get_product(
+            session,
+            run.assessment_run_id,
+            product_type,
+        )
+        if product is None or product.status not in {"complete", "partial"}:
+            raise MapSourceResolutionError(f"loss product {product_key} is unavailable")
+        metric_key = _PRODUCT_METRICS.get(product_key, product_key.removeprefix("loss."))
+        features, status = await _loss_metric_features(
+            session,
+            product,
+            metric_key,
+            town_records,
+            event,
+        )
+        if not features:
+            raise MapSourceResolutionError(
+                f"loss product {product_key} has no matching town metric values"
+            )
+        return _vector_source(
+            source_key,
+            features,
+            checksum=product.output_checksum,
+            style=_style_for_definition(layer_definition),
+            status=status,
+        )
+
+    def _unavailable_source(
+        self,
+        source_key: str,
+        layer_definition: LayerDefinition,
+    ) -> ResolvedMapSource:
+        return ResolvedMapSource(
+            source_key=source_key,
+            kind="vector",
+            status="missing",
+            url=f"local://inline/{source_key}",
+            source={"type": "geojson", "data": {"type": "FeatureCollection", "features": []}},
+            style=_style_for_definition(layer_definition),
+            checksum=None,
+            feature_count=0,
+            metadata={"verified_empty": False},
+        )
+
+    def _with_distances(
+        self,
+        features: list[dict[str, Any]],
+        event: Any,
+    ) -> list[dict[str, Any]]:
+        event_point = Point(
+            float(getattr(event, "longitude")),
+            float(getattr(event, "latitude")),
+        )
+        for feature in features:
+            geometry = shape(feature["geometry"])
+            distance = _haversine_km(event_point, geometry.representative_point())
+            feature["properties"]["distance_km"] = round(distance, 2)
+            feature["properties"]["value_status"] = "available"
+        return features
+
+
+def _style_for_definition(definition: LayerDefinition) -> dict[str, Any]:
+    if definition.geometry_type in {"line", "multiline"}:
+        return {
+            "type": "line",
+            "paint": {
+                "line-color": "#b3261e",
+                "line-width": 3,
+                "line-opacity": 0.9,
+            },
+        }
+    if definition.geometry_type in {"point", "multipoint"}:
+        return {
+            "type": "circle",
+            "paint": {
+                "circle-radius": 8,
+                "circle-color": "#c5523f",
+                "circle-stroke-color": "#ffffff",
+                "circle-stroke-width": 2,
+            },
+        }
+    return {
+        "type": "fill",
+        "paint": {
+            "fill-color": "#c77b3b",
+            "fill-opacity": 0.42,
+        },
+    }
