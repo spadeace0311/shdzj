@@ -315,6 +315,14 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
     ),
     "map.building_damage": (
         _definition(
+            "building-town",
+            "shanghai.building.town",
+            "polygon",
+            "building-town",
+            legend=(_legend("房屋总量"),),
+            attribute_bindings=(_binding("building_count"),),
+        ),
+        _definition(
             "building-damage-town",
             "product:loss.buildings",
             "polygon",
@@ -326,14 +334,6 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
                     metric_key="severe_or_collapsed_area_m2",
                 ),
             ),
-        ),
-        _definition(
-            "building-town",
-            "shanghai.building.town",
-            "polygon",
-            "building-town",
-            legend=(_legend("房屋总量"),),
-            attribute_bindings=(_binding("building_count"),),
         ),
     ),
     "map.key_targets": (

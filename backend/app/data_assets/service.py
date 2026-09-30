@@ -361,12 +361,33 @@ class DataAssetService:
                 )
             )
             if existing is not None:
-                actual_checksum = hashlib.sha256(
+                stored_canonical_checksum = await session.scalar(
+                    select(DataAssetRaster.checksum).where(
+                        DataAssetRaster.version_id == version_id
+                    )
+                )
+                if (
+                    stored_canonical_checksum is None
+                    or version.checksum != stored_canonical_checksum
+                ):
+                    raise ValueError(
+                        "version checksum does not match persisted raster payload"
+                    )
+                source_checksum = hashlib.sha256(
                     source_path.read_bytes()
                 ).hexdigest()
-                if version.checksum != actual_checksum:
+                stored_source_checksum = (version.schema_summary or {}).get(
+                    "source_checksum"
+                )
+                if stored_source_checksum is None:
+                    version.schema_summary = {
+                        **dict(version.schema_summary),
+                        "source_checksum": source_checksum,
+                    }
+                elif stored_source_checksum != source_checksum:
                     raise ValueError(
-                        "version checksum does not match raster payload"
+                        "raster source payload checksum does not match "
+                        "the imported candidate"
                     )
             else:
                 await save_raster_version(
@@ -375,7 +396,13 @@ class DataAssetService:
                     source_path,
                     normalized,
                 )
-            version.schema_summary = dict(schema_summary)
+            version.schema_summary = {
+                **dict(version.schema_summary),
+                **dict(schema_summary),
+                "source_checksum": hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest(),
+            }
             version.record_count = 0
             version.source_crs = normalized.source_crs
             version.spatial_extent = _bounds_wkt_element(

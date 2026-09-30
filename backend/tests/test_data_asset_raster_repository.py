@@ -304,6 +304,78 @@ async def test_populate_projected_raster_persists_wgs84_extent_and_source_crs(
     )
 
 
+async def test_populate_candidate_version_raster_retry_is_idempotent(
+    session_factory,
+    seeded_compressed_imported_version,
+) -> None:
+    source = seeded_compressed_imported_version
+    descriptor = GeoTiffAssetImporter().load(
+        source.source_path,
+        source.definition,
+    )
+    schema_summary = {
+        "file_format": "geotiff",
+        "source_crs": descriptor.source_crs,
+    }
+    service = DataAssetService()
+
+    async with session_factory() as session:
+        async with session.begin():
+            first = await service.populate_candidate_version(
+                session,
+                source.version_id,
+                descriptor,
+                schema_summary,
+                source_path=source.source_path,
+            )
+
+    async with session_factory() as session:
+        async with session.begin():
+            second = await service.populate_candidate_version(
+                session,
+                source.version_id,
+                descriptor,
+                schema_summary,
+                source_path=source.source_path,
+            )
+
+    source_checksum = hashlib.sha256(source.source_path.read_bytes()).hexdigest()
+    async with session_factory() as session:
+        async with session.begin():
+            version = await session.get(DataAssetVersion, source.version_id)
+            stored_canonical_checksum = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT checksum
+                        FROM data_asset_rasters
+                        WHERE version_id = :version_id
+                        """
+                    ),
+                    {"version_id": source.version_id},
+                )
+            ).scalar_one()
+            raster_count = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT COUNT(*)
+                        FROM data_asset_rasters
+                        WHERE version_id = :version_id
+                        """
+                    ),
+                    {"version_id": source.version_id},
+                )
+            ).scalar_one()
+
+    assert second.id == first.id
+    assert version is not None
+    assert version.checksum == stored_canonical_checksum
+    assert version.checksum != source_checksum
+    assert version.schema_summary["source_checksum"] == source_checksum
+    assert raster_count == 1
+
+
 async def test_save_raster_version_rejects_version_checksum_mismatch(
     session_factory,
     seeded_imported_version,

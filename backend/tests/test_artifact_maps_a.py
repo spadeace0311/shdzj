@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -10,7 +11,7 @@ import pytest
 import numpy as np
 from geoalchemy2.elements import WKTElement
 from PIL import Image
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
 from app.artifacts.context import ProductionContextService
@@ -30,7 +31,6 @@ from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.import_jobs import QueueImportRequest, queue_import_job
 from app.data_assets.models import DataAsset, DataAssetRecord, DataAssetVersion
 from app.data_assets.raster_importer import GeoTiffAssetImporter
-from app.data_assets.raster_repository import save_raster_version
 from app.data_assets.registry import get_asset_definition
 from app.data_assets.repository import DataAssetRepository
 from app.data_assets.service import DataAssetService, compute_table_checksum
@@ -350,6 +350,79 @@ async def _render_product_map(
     return result, context
 
 
+async def _replace_product_metrics_and_render(
+    *,
+    session_factory,
+    production_renderer,
+    tmp_path: Path,
+    context,
+    artifact_key: str,
+    product_key: str,
+    product_type: str,
+    metrics: tuple[tuple[str, float, str, str], ...],
+) -> tuple:
+    binding = await _dependency_binding(
+        session_factory,
+        context.production_task_id,
+        product_key,
+    )
+    area_scope = "city" if product_type == "resource_demand" else "town"
+    area_code = "shanghai" if product_type == "resource_demand" else "310115000001"
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(LossMetricValue).where(
+                    LossMetricValue.product_id == binding.bound_entity_id
+                )
+            )
+            for metric_key, numeric_value, value_status, unit in metrics:
+                session.add(
+                    LossMetricValue(
+                        product_id=binding.bound_entity_id,
+                        area_scope=area_scope,
+                        area_code=area_code,
+                        area_name="fixture town",
+                        metric_key=metric_key,
+                        value_type="central",
+                        value_status=value_status,
+                        numeric_value=numeric_value,
+                        unit=unit,
+                        precision=2,
+                        quality_grade="L1",
+                    )
+                )
+            product = await session.get(LossProduct, binding.bound_entity_id)
+            assert product is not None
+            product.output_checksum = _loss_checksum(product_type, metrics)
+            await session.flush()
+            await session.execute(
+                update(ArtifactTaskDependencyBinding)
+                .where(
+                    ArtifactTaskDependencyBinding.production_task_id
+                    == binding.production_task_id,
+                    ArtifactTaskDependencyBinding.dependency_key == product_key,
+                )
+                .values(bound_checksum=product.output_checksum)
+            )
+
+    package, renderer = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            high_context = await service.build_map_context(
+                session,
+                binding.production_task_id,
+            )
+    high_result = await renderer.render(
+        MapSpecBuilder().build(high_context),
+        tmp_path / f"{artifact_key}-high.jpg",
+    )
+    return high_result, high_context
+
+
 async def _publish_asset(
     session_factory,
     asset_key: str,
@@ -429,6 +502,125 @@ async def _publish_population_asset(session_factory, version: str) -> UUID:
         "shanghai.population.town",
         records=_population_records().records,
     )
+
+
+async def _active_region_bounds(
+    session_factory,
+) -> tuple[float, float, float, float]:
+    from sqlalchemy import func
+
+    from app.regions.models import RegionBoundary
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(
+                    func.ST_XMin(RegionBoundary.geom),
+                    func.ST_YMin(RegionBoundary.geom),
+                    func.ST_XMax(RegionBoundary.geom),
+                    func.ST_YMax(RegionBoundary.geom),
+                )
+                .where(RegionBoundary.is_active.is_(True))
+                .limit(1)
+            )
+        ).one_or_none()
+    if row is None:
+        raise AssertionError("active region boundary is required for GDP coverage")
+    return tuple(float(value) for value in row)
+
+
+def _write_publishable_gdp_raster(path: Path, bounds: tuple[float, ...]) -> None:
+    import numpy as np
+    import rasterio
+    from rasterio.transform import Affine
+
+    min_x, min_y, max_x, max_y = bounds
+    width = 16
+    height = 16
+    transform = Affine(
+        (max_x - min_x) / width,
+        0,
+        min_x,
+        0,
+        -(max_y - min_y) / height,
+        max_y,
+    )
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        nodata=-9999.0,
+        transform=transform,
+    ) as target:
+        target.write(np.full((height, width), 100.0, dtype="float32"), 1)
+
+
+async def _publish_gdp_raster(
+    session_factory,
+    tmp_path: Path,
+) -> DataAssetVersion:
+    bounds = await _active_region_bounds(session_factory)
+    source_path = tmp_path / "gdp-publishable.tif"
+    _write_publishable_gdp_raster(source_path, bounds)
+    definition = get_asset_definition("shanghai.gdp.raster")
+    descriptor = GeoTiffAssetImporter().load(source_path, definition)
+    source_checksum = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = await queue_import_job(
+                session,
+                QueueImportRequest(
+                    asset_key="shanghai.gdp.raster",
+                    version=f"gdp-publishable-{uuid4()}",
+                    source_uri="https://example.gov.invalid/gdp-publishable",
+                    license_name=None,
+                    acquired_at=None,
+                    valid_from=None,
+                    valid_to=None,
+                    change_note="maps-a publishable GDP fixture",
+                    file_name="gdp-publishable.tif",
+                    file_format="geotiff",
+                    file_size_bytes=source_path.stat().st_size,
+                    checksum=source_checksum,
+                    relative_path="fixture/gdp-publishable.tif",
+                    requested_by="maps-a-fixture",
+                ),
+            )
+            service = DataAssetService()
+            await service.populate_candidate_version(
+                session,
+                job.asset_version_id,
+                descriptor,
+                {
+                    "file_format": "geotiff",
+                    "source_crs": descriptor.source_crs,
+                },
+                source_path=source_path,
+            )
+            report = await service.validate_version(
+                session,
+                job.asset_version_id,
+                actor="maps-a-fixture",
+            )
+            if not report.publishable:
+                raise AssertionError(
+                    "GDP raster fixture failed validation: "
+                    f"{[issue.message for issue in report.errors]}"
+                )
+            version = await service.publish_version(
+                session,
+                job.asset_version_id,
+                "maps-a-fixture",
+                "maps-a publishable GDP fixture",
+            )
+            _CREATED_VERSION_IDS.add(version.id)
+            return version
 
 
 def _loss_checksum(
@@ -1073,7 +1265,6 @@ async def test_production_population_context_resolves_published_vector(
 
 async def test_production_gdp_context_resolves_published_raster(
     seeded_artifact_assessment,
-    seeded_imported_version,
     session_factory,
     production_renderer,
     tmp_path: Path,
@@ -1084,27 +1275,7 @@ async def test_production_gdp_context_resolves_published_raster(
         records=(_admin_city_record(),),
         spatial_extent=(121.2, 30.9, 121.8, 31.5),
     )
-    descriptor = GeoTiffAssetImporter().load(
-        seeded_imported_version.source_path,
-        seeded_imported_version.definition,
-    )
-    async with session_factory() as session:
-        async with session.begin():
-            await save_raster_version(
-                session,
-                seeded_imported_version.version_id,
-                seeded_imported_version.source_path,
-                descriptor,
-            )
-            version = await session.get(
-                DataAssetVersion,
-                seeded_imported_version.version_id,
-            )
-            assert version is not None
-            version.status = "validated"
-            await session.flush()
-            version.status = "published"
-            version.published_at = datetime.now(UTC)
+    published_version = await _publish_gdp_raster(session_factory, tmp_path)
 
     package, renderer = production_renderer
     service = ProductionContextService(
@@ -1126,12 +1297,16 @@ async def test_production_gdp_context_resolves_published_raster(
     raster_layer = next(layer for layer in layers if layer.id == "gdp-raster")
     assert raster_layer.type == "raster"
     assert raster_layer.source["type"] == "image"
+    frozen = context.asset_versions["shanghai.gdp.raster"]
+    assert frozen.version == published_version.version
+    assert frozen.checksum == published_version.checksum
     result = await renderer.render(
         MapSpecBuilder().build(context),
         tmp_path / "gdp.jpg",
     )
     assert result.non_empty_ratio > 0.2
-    assert result.render_manifest["layer_checksums"]["gdp-raster"]
+    assert result.render_manifest["layer_versions"]["gdp-raster"] == frozen.version
+    assert result.render_manifest["layer_checksums"]["gdp-raster"] == frozen.checksum
 
 
 async def test_real_missing_required_asset_fails_hard(
@@ -1548,67 +1723,92 @@ async def test_product_map_metric_encoding_changes_pixels(
         "artifact_key",
         "product_key",
         "product_type",
-        "metrics",
+        "low_metrics",
+        "high_metrics",
         "publish_towns",
         "layer_id",
-        "expected_properties",
+        "metric_property",
+        "low_properties",
+        "high_properties",
     ),
     (
         (
             "map.economic_loss",
             "loss.economic",
             "economic_loss",
-            (("total_loss_yuan", 1_250_000, "available", "yuan"),),
+            (("total_loss_yuan", 100_000.0, "available", "yuan"),),
+            (("total_loss_yuan", 1_900_000.0, "available", "yuan"),),
             True,
             "economic-loss-town",
-            {"economic_loss": 1_250_000},
+            "economic_loss",
+            {"economic_loss": 100_000.0},
+            {"economic_loss": 1_900_000.0},
         ),
         (
             "map.rescue_demand",
             "loss.resources",
             "resource_demand",
-            (("rescue_team.quantity", 5, "available", "count"),),
+            (("rescue_team.quantity", 1.0, "available", "count"),),
+            (("rescue_team.quantity", 100.0, "available", "count"),),
             False,
             "rescue-demand-town",
-            {"rescue_teams": 5},
+            "rescue_teams",
+            {"rescue_teams": 1.0},
+            {"rescue_teams": 100.0},
         ),
         (
             "map.material_demand",
             "loss.resources",
             "resource_demand",
             tuple(
-                (f"{kind}.quantity", index, "available", "count")
-                for index, kind in enumerate(
-                    (
-                        "tent",
-                        "drinking_water",
-                        "food",
-                        "clothing",
-                        "quilt",
-                        "blanket",
-                        "stretcher",
-                        "sickbed",
-                        "toilet",
-                    ),
-                    start=1,
+                (f"{kind}.quantity", 1.0, "available", "count")
+                for kind in (
+                    "tent",
+                    "drinking_water",
+                    "food",
+                    "clothing",
+                    "quilt",
+                    "blanket",
+                    "stretcher",
+                    "sickbed",
+                    "toilet",
+                )
+            ),
+            tuple(
+                (f"{kind}.quantity", 100.0, "available", "count")
+                for kind in (
+                    "tent",
+                    "drinking_water",
+                    "food",
+                    "clothing",
+                    "quilt",
+                    "blanket",
+                    "stretcher",
+                    "sickbed",
+                    "toilet",
                 )
             ),
             False,
             "material-demand-town",
-            {"tent": 1, "toilet": 9},
+            "tent",
+            {"tent": 1.0, "toilet": 1.0},
+            {"tent": 100.0, "toilet": 100.0},
         ),
         (
             "map.building_damage",
             "loss.buildings",
             "building_damage",
-            (("severe_or_collapsed_area_m2", 300.5, "available", "m2"),),
+            (("severe_or_collapsed_area_m2", 10.0, "available", "m2"),),
+            (("severe_or_collapsed_area_m2", 9_500.0, "available", "m2"),),
             True,
             "building-damage-town",
-            {"damaged_buildings": 300.5},
+            "damaged_buildings",
+            {"damaged_buildings": 10.0},
+            {"damaged_buildings": 9_500.0},
         ),
     ),
 )
-async def test_product_map_matrix_renders_frozen_sources(
+async def test_product_map_matrix_metric_encoding_changes_pixels(
     seeded_artifact_assessment,
     session_factory,
     production_renderer,
@@ -1616,12 +1816,15 @@ async def test_product_map_matrix_renders_frozen_sources(
     artifact_key,
     product_key,
     product_type,
-    metrics,
+    low_metrics,
+    high_metrics,
     publish_towns,
     layer_id,
-    expected_properties,
+    metric_property,
+    low_properties,
+    high_properties,
 ) -> None:
-    result, context = await _render_product_map(
+    low_result, context = await _render_product_map(
         fixture=seeded_artifact_assessment,
         session_factory=session_factory,
         production_renderer=production_renderer,
@@ -1629,29 +1832,65 @@ async def test_product_map_matrix_renders_frozen_sources(
         artifact_key=artifact_key,
         product_key=product_key,
         product_type=product_type,
-        metrics=metrics,
+        metrics=low_metrics,
         publish_towns=publish_towns,
     )
-    layers = MapLayerRegistry.build(artifact_key, context)
-    metric_layer = next(layer for layer in layers if layer.id == layer_id)
-    feature = metric_layer.source["data"]["features"][0]
-    for property_name, expected_value in expected_properties.items():
-        assert feature["properties"][property_name] == expected_value
-    metric_property = next(
-        binding["property_name"]
-        for binding in metric_layer.metadata["attribute_bindings"]
-        if binding.get("metric_key")
+    low_layer = next(
+        layer
+        for layer in MapLayerRegistry.build(artifact_key, context)
+        if layer.id == layer_id
     )
-    assert metric_layer.style["paint"]["fill-color"][2] == ["get", metric_property]
-    assert result.non_empty_ratio > 0.2
-    assert len(result.checksum) == 64
-    binding = await _dependency_binding(
+    low_feature = low_layer.source["data"]["features"][0]
+    for property_name, expected_value in low_properties.items():
+        assert low_feature["properties"][property_name] == expected_value
+    assert low_layer.style["paint"]["fill-color"][2] == ["get", metric_property]
+    assert low_result.non_empty_ratio > 0.2
+
+    low_binding = await _dependency_binding(
         session_factory,
         context.production_task_id,
         product_key,
     )
-    assert result.render_manifest["layer_checksums"][layer_id] == binding.bound_checksum
-    assert result.render_manifest["layer_versions"][layer_id] == binding.bound_version
+    assert low_result.render_manifest["layer_checksums"][layer_id] == (
+        low_binding.bound_checksum
+    )
+    assert low_result.render_manifest["layer_versions"][layer_id] == (
+        low_binding.bound_version
+    )
+
+    high_result, high_context = await _replace_product_metrics_and_render(
+        session_factory=session_factory,
+        production_renderer=production_renderer,
+        tmp_path=tmp_path,
+        context=context,
+        artifact_key=artifact_key,
+        product_key=product_key,
+        product_type=product_type,
+        metrics=high_metrics,
+    )
+    high_layer = next(
+        layer
+        for layer in MapLayerRegistry.build(artifact_key, high_context)
+        if layer.id == layer_id
+    )
+    high_feature = high_layer.source["data"]["features"][0]
+    for property_name, expected_value in high_properties.items():
+        assert high_feature["properties"][property_name] == expected_value
+    assert high_layer.style["paint"]["fill-color"][2] == ["get", metric_property]
+    high_binding = await _dependency_binding(
+        session_factory,
+        high_context.production_task_id,
+        product_key,
+    )
+    assert high_result.render_manifest["layer_checksums"][layer_id] == (
+        high_binding.bound_checksum
+    )
+    assert high_result.render_manifest["layer_versions"][layer_id] == (
+        high_binding.bound_version
+    )
+    assert _central_map_red_mean(high_result.path) > _central_map_red_mean(
+        low_result.path
+    )
 
 
 @pytest.mark.parametrize(
