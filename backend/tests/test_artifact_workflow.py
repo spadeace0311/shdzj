@@ -13,12 +13,13 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from app.artifacts.worker import _idempotency_key
+from app.artifacts.worker import ArtifactActivities, _idempotency_key
 from app.artifacts.workflow import (
     ArtifactDependencyWaitInput,
     ArtifactProductionWorkflow,
     ArtifactProductionWorkflowInput,
     ArtifactPublicationInput,
+    ArtifactTerminalizationInput,
     ArtifactTaskActivityInput,
     ArtifactValidationInput,
 )
@@ -630,5 +631,68 @@ async def test_repository_cancel_run_is_terminal(
     assert canceled.status == "canceled"
     assert all(
         task.status == "canceled"
+        for task in tasks
+    )
+
+
+def test_workflow_input_rejects_naive_deadline() -> None:
+    with pytest.raises(ValueError, match="timezone"):
+        ArtifactProductionWorkflowInput(
+            production_run_id=str(uuid4()),
+            assessment_run_id=str(uuid4()),
+            event_id=str(uuid4()),
+            revision_id=str(uuid4()),
+            deadline_at="2026-09-26T03:08:00",
+            catalog_version="catalog-v1",
+            context_fingerprint="",
+            launch_mode="assessment_child",
+            generation_seq=1,
+            generation_scope="full",
+            required_outputs=(),
+        )
+
+
+async def test_finalize_run_with_failure_persists_category(
+    seeded_artifact_assessment,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    repository = ArtifactProductionRepository()
+    async with seeded_artifact_assessment._session_factory() as session:
+        async with session.begin():
+            finalized = await repository.finalize_run_with_failure(
+                session,
+                run.id,
+                datetime.now(UTC),
+                "validation_failed",
+                "artifact validation failed",
+            )
+
+    assert finalized.status == "failed"
+    assert '"error_category": "validation_failed"' in finalized.last_error
+
+
+async def test_real_artifact_activities_terminalizes_assessment_failure(
+    seeded_artifact_assessment,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    activities = ArtifactActivities(seeded_artifact_assessment._session_factory)
+    result = await activities.terminalize_artifact_production(
+        ArtifactTerminalizationInput(
+            production_run_id=str(run.id),
+            observed_at=datetime.now(UTC).isoformat(),
+            reason="assessment_failed",
+            summary="parent assessment failed",
+        )
+    )
+
+    assert result["status"] in {"failed", "partial"}
+    async with seeded_artifact_assessment._session_factory() as session:
+        async with session.begin():
+            tasks = await ArtifactProductionRepository().list_tasks(
+                session,
+                run.id,
+            )
+    assert all(
+        task.status != "pending" and task.status != "running"
         for task in tasks
     )

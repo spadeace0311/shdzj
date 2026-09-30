@@ -904,6 +904,9 @@ async def run_artifact_dispatcher(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     del session_factory, sleep
+    # Task 13 owns standalone/override API dispatch. This process is
+    # intentionally a no-op in Task 12 so tests can exercise registration
+    # without publishing an incomplete production dispatcher.
     stop_event = stop_event or asyncio.Event()
     client = client or await _connect_temporal(configured)
     logger.info("artifact production dispatcher connected")

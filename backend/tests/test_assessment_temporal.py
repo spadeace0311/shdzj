@@ -14,6 +14,7 @@ from app.assessment.models import AssessmentRun, AssessmentTask
 from app.assessment.repository import AssessmentRepository
 from app.assessment.temporal import (
     AssessmentActivities,
+    AssessmentRunActivityInput,
     AssessmentWorkflow,
     AssessmentWorkflowInput,
     FinalizeAssessmentInput,
@@ -613,3 +614,33 @@ async def test_building_failure_prevents_casualty_and_economic_activities(
     assert result.status == "failed"
     assert "casualties" not in calls
     assert "economic" not in calls
+
+
+@pytest.mark.parametrize("status", ("failed", "skipped", "canceled"))
+async def test_launch_marker_rejects_terminal_task(
+    session_factory,
+    status: str,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
+    )
+    prepared = await activities.prepare_assessment(request)
+
+    async with session_factory() as session:
+        async with session.begin():
+            task = await session.scalar(
+                select(AssessmentTask).where(
+                    AssessmentTask.run_id == prepared.run_id,
+                    AssessmentTask.task_key == "artifact.production",
+                )
+            )
+            assert task is not None
+            task.status = status
+
+    with pytest.raises(ValueError, match="terminal"):
+        await activities.mark_artifact_production_launched(
+            AssessmentRunActivityInput(prepared.run_id)
+        )

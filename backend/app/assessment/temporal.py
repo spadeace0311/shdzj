@@ -505,7 +505,9 @@ class AssessmentActivities:
         request: AssessmentRunActivityInput,
     ):
         from app.assessment.models import AssessmentTask
+        from app.assessment.repository import AssessmentRepository
 
+        repository = AssessmentRepository()
         async with self._session_factory() as session:
             async with session.begin():
                 task = await session.scalar(
@@ -518,15 +520,28 @@ class AssessmentActivities:
                     return None
                 if task.status == "succeeded":
                     return task.status
-                now = datetime.now(UTC)
-                task.status = "succeeded"
-                task.completed_at = now
-                task.attempt_count = max(task.attempt_count, 1)
-                task.result = {
-                    "production_run_id": None,
-                    "status": "launched",
-                }
-                task.last_error = None
+                if task.status in {"failed", "skipped", "canceled"}:
+                    raise ValueError(
+                        "artifact.production task is already terminal and cannot "
+                        "be marked launched"
+                    )
+                await repository.start_task(
+                    session,
+                    request.run_id,
+                    "artifact.production",
+                    "artifact-production-v1",
+                    "artifact-production-child-started",
+                )
+                await session.flush()
+                await repository.complete_task(
+                    session,
+                    task.id,
+                    "artifact-production-child-started",
+                    {
+                        "production_run_id": None,
+                        "status": "launched",
+                    },
+                )
                 return task.status
 
     @activity.defn(name="run_intensity_model")

@@ -30,7 +30,9 @@ class ArtifactProductionWorkflowInput:
     def __post_init__(self) -> None:
         # Temporal's default dataclass converter does not serialize datetime.
         # deadline_at deliberately uses an ISO-8601 string with a timezone.
-        datetime.fromisoformat(self.deadline_at.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(self.deadline_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("deadline_at must include timezone information")
 
 
 @dataclass(frozen=True, slots=True)

@@ -1165,7 +1165,13 @@ class ArtifactProductionRepository:
         ]
         run.status = "partial" if successful else "failed"
         run.completed_at = observed_at
-        run.last_error = summary[:2000]
+        run.last_error = json.dumps(
+            {
+                "error_category": error_category[:64],
+                "summary": summary[:2000],
+            },
+            ensure_ascii=False,
+        )
         run.final_input_fingerprint = _final_fingerprint(tasks)
         run.updated_at = observed_at
         await session.flush()
