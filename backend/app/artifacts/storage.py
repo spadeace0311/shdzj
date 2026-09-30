@@ -139,6 +139,21 @@ class ArtifactStore:
         finally:
             staged.unlink(missing_ok=True)
 
+    def relative_path_for(self, checksum: str, *, file_name: str) -> str:
+        if len(checksum) != 64:
+            raise ValueError("checksum must contain 64 hexadecimal characters")
+        try:
+            int(checksum, 16)
+        except ValueError as error:
+            raise ValueError(
+                "checksum must contain 64 hexadecimal characters"
+            ) from error
+        safe_name = _safe_file_name(file_name)
+        return (
+            f"objects/{checksum[:2]}/{checksum[2:4]}/"
+            f"{checksum}-{safe_name}"
+        )
+
     def resolve(self, relative_path: str) -> Path:
         normalized = _safe_relative_path(relative_path)
         root = self._root

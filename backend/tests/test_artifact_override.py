@@ -18,6 +18,7 @@ from app.artifacts.models import (
     ProductionRun,
 )
 from app.artifacts.service import (
+    ArtifactOverrideResponse,
     ArtifactOverrideService,
     ArtifactOverrideValidationError,
     IdempotencyConflictError,
@@ -286,6 +287,99 @@ async def test_same_bytes_failure_preserves_current_publication_file(
         )
     assert current is not None
     assert current.artifact_id == first.artifact_id
+
+
+async def test_stale_cleanup_waits_for_in_flight_same_checksum_publisher(
+    seeded_artifact_assessment,
+    seeded_event,
+    session_factory,
+    tmp_path,
+) -> None:
+    await seeded_artifact_assessment.published_artifact(
+        "map.epicenter",
+        version=1,
+    )
+    stale_cleanup_ready = asyncio.Event()
+    allow_stale_cleanup = asyncio.Event()
+    new_worker_staged = asyncio.Event()
+
+    async def stale_cleanup_hook() -> None:
+        stale_cleanup_ready.set()
+        await allow_stale_cleanup.wait()
+
+    async def new_worker_staged_hook() -> None:
+        new_worker_staged.set()
+
+    service = ArtifactOverrideService(
+        session_factory=session_factory,
+        storage_root=tmp_path / "artifacts",
+        lease_seconds=2.0,
+        poll_interval=0.01,
+        after_stage_before_store_hook=new_worker_staged_hook,
+        before_cleanup_reference_check_hook=stale_cleanup_hook,
+    )
+
+    async def stale_worker() -> bool:
+        try:
+            await service.override(
+                actor_id="admin-id",
+                event_id=seeded_event.id,
+                artifact_key="map.epicenter",
+                output_profile="a3v-professional",
+                revision_id=seeded_event.current_revision_id,
+                reason="stale same checksum",
+                expected_current_artifact_id=uuid.uuid4(),
+                idempotency_key="00000000-0000-0000-0000-000000000011",
+                upload=io.BytesIO(_VALID_JPEG_BYTES),
+            )
+        except IdempotencyConflictError:
+            return True
+        return False
+
+    async def new_worker() -> ArtifactOverrideResponse:
+        return await service.override(
+            actor_id="admin-id",
+            event_id=seeded_event.id,
+            artifact_key="map.epicenter",
+            output_profile="a3v-professional",
+            revision_id=seeded_event.current_revision_id,
+            reason="new same checksum",
+            expected_current_artifact_id=None,
+            idempotency_key="00000000-0000-0000-0000-000000000012",
+            upload=io.BytesIO(_VALID_JPEG_BYTES),
+        )
+
+    stale_task = asyncio.create_task(stale_worker())
+    await asyncio.wait_for(stale_cleanup_ready.wait(), timeout=10)
+    new_task = asyncio.create_task(new_worker())
+    await asyncio.wait_for(new_worker_staged.wait(), timeout=10)
+    allow_stale_cleanup.set()
+
+    stale_conflicted = await asyncio.wait_for(stale_task, timeout=10)
+    response = await asyncio.wait_for(new_task, timeout=10)
+    assert stale_conflicted is True
+
+    async with session_factory() as session:
+        artifact = await session.get(GeneratedArtifact, response.artifact_id)
+        assert artifact is not None
+        storage_path = artifact.storage_path
+        current = await session.scalar(
+            select(ArtifactPublication).where(
+                ArtifactPublication.event_id == seeded_event.id,
+                ArtifactPublication.artifact_key == "map.epicenter",
+                ArtifactPublication.output_profile == "a3v-professional",
+                ArtifactPublication.production_mode == "live",
+                ArtifactPublication.superseded_at.is_(None),
+            )
+        )
+
+    stored_path = ArtifactStore(
+        tmp_path / "artifacts",
+        max_override_bytes=1024 * 1024,
+    ).resolve(storage_path)
+    assert stored_path.exists()
+    assert current is not None
+    assert current.artifact_id == response.artifact_id
 
 
 async def test_expired_processing_with_committed_records_recovers_without_new_run(

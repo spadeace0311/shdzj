@@ -239,6 +239,33 @@ def test_validator_docx_requires_exact_mode_marker(tmp_path) -> None:
     assert correct_result.valid is True
 
 
+def test_validator_docx_requires_replay_marker(tmp_path) -> None:
+    from docx import Document
+
+    wrong_marker = tmp_path / "wrong-replay.docx"
+    document = Document()
+    document.add_paragraph("【测试】")
+    document.save(wrong_marker)
+    wrong_result = ArtifactValidator().validate(
+        wrong_marker,
+        _docx_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert wrong_result.valid is False
+    assert wrong_result.error_category == "marker_missing"
+
+    correct_marker = tmp_path / "correct-replay.docx"
+    document = Document()
+    document.add_paragraph("【测试回放】")
+    document.save(correct_marker)
+    correct_result = ArtifactValidator().validate(
+        correct_marker,
+        _docx_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert correct_result.valid is True
+
+
 def test_validator_pptx_accepts_clean_deck_and_reports_page_count(
     tmp_path,
 ) -> None:
@@ -316,6 +343,35 @@ def test_validator_pptx_requires_exact_mode_marker(tmp_path) -> None:
     assert correct_result.valid is True
 
 
+def test_validator_pptx_requires_replay_marker(tmp_path) -> None:
+    from pptx import Presentation
+
+    wrong_marker = tmp_path / "wrong-replay.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[0])
+    slide.shapes.title.text = "【测试】"
+    presentation.save(wrong_marker)
+    wrong_result = ArtifactValidator().validate(
+        wrong_marker,
+        _pptx_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert wrong_result.valid is False
+    assert wrong_result.error_category == "marker_missing"
+
+    correct_marker = tmp_path / "correct-replay.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[0])
+    slide.shapes.title.text = "【测试回放】"
+    presentation.save(correct_marker)
+    correct_result = ArtifactValidator().validate(
+        correct_marker,
+        _pptx_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert correct_result.valid is True
+
+
 def test_validator_map_ignores_file_name_marker_and_accepts_metadata(
     tmp_path,
 ) -> None:
@@ -347,3 +403,24 @@ def test_validator_map_ignores_file_name_marker_and_accepts_metadata(
     )
     assert wrong_result.valid is False
     assert wrong_result.error_category == "marker_missing"
+
+
+def test_validator_map_requires_replay_metadata_marker(tmp_path) -> None:
+    wrong_marker = tmp_path / "wrong-replay-map.jpg"
+    _write_map_jpeg(wrong_marker, comment="【测试】")
+    wrong_result = ArtifactValidator().validate(
+        wrong_marker,
+        _map_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert wrong_result.valid is False
+    assert wrong_result.error_category == "marker_missing"
+
+    correct_marker = tmp_path / "correct-replay-map.jpg"
+    _write_map_jpeg(correct_marker, comment="【测试回放】")
+    correct_result = ArtifactValidator().validate(
+        correct_marker,
+        _map_definition(),
+        production_mode=ProductionMode.REPLAY,
+    )
+    assert correct_result.valid is True

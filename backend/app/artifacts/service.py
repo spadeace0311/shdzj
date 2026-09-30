@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -410,6 +411,12 @@ class ArtifactOverrideService:
         max_override_bytes: int | None = None,
         lease_seconds: float = 60.0,
         poll_interval: float = 0.05,
+        after_stage_before_store_hook: (
+            Callable[[], Awaitable[None]] | None
+        ) = None,
+        before_cleanup_reference_check_hook: (
+            Callable[[], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         self._session_factory = session_factory
         if catalog is None and repository is not None:
@@ -437,6 +444,10 @@ class ArtifactOverrideService:
             raise ValueError("poll_interval must be positive")
         self._lease_seconds = lease_seconds
         self._poll_interval = poll_interval
+        self._after_stage_before_store_hook = after_stage_before_store_hook
+        self._before_cleanup_reference_check_hook = (
+            before_cleanup_reference_check_hook
+        )
 
     @staticmethod
     def endpoint_for(
@@ -536,54 +547,56 @@ class ArtifactOverrideService:
                     summary=validation.summary,
                 )
 
-            stored = self._store.store_immutable(
-                staged,
+            object_relative_path = self._store.relative_path_for(
+                checksum,
                 file_name=file_name,
             )
-            response = await self._commit_override(
-                context=context,
-                definition=definition,
-                claim=claim,
-                stored=stored,
-                validation=validation,
-                actor_id=actor_id,
-                reason=reason,
-                expected_current_artifact_id=expected_current_artifact_id,
-            )
-            committed = True
-            return response
-        except IdempotencyConflictError as error:
-            if claim is not None:
-                await self._persist_failure(
-                    claim.id,
-                    claim.lease_generation,
-                    error_category="conflict",
-                    summary=str(error),
-                    error_type="IdempotencyConflictError",
-                    response_status=409,
+            if self._after_stage_before_store_hook is not None:
+                await self._after_stage_before_store_hook()
+            async with self._object_guard(object_relative_path):
+                stored = self._store.store_immutable(
+                    staged,
+                    file_name=file_name,
                 )
-            raise
-        except ArtifactOverrideLeaseError as error:
-            if claim is not None:
-                await self._persist_failure(
-                    claim.id,
-                    claim.lease_generation,
-                    error_category="conflict",
-                    summary=str(error),
-                    error_type="ArtifactOverrideLeaseError",
-                    response_status=409,
-                )
-            raise
+                try:
+                    response = await self._commit_override(
+                        context=context,
+                        definition=definition,
+                        claim=claim,
+                        stored=stored,
+                        validation=validation,
+                        actor_id=actor_id,
+                        reason=reason,
+                        expected_current_artifact_id=expected_current_artifact_id,
+                    )
+                    committed = True
+                    return response
+                except (
+                    IdempotencyConflictError,
+                    ArtifactOverrideLeaseError,
+                ) as error:
+                    await self._persist_failure(
+                        claim.id,
+                        claim.lease_generation,
+                        error_category="conflict",
+                        summary=str(error),
+                        error_type=type(error).__name__,
+                        response_status=409,
+                    )
+                    raise
+                finally:
+                    if stored is not None and not committed:
+                        await self._delete_if_unreferenced(stored)
         finally:
             if staged is not None:
                 staged.unlink(missing_ok=True)
-            if stored is not None and not committed:
-                await self._delete_if_unreferenced(stored)
 
     async def _delete_if_unreferenced(
         self,
         stored: StoredArtifactFile,
     ) -> None:
+        if self._before_cleanup_reference_check_hook is not None:
+            await self._before_cleanup_reference_check_hook()
         if await self._is_storage_path_referenced(stored.relative_path):
             return
         self._store.delete_unreferenced(stored)
@@ -607,6 +620,29 @@ class ArtifactOverrideService:
                 )
             )
         return bool(artifact_count) or bool(publication_count)
+
+    @asynccontextmanager
+    async def _object_guard(self, relative_path: str):
+        lock_key = f"artifact-object:{relative_path}"
+        async with self._session_factory() as session:
+            connection = await session.connection()
+            await connection.execute(
+                text(
+                    "SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"
+                ),
+                {"lock_key": lock_key},
+            )
+            try:
+                yield
+            finally:
+                await connection.execute(
+                    text(
+                        "SELECT pg_advisory_unlock("
+                        "hashtextextended(:lock_key, 0))"
+                    ),
+                    {"lock_key": lock_key},
+                )
+                await session.rollback()
 
     async def _load_context(
         self,
