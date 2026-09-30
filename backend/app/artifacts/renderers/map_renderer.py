@@ -224,7 +224,15 @@ class MapRenderSpec:
             "base_style": self.base_style,
             "marker": self.marker,
             "layer_versions": {
-                layer.id: str(layer.metadata.get("version", "v1"))
+                layer.id: str(
+                    layer.metadata.get("version")
+                    or layer.metadata.get("source_checksum")
+                    or "unresolved"
+                )
+                for layer in self.layers
+            },
+            "layer_checksums": {
+                layer.id: layer.metadata.get("source_checksum")
                 for layer in self.layers
             },
             "template_version": self.template_version,

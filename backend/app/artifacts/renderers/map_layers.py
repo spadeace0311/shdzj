@@ -44,6 +44,7 @@ class AttributeBinding:
     property_name: str | None = None
     value_status: str = "available"
     metric_key: str | None = None
+    allow_zero: bool = False
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -51,6 +52,7 @@ class AttributeBinding:
             "property_name": self.property_name,
             "value_status": self.value_status,
             "metric_key": self.metric_key,
+            "allow_zero": self.allow_zero,
         }
 
 
@@ -74,12 +76,14 @@ def _binding(
     property_name: str | None = None,
     value_status: str = "available",
     metric_key: str | None = None,
+    allow_zero: bool = False,
 ) -> AttributeBinding:
     return AttributeBinding(
         field=field,
         property_name=property_name or field,
         value_status=value_status,
         metric_key=metric_key,
+        allow_zero=allow_zero,
     )
 
 
@@ -156,7 +160,11 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "rescue-demand-town",
             legend=(_legend("救援力量需求"),),
             attribute_bindings=(
-                _binding("rescue_teams", metric_key="rescue_team.quantity"),
+                _binding(
+                    "rescue_teams",
+                    metric_key="rescue_team.quantity",
+                    allow_zero=True,
+                ),
             ),
         ),
     ),
@@ -197,8 +205,23 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "polygon",
             "material-demand-town",
             legend=(_legend("物资需求"),),
-            attribute_bindings=(
-                _binding("material_demand", metric_key="material_demand"),
+            attribute_bindings=tuple(
+                _binding(
+                    metric_key.split(".", 1)[0],
+                    metric_key=metric_key,
+                    allow_zero=True,
+                )
+                for metric_key in (
+                    "tent.quantity",
+                    "drinking_water.quantity",
+                    "food.quantity",
+                    "clothing.quantity",
+                    "quilt.quantity",
+                    "blanket.quantity",
+                    "stretcher.quantity",
+                    "sickbed.quantity",
+                    "toilet.quantity",
+                )
             ),
         ),
     ),
@@ -339,7 +362,10 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "point",
             "epicenter",
             legend=(_legend("震中"),),
-            attribute_bindings=(_binding("magnitude"), _binding("depth_km")),
+            attribute_bindings=(
+                _binding("magnitude", allow_zero=True),
+                _binding("depth_km", allow_zero=True),
+            ),
         ),
         _definition(
             "admin-boundary",
@@ -356,7 +382,10 @@ _A_CLASS_DEFINITIONS: Mapping[str, tuple[LayerDefinition, ...]] = {
             "point",
             "distance-reference-points",
             legend=(_legend("主要城市"),),
-            attribute_bindings=(_binding("name"), _binding("distance_km")),
+            attribute_bindings=(
+                _binding("name"),
+                _binding("distance_km", allow_zero=True),
+            ),
         ),
     ),
 }
@@ -410,6 +439,11 @@ def _to_map_layer(
             source.get("checksum")
             if isinstance(source, Mapping)
             else getattr(source, "checksum", None)
+        ),
+        "version": (
+            source.get("version")
+            if isinstance(source, Mapping)
+            else getattr(source, "version", None)
         ),
         "feature_count": (
             source.get("feature_count", 0)
@@ -594,10 +628,20 @@ def _content_quality_reasons(source_key: str, layer: Any) -> tuple[str, ...]:
     reasons: list[str] = []
     placeholders = {"available", "TBD", "TODO", "待补充", "稍后补充"}
     metadata = _metadata(layer)
-    bound_properties = {
-        str(binding.get("property_name") or binding.get("field") or "")
+    bindings = tuple(
+        binding
         for binding in metadata.get("attribute_bindings", ())
         if isinstance(binding, Mapping)
+    )
+    bound_properties = {
+        str(binding.get("property_name") or binding.get("field") or "")
+        for binding in bindings
+    }
+    allow_zero = {
+        str(binding.get("property_name") or binding.get("field") or ""): bool(
+            binding.get("allow_zero")
+        )
+        for binding in bindings
     }
     for feature in features:
         if not isinstance(feature, Mapping):
@@ -623,6 +667,7 @@ def _content_quality_reasons(source_key: str, layer: Any) -> tuple[str, ...]:
                 and isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and value == 0
+                and not allow_zero.get(property_name, False)
             ):
                 reasons.append(f"{source_key} contains an unexpected zero substitution")
         for key, value in properties.items():

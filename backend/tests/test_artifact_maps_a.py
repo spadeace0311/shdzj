@@ -31,7 +31,10 @@ from app.data_assets.registry import get_asset_definition
 from app.data_assets.service import DataAssetService
 from app.loss.models import LossMetricValue, LossProduct
 from tests.basemap_fixtures import make_in_memory_package, png_tile_bytes
-from tests.data_asset_helpers import publish_new_population_version
+from tests.data_asset_helpers import (
+    _cleanup_fixture_data,
+    publish_new_population_version,
+)
 
 
 A_CLASS_ARTIFACTS = (
@@ -70,6 +73,23 @@ async def _dispose_engine_between_tests():
     await engine.dispose()
     yield
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def _cleanup_maps_a_data_assets(session_factory):
+    yield
+    from sqlalchemy import delete
+
+    await _cleanup_fixture_data(session_factory)
+    async with session_factory() as session:
+        async with session.begin():
+            from app.data_assets.models import DataAssetVersion
+
+            await session.execute(
+                delete(DataAssetVersion).where(
+                    DataAssetVersion.imported_by == "maps-a-fixture"
+                )
+            )
 
 
 def _settings_manifests() -> tuple[MapViewportTileManifest, ...]:
@@ -182,20 +202,23 @@ async def _add_loss_metric(
     metric_key: str,
     numeric_value: float,
     value_status: str,
+    area_scope: str = "town",
+    area_code: str = "310115000001",
+    unit: str = "count",
 ) -> None:
     async with fixture._session_factory() as session:
         async with session.begin():
             session.add(
                 LossMetricValue(
                     product_id=product.id,
-                    area_scope="town",
-                    area_code="310115000001",
+                    area_scope=area_scope,
+                    area_code=area_code,
                     area_name="fixture town",
                     metric_key=metric_key,
                     value_type="central",
                     value_status=value_status,
                     numeric_value=numeric_value,
-                    unit="count",
+                    unit=unit,
                     precision=2,
                     quality_grade="L1",
                 )
@@ -233,6 +256,83 @@ async def _prepare_product_dependencies(fixture, artifact_key: str):
                 run.id,
             )
     return task
+
+
+async def _render_product_map(
+    *,
+    fixture,
+    session_factory,
+    production_renderer,
+    tmp_path: Path,
+    artifact_key: str,
+    product_type: str,
+    metrics: tuple[tuple[str, float, str, str], ...],
+    publish_towns: bool,
+) -> tuple:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.city",
+        records=(_admin_city_record(),),
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
+    if publish_towns:
+        await publish_new_population_version(session_factory, f"{artifact_key}-town")
+        await _publish_asset(
+            session_factory,
+            "shanghai.building.town",
+            records=(
+                NormalizedRecord(
+                    row_number=1,
+                    business_key="310115000001",
+                    properties={"building_count": 100},
+                    geometry_wkt=None,
+                ),
+            ),
+        )
+    product = await _create_loss_product(
+        fixture,
+        product_type=product_type,
+        version=f"{product_type}-{artifact_key}",
+        checksum="e" * 64,
+    )
+    for metric_key, numeric_value, value_status, unit in metrics:
+        await _add_loss_metric(
+            fixture,
+            product,
+            metric_key=metric_key,
+            numeric_value=numeric_value,
+            value_status=value_status,
+            area_scope="city" if product_type == "resource_demand" else "town",
+            area_code="shanghai" if product_type == "resource_demand" else "310115000001",
+            unit=unit,
+        )
+
+    run = await fixture.create_full_run()
+    task = await fixture.first_task(run.id, artifact_key)
+    async with session_factory() as session:
+        async with session.begin():
+            await ArtifactProductionRepository().prepare_dependencies(
+                session,
+                run.id,
+            )
+    package, renderer = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await service.freeze_static_context(
+                session,
+                run.id,
+                fixture.catalog,
+            )
+            context = await service.build_map_context(session, task.id)
+    result = await renderer.render(
+        MapSpecBuilder().build(context),
+        tmp_path / f"{artifact_key}.jpg",
+    )
+    return result, context
 
 
 async def _publish_asset(
@@ -483,6 +583,22 @@ def _has_red_marker(path: Path) -> bool:
     )
 
 
+async def _page_text(
+    map_renderer,
+    spec,
+    selector: str,
+) -> str:
+    slot = await map_renderer._browser_pool.acquire_page()
+    try:
+        await slot.page.set_content(
+            map_renderer._renderer_html(spec, {}),
+            wait_until="domcontentloaded",
+        )
+        return await slot.page.locator(selector).inner_text()
+    finally:
+        await map_renderer._browser_pool.release_slot(slot.token)
+
+
 @pytest.mark.parametrize(
     ("production_mode", "marker"),
     (
@@ -511,6 +627,42 @@ async def test_mode_markers_are_visible_in_pixels(
 
     assert result.file_name.startswith(marker)
     assert _has_red_marker(result.path) is True
+    page_text = await _page_text(
+        map_renderer,
+        MapSpecBuilder().build(context),
+        ".mode-marker",
+    )
+    assert page_text == marker
+
+
+async def test_review_marker_is_visible_on_page(
+    seeded_artifact_assessment,
+    map_renderer,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.transport")
+    context = replace(
+        context,
+        resolved_sources={
+            "shanghai.road.network": {
+                "source_key": "shanghai.road.network",
+                "kind": "vector",
+                "status": "missing",
+                "url": "local://inline/shanghai.road.network",
+                "source": {
+                    "type": "geojson",
+                    "data": {"type": "FeatureCollection", "features": []},
+                },
+                "style": {"type": "line", "paint": {}},
+                "checksum": None,
+                "version": None,
+                "feature_count": 0,
+                "metadata": {"verified_empty": False},
+            }
+        },
+    )
+    spec = MapSpecBuilder().build(context)
+    page_text = await _page_text(map_renderer, spec, ".quality")
+    assert "待复核" in page_text
 
 
 async def test_production_population_context_resolves_published_vector(
@@ -551,6 +703,8 @@ async def test_production_gdp_context_resolves_published_raster(
     seeded_artifact_assessment,
     seeded_imported_version,
     session_factory,
+    production_renderer,
+    tmp_path: Path,
 ) -> None:
     descriptor = GeoTiffAssetImporter().load(
         seeded_imported_version.source_path,
@@ -574,12 +728,10 @@ async def test_production_gdp_context_resolves_published_raster(
             version.status = "published"
             version.published_at = datetime.now(UTC)
 
+    package, renderer = production_renderer
     service = ProductionContextService(
         repository=ArtifactProductionRepository(),
-        offline_basemap_packages={
-            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
-            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
-        },
+        offline_basemap_packages={"gaode": package},
     )
     run = await seeded_artifact_assessment.create_full_run()
     task = await seeded_artifact_assessment.first_task(run.id, "map.gdp")
@@ -596,6 +748,12 @@ async def test_production_gdp_context_resolves_published_raster(
     raster_layer = next(layer for layer in layers if layer.id == "gdp-raster")
     assert raster_layer.type == "raster"
     assert raster_layer.source["type"] == "image"
+    result = await renderer.render(
+        MapSpecBuilder().build(context),
+        tmp_path / "gdp.jpg",
+    )
+    assert result.non_empty_ratio > 0.2
+    assert result.render_manifest["layer_checksums"]["gdp-raster"]
 
 
 async def test_real_missing_required_asset_fails_hard(
@@ -656,6 +814,8 @@ async def test_real_missing_required_asset_fails_hard(
 async def test_real_verified_empty_fault_source(
     seeded_artifact_assessment,
     session_factory,
+    production_renderer,
+    tmp_path: Path,
 ) -> None:
     await _publish_asset(
         session_factory,
@@ -664,12 +824,10 @@ async def test_real_verified_empty_fault_source(
         spatial_extent=(121.2, 30.9, 121.8, 31.5),
     )
     await _publish_asset(session_factory, "shanghai.fault")
+    package, renderer = production_renderer
     service = ProductionContextService(
         repository=ArtifactProductionRepository(),
-        offline_basemap_packages={
-            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
-            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
-        },
+        offline_basemap_packages={"gaode": package},
     )
     run = await seeded_artifact_assessment.create_full_run()
     task = await seeded_artifact_assessment.first_task(run.id, "map.active_faults")
@@ -686,6 +844,12 @@ async def test_real_verified_empty_fault_source(
     fault_layer = next(layer for layer in layers if layer.id == "active-faults")
     assert fault_layer.metadata["verified_empty"] is True
     assert "检索范围内无活动断裂记录" in MapSpecBuilder().build(context).source_notes
+    result = await renderer.render(
+        MapSpecBuilder().build(context),
+        tmp_path / "fault-empty.jpg",
+    )
+    assert result.non_empty_ratio > 0.2
+    assert result.quality.grade == "A"
 
 
 async def test_product_metric_full_chain_render(
@@ -744,6 +908,99 @@ async def test_product_metric_full_chain_render(
     assert metric_layer.source["data"]["features"][0]["properties"]["deaths"] == 12
     assert result.quality.grade == "A"
     assert result.render_manifest["base_provider"] == "gaode"
+
+
+@pytest.mark.parametrize(
+    (
+        "artifact_key",
+        "product_type",
+        "metrics",
+        "publish_towns",
+        "layer_id",
+        "expected_properties",
+    ),
+    (
+        (
+            "map.economic_loss",
+            "economic_loss",
+            (("total_loss_yuan", 1_250_000, "available", "yuan"),),
+            True,
+            "economic-loss-town",
+            {"economic_loss": 1_250_000},
+        ),
+        (
+            "map.rescue_demand",
+            "resource_demand",
+            (("rescue_team.quantity", 5, "available", "count"),),
+            False,
+            "rescue-demand-town",
+            {"rescue_teams": 5},
+        ),
+        (
+            "map.material_demand",
+            "resource_demand",
+            tuple(
+                (f"{kind}.quantity", index, "available", "count")
+                for index, kind in enumerate(
+                    (
+                        "tent",
+                        "drinking_water",
+                        "food",
+                        "clothing",
+                        "quilt",
+                        "blanket",
+                        "stretcher",
+                        "sickbed",
+                        "toilet",
+                    ),
+                    start=1,
+                )
+            ),
+            False,
+            "material-demand-town",
+            {"tent": 1, "toilet": 9},
+        ),
+        (
+            "map.building_damage",
+            "building_damage",
+            (("severe_or_collapsed_area_m2", 300.5, "available", "m2"),),
+            True,
+            "building-damage-town",
+            {"damaged_buildings": 300.5},
+        ),
+    ),
+)
+async def test_product_map_matrix_renders_frozen_sources(
+    seeded_artifact_assessment,
+    session_factory,
+    production_renderer,
+    tmp_path: Path,
+    artifact_key,
+    product_type,
+    metrics,
+    publish_towns,
+    layer_id,
+    expected_properties,
+) -> None:
+    result, context = await _render_product_map(
+        fixture=seeded_artifact_assessment,
+        session_factory=session_factory,
+        production_renderer=production_renderer,
+        tmp_path=tmp_path,
+        artifact_key=artifact_key,
+        product_type=product_type,
+        metrics=metrics,
+        publish_towns=publish_towns,
+    )
+    layers = MapLayerRegistry.build(artifact_key, context)
+    metric_layer = next(layer for layer in layers if layer.id == layer_id)
+    feature = metric_layer.source["data"]["features"][0]
+    for property_name, expected_value in expected_properties.items():
+        assert feature["properties"][property_name] == expected_value
+    assert result.non_empty_ratio > 0.2
+    assert len(result.checksum) == 64
+    assert result.render_manifest["layer_checksums"][layer_id]
+    assert result.render_manifest["layer_versions"][layer_id] != "v1"
 
 
 @pytest.mark.parametrize(

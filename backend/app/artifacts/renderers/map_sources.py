@@ -24,6 +24,7 @@ from app.data_assets.raster_repository import load_raster_version
 from app.data_assets.repository import AssetRecord, DataAssetRepository
 from app.data_assets.models import DataAsset, DataAssetVersion
 from app.intensity.repository import IntensityRepository
+from app.intensity.models import IntensityFieldProduct
 from app.loss.domain import LossProductType
 from app.loss.models import LossMetricValue, LossProduct
 
@@ -41,6 +42,7 @@ class ResolvedMapSource:
     source: dict[str, Any]
     style: dict[str, Any]
     checksum: str | None
+    version: str | None
     feature_count: int
     metadata: dict[str, Any]
 
@@ -61,19 +63,6 @@ _ARTIFACT_METRIC_KEYS = {
     "map.buried": ("buried",),
     "map.building_damage": ("severe_or_collapsed_area_m2",),
 }
-
-_MATERIAL_METRIC_KEYS = (
-    "tent.quantity",
-    "drinking_water.quantity",
-    "food.quantity",
-    "clothing.quantity",
-    "quilt.quantity",
-    "blanket.quantity",
-    "stretcher.quantity",
-    "sickbed.quantity",
-    "toilet.quantity",
-)
-
 
 def _haversine_km(left: Point, right: Point) -> float:
     lon1, lat1 = math.radians(left.x), math.radians(left.y)
@@ -114,6 +103,7 @@ def _vector_source(
     features: list[dict[str, Any]],
     *,
     checksum: str | None,
+    version: str | None,
     style: dict[str, Any],
     status: str = "bound",
 ) -> ResolvedMapSource:
@@ -131,6 +121,7 @@ def _vector_source(
         },
         style=style,
         checksum=checksum,
+        version=version,
         feature_count=len(features),
         metadata={"verified_empty": status == "verified_empty"},
     )
@@ -175,6 +166,7 @@ def _dataset_raster_source(
     source_key: str,
     identity: uuid.UUID | None,
     checksum: str | None,
+    version: str | None,
 ) -> ResolvedMapSource:
     with MemoryFile(payload).open() as dataset:
         if dataset.crs is None:
@@ -216,6 +208,7 @@ def _dataset_raster_source(
         },
         style={"type": "raster", "paint": {"raster-opacity": 0.82}},
         checksum=checksum,
+        version=version,
         feature_count=1,
         metadata={"verified_empty": False},
     )
@@ -228,6 +221,7 @@ def _array_raster_source(
     source_key: str,
     identity: uuid.UUID | None,
     checksum: str | None,
+    version: str | None,
 ) -> ResolvedMapSource:
     if not bands:
         raise MapSourceResolutionError(f"{source_key} has no raster bands")
@@ -259,16 +253,17 @@ def _array_raster_source(
             source_key=source_key,
             identity=identity,
             checksum=checksum,
+            version=version,
         )
 
 
 async def _loss_metric_features(
     session: AsyncSession,
     product: LossProduct,
-    metric_keys: tuple[str, ...],
-    property_name: str,
-    town_records: list[AssetRecord],
+    metric_bindings: tuple[tuple[str, str], ...],
+    area_records: list[AssetRecord],
 ) -> tuple[list[dict[str, Any]], str]:
+    metric_keys = tuple(key for key, _ in metric_bindings)
     rows = list(
         (
             await session.scalars(
@@ -280,25 +275,36 @@ async def _loss_metric_features(
             )
         ).all()
     )
-    by_area: dict[str, list[LossMetricValue]] = {}
+    by_area_metric: dict[tuple[str, str], list[LossMetricValue]] = {}
     for row in rows:
-        by_area.setdefault(str(row.area_code), []).append(row)
+        by_area_metric.setdefault(
+            (str(row.area_code), row.metric_key),
+            [],
+        ).append(row)
     features: list[dict[str, Any]] = []
-    for record in town_records:
+    for record in area_records:
         feature = _feature_from_record(record)
         if feature is None:
             continue
-        rows_for_area = by_area.get(str(record.business_key))
-        if not rows_for_area:
+        selected_rows: list[LossMetricValue] = []
+        for metric_key, property_name in metric_bindings:
+            rows_for_metric = by_area_metric.get(
+                (str(record.business_key), metric_key),
+                [],
+            )
+            if len(rows_for_metric) != 1:
+                selected_rows = []
+                break
+            row = rows_for_metric[0]
+            if row.numeric_value is None:
+                selected_rows = []
+                break
+            feature["properties"][property_name] = float(row.numeric_value)
+            selected_rows.append(row)
+        if not selected_rows:
             continue
-        numeric_values = [
-            float(row.numeric_value)
-            for row in rows_for_area
-            if row.numeric_value is not None
-        ]
-        feature["properties"][property_name] = sum(numeric_values)
         feature["properties"]["value_status"] = _merged_value_status(
-            [row.value_status for row in rows_for_area]
+            [row.value_status for row in selected_rows]
         )
         feature["properties"]["product_checksum"] = product.output_checksum
         features.append(feature)
@@ -353,6 +359,13 @@ class MapSourceResolver:
                 session,
                 town_asset.asset_version_id,
             )
+        city_asset = asset_versions.get("shanghai.admin.city")
+        city_records: list[AssetRecord] = []
+        if city_asset is not None and city_asset.resolution_status == "bound":
+            city_records = await self._data_asset_repository.list_records(
+                session,
+                city_asset.asset_version_id,
+            )
 
         registry_definitions = {
             item.source_key: item
@@ -393,14 +406,20 @@ class MapSourceResolver:
                     layer_definition,
                 )
                 continue
-            resolved[source_key] = await self._asset_source(
-                session,
-                source_key=source_key,
-                asset_item=item,
-                layer_definition=layer_definition,
-                event=event,
-                town_records=town_records,
-            )
+            try:
+                resolved[source_key] = await self._asset_source(
+                    session,
+                    source_key=source_key,
+                    asset_item=item,
+                    layer_definition=layer_definition,
+                    event=event,
+                    town_records=town_records,
+                )
+            except MapSourceResolutionError:
+                resolved[source_key] = self._unavailable_source(
+                    source_key,
+                    layer_definition,
+                )
 
         for dependency in definition.depends_on:
             if dependency.kind.value != "assessment_product":
@@ -427,6 +446,7 @@ class MapSourceResolver:
                 binding=binding,
                 run=run,
                 town_records=town_records,
+                city_records=city_records,
                 layer_definition=layer_definition,
                 event=event,
                 artifact_key=task.artifact_key,
@@ -464,6 +484,7 @@ class MapSourceResolver:
             source_key,
             [feature],
             checksum=None,
+            version=None,
             style={
                 "type": "circle",
                 "paint": {
@@ -493,6 +514,7 @@ class MapSourceResolver:
                 source_key=source_key,
                 identity=version.id,
                 checksum=version.checksum,
+                version=version.version,
             )
         records = await self._data_asset_repository.list_records(session, version.id)
         records = self._join_geometry_records(
@@ -527,6 +549,7 @@ class MapSourceResolver:
             source_key,
             features,
             checksum=version.checksum,
+            version=version.version,
             style=_style_for_definition(layer_definition),
             status=status,
         )
@@ -584,7 +607,11 @@ class MapSourceResolver:
             )
         version = row[0]
         frozen_checksum = getattr(asset_item, "checksum", None)
-        if frozen_checksum and version.checksum != frozen_checksum:
+        if not isinstance(frozen_checksum, str) or not frozen_checksum:
+            raise MapSourceResolutionError(
+                f"frozen asset {source_key} has no checksum"
+            )
+        if version.checksum != frozen_checksum:
             raise MapSourceResolutionError(
                 f"frozen checksum mismatch for asset {source_key}"
             )
@@ -625,14 +652,28 @@ class MapSourceResolver:
         binding: ArtifactTaskDependencyBinding,
         run: ProductionRun,
         town_records: list[AssetRecord],
+        city_records: list[AssetRecord],
         layer_definition: LayerDefinition,
         event: Any,
         artifact_key: str,
     ) -> ResolvedMapSource:
         if product_key == "intensity.fusion":
+            intensity_product = await session.get(
+                IntensityFieldProduct,
+                binding.bound_entity_id,
+            )
+            if (
+                intensity_product is None
+                or intensity_product.run_id != run.assessment_run_id
+                or intensity_product.product_type != "fusion"
+                or intensity_product.output_checksum != binding.bound_checksum
+            ):
+                raise MapSourceResolutionError(
+                    "intensity product binding identity mismatch"
+                )
             bands, metadata = await IntensityRepository().load_raster(
                 session,
-                binding.bound_entity_id,
+                intensity_product.id,
             )
             return _array_raster_source(
                 bands,
@@ -640,6 +681,7 @@ class MapSourceResolver:
                 source_key=source_key,
                 identity=binding.bound_entity_id,
                 checksum=binding.bound_checksum,
+                version=binding.bound_version,
             )
 
         product_type = _LOSS_PRODUCT_TYPES.get(product_key)
@@ -660,31 +702,21 @@ class MapSourceResolver:
             )
         if product.status not in {"complete", "partial"}:
             raise MapSourceResolutionError(f"loss product {product_key} is unavailable")
-        if artifact_key == "map.material_demand":
-            metric_keys = _MATERIAL_METRIC_KEYS
-            property_name = "material_demand"
-        else:
-            metric_keys = _ARTIFACT_METRIC_KEYS.get(
-                artifact_key,
-                (layer_definition.attribute_bindings[0].metric_key,)
-                if layer_definition.attribute_bindings
-                else (),
-            )
-            property_name = (
-                layer_definition.attribute_bindings[0].property_name
-                if layer_definition.attribute_bindings
-                else "value"
-            )
-        if not metric_keys:
+        metric_bindings = tuple(
+            (binding.metric_key, binding.property_name or binding.field)
+            for binding in layer_definition.attribute_bindings
+            if binding.metric_key
+        )
+        if not metric_bindings:
             raise MapSourceResolutionError(
                 f"map {artifact_key} has no product metric binding"
             )
+        area_records = city_records if product_type is LossProductType.RESOURCE_DEMAND else town_records
         features, status = await _loss_metric_features(
             session,
             product,
-            metric_keys,
-            property_name,
-            town_records,
+            metric_bindings,
+            area_records,
         )
         if not features:
             raise MapSourceResolutionError(
@@ -694,6 +726,7 @@ class MapSourceResolver:
             source_key,
             features,
             checksum=product.output_checksum,
+            version=binding.bound_version,
             style=_style_for_definition(layer_definition),
             status=status,
         )
@@ -711,6 +744,7 @@ class MapSourceResolver:
             source={"type": "geojson", "data": {"type": "FeatureCollection", "features": []}},
             style=_style_for_definition(layer_definition),
             checksum=None,
+            version=None,
             feature_count=0,
             metadata={"verified_empty": False},
         )
