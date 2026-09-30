@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
+import zipfile
 
 from docx import Document
 from docx.enum.section import WD_SECTION
@@ -79,6 +81,28 @@ def build_background_templates(output_dir: Path) -> dict[str, Path]:
         "{{generated_by}}"
     )
 
-    document.save(temporary)
+    _save_deterministic_docx(document, temporary)
     os.replace(temporary, target)
     return {"background-template": target}
+
+
+def _save_deterministic_docx(document: Document, target: Path) -> None:
+    buffer = io.BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    with zipfile.ZipFile(buffer, "r") as source:
+        with zipfile.ZipFile(
+            target,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as destination:
+            for item in source.infolist():
+                info = zipfile.ZipInfo(
+                    item.filename,
+                    date_time=(1980, 1, 1, 0, 0, 0),
+                )
+                info.compress_type = zipfile.ZIP_DEFLATED
+                destination.writestr(
+                    info,
+                    source.read(item.filename),
+                )

@@ -105,6 +105,16 @@ BUILDING_GRID_REQUIRED_ASSETS = (
     "shanghai.building.town",
     "basemap.gaode.offline",
 )
+BACKGROUND_DOC_KEYS = {
+    "doc.background",
+    "doc.housing",
+    "doc.economy",
+    "doc.population",
+    "doc.key_targets",
+    "doc.spatial_distances",
+    "doc.area_overview",
+    "doc.historical_catalog",
+}
 
 
 class _StrictSafeLoader(yaml.SafeLoader):
@@ -242,6 +252,12 @@ def _parse_definition(
     if page_size is not None and not isinstance(page_size, str):
         raise ValueError(f"{artifact_key} page_size must be a string or null")
 
+    template_package = raw_definition.get("template_package")
+    if template_package is not None and (
+        not isinstance(template_package, str) or not template_package.strip()
+    ):
+        raise ValueError(f"{artifact_key} template_package must be a non-empty string")
+
     string_fields: dict[str, str] = {}
     for field_name in (
         "display_name",
@@ -299,6 +315,11 @@ def _parse_definition(
             raw_definition.get("degrade_conditions", []),
             f"{artifact_key}.degrade_conditions",
         ),
+        template_package=template_package,
+        control_fields=_string_tuple(
+            raw_definition.get("control_fields", []),
+            f"{artifact_key}.control_fields",
+        ),
     )
 
 
@@ -337,6 +358,16 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
                 raise ValueError(f"{definition.artifact_key} must use docx")
         elif definition.kind == ArtifactKind.PPTX and definition.format != "pptx":
             raise ValueError(f"{definition.artifact_key} must use pptx")
+
+        if definition.artifact_key in BACKGROUND_DOC_KEYS:
+            if definition.template_package != "background-template":
+                raise ValueError(
+                    f"{definition.artifact_key} must use the background-template package"
+                )
+            if not definition.control_fields:
+                raise ValueError(
+                    f"{definition.artifact_key} must declare document control fields"
+                )
 
         hard_identities = {
             (

@@ -144,6 +144,8 @@ class ArtifactDefinition:
     dpi: int | None = None
     page_size: str | None = None
     degrade_conditions: tuple[str, ...] = ()
+    template_package: str | None = None
+    control_fields: tuple[str, ...] = ()
 
     @property
     def is_conditional_degrade(self) -> bool:

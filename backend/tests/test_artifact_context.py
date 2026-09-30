@@ -1,6 +1,7 @@
 import hashlib
 import uuid
 from datetime import UTC, datetime
+from io import BytesIO
 
 import pytest
 from sqlalchemy import select
@@ -15,10 +16,12 @@ from app.artifacts.context import ProductionContextService
 from app.artifacts.models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
+    GeneratedArtifact,
     ProductionInputSnapshot,
     ProductionInputSnapshotItem,
 )
 from app.artifacts.repository import ArtifactProductionRepository
+from app.artifacts.storage import ArtifactStore
 from app.assessment.models import AssessmentRun
 from app.config import settings
 from app.data_assets.models import DataAsset, DataAssetVersion
@@ -360,6 +363,66 @@ async def test_static_context_is_deterministic_and_does_not_drift(
     assert second.template_versions["map.epicenter"]["version"] == "v1"
     assert latest_template is not None
     assert latest_template.version == "v2"
+
+
+async def test_document_context_resolves_generated_artifact_path(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+    map_task = await seeded_artifact_assessment.first_task(
+        run.id,
+        "map.epicenter",
+    )
+    stored = ArtifactStore(settings.artifact_storage_root).store_immutable_stream(
+        BytesIO(b"fixture-map-artifact"),
+        file_name="epicenter.jpg",
+    )
+    artifact = GeneratedArtifact(
+        production_run_id=run.id,
+        production_task_id=map_task.id,
+        event_id=seeded_artifact_assessment.event_id,
+        revision_id=seeded_artifact_assessment.revision_id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        artifact_version=1,
+        is_final=True,
+        production_mode="live",
+        status="complete",
+        quality_grade="A",
+        needs_review=False,
+        publication_mode="automatic",
+        marker=None,
+        file_name="epicenter.jpg",
+        format="jpg",
+        storage_path=stored.relative_path,
+        checksum=stored.checksum,
+        size_bytes=stored.size_bytes,
+        width=4761,
+        height=3369,
+        generated_at=datetime.now(UTC),
+    )
+    session.add(artifact)
+    await session.flush()
+
+    document_task = await seeded_artifact_assessment.first_task(
+        run.id,
+        "doc.area_overview",
+    )
+    context = await production_context_service.build_document_context(
+        session,
+        document_task.id,
+        "docx",
+    )
+
+    assert context.artifact_paths["map.epicenter"] == stored.managed_path
+    assert context.artifacts["map.epicenter"].checksum == stored.checksum
 
 
 async def test_missing_but_optional_asset_is_recorded_not_invented(

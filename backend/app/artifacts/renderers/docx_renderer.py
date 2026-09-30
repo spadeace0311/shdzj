@@ -4,7 +4,7 @@ import hashlib
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,8 @@ from typing import Any
 from docx import Document
 from docx.document import Document as DocumentObject
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Cm
 from PIL import Image
 
@@ -52,7 +54,6 @@ class DocumentSection:
     title: str
     body: tuple[str, ...] = ()
     table: tuple[tuple[str, ...], ...] = ()
-    image_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +157,19 @@ def _metric(payload: Mapping[str, Any], *keys: str) -> str:
         value = payload.get(key)
         if value is not None and str(value).strip():
             return str(value)
-    return "数据缺失，待复核"
+    return "数据不可用，待复核"
+
+
+def _manifest_value(
+    manifest: Mapping[str, Any],
+    key: str,
+    *,
+    source: str,
+) -> str:
+    value = manifest.get(key)
+    if value is None or str(value).strip() == "":
+        return f"数据不可用，待复核：{source}"
+    return str(value)
 
 
 def _asset_summary(
@@ -167,6 +180,109 @@ def _asset_summary(
     if asset is None or asset.checksum is None:
         return f"{asset_key}: 数据缺失，待复核"
     return f"{asset_key}: 已冻结 / 版本 {asset.version or '未知'} / {asset.checksum[:12]}"
+
+
+def _catalog_control_values(
+    artifact_key: str,
+    declared_fields: tuple[str, ...],
+    manifest: Mapping[str, Any],
+    asset_versions: Mapping[str, FrozenAssetVersion],
+) -> dict[str, Any]:
+    event = dict(manifest.get("event") or {})
+    buildings = _product_payload(manifest, "loss.buildings")
+    population = _product_payload(manifest, "loss.population")
+    economy = _product_payload(manifest, "loss.economic")
+    intensity = _product_payload(manifest, "intensity.fusion")
+    historical = (
+        dict(manifest["historical_earthquakes"])
+        if isinstance(manifest.get("historical_earthquakes"), Mapping)
+        else {}
+    )
+    spatial = (
+        dict(manifest["spatial_distances"])
+        if isinstance(manifest.get("spatial_distances"), Mapping)
+        else {}
+    )
+    targets = (
+        dict(manifest["targets"])
+        if isinstance(manifest.get("targets"), Mapping)
+        else {}
+    )
+    overview = (
+        dict(manifest["area_overview"])
+        if isinstance(manifest.get("area_overview"), Mapping)
+        else {}
+    )
+    coordinate = (
+        f"{float(event.get('longitude', 0.0)):.6f} E, "
+        f"{float(event.get('latitude', 0.0)):.6f} N"
+    )
+    common = {
+        "event": event.get("place") or "未命名震中",
+        "place": event.get("place") or "未命名震中",
+        "origin_time": _isoformat(event.get("origin_time")),
+        "coordinate": coordinate,
+        "depth": f"{float(event.get('depth_km', 0.0)):.2f} km",
+    }
+    values: dict[str, Any] = dict(common)
+    values.update(
+        {
+            "historical_earthquakes": _metric(historical, "summary"),
+            "nearby_faults": _asset_summary(asset_versions, "shanghai.fault"),
+            "geographic_notes": _metric(overview, "geography"),
+            "town_totals": _metric(buildings, "total", "town_totals"),
+            "structure_type": _metric(buildings, "structure_type", "structure_summary"),
+            "damage_statistics": (
+                f"{_metric(buildings, 'slight')}/{_metric(buildings, 'moderate')}/"
+                f"{_metric(buildings, 'severe')}"
+            ),
+            "coverage_quality": _asset_summary(
+                asset_versions,
+                "shanghai.building.town",
+            ),
+            "gdp": _metric(economy, "gdp", "total"),
+            "industry_structure": (
+                f"{_metric(economy, 'primary')}/{_metric(economy, 'secondary')}/"
+                f"{_metric(economy, 'tertiary')}"
+            ),
+            "economic_loss": _metric(economy, "loss", "economic_loss"),
+            "source_scenario": "loss.economic",
+            "resident_population": _metric(population, "resident"),
+            "floating_population": _metric(population, "floating"),
+            "household": _metric(population, "households"),
+            "age_structure": _metric(population, "age_structure"),
+            "affected_population": _metric(population, "affected"),
+            "shelter": _metric(targets, "shelter"),
+            "school": _metric(targets, "school"),
+            "hospital": _metric(targets, "hospital"),
+            "hazard_source": _metric(targets, "hazard_source"),
+            "rescue_team": _metric(targets, "rescue_team"),
+            "cultural_relic": _metric(targets, "cultural_relic"),
+            "key_target_list": _metric(targets, "key_target"),
+            "city_distance": _metric(spatial, "city_distance"),
+            "county_distance": _metric(spatial, "county_distance"),
+            "town_distance": _metric(spatial, "town_distance"),
+            "major_city_distance": _metric(spatial, "major_city_distance"),
+            "key_target_distance": _metric(spatial, "key_target_distance"),
+            "fault_distance": _metric(spatial, "fault_distance"),
+            "geography": _metric(overview, "geography"),
+            "administration": _metric(overview, "administration"),
+            "intensity": _metric(intensity, "summary", "grade"),
+            "population": _metric(population, "affected", "resident"),
+            "buildings": _metric(buildings, "total", "severe"),
+            "economy": _metric(economy, "gdp", "loss"),
+            "key_risks": _metric(overview, "key_risks"),
+            "radius": _metric(historical, "radius_km"),
+            "magnitude_threshold": _metric(historical, "magnitude_threshold"),
+            "historical_earthquake_catalog": _metric(historical, "summary"),
+            "disaster_earthquake_catalog": _metric(historical, "disaster_summary"),
+            "statistics": _metric(historical, "statistics"),
+        }
+    )
+    return {
+        key: values.get(key, "数据不可用，待复核")
+        for key in declared_fields
+    }
 
 
 def build_background_document_spec(
@@ -180,6 +296,10 @@ def build_background_document_spec(
 
     catalog = load_catalog(settings.artifact_catalog_path)
     definition = catalog.get(artifact_key, context.output_profile)
+    if definition.template_package != "background-template":
+        raise ValueError(
+            f"{artifact_key} must use the background-template package"
+        )
     manifest = dict(context.manifest)
     event = dict(manifest.get("event") or {})
     t1_at = event.get("t1_at", manifest.get("t1_at"))
@@ -277,6 +397,22 @@ def build_background_document_spec(
         "generated_by": "地震应急辅助决策系统",
         "title": f"{marker or ''}{definition.display_name}",
     }
+    control_fields.update(
+        _catalog_control_values(
+            artifact_key,
+            definition.control_fields,
+            manifest,
+            asset_versions,
+        )
+    )
+    missing_control_fields = [
+        key for key in definition.control_fields if key not in control_fields
+    ]
+    if missing_control_fields:
+        raise ValueError(
+            f"missing declared control fields for {artifact_key}: "
+            + ", ".join(missing_control_fields)
+        )
 
     sections = _background_sections(artifact_key, manifest, asset_versions)
     if sections:
@@ -292,7 +428,6 @@ def build_background_document_spec(
                 title=first.title,
                 body=control_body,
                 table=first.table,
-                image_keys=first.image_keys,
             ),
             *sections[1:],
         )
@@ -313,7 +448,7 @@ def build_background_document_spec(
         control_fields=control_fields,
         sections=sections,
         images=images,
-        charts=_background_charts(artifact_key, manifest),
+        charts=_background_charts(artifact_key, manifest, marker=marker),
         quality=RenderQuality(
             grade=definition.quality_policy,
             needs_review=needs_review,
@@ -350,6 +485,8 @@ def _background_images(
 def _background_charts(
     artifact_key: str,
     manifest: Mapping[str, Any],
+    *,
+    marker: str | None,
 ) -> tuple[ChartSpec, ...]:
     if artifact_key == "doc.population":
         population = _product_payload(manifest, "loss.population")
@@ -366,6 +503,7 @@ def _background_charts(
                 labels=labels,
                 series=(_chart_series("人口影响", values),),
                 y_label="数量",
+                marker=marker,
             ),
         )
     if artifact_key == "doc.housing":
@@ -384,6 +522,7 @@ def _background_charts(
                 labels=labels,
                 series=(_chart_series("房屋数量", values),),
                 y_label="数量",
+                marker=marker,
             ),
         )
     if artifact_key == "doc.economy":
@@ -402,6 +541,7 @@ def _background_charts(
                 labels=labels,
                 series=(_chart_series("金额", values),),
                 y_label="金额",
+                marker=marker,
             ),
         )
     return ()
@@ -432,7 +572,26 @@ def _background_sections(
     population = _product_payload(manifest, "loss.population")
     economy = _product_payload(manifest, "loss.economic")
     intensity = _product_payload(manifest, "intensity.fusion")
-    historical = _product_payload(manifest, "historical.earthquakes")
+    historical_manifest = (
+        dict(manifest["historical_earthquakes"])
+        if isinstance(manifest.get("historical_earthquakes"), Mapping)
+        else {}
+    )
+    spatial = (
+        dict(manifest["spatial_distances"])
+        if isinstance(manifest.get("spatial_distances"), Mapping)
+        else {}
+    )
+    targets = (
+        dict(manifest["targets"])
+        if isinstance(manifest.get("targets"), Mapping)
+        else {}
+    )
+    overview = (
+        dict(manifest["area_overview"])
+        if isinstance(manifest.get("area_overview"), Mapping)
+        else {}
+    )
 
     if artifact_key == "doc.background":
         return (
@@ -450,12 +609,23 @@ def _background_sections(
                     f"震源深度：{float(event.get('depth_km', 0.0)):.2f} km",
                 ),
             ),
-            DocumentSection("所在行政区", ("上海市及邻近行政区", "行政区边界数据为离线冻结资产")),
+            DocumentSection(
+                "所在行政区",
+                (
+                    _manifest_value(
+                        manifest,
+                        "area_overview",
+                        source="assessment manifest / area_overview.administration",
+                    )
+                    if isinstance(manifest.get("area_overview"), Mapping)
+                    else "数据不可用，待复核：assessment manifest / area_overview",
+                ),
+            ),
             DocumentSection(
                 "历史地震",
                 (
                     _asset_summary(asset_versions, "shanghai.historical.earthquakes"),
-                    _metric(historical, "summary") if historical else "目录数据由历史地震资产提供",
+                    _metric(historical_manifest, "summary"),
                 ),
             ),
             DocumentSection(
@@ -464,15 +634,30 @@ def _background_sections(
             ),
             DocumentSection(
                 "基础地理背景",
-                ("上海市地处长江三角洲，地势低平，河网密布。", "基础地理信息来自离线行政区与底图资产。"),
+                (
+                    _manifest_value(
+                        overview,
+                        "geography",
+                        source="assessment manifest / area_overview.geography",
+                    ),
+                ),
             ),
         )
     if artifact_key == "doc.housing":
         return (
-            DocumentSection("街镇房屋总量", (_metric(buildings, "total", "town_totals"),)),
+            DocumentSection(
+                "街镇房屋总量",
+                (
+                    f"房屋总量：{_metric(buildings, 'total', 'town_totals')}",
+                    _asset_summary(asset_versions, "shanghai.building.town"),
+                ),
+            ),
             DocumentSection(
                 "结构类型",
-                ("结构分类数据来自 shanghai.building.town 冻结资产。",),
+                (
+                    _metric(buildings, "structure_type", "structure_summary"),
+                    _asset_summary(asset_versions, "shanghai.building.town"),
+                ),
             ),
             DocumentSection(
                 "破坏统计",
@@ -486,7 +671,10 @@ def _background_sections(
                 "覆盖与质量",
                 (
                     _asset_summary(asset_versions, "shanghai.building.town"),
-                    "评估产品版本与数据资产校验和以冻结快照为准。",
+                    (
+                        "评估产品版本："
+                        f"{buildings.get('version') or '数据不可用，待复核'}"
+                    ),
                 ),
             ),
         )
@@ -504,7 +692,13 @@ def _background_sections(
             DocumentSection("经济损失", (_metric(economy, "loss", "economic_loss"),)),
             DocumentSection(
                 "来源与情景",
-                ("经济损失来源：loss.economic 评估产品。", "情景口径以冻结损失参数与区域配置为准。"),
+                (
+                    "来源：loss.economic",
+                    (
+                        "模型参数版本："
+                        f"{manifest.get('loss', {}).get('parameter_package', {}).get('version')}"
+                    ),
+                ),
             ),
         )
     if artifact_key == "doc.population":
@@ -516,55 +710,131 @@ def _background_sections(
             DocumentSection("受灾人口", (_metric(population, "affected"),)),
         )
     if artifact_key == "doc.key_targets":
-        rows = (
-            ("避难场所", _asset_summary(asset_versions, "shanghai.shelter.emergency")),
-            ("学校", _asset_summary(asset_versions, "shanghai.education.school")),
-            ("医院", _asset_summary(asset_versions, "shanghai.health.hospital")),
-            ("危险源", _asset_summary(asset_versions, "shanghai.hazard_source")),
-            ("救援队伍", _asset_summary(asset_versions, "shanghai.rescue_team")),
-            ("文物单位", _asset_summary(asset_versions, "shanghai.cultural_relic")),
-            ("重点目标", _asset_summary(asset_versions, "shanghai.key_target")),
+        return (
+            DocumentSection(
+                "避难场所",
+                (
+                    _metric(targets, "shelter"),
+                    _asset_summary(asset_versions, "shanghai.shelter.emergency"),
+                ),
+            ),
+            DocumentSection(
+                "学校",
+                (
+                    _metric(targets, "school"),
+                    _asset_summary(asset_versions, "shanghai.education.school"),
+                ),
+            ),
+            DocumentSection(
+                "医院",
+                (
+                    _metric(targets, "hospital"),
+                    _asset_summary(asset_versions, "shanghai.health.hospital"),
+                ),
+            ),
+            DocumentSection(
+                "危险源",
+                (
+                    _metric(targets, "hazard_source"),
+                    _asset_summary(asset_versions, "shanghai.hazard_source"),
+                ),
+            ),
+            DocumentSection(
+                "救援队伍",
+                (
+                    _metric(targets, "rescue_team"),
+                    _asset_summary(asset_versions, "shanghai.rescue_team"),
+                ),
+            ),
+            DocumentSection(
+                "文物单位",
+                (
+                    _metric(targets, "cultural_relic"),
+                    _asset_summary(asset_versions, "shanghai.cultural_relic"),
+                ),
+            ),
+            DocumentSection(
+                "重点目标列表",
+                (
+                    _metric(targets, "key_target"),
+                    _asset_summary(asset_versions, "shanghai.key_target"),
+                ),
+            ),
         )
-        return tuple(
-            DocumentSection(label, (summary,))
-            for label, summary in rows
-        ) + (DocumentSection("重点目标列表", ("重点目标清单以冻结资产为准。",)),)
     if artifact_key == "doc.spatial_distances":
         return (
-            DocumentSection("城市距离", ("上海主城区距离为空间分析结果。",)),
-            DocumentSection("区县距离", ("各区县中心距离由冻结参考点计算。",)),
-            DocumentSection("街镇距离", ("街镇中心距离由行政区划资产计算。",)),
-            DocumentSection("主要城市距离", (_asset_summary(asset_versions, "shanghai.distance.reference_points"),)),
-            DocumentSection("重点目标距离", ("重点目标距离引用重点目标资产。",)),
-            DocumentSection("断裂距离", (_asset_summary(asset_versions, "shanghai.fault"),)),
+            DocumentSection("城市距离", (f"{_metric(spatial, 'city_distance')} km",)),
+            DocumentSection("区县距离", (f"{_metric(spatial, 'county_distance')} km",)),
+            DocumentSection("街镇距离", (f"{_metric(spatial, 'town_distance')} km",)),
+            DocumentSection(
+                "主要城市距离",
+                (f"{_metric(spatial, 'major_city_distance')} km",),
+            ),
+            DocumentSection(
+                "重点目标距离",
+                (f"{_metric(spatial, 'key_target_distance')} km",),
+            ),
+            DocumentSection("断裂距离", (f"{_metric(spatial, 'fault_distance')} km",)),
         )
     if artifact_key == "doc.area_overview":
         return (
             DocumentSection(
                 "地理概况",
-                ("上海市地势低平，水网密集，中心城区人口与设施高度集中。",),
+                (
+                    _manifest_value(
+                        overview,
+                        "geography",
+                        source="assessment manifest / area_overview.geography",
+                    ),
+                ),
             ),
-            DocumentSection("行政区", ("上海市及周边行政区，专业成果仅覆盖上海市域。",)),
+            DocumentSection(
+                "行政区",
+                (
+                    _manifest_value(
+                        overview,
+                        "administration",
+                        source="assessment manifest / area_overview.administration",
+                    ),
+                ),
+            ),
             DocumentSection("烈度", (_metric(intensity, "summary", "grade"),)),
             DocumentSection("人口", (_metric(population, "affected", "resident"),)),
             DocumentSection("房屋", (_metric(buildings, "total", "severe"),)),
             DocumentSection("经济", (_metric(economy, "gdp", "loss"),)),
             DocumentSection(
                 "关键风险",
-                ("人口密集区、重点目标、危险源和断裂带为关键风险控制项。",),
-                image_keys=("map.epicenter",),
+                (
+                    _manifest_value(
+                        overview,
+                        "key_risks",
+                        source="assessment manifest / area_overview.key_risks",
+                    ),
+                ),
             ),
         )
     if artifact_key == "doc.historical_catalog":
         return (
-            DocumentSection("检索半径", ("半径：50 km（受控目录参数）",)),
-            DocumentSection("震级阈值", ("震级阈值：M >= 3.0",)),
+            DocumentSection(
+                "检索半径",
+                (f"{_metric(historical_manifest, 'radius_km')} km",),
+            ),
+            DocumentSection(
+                "震级阈值",
+                (f"M >= {_metric(historical_manifest, 'magnitude_threshold')}",),
+            ),
             DocumentSection(
                 "历史地震目录",
-                (_asset_summary(asset_versions, "shanghai.historical.earthquakes"),),
+                (
+                    _metric(historical_manifest, "summary"),
+                    _asset_summary(asset_versions, "shanghai.historical.earthquakes"),
+                ),
             ),
-            DocumentSection("灾害地震目录", ("灾害地震目录由历史地震资产筛选得到。",)),
-            DocumentSection("统计", ("记录数、最大震级和最近事件以冻结目录为准。",)),
+            DocumentSection(
+                "灾害地震目录",
+                (_metric(historical_manifest, "disaster_summary"),),
+            ),
+            DocumentSection("统计", (_metric(historical_manifest, "statistics"),)),
         )
     raise ValueError(f"unsupported background document key: {artifact_key}")
 
@@ -585,38 +855,9 @@ class DocxRenderer:
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{os.getpid()}.docx")
-        document = Document(str(spec.template_path))
-
-        self._replace_placeholders(document, spec)
-        self._remove_section_placeholders(document)
-        self._append_sections(document, spec)
-        self._embed_images(document, spec, target.parent)
-        self._set_footer(document, spec)
-        self._assert_no_placeholders(document)
-
-        page_count = self._page_count(document)
-        document.save(temporary)
-        os.replace(temporary, target)
-
-        checksum = _sha256_path(target)
-        image_checksums = self._resolved_image_checksums(spec, target.parent)
-        render_manifest: dict[str, Any] = {
-            "marker": spec.marker,
-            "template_version": spec.template_version,
-            "template_checksum": spec.template_checksum,
-            "image_checksums": image_checksums,
-            "image_paths": {
-                key: str(image.path)
-                for key, image in self._all_images(spec, target.parent).items()
-            },
-            "control_fields": dict(spec.control_fields),
-            "quality": spec.quality.to_dict(),
-            "page_count": page_count,
-            "unresolved_placeholder_count": 0,
-            "renderer_version": DOCX_RENDERER_VERSION,
-            "context_fingerprint": spec.context_fingerprint,
-            "input_fingerprint": spec.input_fingerprint,
-        }
+        actual_template_checksum = _sha256_path(spec.template_path)
+        if actual_template_checksum != spec.template_checksum:
+            raise ValueError("template checksum mismatch")
         file_name = build_artifact_file_name(
             ArtifactNameContext(
                 place=str(spec.event.get("place") or "未命名震中"),
@@ -628,6 +869,45 @@ class DocxRenderer:
             ),
             extension="docx",
         )
+        control_fields = dict(spec.control_fields)
+        control_fields["file_name"] = file_name
+        control_fields["page_number"] = ""
+        spec = replace(spec, control_fields=control_fields)
+
+        document = Document(str(spec.template_path))
+
+        self._replace_placeholders(document, spec)
+        self._remove_section_placeholders(document)
+        self._append_sections(document, spec)
+        images = self._all_images(spec, target.parent)
+        self._embed_images(document, images)
+        self._set_footer(document, spec, file_name)
+        self._assert_no_placeholders(document)
+
+        page_count = self._page_count(document)
+        document.save(temporary)
+        os.replace(temporary, target)
+
+        checksum = _sha256_path(target)
+        image_checksums = self._image_checksums(images)
+        render_manifest: dict[str, Any] = {
+            "marker": spec.marker,
+            "template_version": spec.template_version,
+            "template_checksum": spec.template_checksum,
+            "image_checksums": image_checksums,
+            "image_paths": {
+                key: str(image.path)
+                for key, image in images.items()
+            },
+            "control_fields": dict(spec.control_fields),
+            "quality": spec.quality.to_dict(),
+            "page_count": page_count,
+            "page_count_method": "declared_page_breaks_plus_one",
+            "unresolved_placeholder_count": 0,
+            "renderer_version": DOCX_RENDERER_VERSION,
+            "context_fingerprint": spec.context_fingerprint,
+            "input_fingerprint": spec.input_fingerprint,
+        }
         return RenderResult(
             path=target,
             format="docx",
@@ -657,8 +937,8 @@ class DocxRenderer:
         spec: DocumentRenderSpec,
     ) -> None:
         values = dict(spec.control_fields)
-        values["file_name"] = "正式成果文件"
-        values["page_number"] = "1"
+        values["file_name"] = spec.control_fields.get("file_name", "")
+        values["page_number"] = ""
         values["version"] = spec.template_version
         values["generated_by"] = "地震应急辅助决策系统"
         for paragraph in _iter_document_paragraphs(document):
@@ -710,10 +990,8 @@ class DocxRenderer:
     def _embed_images(
         self,
         document: DocumentObject,
-        spec: DocumentRenderSpec,
-        output_parent: Path,
+        images: Mapping[str, DocumentImage],
     ) -> None:
-        images = self._all_images(spec, output_parent)
         if not images:
             return
         first = next(iter(images.values()))
@@ -743,13 +1021,21 @@ class DocxRenderer:
                 return paragraph
         return None
 
-    def _set_footer(self, document: DocumentObject, spec: DocumentRenderSpec) -> None:
+    def _set_footer(
+        self,
+        document: DocumentObject,
+        spec: DocumentRenderSpec,
+        file_name: str,
+    ) -> None:
         footer = document.sections[0].footer
-        footer.paragraphs[0].text = (
-            "正式成果文件 | 第 1 页 | 版本 "
-            f"{spec.template_version} | 地震应急辅助决策系统"
+        paragraph = footer.paragraphs[0]
+        paragraph.text = ""
+        paragraph.add_run(f"{file_name} | 第 ")
+        _add_page_number_field(paragraph)
+        paragraph.add_run(
+            f" 页 | 版本 {spec.template_version} | 地震应急辅助决策系统"
         )
-        footer.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     def _assert_no_placeholders(self, document: DocumentObject) -> None:
         text = "\n".join(
@@ -785,13 +1071,12 @@ class DocxRenderer:
             )
         return images
 
-    def _resolved_image_checksums(
+    def _image_checksums(
         self,
-        spec: DocumentRenderSpec,
-        output_parent: Path,
+        images: Mapping[str, DocumentImage],
     ) -> dict[str, str]:
         checksums: dict[str, str] = {}
-        for key, image in self._all_images(spec, output_parent).items():
+        for key, image in images.items():
             checksum = image.checksum or _sha256_path(image.path)
             if image.checksum and checksum != image.checksum:
                 raise ValueError(f"image checksum mismatch for {key}")
@@ -823,6 +1108,20 @@ def _iter_table_paragraphs(table: Any) -> tuple[Any, ...]:
 
 def _paragraph_has_page_break(paragraph: Any) -> bool:
     return paragraph._element.xpath(".//w:br[@w:type='page']")
+
+
+def _add_page_number_field(paragraph: Any) -> None:
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.append(begin)
+    run._r.append(instruction)
+    run._r.append(end)
 
 
 def _image_dimensions(path: Path) -> tuple[int, int]:

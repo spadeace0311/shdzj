@@ -187,6 +187,7 @@ class ArtifactValidator:
 
             document = Document(path)
             text = _docx_text(document)
+            page_count = _docx_declared_page_count(document)
         except Exception as error:
             return _invalid(
                 "format_mismatch",
@@ -209,9 +210,12 @@ class ArtifactValidator:
             )
         return ValidationResult(
             valid=True,
-            summary="DOCX opened and contains no unresolved placeholders",
+            summary=(
+                "DOCX opened with no unresolved placeholders; page count is "
+                "declared page breaks plus one"
+            ),
             checksum=checksum,
-            page_count=1,
+            page_count=page_count,
         )
 
     def _validate_pptx(
@@ -348,6 +352,14 @@ def _docx_text(document: Any) -> str:
                     for cell in row.cells:
                         pieces.append(cell.text)
     return "\n".join(pieces)
+
+
+def _docx_declared_page_count(document: Any) -> int:
+    count = 1
+    for paragraph in document.paragraphs:
+        if paragraph._element.xpath(".//w:br[@w:type='page']"):
+            count += 1
+    return count
 
 
 def _pptx_text(presentation: Any) -> str:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from docx import Document
+import numpy as np
 from PIL import Image
 
 from app.artifacts.renderers.chart_renderer import ChartRenderer, ChartSeries, ChartSpec
@@ -12,6 +15,7 @@ from app.artifacts.renderers.docx_renderer import (
     DocxRenderer,
     build_background_document_spec,
 )
+from app.artifacts.template_builder import build_background_templates
 
 BACKGROUND_DOCS = (
     "doc.background",
@@ -55,6 +59,16 @@ def chart_renderer() -> ChartRenderer:
     return ChartRenderer()
 
 
+class CountingChartRenderer(ChartRenderer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.render_count = 0
+
+    def render(self, spec: ChartSpec, output_path: Path):
+        self.render_count += 1
+        return super().render(spec, output_path)
+
+
 @pytest.mark.parametrize("artifact_key", BACKGROUND_DOCS)
 async def test_background_documents_are_valid_docx(
     artifact_key: str,
@@ -77,24 +91,39 @@ async def test_background_documents_are_valid_docx(
     assert result.control_fields["template_version"] == "v1"
 
 
-async def test_docx_contains_mode_marker_in_pixels_and_metadata(
+@pytest.mark.parametrize(
+    ("production_mode", "marker"),
+    (
+        ("test", "【测试】"),
+        ("drill", "【演练】"),
+        ("replay", "【测试回放】"),
+    ),
+)
+async def test_docx_contains_mode_marker_in_filename_body_manifest_and_chart(
+    production_mode: str,
+    marker: str,
     seeded_artifact_assessment,
     docx_renderer: DocxRenderer,
     tmp_path: Path,
 ) -> None:
     context = await seeded_artifact_assessment.document_context(
-        "doc.background",
-        production_mode="test",
+        "doc.population",
+        production_mode=production_mode,
     )
+    spec = build_background_document_spec(context, "doc.population")
+    assert all(chart.marker == marker for chart in spec.charts)
     result = await docx_renderer.render(
-        build_background_document_spec(context, "doc.background"),
-        tmp_path / "test.docx",
+        spec,
+        tmp_path / f"{production_mode}.docx",
     )
     document = Document(result.path)
 
-    assert "【测试】" in result.file_name
-    assert "【测试】" in document.paragraphs[0].text
-    assert result.render_manifest["marker"] == "【测试】"
+    assert marker in result.file_name
+    assert marker in document.paragraphs[0].text
+    assert result.render_manifest["marker"] == marker
+    chart_path = Path(result.render_manifest["image_paths"]["population-impact"])
+    image = np.asarray(Image.open(chart_path).convert("RGB"))
+    assert np.any(image[40:100, 40:180] < 245)
 
 
 async def test_docx_reuses_the_same_map_checksum_for_repeated_reference(
@@ -142,6 +171,7 @@ async def test_chart_renderer_generates_deterministic_local_png(
             ChartSeries(name="常住人口", values=(18.2, 71.6, 10.2)),
         ),
         y_label="比例（%）",
+        marker="【测试】",
     )
     first_path = tmp_path / "first.png"
     second_path = tmp_path / "second.png"
@@ -151,12 +181,104 @@ async def test_chart_renderer_generates_deterministic_local_png(
 
     assert first.checksum == second.checksum
     assert first.render_manifest["image_checksums"]["population-age"] == first.checksum
+    assert first.render_manifest["font_family"] == "Noto Sans CJK SC"
+    assert first.render_manifest["marker_baked"] is True
     with Image.open(first_path) as image:
         assert image.size == (spec.width, spec.height)
         assert image.format == "PNG"
         assert tuple(
             round(value) for value in image.info.get("dpi", (0, 0))
         ) == (spec.dpi, spec.dpi)
+
+
+def test_chart_renderer_uses_configured_cjk_font_without_missing_glyph_warnings(
+    chart_renderer: ChartRenderer,
+    tmp_path: Path,
+) -> None:
+    spec = ChartSpec(
+        chart_id="population-age",
+        title="常住人口年龄结构",
+        labels=("0-14岁", "15-64岁", "65岁及以上"),
+        series=(ChartSeries(name="常住人口", values=(18.2, 71.6, 10.2)),),
+        marker="【测试】",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chart_renderer.render(spec, tmp_path / "font.png")
+
+    assert not any("Glyph" in str(item.message) for item in caught)
+    assert not any("missing from font" in str(item.message) for item in caught)
+
+
+async def test_docx_rejects_template_checksum_mismatch(
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context("doc.background")
+    spec = build_background_document_spec(context, "doc.background")
+    bad_spec = replace(spec, template_checksum="0" * 64)
+
+    with pytest.raises(ValueError, match="template checksum mismatch"):
+        await docx_renderer.render(bad_spec, tmp_path / "bad.docx")
+
+
+async def test_docx_footer_contains_real_file_name_and_page_field(
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context("doc.background")
+    result = await docx_renderer.render(
+        build_background_document_spec(context, "doc.background"),
+        tmp_path / "background.docx",
+    )
+    document = Document(result.path)
+    footer_xml = document.sections[0].footer.paragraphs[0]._element.xml
+
+    assert result.file_name in footer_xml
+    assert "PAGE" in footer_xml
+    assert result.render_manifest["page_count_method"] == "declared_page_breaks_plus_one"
+
+
+async def test_docx_renders_each_chart_once(
+    seeded_artifact_assessment,
+    tmp_path: Path,
+) -> None:
+    chart_renderer = CountingChartRenderer()
+    renderer = DocxRenderer(chart_renderer=chart_renderer)
+    context = await seeded_artifact_assessment.document_context("doc.population")
+    result = await renderer.render(
+        build_background_document_spec(context, "doc.population"),
+        tmp_path / "population.docx",
+    )
+
+    assert chart_renderer.render_count == 1
+    assert "population-impact" in result.render_manifest["image_checksums"]
+
+
+def test_build_background_templates_is_deterministic_and_contains_placeholders(
+    tmp_path: Path,
+) -> None:
+    first = build_background_templates(tmp_path / "first")
+    second = build_background_templates(tmp_path / "second")
+    first_path = first["background-template"]
+    second_path = second["background-template"]
+
+    assert _sha256_path(first_path) == _sha256_path(second_path)
+    document = Document(first_path)
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert "{{title}}" in text
+    assert "{{section_1_title}}" in text
+    assert "{{section_1_body}}" in text
+    assert "{{section_1_image}}" in text
+    footer_text = document.sections[0].footer.paragraphs[0].text
+    assert "{{file_name}}" in footer_text
+    assert "{{page_number}}" in footer_text
+    section = document.sections[0]
+    assert round(section.page_width.cm) == 21
+    assert round(section.page_height.cm) == 30
 
 
 @pytest.mark.parametrize(
@@ -210,3 +332,34 @@ async def test_each_background_document_has_its_required_sections(
 
     for section in expected_sections:
         assert section in text
+
+
+@pytest.mark.parametrize(
+    ("artifact_key", "expected_values"),
+    (
+        ("doc.background", {"12 条，最大震级 4.9", "长江三角洲冲积平原"}),
+        ("doc.housing", {"10000", "1200", "300", "80"}),
+        ("doc.economy", {"560000", "12000", "220000", "328000", "8800"}),
+        ("doc.population", {"120000", "18000", "52000", "4300", "18.2%"}),
+        ("doc.key_targets", {"避难场所 45 处", "学校 118 所", "医院 36 所"}),
+        ("doc.spatial_distances", {"8.6 km", "12.4 km", "5.2 km"}),
+        ("doc.area_overview", {"长江三角洲冲积平原", "人口密集区、重点目标、危险源与断裂带"}),
+        ("doc.historical_catalog", {"50 km", "M >= 3.0", "12 条 / 3 条灾害"}),
+    ),
+)
+async def test_background_documents_use_concrete_manifest_values(
+    artifact_key: str,
+    expected_values: set[str],
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context(artifact_key)
+    result = await docx_renderer.render(
+        build_background_document_spec(context, artifact_key),
+        tmp_path / f"{artifact_key}.docx",
+    )
+    text = "\n".join(paragraph.text for paragraph in Document(result.path).paragraphs)
+
+    for expected in expected_values:
+        assert expected in text

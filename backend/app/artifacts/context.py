@@ -26,12 +26,14 @@ from app.artifacts.domain import ArtifactCatalog, ArtifactKind, DependencyKind
 from app.artifacts.models import (
     ArtifactTemplate,
     ArtifactTemplateVersion,
+    GeneratedArtifact,
     ProductionInputSnapshot,
     ProductionRun,
     ProductionTask,
 )
 from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.service import sha256_json
+from app.artifacts.storage import ArtifactStore
 from app.assessment.models import AssessmentRun
 from app.config import settings
 from app.data_assets.locks import lock_data_asset_catalog
@@ -510,6 +512,12 @@ class ProductionContextService:
             production_task_id,
         )
         manifest = dict(snapshot.manifest)
+        artifact_paths, generated_assets = await self._resolve_generated_artifacts(
+            session,
+            run.id,
+        )
+        asset_versions = _frozen_asset_map(manifest.get("assets", ()))
+        asset_versions.update(generated_assets)
         return DocumentRenderContext(
             production_task_id=task.id,
             production_run_id=run.id,
@@ -518,11 +526,46 @@ class ProductionContextService:
             document_type=document_type,
             context_fingerprint=snapshot.context_fingerprint,
             template_versions=_template_map(manifest.get("templates", ())),
-            asset_versions=_frozen_asset_map(manifest.get("assets", ())),
+            asset_versions=asset_versions,
             manifest=manifest,
             production_mode=run.production_mode,
             marker=_mode_marker(run.production_mode),
+            artifact_paths=artifact_paths,
         )
+
+    async def _resolve_generated_artifacts(
+        self,
+        session: AsyncSession,
+        production_run_id: uuid.UUID,
+    ) -> tuple[dict[str, Path], dict[str, FrozenAssetVersion]]:
+        rows = (
+            await session.scalars(
+                select(GeneratedArtifact).where(
+                    GeneratedArtifact.production_run_id == production_run_id,
+                    GeneratedArtifact.is_final.is_(True),
+                )
+            )
+        ).all()
+        store = ArtifactStore(settings.artifact_storage_root)
+        paths: dict[str, Path] = {}
+        assets: dict[str, FrozenAssetVersion] = {}
+        for artifact in rows:
+            resolved = store.resolve(artifact.storage_path)
+            if not resolved.is_file():
+                continue
+            paths[artifact.artifact_key] = resolved
+            assets[artifact.artifact_key] = FrozenAssetVersion(
+                asset_key=artifact.artifact_key,
+                role="artifact",
+                resolution_status=(
+                    "bound" if artifact.status == "complete" else "degraded"
+                ),
+                asset_version_id=artifact.id,
+                checksum=artifact.checksum,
+                coverage={},
+                version=str(artifact.artifact_version),
+            )
+        return paths, assets
 
     async def _load_task_snapshot(
         self,

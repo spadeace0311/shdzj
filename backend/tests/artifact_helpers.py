@@ -362,7 +362,9 @@ class ArtifactAssessmentFixture:
             "drill": "【演练】",
             "replay": "【测试回放】",
         }[production_mode]
-        template_checksum = _checksum("background-template-v1")
+        template_checksum = _sha256_file(
+            Path(settings.artifact_template_root) / "background-template.docx"
+        )
         template_versions = {
             "background-template": {
                 "template_key": "background-template",
@@ -443,6 +445,7 @@ class ArtifactAssessmentFixture:
                         "resident": 120000,
                         "floating": 18000,
                         "households": 52000,
+                        "age_structure": "0-14岁 18.2%；15-64岁 71.6%；65岁及以上 10.2%",
                         "affected": 4300,
                     },
                     "loss.economic": {
@@ -455,6 +458,35 @@ class ArtifactAssessmentFixture:
                         "loss": 8800,
                     },
                 },
+            },
+            "historical_earthquakes": {
+                "radius_km": 50,
+                "magnitude_threshold": 3.0,
+                "summary": "半径内历史地震 12 条，最大震级 4.9",
+                "disaster_summary": "灾害地震 3 条，需复核",
+                "statistics": "12 条 / 3 条灾害",
+            },
+            "spatial_distances": {
+                "city_distance": 8.6,
+                "county_distance": 12.4,
+                "town_distance": 5.2,
+                "major_city_distance": 18.9,
+                "key_target_distance": 6.3,
+                "fault_distance": 21.7,
+            },
+            "targets": {
+                "shelter": "避难场所 45 处",
+                "school": "学校 118 所",
+                "hospital": "医院 36 所",
+                "hazard_source": "危险源 22 处",
+                "rescue_team": "救援队 9 支",
+                "cultural_relic": "文物 17 处",
+                "key_target": "重点目标 64 处",
+            },
+            "area_overview": {
+                "geography": "长江三角洲冲积平原，水网密集",
+                "administration": "上海市及邻近行政区",
+                "key_risks": "人口密集区、重点目标、危险源与断裂带",
             },
             "loss": {
                 "parameter_package": {

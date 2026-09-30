@@ -11,12 +11,26 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+from matplotlib import font_manager
 import matplotlib.pyplot as plt
 from PIL import Image
 
 from app.artifacts.renderers.base import RenderQuality, RenderResult
+from app.config import settings
 
 CHART_RENDERER_VERSION = "artifact-chart-renderer-v1"
+FONT_FAMILY = "Noto Sans CJK SC"
+
+
+def _configure_font() -> None:
+    font_path = Path(settings.artifact_font_path)
+    if not font_path.is_file():
+        raise FileNotFoundError(f"artifact font file does not exist: {font_path}")
+    font_manager.fontManager.addfont(str(font_path))
+    properties = font_manager.FontProperties(fname=str(font_path))
+    family = properties.get_name() or FONT_FAMILY
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = [family, FONT_FAMILY, "DejaVu Sans"]
 
 
 def _sha256_path(path: Path) -> str:
@@ -73,6 +87,7 @@ class ChartSpec:
 
 class ChartRenderer:
     def render(self, spec: ChartSpec, output_path: Path) -> RenderResult:
+        _configure_font()
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{os.getpid()}")
@@ -100,6 +115,8 @@ class ChartRenderer:
             "source_note": spec.source_note,
             "renderer_version": CHART_RENDERER_VERSION,
             "matplotlib_backend": "Agg",
+            "font_family": FONT_FAMILY,
+            "marker_baked": spec.marker is not None,
             "marker": spec.marker,
             "quality": spec.quality.to_dict(),
         }
@@ -142,6 +159,18 @@ class ChartRenderer:
         if len(spec.series) > 1:
             axis.legend()
         axis.grid(True, alpha=0.25)
+        if spec.marker:
+            axis.text(
+                0.98,
+                0.02,
+                spec.marker,
+                transform=axis.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=14,
+                color="#b3261e",
+                fontweight="bold",
+            )
 
 
 def _image_size(path: Path) -> tuple[int, int]:

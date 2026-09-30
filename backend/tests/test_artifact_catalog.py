@@ -158,6 +158,136 @@ def test_catalog_locks_legacy_codes_and_map_output_specifications() -> None:
     assert catalog.get("deck.decision_report", "a3v-professional").format == "pptx"
 
 
+def test_catalog_exposes_typed_background_template_and_control_fields() -> None:
+    catalog = ArtifactCatalog.load(CATALOG_PATH)
+    expected = {
+        "doc.background": (
+            "event",
+            "place",
+            "origin_time",
+            "coordinate",
+            "depth",
+            "historical_earthquakes",
+            "nearby_faults",
+            "geographic_notes",
+        ),
+        "doc.housing": (
+            "town_totals",
+            "structure_type",
+            "damage_statistics",
+            "coverage_quality",
+        ),
+        "doc.economy": (
+            "gdp",
+            "industry_structure",
+            "economic_loss",
+            "source_scenario",
+        ),
+        "doc.population": (
+            "resident_population",
+            "floating_population",
+            "household",
+            "age_structure",
+            "affected_population",
+        ),
+        "doc.key_targets": (
+            "shelter",
+            "school",
+            "hospital",
+            "hazard_source",
+            "rescue_team",
+            "cultural_relic",
+            "key_target_list",
+        ),
+        "doc.spatial_distances": (
+            "city_distance",
+            "county_distance",
+            "town_distance",
+            "major_city_distance",
+            "key_target_distance",
+            "fault_distance",
+        ),
+        "doc.area_overview": (
+            "geography",
+            "administration",
+            "intensity",
+            "population",
+            "buildings",
+            "economy",
+            "key_risks",
+        ),
+        "doc.historical_catalog": (
+            "radius",
+            "magnitude_threshold",
+            "historical_earthquake_catalog",
+            "disaster_earthquake_catalog",
+            "statistics",
+        ),
+    }
+
+    for key, control_fields in expected.items():
+        definition = catalog.get(key, "a3v-professional")
+        assert definition.template_package == "background-template"
+        assert definition.control_fields == control_fields
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("template_package", ""),
+        ("control_fields", []),
+        ("control_fields", ["duplicate", "duplicate"]),
+    ),
+)
+def test_catalog_rejects_invalid_background_control_metadata(
+    tmp_path: Path,
+    field_name: str,
+    field_value: object,
+) -> None:
+    catalog_text = CATALOG_PATH.read_text(encoding="utf-8")
+    if field_name == "template_package":
+        invalid_catalog_text = catalog_text.replace(
+            "    template_package: background-template\n",
+            '    template_package: ""\n',
+            1,
+        )
+    elif not field_value:
+        invalid_catalog_text = catalog_text.replace(
+            "    control_fields:\n"
+            "      - event\n"
+            "      - place\n"
+            "      - origin_time\n"
+            "      - coordinate\n"
+            "      - depth\n"
+            "      - historical_earthquakes\n"
+            "      - nearby_faults\n"
+            "      - geographic_notes\n",
+            "    control_fields: []\n",
+            1,
+        )
+    else:
+        invalid_catalog_text = catalog_text.replace(
+            "    control_fields:\n"
+            "      - event\n"
+            "      - place\n"
+            "      - origin_time\n"
+            "      - coordinate\n"
+            "      - depth\n"
+            "      - historical_earthquakes\n"
+            "      - nearby_faults\n"
+            "      - geographic_notes\n",
+            "    control_fields:\n"
+            "      - event\n"
+            "      - event\n",
+            1,
+        )
+    invalid_catalog = tmp_path / f"invalid-{field_name}.yaml"
+    invalid_catalog.write_text(invalid_catalog_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="doc.background"):
+        ArtifactCatalog.load(invalid_catalog)
+
+
 def test_catalog_dependencies_are_typed_and_acyclic() -> None:
     catalog = ArtifactCatalog.load(CATALOG_PATH)
     decision = catalog.get("doc.decision_report", "a3v-professional")
