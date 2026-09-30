@@ -19,7 +19,7 @@ from PIL import Image
 
 from app.artifacts.catalog import load_catalog
 from app.artifacts.context import DocumentRenderContext, FrozenAssetVersion
-from app.artifacts.domain import ArtifactNameContext, ProductionMode
+from app.artifacts.domain import ArtifactNameContext, DependencyKind, ProductionMode
 from app.artifacts.naming import build_artifact_file_name
 from app.artifacts.renderers.base import RenderQuality, RenderResult
 from app.artifacts.renderers.chart_renderer import ChartRenderer, ChartSpec
@@ -36,6 +36,36 @@ BACKGROUND_DOC_KEYS = {
     "doc.spatial_distances",
     "doc.area_overview",
     "doc.historical_catalog",
+}
+CORE_DOC_KEYS = {
+    "doc.rapid_brief",
+    "doc.rapid_report",
+    "doc.decision_report",
+    "deck.decision_report",
+}
+DECISION_DECK_MAP_KEYS = (
+    "map.intensity",
+    "map.economic_loss",
+    "map.rescue_demand",
+    "map.deaths",
+    "map.injuries",
+    "map.buried",
+    "map.material_demand",
+    "map.active_faults",
+    "map.key_targets",
+    "map.building_damage",
+    "map.epicenter",
+    "map.city_distances",
+)
+_OPTIONAL_ARTIFACT_REVIEW_LABELS = {
+    "map.reservoirs": "水库数据待复核",
+    "map.metro": "地铁数据待复核",
+    "map.seismic_stations": "地震台站数据待复核",
+    "map.rescue_teams": "救援队伍数据待复核",
+    "map.cultural_relics": "文物单位数据待复核",
+    "map.pga_zoning": "地震动区划数据待复核",
+    "map.shelter_emergency": "避难场所数据待复核",
+    "map.building_grid": "建筑物公里格网数据待复核",
 }
 
 
@@ -507,6 +537,594 @@ def build_background_document_spec(
         event=event,
         asset_versions=asset_versions,
     )
+
+
+def build_core_document_spec(
+    context: DocumentRenderContext,
+    artifact_key: str,
+) -> DocumentRenderSpec:
+    if artifact_key not in CORE_DOC_KEYS:
+        raise ValueError(f"unsupported core document key: {artifact_key}")
+    if context.artifact_key != artifact_key:
+        raise ValueError("document context artifact_key does not match requested artifact")
+
+    catalog = load_catalog(settings.artifact_catalog_path)
+    definition = catalog.get(artifact_key, context.output_profile)
+    manifest = dict(context.manifest)
+    event = dict(manifest.get("event") or {})
+    t1_at = event.get("t1_at", manifest.get("t1_at"))
+    production_mode = context.production_mode
+    marker = context.marker or _mode_marker(production_mode)
+
+    template_key, template_file = _core_template_identity(artifact_key)
+    template = context.template_versions.get(template_key)
+    template_version = (
+        str(template.get("version"))
+        if isinstance(template, Mapping) and template.get("version")
+        else "v1"
+    )
+    template_path = Path(settings.artifact_template_root) / template_file
+    template_checksum = (
+        str(template.get("checksum"))
+        if isinstance(template, Mapping) and template.get("checksum")
+        else _sha256_path(template_path)
+    )
+    if len(template_checksum) != 64:
+        template_checksum = _sha256_path(template_path)
+
+    hard_product_keys, hard_artifact_keys, optional_artifact_keys = (
+        _core_dependency_keys(definition)
+    )
+    if artifact_key == "deck.decision_report":
+        required_map_keys = DECISION_DECK_MAP_KEYS
+        artifact_dependency_keys = (
+            tuple(hard_artifact_keys) + DECISION_DECK_MAP_KEYS
+        )
+    else:
+        required_map_keys = tuple(
+            key for key in hard_artifact_keys if key.startswith("map.")
+        )
+        artifact_dependency_keys = tuple(hard_artifact_keys)
+
+    missing_products = [
+        key for key in hard_product_keys if not _product_payload(manifest, key)
+    ]
+    missing_required_artifacts = [
+        key
+        for key in artifact_dependency_keys
+        if not _artifact_available(context, key)
+    ]
+    missing_optional_artifacts = [
+        key
+        for key in optional_artifact_keys
+        if not _artifact_available(context, key)
+    ]
+    degradation_reasons = [
+        _dependency_review_label(key)
+        for key in (
+            missing_products
+            + missing_required_artifacts
+            + missing_optional_artifacts
+        )
+    ]
+    needs_review = bool(degradation_reasons)
+
+    if definition.failure_policy == "block" and (
+        missing_products or missing_required_artifacts
+    ):
+        first_missing = (missing_products + missing_required_artifacts)[0]
+        raise FileNotFoundError(
+            f"required core document dependency unavailable: {first_missing}"
+        )
+
+    asset_versions = dict(context.asset_versions)
+    input_payload: dict[str, Any] = {
+        "artifact_key": artifact_key,
+        "output_profile": context.output_profile,
+        "context_fingerprint": context.context_fingerprint,
+        "template_key": template_key,
+        "template_version": template_version,
+        "template_checksum": template_checksum,
+        "products": {
+            key: {
+                "version": _product_payload(manifest, key).get("version"),
+                "checksum": _product_payload(manifest, key).get("checksum"),
+            }
+            for key in sorted(hard_product_keys)
+        },
+        "artifacts": {
+            key: {
+                "checksum": asset.checksum,
+                "version": asset.version,
+            }
+            for key, asset in sorted(asset_versions.items())
+            if key in artifact_dependency_keys
+            or key in optional_artifact_keys
+        },
+    }
+    input_fingerprint = _sha256_bytes(
+        str(input_payload).encode("utf-8")
+    )
+
+    control_fields = _core_control_fields(
+        definition=definition,
+        event=event,
+        manifest=manifest,
+        t1_at=t1_at,
+        marker=marker,
+        template_version=template_version,
+        degradation_reasons=degradation_reasons,
+        needs_review=needs_review,
+        product_keys=hard_product_keys,
+        artifact_keys=artifact_dependency_keys,
+        asset_versions=asset_versions,
+    )
+    sections = _core_sections(
+        artifact_key,
+        manifest,
+        asset_versions,
+        degradation_reasons=degradation_reasons,
+        needs_review=needs_review,
+        control_fields=control_fields,
+    )
+    images = _core_images(
+        context,
+        artifact_key,
+        required_map_keys,
+        optional_artifact_keys,
+    )
+
+    return DocumentRenderSpec(
+        artifact_key=artifact_key,
+        display_name=definition.display_name,
+        title=f"{marker or ''}{definition.display_name}",
+        document_type=context.document_type,
+        template_path=template_path,
+        template_version=template_version,
+        template_checksum=template_checksum,
+        context_fingerprint=context.context_fingerprint,
+        input_fingerprint=input_fingerprint,
+        production_mode=production_mode,
+        marker=marker,
+        control_fields=control_fields,
+        sections=sections,
+        images=images,
+        charts=(),
+        quality=RenderQuality(
+            grade=definition.quality_policy,
+            needs_review=needs_review,
+            degradation_reasons=tuple(degradation_reasons),
+        ),
+        event=event,
+        asset_versions=asset_versions,
+    )
+
+
+def _core_template_identity(artifact_key: str) -> tuple[str, str]:
+    if artifact_key == "deck.decision_report":
+        return "decision-template", "decision-template.pptx"
+    return "background-template", "background-template.docx"
+
+
+def _core_dependency_keys(
+    definition: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    hard_products = tuple(
+        dependency.key
+        for dependency in definition.depends_on
+        if dependency.kind is DependencyKind.ASSESSMENT_PRODUCT
+    )
+    hard_artifacts = tuple(
+        dependency.key
+        for dependency in definition.depends_on
+        if dependency.kind is DependencyKind.ARTIFACT
+    )
+    optional_artifacts = tuple(
+        dependency.key
+        for dependency in definition.optional_depends_on
+        if dependency.kind is DependencyKind.ARTIFACT
+    )
+    return hard_products, hard_artifacts, optional_artifacts
+
+
+def _artifact_available(
+    context: DocumentRenderContext,
+    artifact_key: str,
+) -> bool:
+    asset = context.asset_versions.get(artifact_key)
+    if asset is None or asset.checksum is None:
+        return False
+    path = context.artifact_paths.get(artifact_key)
+    if artifact_key.startswith("map."):
+        return path is not None and path.is_file()
+    return True
+
+
+def _dependency_review_label(key: str) -> str:
+    if key in _OPTIONAL_ARTIFACT_REVIEW_LABELS:
+        return _OPTIONAL_ARTIFACT_REVIEW_LABELS[key]
+    if key.startswith("map."):
+        catalog = load_catalog(settings.artifact_catalog_path)
+        display_name = catalog.get(key, "a3v-professional").display_name
+        compact = (
+            display_name
+            .removeprefix("震区")
+            .removeprefix("震中附近")
+            .removesuffix("分布图")
+            .removesuffix("专题图")
+            .removesuffix("图")
+        )
+        return f"{compact}数据待复核"
+    if "." in key:
+        return f"{key} 数据缺失"
+    return f"{key} 数据待复核"
+
+
+def _core_control_fields(
+    *,
+    definition: Any,
+    event: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    t1_at: Any,
+    marker: str | None,
+    template_version: str,
+    degradation_reasons: Sequence[str],
+    needs_review: bool,
+    product_keys: Sequence[str],
+    artifact_keys: Sequence[str],
+    asset_versions: Mapping[str, FrozenAssetVersion],
+) -> dict[str, Any]:
+    coordinate = (
+        f"{float(event.get('longitude', 0.0)):.6f} E, "
+        f"{float(event.get('latitude', 0.0)):.6f} N"
+    )
+    common = {
+        "event_name": event.get("place") or "未命名震中",
+        "magnitude": f"{float(event.get('magnitude', 0.0)):.1f} 级",
+        "origin_time": _isoformat(event.get("origin_time")),
+        "longitude": f"{float(event.get('longitude', 0.0)):.6f}",
+        "latitude": f"{float(event.get('latitude', 0.0)):.6f}",
+        "depth_km": f"{float(event.get('depth_km', 0.0)):.2f} km",
+        "coordinate": coordinate,
+        "t1_at": _t1_display(t1_at),
+        "data_source": "离线冻结数据资产 / 评估产品 / 系统受控模板",
+        "report_type": definition.display_name,
+        "mode_marker": marker or "正式",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "artifact_version": "V001",
+        "revision_no": str(event.get("revision_no") or "1"),
+        "assessment_run_no": (
+            str(manifest.get("assessment", {}).get("assessment_run_id"))
+            if isinstance(manifest.get("assessment"), Mapping)
+            else "不适用"
+        ),
+        "data_asset_snapshot_fingerprint": (
+            str(manifest.get("assessment", {}).get("data_asset_snapshot_fingerprint"))
+            if isinstance(manifest.get("assessment"), Mapping)
+            else "未冻结"
+        ),
+        "model_parameter_version": (
+            str(manifest.get("loss", {}).get("parameter_package", {}).get("version"))
+            if isinstance(manifest.get("loss"), Mapping)
+            and isinstance(manifest["loss"].get("parameter_package"), Mapping)
+            else "未冻结"
+        ),
+        "template_version": template_version,
+        "quality_grade": definition.quality_policy,
+        "degradation_reasons": "；".join(degradation_reasons) or "无",
+        "needs_review": "待复核" if needs_review else "无",
+        "version": template_version,
+        "file_name": "",
+        "page_number": "",
+        "generated_by": "地震应急辅助决策系统",
+        "title": f"{marker or ''}{definition.display_name}",
+    }
+    dynamic = _core_dynamic_fields(manifest)
+    source_versions = _core_source_versions(
+        manifest,
+        product_keys,
+        artifact_keys,
+        context_assets=asset_versions,
+    )
+    event_facts = (
+        f"事件名称：{common['event_name']}；震级：{common['magnitude']}；"
+        f"发震时刻：{common['origin_time']}；坐标：{coordinate}；"
+        f"震源深度：{common['depth_km']}；{common['t1_at']}"
+    )
+    return {
+        **common,
+        **dynamic,
+        "event_facts": event_facts,
+        "recommendation": _core_recommendation(manifest),
+        "source_versions": "\n".join(source_versions),
+        "spatial_conclusions": _core_spatial_conclusions(manifest),
+    }
+
+
+def _core_dynamic_fields(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    intensity = _product_payload(manifest, "intensity.fusion")
+    buildings = _product_payload(manifest, "loss.buildings")
+    population = _product_payload(manifest, "loss.population")
+    casualties = _product_payload(manifest, "loss.casualties")
+    economy = _product_payload(manifest, "loss.economic")
+    resources = _product_payload(manifest, "loss.resources")
+    spatial = (
+        dict(manifest["spatial_distances"])
+        if isinstance(manifest.get("spatial_distances"), Mapping)
+        else {}
+    )
+    targets = (
+        dict(manifest["targets"])
+        if isinstance(manifest.get("targets"), Mapping)
+        else {}
+    )
+    faults = (
+        dict(manifest["faults"])
+        if isinstance(manifest.get("faults"), Mapping)
+        else {}
+    )
+    return {
+        "intensity": _metric(intensity, "summary", "grade"),
+        "population": _metric(population, "affected", "resident"),
+        "buildings": _metric(buildings, "total", "severe"),
+        "economy": _metric(economy, "loss", "gdp"),
+        "resources": _metric(resources, "summary", "demand"),
+        "casualties": _metric(casualties, "summary", "deaths", "injuries"),
+        "key_targets": _metric(targets, "key_target"),
+        "faults": _metric(faults, "summary", source="shanghai.fault"),
+        "city_distance": _metric(spatial, "city_distance"),
+        "fault_distance": _metric(spatial, "fault_distance"),
+    }
+
+
+def _core_source_versions(
+    manifest: Mapping[str, Any],
+    product_keys: Sequence[str],
+    artifact_keys: Sequence[str],
+    *,
+    context_assets: Mapping[str, FrozenAssetVersion],
+) -> tuple[str, ...]:
+    lines: list[str] = []
+    for key in product_keys:
+        payload = _product_payload(manifest, key)
+        if payload:
+            lines.append(
+                f"{key}: 版本 {payload.get('version') or '未知'} / "
+                f"{str(payload.get('checksum') or '')[:12]}"
+            )
+        else:
+            lines.append(f"{key}: 数据缺失，待复核")
+    for key in artifact_keys:
+        asset = context_assets.get(key)
+        if asset is not None and asset.checksum:
+            lines.append(
+                f"{key}: 版本 {asset.version or '未知'} / {asset.checksum[:12]}"
+            )
+        else:
+            lines.append(f"{key}: 数据缺失，待复核")
+    return tuple(lines)
+
+
+def _core_recommendation(manifest: Mapping[str, Any]) -> str:
+    intensity = _product_payload(manifest, "intensity.fusion")
+    population = _product_payload(manifest, "loss.population")
+    if not intensity and not population:
+        return "评估产品数据不足，建议人工复核后启动响应。"
+    return (
+        f"根据烈度 {_metric(intensity, 'summary', 'grade')} 与受灾人口 "
+        f"{_metric(population, 'affected')}，建议按预案启动相应级别响应，"
+        "优先保障人员搜救和生命线抢修。"
+    )
+
+
+def _core_spatial_conclusions(manifest: Mapping[str, Any]) -> str:
+    spatial = (
+        dict(manifest["spatial_distances"])
+        if isinstance(manifest.get("spatial_distances"), Mapping)
+        else {}
+    )
+    return (
+        f"主要城市距离 {_metric(spatial, 'city_distance')} km；"
+        f"断裂距离 {_metric(spatial, 'fault_distance')} km。"
+        "空间距离信息用于快速圈定应急影响范围。"
+    )
+
+
+def _core_sections(
+    artifact_key: str,
+    manifest: Mapping[str, Any],
+    asset_versions: Mapping[str, FrozenAssetVersion],
+    *,
+    degradation_reasons: Sequence[str],
+    needs_review: bool,
+    control_fields: Mapping[str, Any],
+) -> tuple[DocumentSection, ...]:
+    event = dict(manifest.get("event") or {})
+    intensity = _product_payload(manifest, "intensity.fusion")
+    buildings = _product_payload(manifest, "loss.buildings")
+    population = _product_payload(manifest, "loss.population")
+    casualties = _product_payload(manifest, "loss.casualties")
+    economy = _product_payload(manifest, "loss.economic")
+    resources = _product_payload(manifest, "loss.resources")
+    validation = _product_payload(manifest, "loss.validate")
+    overview = (
+        dict(manifest["area_overview"])
+        if isinstance(manifest.get("area_overview"), Mapping)
+        else {}
+    )
+    spatial = (
+        dict(manifest["spatial_distances"])
+        if isinstance(manifest.get("spatial_distances"), Mapping)
+        else {}
+    )
+    targets = (
+        dict(manifest["targets"])
+        if isinstance(manifest.get("targets"), Mapping)
+        else {}
+    )
+    faults = (
+        dict(manifest["faults"])
+        if isinstance(manifest.get("faults"), Mapping)
+        else {}
+    )
+    quality_lines = [
+        f"质量等级：{control_fields['quality_grade']}",
+        f"降级原因：{control_fields['degradation_reasons']}",
+        f"待复核项：{control_fields['needs_review']}",
+        f"来源与版本：{control_fields['source_versions']}",
+    ]
+    if degradation_reasons:
+        quality_lines.extend(degradation_reasons)
+    quality_section = DocumentSection(
+        "来源与质量",
+        tuple(quality_lines),
+    )
+
+    if artifact_key == "doc.rapid_brief":
+        return (
+            DocumentSection(
+                "核心结论",
+                (
+                    f"事件名称：{event.get('place') or '未命名震中'}",
+                    f"震级：{float(event.get('magnitude', 0.0)):.1f} 级",
+                    f"发震时刻：{_isoformat(event.get('origin_time'))}",
+                    f"T1: {control_fields['t1_at'].removeprefix('T1: ')}",
+                    f"烈度：{_metric(intensity, 'summary', 'grade')}",
+                    f"伤亡：{_metric(casualties, 'summary', 'deaths', 'injuries')}",
+                ),
+            ),
+            DocumentSection(
+                "房屋与人口",
+                (
+                    f"房屋破坏：{_metric(buildings, 'slight')} / "
+                    f"{_metric(buildings, 'moderate')} / "
+                    f"{_metric(buildings, 'severe')}",
+                    f"受灾人口：{_metric(population, 'affected')}",
+                ),
+            ),
+            DocumentSection(
+                "经济与资源",
+                (
+                    f"经济损失：{_metric(economy, 'loss', 'gdp')}",
+                    f"资源需求：{_metric(resources, 'summary', 'demand')}",
+                ),
+            ),
+            quality_section,
+        )
+
+    if artifact_key == "doc.rapid_report":
+        return (
+            DocumentSection(
+                "背景资料综述",
+                (
+                    _manifest_value(
+                        overview,
+                        "geography",
+                        source="assessment manifest / area_overview.geography",
+                    ),
+                    _metric(targets, "key_target"),
+                    _metric(faults, "summary", source="shanghai.fault"),
+                    _metric(spatial, "city_distance"),
+                    _metric(spatial, "fault_distance"),
+                ),
+            ),
+            DocumentSection(
+                "核心评估结果",
+                (
+                    f"烈度：{_metric(intensity, 'summary', 'grade')}",
+                    (
+                        "房屋破坏："
+                        f"{_metric(buildings, 'slight')} / "
+                        f"{_metric(buildings, 'moderate')} / "
+                        f"{_metric(buildings, 'severe')}"
+                    ),
+                    f"受灾人口：{_metric(population, 'affected')}",
+                    f"伤亡：{_metric(casualties, 'summary', 'deaths', 'injuries')}",
+                    f"经济损失：{_metric(economy, 'loss', 'gdp')}",
+                    f"资源需求：{_metric(resources, 'summary', 'demand')}",
+                    f"校验结论：{_metric(validation, 'summary', 'grade')}",
+                ),
+            ),
+            quality_section,
+        )
+
+    if artifact_key == "doc.decision_report":
+        return (
+            DocumentSection(
+                "快速简报结论",
+                (
+                    f"烈度：{_metric(intensity, 'summary', 'grade')}",
+                    f"受灾人口：{_metric(population, 'affected')}",
+                    f"房屋破坏：{_metric(buildings, 'total', 'severe')}",
+                    f"经济损失：{_metric(economy, 'loss', 'gdp')}",
+                ),
+            ),
+            DocumentSection(
+                "快速专报结论",
+                (
+                    _metric(faults, "summary", source="shanghai.fault"),
+                    _metric(targets, "key_target"),
+                    _metric(spatial, "city_distance"),
+                    _metric(spatial, "fault_distance"),
+                ),
+            ),
+            DocumentSection(
+                "重点图件",
+                (
+                    "地震影响场、经济与资源需求、人员伤亡、房屋破坏、"
+                    "活动断裂、重点目标、震中及城市距离图件已嵌入正文。",
+                ),
+            ),
+            quality_section,
+        )
+
+    return (
+        DocumentSection(
+            "辅助决策演示稿固定版式",
+            (
+                "共 8 页：封面、事件参数、响应建议、融合烈度、"
+                "伤亡与房屋破坏、经济与资源需求、重点目标与断裂、"
+                "空间距离与结论。",
+                "所有图件均按本地绝对路径和 checksum 嵌入。",
+            ),
+        ),
+        quality_section,
+    )
+
+
+def _core_images(
+    context: DocumentRenderContext,
+    artifact_key: str,
+    required_map_keys: Sequence[str],
+    optional_map_keys: Sequence[str],
+) -> tuple[DocumentImage, ...]:
+    catalog = load_catalog(settings.artifact_catalog_path)
+    keys: tuple[str, ...]
+    if artifact_key == "deck.decision_report":
+        keys = DECISION_DECK_MAP_KEYS
+    else:
+        keys = tuple(
+            key
+            for key in (*required_map_keys, *optional_map_keys)
+            if key.startswith("map.")
+        )
+    images: list[DocumentImage] = []
+    for key in keys:
+        path = context.artifact_paths.get(key)
+        asset = context.asset_versions.get(key)
+        if path is None or not path.is_file():
+            continue
+        checksum = asset.checksum if asset is not None else _sha256_path(path)
+        definition = catalog.get(key, context.output_profile)
+        images.append(
+            DocumentImage(
+                key=key,
+                path=path,
+                checksum=checksum,
+                caption=f"{definition.display_name}（{key}）",
+            )
+        )
+    return tuple(images)
 
 
 def _background_images(
@@ -1039,6 +1657,7 @@ class DocxRenderer:
                 key: str(image.path)
                 for key, image in images.items()
             },
+            "images": list(images),
             "control_fields": dict(spec.control_fields),
             "quality": spec.quality.to_dict(),
             "page_count": page_count,

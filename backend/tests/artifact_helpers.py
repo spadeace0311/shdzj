@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 
 from app.artifacts.catalog import load_catalog
 from app.artifacts.context import DocumentRenderContext, FrozenAssetVersion
-from app.artifacts.domain import ArtifactCatalog
+from app.artifacts.domain import ArtifactCatalog, DependencyKind
 from app.artifacts.models import (
     ArtifactTaskDependencyBinding,
     GeneratedArtifact,
@@ -353,6 +353,8 @@ class ArtifactAssessmentFixture:
         *,
         production_mode: str = "live",
         t1_at: datetime | None = None,
+        failed_optional_artifacts: set[str] | None = None,
+        missing_artifact_keys: set[str] | None = None,
     ) -> DocumentRenderContext:
         definition = self.catalog.get(artifact_key, "a3v-professional")
         marker = {
@@ -362,8 +364,13 @@ class ArtifactAssessmentFixture:
             "drill": "【演练】",
             "replay": "【测试回放】",
         }[production_mode]
-        template_checksum = _sha256_file(
+        failed_optional_artifacts = set(failed_optional_artifacts or ())
+        missing_artifact_keys = set(missing_artifact_keys or ())
+        background_checksum = _sha256_file(
             Path(settings.artifact_template_root) / "background-template.docx"
+        )
+        decision_checksum = _sha256_file(
+            Path(settings.artifact_template_root) / "decision-template.pptx"
         )
         template_versions = {
             "background-template": {
@@ -371,13 +378,49 @@ class ArtifactAssessmentFixture:
                 "kind": "docx",
                 "display_name": "背景文档模板",
                 "version": "v1",
-                "checksum": template_checksum,
+                "checksum": background_checksum,
                 "published_at": self.deadline_basis_at.isoformat(),
-            }
+            },
+            "decision-template": {
+                "template_key": "decision-template",
+                "kind": "pptx",
+                "display_name": "辅助决策演示模板",
+                "version": "v1",
+                "checksum": decision_checksum,
+                "published_at": self.deadline_basis_at.isoformat(),
+            },
         }
 
         required_asset_keys = set(definition.required_assets)
         optional_asset_keys = set(definition.optional_assets)
+        artifact_dependency_keys = {
+            dependency.key
+            for dependency in definition.depends_on
+            if dependency.kind is DependencyKind.ARTIFACT
+        }
+        artifact_optional_keys = {
+            dependency.key
+            for dependency in definition.optional_depends_on
+            if dependency.kind is DependencyKind.ARTIFACT
+        }
+        if artifact_key == "deck.decision_report":
+            artifact_dependency_keys.update(
+                {
+                    "map.intensity",
+                    "map.economic_loss",
+                    "map.rescue_demand",
+                    "map.deaths",
+                    "map.injuries",
+                    "map.buried",
+                    "map.material_demand",
+                    "map.active_faults",
+                    "map.key_targets",
+                    "map.building_damage",
+                    "map.epicenter",
+                    "map.city_distances",
+                }
+            )
+
         artifact_paths: dict[str, Path] = {}
         asset_versions: dict[str, FrozenAssetVersion] = {}
         for asset_key in sorted(required_asset_keys | optional_asset_keys):
@@ -392,19 +435,47 @@ class ArtifactAssessmentFixture:
             )
         map_root = Path(settings.artifact_storage_root) / "document-fixtures"
         map_root.mkdir(parents=True, exist_ok=True)
-        map_path = map_root / "epicenter.jpg"
-        _write_document_fixture_image(map_path, marker)
-        artifact_paths["map.epicenter"] = map_path
-        map_checksum = _sha256_file(map_path)
-        asset_versions["map.epicenter"] = FrozenAssetVersion(
-            asset_key="map.epicenter",
-            role="artifact",
-            resolution_status="bound",
-            asset_version_id=uuid.uuid4(),
-            checksum=map_checksum,
-            coverage={"status": "complete"},
-            version="v1",
+        fixture_artifact_keys = (
+            artifact_dependency_keys | artifact_optional_keys
         )
+        for dependency_key in sorted(fixture_artifact_keys):
+            if dependency_key in missing_artifact_keys:
+                continue
+            if (
+                dependency_key in artifact_optional_keys
+                and dependency_key in failed_optional_artifacts
+            ):
+                continue
+            if dependency_key.startswith("map."):
+                map_path = map_root / f"{dependency_key}.jpg"
+                _write_document_fixture_image(map_path, marker)
+                artifact_paths[dependency_key] = map_path
+                map_checksum = _sha256_file(map_path)
+                asset_versions[dependency_key] = FrozenAssetVersion(
+                    asset_key=dependency_key,
+                    role="artifact",
+                    resolution_status="bound",
+                    asset_version_id=uuid.uuid4(),
+                    checksum=map_checksum,
+                    coverage={"status": "complete"},
+                    version="v1",
+                )
+            else:
+                doc_path = map_root / f"{dependency_key}.docx"
+                if not doc_path.exists():
+                    doc_path.write_bytes(
+                        b"PK\x03\x04fixture-document-dependency"
+                    )
+                artifact_paths[dependency_key] = doc_path
+                asset_versions[dependency_key] = FrozenAssetVersion(
+                    asset_key=dependency_key,
+                    role="artifact",
+                    resolution_status="bound",
+                    asset_version_id=uuid.uuid4(),
+                    checksum=_sha256_file(doc_path),
+                    coverage={"status": "complete"},
+                    version="v1",
+                )
 
         event = {
             "event_id": str(self.event_id),
@@ -456,6 +527,24 @@ class ArtifactAssessmentFixture:
                         "secondary": 220000,
                         "tertiary": 328000,
                         "loss": 8800,
+                    },
+                    "loss.casualties": {
+                        "version": "casualties-v1",
+                        "checksum": _checksum("casualties-v1"),
+                        "deaths": 18,
+                        "injuries": 42,
+                        "summary": "死亡 18 人，受伤 42 人",
+                    },
+                    "loss.resources": {
+                        "version": "resources-v1",
+                        "checksum": _checksum("resources-v1"),
+                        "summary": "救援力量需求 5 支",
+                    },
+                    "loss.validate": {
+                        "version": "validate-v1",
+                        "checksum": _checksum("validate-v1"),
+                        "grade": "通过",
+                        "summary": "评估结果通过校验",
                     },
                 },
             },
@@ -514,7 +603,10 @@ class ArtifactAssessmentFixture:
                     "checksum": _checksum("parameters-v1"),
                 }
             },
-            "templates": [template_versions["background-template"]],
+            "templates": [
+                template_versions["background-template"],
+                template_versions["decision-template"],
+            ],
             "assets": [
                 {
                     "asset_key": key,

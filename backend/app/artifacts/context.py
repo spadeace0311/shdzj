@@ -159,6 +159,10 @@ class DocumentRenderContext:
     def artifacts(self) -> Mapping[str, FrozenAssetVersion]:
         return self.asset_versions
 
+    @property
+    def pptx_slide_count(self) -> int:
+        return 8
+
 
 class ProductionContextService:
     def __init__(

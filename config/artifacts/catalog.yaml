@@ -868,6 +868,39 @@ artifacts:
     required_assets: []
     optional_assets: []
     template_key: deck.decision_report
+    template_package: decision-template
+    control_fields:
+      - title
+      - event_name
+      - origin_time
+      - magnitude
+      - quality_grade
+      - mode_marker
+      - event_facts
+      - recommendation
+      - intensity
+      - casualties
+      - buildings
+      - economy
+      - resources
+      - key_targets
+      - faults
+      - spatial_conclusions
+      - source_versions
+      - degradation_reasons
+      - needs_review
+      - image:map.intensity
+      - image:map.deaths
+      - image:map.injuries
+      - image:map.building_damage
+      - image:map.economic_loss
+      - image:map.rescue_demand
+      - image:map.material_demand
+      - image:map.key_targets
+      - image:map.active_faults
+      - image:map.epicenter
+      - image:map.city_distances
+      - image:map.buried
     marker_policy: mode
     failure_policy: block
     quality_policy: core
