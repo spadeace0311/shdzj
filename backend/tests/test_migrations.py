@@ -473,6 +473,7 @@ async def _create_missing_snapshot_item_fixture() -> tuple[uuid.UUID, uuid.UUID]
         ProductionInputSnapshotItem,
         ProductionRun,
     )
+    import app.data_assets.models  # noqa: F401
     from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 
     engine = create_async_engine(settings.database_url)
@@ -630,6 +631,29 @@ async def _missing_snapshot_item_state() -> dict[str, object]:
             (identity[0], identity[1]) if identity is not None else None
         ),
     }
+
+
+async def _archive_identity_constraint_exists() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            exists = await connection.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint AS constraint_record
+                        WHERE constraint_record.conname =
+                              'uq_production_input_snapshot_items_missing_snapshot_asset_role'
+                          AND constraint_record.conrelid =
+                              'production_input_snapshot_items_missing'::regclass
+                    )
+                    """
+                )
+            )
+    finally:
+        await engine.dispose()
+    return bool(exists)
 
 
 async def _artifact_trigger_state() -> tuple[set[str], set[str]]:
@@ -1169,3 +1193,30 @@ async def test_0016_preserves_missing_snapshot_items_across_downgrade_upgrade() 
     finally:
         await _delete_missing_snapshot_item_fixture(event_id, raw_id)
         _set_revision(LATEST_REVISION)
+
+
+async def test_0016_archive_has_unique_identity_contract() -> None:
+    _set_revision(LATEST_REVISION)
+    assert await _archive_identity_constraint_exists() is True
+
+
+async def test_0016_clears_archive_orphans_after_deep_downgrade() -> None:
+    _set_revision(LATEST_REVISION)
+    event_id, raw_id = await _create_missing_snapshot_item_fixture()
+    try:
+        _set_revision("0015_artifact_production")
+        downgraded = await _missing_snapshot_item_state()
+        assert downgraded["main_count"] == 0
+        assert downgraded["archive_count"] == 1
+
+        _set_revision("0014_loss_assessment")
+        _set_revision(LATEST_REVISION)
+        restored = await _missing_snapshot_item_state()
+        assert restored["main_count"] == 0
+        assert restored["archive_count"] == 0
+    finally:
+        await _delete_missing_snapshot_item_fixture(event_id, raw_id)
+        try:
+            _set_revision(LATEST_REVISION)
+        except AssertionError:
+            pass

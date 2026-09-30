@@ -12,6 +12,9 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _ARCHIVE_TABLE = "production_input_snapshot_items_missing"
+_ARCHIVE_IDENTITY_CONSTRAINT = (
+    "uq_production_input_snapshot_items_missing_snapshot_asset_role"
+)
 
 
 def upgrade() -> None:
@@ -26,10 +29,13 @@ def upgrade() -> None:
             role VARCHAR(32) NOT NULL,
             coverage JSONB NOT NULL,
             selected_for_render BOOLEAN NOT NULL DEFAULT false,
-            PRIMARY KEY (id)
+            PRIMARY KEY (id),
+            CONSTRAINT {_ARCHIVE_IDENTITY_CONSTRAINT}
+                UNIQUE (snapshot_id, asset_key, role)
         )
         """
     )
+    _ensure_archive_identity_constraint()
     op.alter_column(
         "production_input_snapshot_items",
         "asset_version_id",
@@ -41,6 +47,16 @@ def upgrade() -> None:
         "checksum",
         existing_type=sa.String(length=64),
         nullable=True,
+    )
+    op.execute(
+        f"""
+        DELETE FROM {_ARCHIVE_TABLE} AS archive_row
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM production_input_snapshots AS snapshot_row
+            WHERE snapshot_row.id = archive_row.snapshot_id
+        )
+        """
     )
     op.execute(
         f"""
@@ -64,6 +80,7 @@ def upgrade() -> None:
             coverage,
             selected_for_render
         FROM {_ARCHIVE_TABLE}
+        ON CONFLICT (snapshot_id, asset_key, role) DO NOTHING
         """
     )
     op.execute(f"DELETE FROM {_ARCHIVE_TABLE}")
@@ -81,10 +98,13 @@ def downgrade() -> None:
             role VARCHAR(32) NOT NULL,
             coverage JSONB NOT NULL,
             selected_for_render BOOLEAN NOT NULL DEFAULT false,
-            PRIMARY KEY (id)
+            PRIMARY KEY (id),
+            CONSTRAINT {_ARCHIVE_IDENTITY_CONSTRAINT}
+                UNIQUE (snapshot_id, asset_key, role)
         )
         """
     )
+    _ensure_archive_identity_constraint()
     op.execute(
         f"""
         INSERT INTO {_ARCHIVE_TABLE} (
@@ -109,6 +129,11 @@ def downgrade() -> None:
         FROM production_input_snapshot_items
         WHERE asset_version_id IS NULL
            OR checksum IS NULL
+        ON CONFLICT (snapshot_id, asset_key, role) DO UPDATE
+        SET asset_version_id = EXCLUDED.asset_version_id,
+            checksum = EXCLUDED.checksum,
+            coverage = EXCLUDED.coverage,
+            selected_for_render = EXCLUDED.selected_for_render
         """
     )
     op.execute(
@@ -129,4 +154,25 @@ def downgrade() -> None:
         "asset_version_id",
         existing_type=postgresql.UUID(as_uuid=True),
         nullable=False,
+    )
+
+
+def _ensure_archive_identity_constraint() -> None:
+    op.execute(
+        f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = '{_ARCHIVE_IDENTITY_CONSTRAINT}'
+                  AND conrelid = '{_ARCHIVE_TABLE}'::regclass
+            ) THEN
+                ALTER TABLE {_ARCHIVE_TABLE}
+                ADD CONSTRAINT {_ARCHIVE_IDENTITY_CONSTRAINT}
+                UNIQUE (snapshot_id, asset_key, role);
+            END IF;
+        END;
+        $$
+        """
     )
