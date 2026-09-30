@@ -254,6 +254,61 @@ class AssessmentRepository:
         )
         return task
 
+    async def mark_artifact_production_launched(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+    ) -> AssessmentTask | None:
+        run_event_id = await session.scalar(
+            select(AssessmentRun.event_id).where(AssessmentRun.id == run_id)
+        )
+        if run_event_id is None:
+            raise LookupError("assessment run not found")
+        _, run = await self._lock_event_then_run(
+            session,
+            run_event_id,
+            run_id,
+        )
+        if run is None:
+            raise LookupError("assessment run not found")
+        task = await session.scalar(
+            select(AssessmentTask)
+            .where(
+                AssessmentTask.run_id == run_id,
+                AssessmentTask.task_key == "artifact.production",
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return None
+        if task.status == "succeeded":
+            return task
+        if task.status not in {"pending", "running"}:
+            raise ValueError(
+                "artifact.production task is already terminal and cannot "
+                "be marked launched"
+            )
+
+        algorithm_version = "artifact-production-v1"
+        input_fingerprint = "artifact-production-child-started"
+        await self.start_task(
+            session,
+            run_id,
+            "artifact.production",
+            algorithm_version,
+            input_fingerprint,
+        )
+        await self.complete_task(
+            session,
+            task.id,
+            input_fingerprint,
+            {
+                "production_run_id": None,
+                "status": "launched",
+            },
+        )
+        return task
+
     async def complete_task(
         self,
         session: AsyncSession,

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
@@ -504,44 +503,17 @@ class AssessmentActivities:
         self,
         request: AssessmentRunActivityInput,
     ):
-        from app.assessment.models import AssessmentTask
         from app.assessment.repository import AssessmentRepository
 
         repository = AssessmentRepository()
         async with self._session_factory() as session:
             async with session.begin():
-                task = await session.scalar(
-                    select(AssessmentTask).where(
-                        AssessmentTask.run_id == request.run_id,
-                        AssessmentTask.task_key == "artifact.production",
-                    )
+                task = await repository.mark_artifact_production_launched(
+                    session,
+                    request.run_id,
                 )
                 if task is None:
                     return None
-                if task.status == "succeeded":
-                    return task.status
-                if task.status in {"failed", "skipped", "canceled"}:
-                    raise ValueError(
-                        "artifact.production task is already terminal and cannot "
-                        "be marked launched"
-                    )
-                await repository.start_task(
-                    session,
-                    request.run_id,
-                    "artifact.production",
-                    "artifact-production-v1",
-                    "artifact-production-child-started",
-                )
-                await session.flush()
-                await repository.complete_task(
-                    session,
-                    task.id,
-                    "artifact-production-child-started",
-                    {
-                        "production_run_id": None,
-                        "status": "launched",
-                    },
-                )
                 return task.status
 
     @activity.defn(name="run_intensity_model")

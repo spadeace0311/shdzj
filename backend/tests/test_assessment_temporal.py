@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import os
@@ -644,3 +645,44 @@ async def test_launch_marker_rejects_terminal_task(
         await activities.mark_artifact_production_launched(
             AssessmentRunActivityInput(prepared.run_id)
         )
+
+
+async def test_launch_marker_rejects_failed_transition_under_lock(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    activities = AssessmentActivities(
+        session_factory,
+        intensity_service_factory=lambda: _test_intensity_service(session_factory),
+        loss_service_factory=lambda: _test_loss_service(session_factory),
+    )
+    prepared = await activities.prepare_assessment(request)
+    repository = AssessmentRepository()
+
+    async def hold_failed_task_lock() -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                task = await session.scalar(
+                    select(AssessmentTask)
+                    .where(
+                        AssessmentTask.run_id == prepared.run_id,
+                        AssessmentTask.task_key == "artifact.production",
+                    )
+                    .with_for_update()
+                )
+                assert task is not None
+                task.status = "failed"
+                await session.flush()
+                await asyncio.sleep(0.1)
+
+    async def launch_while_locked() -> None:
+        await asyncio.sleep(0.01)
+        with pytest.raises(ValueError, match="terminal"):
+            async with session_factory() as session:
+                async with session.begin():
+                    await repository.mark_artifact_production_launched(
+                        session,
+                        prepared.run_id,
+                    )
+
+    await asyncio.gather(hold_failed_task_lock(), launch_while_locked())
