@@ -12,6 +12,15 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifacts.basemap import (
+    BasemapSelector,
+    MapViewportTileManifest,
+    OfflineBasemapPackage,
+    OfflineBasemapValidator,
+    SelectedBasemap,
+    VIEWPORT_RADII_KM,
+    load_offline_basemap_packages,
+)
 from app.artifacts.domain import ArtifactCatalog, DependencyKind
 from app.artifacts.models import (
     ArtifactTemplate,
@@ -62,6 +71,7 @@ class StaticProductionContext:
     context_fingerprint: str
     manifest: Mapping[str, Any]
     items: Mapping[str, FrozenAssetVersion]
+    selected_basemap: SelectedBasemap | None
 
     def item(self, asset_key: str) -> FrozenAssetVersion:
         try:
@@ -91,6 +101,7 @@ class MapRenderContext:
     context_fingerprint: str
     basemap_manifest: Mapping[str, Any]
     asset_versions: Mapping[str, FrozenAssetVersion]
+    selected_basemap: SelectedBasemap | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,12 +123,14 @@ class ProductionContextService:
         repository: ArtifactProductionRepository | None = None,
         data_asset_repository: DataAssetRepository | None = None,
         artifact_asset_catalog_path: str | None = None,
+        offline_basemap_packages: Mapping[str, OfflineBasemapPackage] | None = None,
     ) -> None:
         self._repository = repository or ArtifactProductionRepository()
         self._data_asset_repository = data_asset_repository or DataAssetRepository()
         self._artifact_asset_catalog_path = (
             artifact_asset_catalog_path or settings.artifact_asset_catalog_path
         )
+        self._offline_basemap_packages = offline_basemap_packages
 
     async def freeze_static_context(
         self,
@@ -158,13 +171,38 @@ class ProductionContextService:
             asset_versions["manifest"],
             key=lambda item: (item["asset_key"], item["role"]),
         )
-        basemap_manifest = _basemap_manifest(sorted_asset_versions)
+        basemap_viewport_manifests = tuple(
+            MapViewportTileManifest.build(
+                center_lon=float(event.longitude),
+                center_lat=float(event.latitude),
+                radius_km=radius_km,
+                output_width=settings.artifact_basemap_output_width,
+                output_height=settings.artifact_basemap_output_height,
+                zoom_levels=settings.artifact_basemap_zoom_levels,
+                padding=settings.artifact_basemap_buffer_pixels,
+            )
+            for radius_km in VIEWPORT_RADII_KM
+        )
+        basemap_tile_manifests = _basemap_tile_manifest_entries(
+            basemap_viewport_manifests,
+        )
 
         deadline_basis_at = (
             assessment_run.deadline_basis_at
             if assessment_run is not None
             else run.deadline_basis_at
         )
+        selected_basemap_payload = self._select_basemap(
+            basemap_viewport_manifests,
+            observed_at=deadline_basis_at,
+        )
+        selected_basemap = _selected_basemap(selected_basemap_payload)
+        basemap_manifest = _basemap_manifest(
+            sorted_asset_versions,
+            basemap_tile_manifests,
+            selected_basemap_payload,
+        )
+
         data_asset_snapshot_fingerprint = (
             await self._data_asset_snapshot_fingerprint(
                 session,
@@ -187,6 +225,12 @@ class ProductionContextService:
                 "revision_no": revision.revision_no,
                 "event_kind": revision.revision_kind,
                 "t1_at": _isoformat(event.t1_at),
+                "longitude": float(event.longitude),
+                "latitude": float(event.latitude),
+                "place": event.place,
+                "magnitude": float(event.magnitude),
+                "origin_time": _isoformat(event.origin_time),
+                "depth_km": float(event.depth_km),
                 "deadline_basis_at": deadline_basis_at.isoformat(),
             },
             "t1_at": _isoformat(event.t1_at),
@@ -251,6 +295,7 @@ class ProductionContextService:
             context_fingerprint=context_fingerprint,
             manifest=manifest,
             items=asset_versions["items"],
+            selected_basemap=selected_basemap,
         )
 
     async def build_task_context(
@@ -286,15 +331,60 @@ class ProductionContextService:
             production_task_id,
         )
         manifest = dict(snapshot.manifest)
+        basemap_manifest = dict(manifest.get("basemaps", ()))
         return MapRenderContext(
             production_task_id=task.id,
             production_run_id=run.id,
             artifact_key=task.artifact_key,
             output_profile=task.output_profile,
             context_fingerprint=snapshot.context_fingerprint,
-            basemap_manifest=dict(manifest.get("basemaps", ())),
+            basemap_manifest=basemap_manifest,
             asset_versions=_frozen_asset_map(manifest.get("assets", ())),
+            selected_basemap=_selected_basemap(
+                basemap_manifest.get("selected_basemap")
+            ),
         )
+
+    def _select_basemap(
+        self,
+        manifests: tuple[MapViewportTileManifest, ...],
+        *,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        packages = self._offline_basemap_packages
+        if packages is None:
+            packages = load_offline_basemap_packages(settings.artifact_basemap_root)
+        gaode = packages.get("gaode")
+        tianditu = packages.get("tianditu")
+        if gaode is None and tianditu is None:
+            return None
+        if gaode is not None and tianditu is not None:
+            return BasemapSelector().select(
+                gaode,
+                tianditu,
+                manifests,
+                observed_at=observed_at,
+            ).to_dict()
+
+        validator = OfflineBasemapValidator()
+        for provider, package in (("gaode", gaode), ("tianditu", tianditu)):
+            if package is None:
+                continue
+            result = validator.validate_package(
+                package,
+                manifests,
+                observed_at=observed_at,
+            )
+            if result.valid:
+                return {
+                    "provider": package.provider,
+                    "package_id": package.package_id,
+                    "version": package.version,
+                    "checksum": package.checksum,
+                    "selection_reason": f"{provider} validated",
+                    "provider_style_key": f"{provider}-local-v1",
+                }
+        return None
 
     async def build_document_context(
         self,
@@ -547,11 +637,53 @@ def _coverage(version: object | None) -> dict[str, Any]:
     return {}
 
 
-def _basemap_manifest(asset_entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _basemap_tile_manifest_entries(
+    manifests: Sequence[MapViewportTileManifest],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for manifest in manifests:
+        entries.extend(manifest.static_entries())
+    return sorted(
+        entries,
+        key=lambda item: (item["viewport_radius_km"], item["zoom_level"]),
+    )
+
+
+def _selected_basemap(payload: object) -> SelectedBasemap | None:
+    if not isinstance(payload, Mapping):
+        return None
+    provider = payload.get("provider")
+    package_id = payload.get("package_id")
+    version = payload.get("version")
+    checksum = payload.get("checksum")
+    selection_reason = payload.get("selection_reason")
+    if not all(
+        isinstance(value, str)
+        for value in (provider, package_id, version, checksum, selection_reason)
+    ):
+        return None
+    return SelectedBasemap(
+        provider=provider,
+        package_id=package_id,
+        version=version,
+        checksum=checksum,
+        selection_reason=selection_reason,
+    )
+
+
+def _basemap_manifest(
+    asset_entries: Sequence[Mapping[str, Any]],
+    tile_manifest_entries: Sequence[Mapping[str, Any]],
+    selected_basemap: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     by_key = {item["asset_key"]: item for item in asset_entries}
     return {
         "gaode": dict(by_key.get("basemap.gaode.offline", {})),
         "tianditu": dict(by_key.get("basemap.tianditu.offline", {})),
+        "manifests": [dict(entry) for entry in tile_manifest_entries],
+        "selected_basemap": (
+            dict(selected_basemap) if selected_basemap is not None else None
+        ),
     }
 
 

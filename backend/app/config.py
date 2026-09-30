@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     artifact_template_root: str = "/config/artifacts/templates"
     artifact_catalog_path: str = "/config/artifacts/catalog.yaml"
     artifact_font_path: str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    artifact_basemap_root: str = "/var/lib/artifacts/basemaps"
+    artifact_basemap_output_width: int = 4761
+    artifact_basemap_output_height: int = 3369
+    artifact_basemap_buffer_pixels: int = 256
+    artifact_basemap_zoom_levels: tuple[int, ...] = (9, 10, 11, 12)
     artifact_max_override_bytes: int = 1_073_741_824
     artifact_render_concurrency: int = 4
     artifact_optional_dependency_reserve_seconds: int = 30
@@ -144,6 +149,7 @@ class Settings(BaseSettings):
             self.artifact_template_root,
             self.artifact_catalog_path,
             self.artifact_font_path,
+            self.artifact_basemap_root,
         )
         for path in artifact_paths:
             if not path.strip():
@@ -154,6 +160,23 @@ class Settings(BaseSettings):
             raise ValueError("ARTIFACT_RENDER_CONCURRENCY must be between 1 and 6")
         if not 1 <= self.artifact_browser_pool_size <= 8:
             raise ValueError("ARTIFACT_BROWSER_POOL_SIZE must be between 1 and 8")
+        if self.artifact_basemap_output_width <= 0:
+            raise ValueError("ARTIFACT_BASEMAP_OUTPUT_WIDTH must be positive")
+        if self.artifact_basemap_output_height <= 0:
+            raise ValueError("ARTIFACT_BASEMAP_OUTPUT_HEIGHT must be positive")
+        if self.artifact_basemap_buffer_pixels < 0:
+            raise ValueError("ARTIFACT_BASEMAP_BUFFER_PIXELS must not be negative")
+        if not self.artifact_basemap_zoom_levels:
+            raise ValueError("ARTIFACT_BASEMAP_ZOOM_LEVELS must not be empty")
+        if any(
+            isinstance(zoom, bool)
+            or not isinstance(zoom, int)
+            or not 0 <= zoom <= 22
+            for zoom in self.artifact_basemap_zoom_levels
+        ):
+            raise ValueError(
+                "ARTIFACT_BASEMAP_ZOOM_LEVELS must contain integers between 0 and 22"
+            )
         if not 0 < self.artifact_optional_dependency_reserve_seconds < 300:
             raise ValueError(
                 "ARTIFACT_OPTIONAL_DEPENDENCY_RESERVE_SECONDS must be positive "

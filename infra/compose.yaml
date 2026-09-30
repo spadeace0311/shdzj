@@ -41,6 +41,7 @@ services:
       - ../config:/config
       - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
       - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
     depends_on:
       postgres:
         condition: service_healthy
