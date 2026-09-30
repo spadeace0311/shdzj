@@ -1,3 +1,9 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
 from app.data_assets.domain import (
     AggregateFieldTolerance,
     AssetContract,
@@ -379,3 +385,112 @@ def get_asset_definition(asset_key: str) -> DataAssetDefinition:
         return _BY_KEY[asset_key]
     except KeyError as exc:
         raise KeyError(f"unknown data asset: {asset_key}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAssetContract:
+    asset_key: str
+    data_type: str
+    geometry_type: str | None
+    required_fields: tuple[str, ...]
+    crs: str
+    artifact_usage: tuple[str, ...]
+    classification: str
+
+
+def load_artifact_asset_contracts(
+    path: str | Path,
+) -> tuple[ArtifactAssetContract, ...]:
+    payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("artifact asset contracts must be a list")
+
+    contracts: list[ArtifactAssetContract] = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise ValueError(f"artifact asset contract at index {index} must be a mapping")
+        asset_key = _required_string(item, "asset_key", index)
+        data_type = _required_string(item, "data_type", index)
+        geometry_type = item.get("geometry_type")
+        if geometry_type is not None and not isinstance(geometry_type, str):
+            raise ValueError(
+                f"artifact asset contract {asset_key} geometry_type must be a string or null"
+            )
+        crs = _required_string(item, "crs", index)
+        classification = _required_string(item, "classification", index)
+        required_fields = _string_tuple(
+            item.get("required_fields"),
+            f"artifact asset contract {asset_key}.required_fields",
+            allow_empty=True,
+        )
+        artifact_usage = _string_tuple(
+            item.get("artifact_usage"),
+            f"artifact asset contract {asset_key}.artifact_usage",
+            allow_empty=False,
+        )
+        contracts.append(
+            ArtifactAssetContract(
+                asset_key=asset_key,
+                data_type=data_type,
+                geometry_type=geometry_type,
+                required_fields=required_fields,
+                crs=crs,
+                artifact_usage=artifact_usage,
+                classification=classification,
+            )
+        )
+
+    keys = [contract.asset_key for contract in contracts]
+    if len(keys) != len(set(keys)):
+        raise ValueError("artifact asset contract keys must not overlap")
+    return tuple(contracts)
+
+
+def get_artifact_asset_contracts(
+    path: str | Path | None = None,
+) -> tuple[ArtifactAssetContract, ...]:
+    if path is None:
+        from app.config import settings
+
+        path = settings.artifact_asset_catalog_path
+    return load_artifact_asset_contracts(path)
+
+
+def registered_artifact_asset_keys(
+    path: str | Path | None = None,
+) -> tuple[str, ...]:
+    return tuple(
+        contract.asset_key
+        for contract in get_artifact_asset_contracts(path)
+    )
+
+
+def get_artifact_asset_keys(
+    path: str | Path | None = None,
+) -> tuple[str, ...]:
+    return registered_artifact_asset_keys(path)
+
+
+def _required_string(item: dict[str, Any], field: str, index: int) -> str:
+    value = item.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"artifact asset contract at index {index} requires {field}")
+    return value
+
+
+def _string_tuple(
+    value: Any,
+    label: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, ...]:
+    if value is None:
+        value = []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{label} must be a list")
+    values = tuple(str(item) for item in value)
+    if not allow_empty and not values:
+        raise ValueError(f"{label} must not be empty")
+    if any(not item.strip() for item in values):
+        raise ValueError(f"{label} must contain non-empty strings")
+    return values
