@@ -6,6 +6,10 @@ from app.artifacts.domain import ArtifactNameContext, ProductionMode
 from app.artifacts.naming import build_artifact_file_name
 
 
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
 def test_file_name_contains_required_mode_marker_and_version() -> None:
     context = ArtifactNameContext(
         place="浦东新区",
@@ -112,3 +116,38 @@ def test_file_name_rejects_version_that_cannot_fit_three_digits() -> None:
 
     with pytest.raises(ValueError):
         build_artifact_file_name(context, extension="jpg")
+
+
+def test_file_name_limits_non_bmp_place_by_utf16_units() -> None:
+    context = ArtifactNameContext(
+        place="😀" * 80,
+        magnitude=5.0,
+        display_name="震中位置分布图",
+        version=1,
+        generated_at="2026-09-30T15:30:00+08:00",
+        production_mode=ProductionMode.LIVE,
+    )
+
+    file_name = build_artifact_file_name(context, extension="jpg")
+    place = file_name.split("_5.0级地震_", maxsplit=1)[0]
+
+    assert place == "😀" * 40
+    assert _utf16_units(place) <= 80
+    assert _utf16_units(file_name) <= 240
+
+
+def test_file_name_limits_large_non_bmp_name_by_utf16_units() -> None:
+    context = ArtifactNameContext(
+        place="地" * 80,
+        magnitude=5.0,
+        display_name="😀" * 120,
+        version=999,
+        generated_at="2026-09-30T15:30:00+08:00",
+        production_mode=ProductionMode.REPLAY,
+    )
+
+    file_name = build_artifact_file_name(context, extension="jpg")
+
+    assert _utf16_units(file_name) <= 240
+    assert not any(0xD800 <= ord(character) <= 0xDFFF for character in file_name)
+    assert file_name.endswith("_V999_20260930-153000.jpg")

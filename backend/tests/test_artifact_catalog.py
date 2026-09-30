@@ -5,6 +5,7 @@ import pytest
 from app.artifacts.catalog import ArtifactCatalog
 from app.artifacts.dependencies import ArtifactDependencyGraph
 from app.artifacts.domain import (
+    ArtifactDefinition,
     ArtifactKind,
     DependencyKind,
     DependencySpec,
@@ -84,6 +85,16 @@ B_CLASS_ONLY_MAPS = (
     "map.seismic_stations",
     "map.rescue_teams",
     "map.cultural_relics",
+)
+
+RAPID_REPORT_PRODUCTS = (
+    "intensity.fusion",
+    "loss.buildings",
+    "loss.population",
+    "loss.casualties",
+    "loss.economic",
+    "loss.resources",
+    "loss.validate",
 )
 
 
@@ -230,6 +241,10 @@ def test_catalog_has_exact_document_dependencies() -> None:
         ("artifact", "map.epicenter", profile),
     }
     assert hard("doc.rapid_report") == {
+        *{
+            ("assessment_product", product_key, None)
+            for product_key in RAPID_REPORT_PRODUCTS
+        },
         ("artifact", "doc.background", profile),
         ("artifact", "doc.housing", profile),
         ("artifact", "doc.economy", profile),
@@ -282,11 +297,155 @@ def test_catalog_encodes_optional_and_conditional_degradation_rules() -> None:
     building_grid = catalog.get("map.building_grid", "a3v-professional")
     assert building_grid.quality_policy == "C"
     assert building_grid.failure_policy == "degrade"
+    assert building_grid.required_assets == (
+        "shanghai.admin.town",
+        "shanghai.building.town",
+        "basemap.gaode.offline",
+    )
+    assert "spatial_allocation_rule" not in building_grid.required_assets
     assert building_grid.allows_degraded_output(spatialized_estimate=False) is False
     assert building_grid.allows_degraded_output(spatialized_estimate=True) is True
 
     transport = catalog.get("map.transport", "a3v-professional")
     assert "shanghai.road.network" in transport.optional_assets
+    assert transport.allows_degraded_output() is False
+    assert transport.allows_degraded_output(
+        condition="optional_asset_missing"
+    ) is True
+    assert transport.allows_degraded_output(
+        condition="required_asset_missing"
+    ) is False
+
+    for key in set(A_CLASS_MAPS) - {"map.transport"}:
+        definition = catalog.get(key, "a3v-professional")
+        assert definition.allows_degraded_output(
+            condition="optional_asset_missing"
+        ) is False
+
+
+def test_dependency_cycle_detection_includes_optional_dependencies() -> None:
+    def definition(
+        key: str,
+        optional_depends_on: tuple[DependencySpec, ...] = (),
+    ) -> ArtifactDefinition:
+        return ArtifactDefinition(
+            artifact_key=key,
+            display_name=key,
+            kind=ArtifactKind.MAP,
+            output_profile="test-profile",
+            format="jpg",
+            legacy_code=key,
+            priority=1,
+            depends_on=(),
+            optional_depends_on=optional_depends_on,
+            required_assets=(),
+            optional_assets=(),
+            template_key=key,
+            marker_policy="mode",
+            failure_policy="degrade",
+            quality_policy="B",
+        )
+
+    catalog = ArtifactCatalog(
+        catalog_version="test",
+        definitions=(
+            definition(
+                "map.left",
+                (
+                    DependencySpec(
+                        DependencyKind.ARTIFACT,
+                        "map.right",
+                        "test-profile",
+                    ),
+                ),
+            ),
+            definition(
+                "map.right",
+                (
+                    DependencySpec(
+                        DependencyKind.ARTIFACT,
+                        "map.left",
+                        "test-profile",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        catalog.assert_acyclic()
+
+
+def test_catalog_rejects_duplicate_yaml_keys(tmp_path: Path) -> None:
+    catalog_text = CATALOG_PATH.read_text(encoding="utf-8")
+    artifact_marker = "\n  map.epicenter:\n"
+    assert catalog_text.count(artifact_marker) == 1
+    duplicate = catalog_text.replace(
+        artifact_marker,
+        (
+            f"{artifact_marker}"
+            "    display_name: 重复项\n\n"
+            "  map.epicenter:\n"
+        ),
+        1,
+    )
+    invalid_catalog = tmp_path / "duplicate.yaml"
+    invalid_catalog.write_text(duplicate, encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        ArtifactCatalog.load(invalid_catalog)
+
+    message = str(error.value)
+    assert "duplicate key 'map.epicenter'" in message
+    assert "line" in message
+
+
+def test_catalog_rejects_non_string_artifact_keys(tmp_path: Path) -> None:
+    catalog_text = CATALOG_PATH.read_text(encoding="utf-8")
+    invalid_catalog_text = catalog_text.replace(
+        "artifacts:\n",
+        (
+            "artifacts:\n"
+            "  123:\n"
+            "    display_name: invalid\n"
+        ),
+        1,
+    )
+    invalid_catalog = tmp_path / "non-string-key.yaml"
+    invalid_catalog.write_text(invalid_catalog_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        ArtifactCatalog.load(invalid_catalog)
+
+    message = str(error.value)
+    assert "artifacts key at index 0" in message
+    assert "123" in message
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "label"),
+    (
+        ("null", "null"),
+        ('""', "empty"),
+        ("unsupported", "unsupported"),
+    ),
+)
+def test_catalog_rejects_missing_or_invalid_marker_policy(
+    tmp_path: Path,
+    yaml_value: str,
+    label: str,
+) -> None:
+    catalog_text = CATALOG_PATH.read_text(encoding="utf-8")
+    invalid_catalog_text = catalog_text.replace(
+        "marker_policy: mode",
+        f"marker_policy: {yaml_value}",
+        1,
+    )
+    invalid_catalog = tmp_path / f"marker-policy-{label}.yaml"
+    invalid_catalog.write_text(invalid_catalog_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"marker_policy"):
+        ArtifactCatalog.load(invalid_catalog)
 
 
 def test_scope_parser_rejects_ambiguous_artifact_scope() -> None:

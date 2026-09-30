@@ -21,6 +21,22 @@ _MODE_MARKERS = {
 }
 
 
+def _utf16_units(value: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _truncate_utf16(value: str, limit: int) -> str:
+    used = 0
+    characters: list[str] = []
+    for character in value:
+        character_units = 2 if ord(character) > 0xFFFF else 1
+        if used + character_units > limit:
+            break
+        characters.append(character)
+        used += character_units
+    return "".join(characters)
+
+
 def _sanitize_component(value: str) -> str:
     sanitized = _WINDOWS_ILLEGAL.sub("_", value)
     sanitized = _REPEATED_UNDERSCORES.sub("_", sanitized)
@@ -32,9 +48,9 @@ def _sanitize_component(value: str) -> str:
 
 def _shorten_component(value: str, limit: int) -> str:
     value = _sanitize_component(value)
-    if len(value) <= limit:
+    if _utf16_units(value) <= limit:
         return value
-    shortened = value[:limit].rstrip(" ._")
+    shortened = _truncate_utf16(value, limit).rstrip(" ._")
     if not shortened:
         raise ValueError("artifact name component is empty after truncation")
     return shortened
@@ -83,16 +99,19 @@ def build_artifact_file_name(
     )
     stem = _REPEATED_UNDERSCORES.sub("_", stem).strip(" ._")
     file_name = f"{stem}.{normalized_extension}"
-    if len(file_name) > 240:
-        overflow = len(file_name) - 240
-        display_name = display_name[: max(1, len(display_name) - overflow)].rstrip(" ._")
+    if _utf16_units(file_name) > 240:
+        overflow = _utf16_units(file_name) - 240
+        display_name = _shorten_component(
+            display_name,
+            max(1, _utf16_units(display_name) - overflow),
+        )
         stem = (
             f"{marker}{place}_{context.magnitude:.1f}级地震_{display_name}_"
             f"V{context.version:03d}_{generated_at:%Y%m%d-%H%M%S}"
         )
         stem = _REPEATED_UNDERSCORES.sub("_", stem).strip(" ._")
         file_name = f"{stem}.{normalized_extension}"
-    if len(file_name) > 240:
+    if _utf16_units(file_name) > 240:
         raise ValueError("artifact file name exceeds the supported length")
     if Path(file_name).name != file_name:
         raise ValueError("artifact file name must not contain path components")

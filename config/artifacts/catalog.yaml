@@ -409,7 +409,6 @@ artifacts:
       - shanghai.admin.town
       - shanghai.building.town
       - basemap.gaode.offline
-      - spatial_allocation_rule
     optional_assets: []
     template_key: map.building_grid
     marker_policy: mode
@@ -711,6 +710,13 @@ artifacts:
     page_size: A4
     priority: 100
     depends_on:
+      - {kind: assessment_product, key: intensity.fusion}
+      - {kind: assessment_product, key: loss.buildings}
+      - {kind: assessment_product, key: loss.population}
+      - {kind: assessment_product, key: loss.casualties}
+      - {kind: assessment_product, key: loss.economic}
+      - {kind: assessment_product, key: loss.resources}
+      - {kind: assessment_product, key: loss.validate}
       - {kind: artifact, key: doc.background, output_profile: a3v-professional}
       - {kind: artifact, key: doc.housing, output_profile: a3v-professional}
       - {kind: artifact, key: doc.economy, output_profile: a3v-professional}

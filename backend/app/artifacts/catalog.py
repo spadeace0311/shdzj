@@ -91,6 +91,77 @@ B_CLASS_MAPS = (
 PROFILE = "a3v-professional"
 MAP_DIMENSIONS = (4761, 3369)
 MAP_DPI = 300
+RAPID_REPORT_PRODUCT_KEYS = (
+    "intensity.fusion",
+    "loss.buildings",
+    "loss.population",
+    "loss.casualties",
+    "loss.economic",
+    "loss.resources",
+    "loss.validate",
+)
+BUILDING_GRID_REQUIRED_ASSETS = (
+    "shanghai.admin.town",
+    "shanghai.building.town",
+    "basemap.gaode.offline",
+)
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_mapping(
+    loader: _StrictSafeLoader,
+    node: yaml.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            hash(key)
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found unhashable key",
+                key_node.start_mark,
+            ) from error
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
+
+
+def _load_yaml(path: Path) -> Any:
+    try:
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=_StrictSafeLoader)
+    except yaml.YAMLError as error:
+        mark = getattr(error, "problem_mark", None) or getattr(
+            error,
+            "context_mark",
+            None,
+        )
+        if mark is not None:
+            detail = getattr(error, "problem", None) or str(error)
+            raise ValueError(
+                f"invalid YAML in {path} at line {mark.line + 1}, "
+                f"column {mark.column + 1}: {detail}"
+            ) from error
+        raise ValueError(f"invalid YAML in {path}: {error}") from error
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -177,6 +248,7 @@ def _parse_definition(
         "format",
         "legacy_code",
         "template_key",
+        "marker_policy",
         "failure_policy",
         "quality_policy",
     ):
@@ -186,6 +258,8 @@ def _parse_definition(
         string_fields[field_name] = value
     if string_fields["failure_policy"] not in {"block", "degrade"}:
         raise ValueError(f"{artifact_key} failure_policy must be block or degrade")
+    if string_fields["marker_policy"] != "mode":
+        raise ValueError(f"{artifact_key} marker_policy must be mode")
 
     return ArtifactDefinition(
         artifact_key=artifact_key,
@@ -212,7 +286,7 @@ def _parse_definition(
             f"{artifact_key}.optional_assets",
         ),
         template_key=string_fields["template_key"],
-        marker_policy=str(raw_definition.get("marker_policy", "mode")),
+        marker_policy=string_fields["marker_policy"],
         failure_policy=string_fields["failure_policy"],
         quality_policy=string_fields["quality_policy"],
         dimensions=_dimensions(
@@ -288,6 +362,14 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
             raise ValueError(
                 f"{definition.artifact_key} has an asset in both required and optional lists"
             )
+        if (
+            "spatial_allocation_rule" in definition.required_assets
+            or "spatial_allocation_rule" in definition.optional_assets
+        ):
+            raise ValueError(
+                f"{definition.artifact_key} cannot register a model allocation rule "
+                "as a data asset"
+            )
         for dependency in (*definition.depends_on, *definition.optional_depends_on):
             if dependency.kind == DependencyKind.ARTIFACT:
                 catalog.get(dependency.key, dependency.output_profile or "")
@@ -296,9 +378,17 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
         definition = catalog.get(key, PROFILE)
         if definition.quality_policy != "A" or definition.failure_policy != "block":
             raise ValueError(f"A-class map {key} must use quality A and block failures")
-        if definition.optional_assets and key != "map.transport":
+        if key == "map.transport":
+            if (
+                definition.optional_assets != ("shanghai.road.network",)
+                or definition.degrade_conditions != ("optional_asset_missing",)
+            ):
+                raise ValueError(
+                    "map.transport requires only road network optional degradation"
+                )
+        elif definition.optional_assets or definition.degrade_conditions:
             raise ValueError(
-                f"A-class map {key} cannot declare optional assets; only map.transport may degrade"
+                f"A-class map {key} cannot declare the M11 degradation exception"
             )
 
     for key in B_CLASS_MAPS:
@@ -310,6 +400,7 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
     if (
         building_grid.quality_policy != "C"
         or building_grid.failure_policy != "degrade"
+        or building_grid.required_assets != BUILDING_GRID_REQUIRED_ASSETS
         or building_grid.degrade_conditions != ("spatialized_estimate",)
     ):
         raise ValueError("map.building_grid requires conditional spatialized degradation")
@@ -319,6 +410,11 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
         dependency.key
         for dependency in rapid_report.depends_on
         if dependency.kind == DependencyKind.ARTIFACT
+    }
+    hard_product_keys = {
+        dependency.key
+        for dependency in rapid_report.depends_on
+        if dependency.kind == DependencyKind.ASSESSMENT_PRODUCT
     }
     optional_artifact_keys = {
         dependency.key
@@ -337,6 +433,10 @@ def _validate_catalog(catalog: ArtifactCatalog) -> None:
     }
     if hard_artifact_keys != expected_background | set(A_CLASS_MAPS):
         raise ValueError("doc.rapid_report has an invalid A-class dependency set")
+    if hard_product_keys != set(RAPID_REPORT_PRODUCT_KEYS):
+        raise ValueError(
+            "doc.rapid_report has an invalid assessment product dependency set"
+        )
     if optional_artifact_keys != set(B_CLASS_MAPS) | {"map.building_grid"}:
         raise ValueError("doc.rapid_report has an invalid optional dependency set")
 
@@ -347,17 +447,26 @@ def load_catalog(path: str | Path) -> ArtifactCatalog:
     catalog_path = Path(path)
     if not catalog_path.is_file():
         raise FileNotFoundError(f"artifact catalog does not exist: {catalog_path}")
-    raw = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+    raw = _load_yaml(catalog_path) or {}
     root = _mapping(raw, "artifact catalog")
     catalog_version = root.get("catalog_version")
     if not isinstance(catalog_version, str) or not catalog_version:
         raise ValueError("catalog_version must be a non-empty string")
 
     raw_definitions = _mapping(root.get("artifacts"), "artifacts")
+    for index, artifact_key in enumerate(raw_definitions):
+        if not isinstance(artifact_key, str) or not artifact_key:
+            raise ValueError(
+                f"artifacts key at index {index} must be a non-empty string: "
+                f"{artifact_key!r}"
+            )
+    if tuple(raw_definitions) != EXPECTED_ARTIFACT_KEYS:
+        raise ValueError(
+            "artifacts must contain exactly the 39 required keys in order"
+        )
     definitions = tuple(
         _parse_definition(artifact_key, _mapping(definition, artifact_key))
         for artifact_key, definition in raw_definitions.items()
-        if isinstance(artifact_key, str)
     )
     catalog = ArtifactCatalog(
         catalog_version=catalog_version,

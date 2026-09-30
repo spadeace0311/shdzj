@@ -149,7 +149,18 @@ class ArtifactDefinition:
     def is_conditional_degrade(self) -> bool:
         return bool(self.degrade_conditions)
 
-    def allows_degraded_output(self, *, spatialized_estimate: bool | None = None) -> bool:
+    def allows_degraded_output(
+        self,
+        *,
+        condition: str | None = None,
+        spatialized_estimate: bool | None = None,
+    ) -> bool:
+        if condition is not None:
+            if condition not in self.degrade_conditions:
+                return False
+            if condition == "spatialized_estimate":
+                return spatialized_estimate is True
+            return True
         if self.failure_policy != "degrade":
             return False
         if "spatialized_estimate" in self.degrade_conditions:
@@ -246,7 +257,10 @@ class ArtifactCatalog:
                 raise ValueError(f"artifact dependency cycle at {identity[0]}")
             visiting.add(identity)
             definition = self._by_key[identity]
-            for dependency in definition.depends_on:
+            for dependency in (
+                *definition.depends_on,
+                *definition.optional_depends_on,
+            ):
                 if dependency.kind != DependencyKind.ARTIFACT:
                     continue
                 dependency_identity = (dependency.key, dependency.output_profile or "")
