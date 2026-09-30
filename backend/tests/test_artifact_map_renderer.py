@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
+from app.artifacts.basemap import (
+    MapViewportTileManifest,
+    VIEWPORT_RADII_KM,
+    load_offline_basemap_packages,
+)
 from app.artifacts.context import MapRenderContext, ProductionContextService
 from app.artifacts.repository import ArtifactProductionRepository
 from app.config import settings
@@ -18,7 +22,6 @@ from app.artifacts.renderers.map_renderer import (
     RemoteAssetForbiddenError,
 )
 from tests.basemap_fixtures import (
-    make_in_memory_package,
     png_tile_bytes,
     union_bounds_3857,
     write_basemap_package,
@@ -117,6 +120,14 @@ async def test_epicenter_map_renders_a3v_professional(
     monkeypatch.setattr(settings, "artifact_basemap_root", str(basemap_root))
     context = await seeded_artifact_assessment.map_context("map.epicenter")
     spec = MapSpecBuilder().build(context)
+    actual_package = load_offline_basemap_packages(basemap_root)["gaode"]
+    spec = replace(
+        spec,
+        selected_basemap={
+            **spec.selected_basemap,
+            "checksum": actual_package.checksum,
+        },
+    )
     result = await map_renderer.render(spec, tmp_path / "epicenter.jpg")
 
     assert spec.title == "震中位置分布图"
@@ -141,13 +152,9 @@ async def test_formal_context_renders_real_offline_basemap_and_epicenter(
     basemap_root = tmp_path / "basemaps"
     _write_real_basemap_package(basemap_root)
     monkeypatch.setattr(settings, "artifact_basemap_root", str(basemap_root))
-    manifests = _settings_manifests()
     service = ProductionContextService(
         repository=ArtifactProductionRepository(),
-        offline_basemap_packages={
-            "gaode": make_in_memory_package(manifests, provider="gaode"),
-            "tianditu": make_in_memory_package(manifests, provider="tianditu"),
-        },
+        offline_basemap_packages=load_offline_basemap_packages(basemap_root),
     )
     run = await seeded_artifact_assessment.create_full_run()
     task = await seeded_artifact_assessment.first_task(run.id, "map.epicenter")
@@ -168,6 +175,9 @@ async def test_formal_context_renders_real_offline_basemap_and_epicenter(
     assert result.width == 4761
     assert result.height == 3369
     assert result.render_manifest["base_provider"] == "gaode"
+    assert result.render_manifest["base_package_checksum"] == (
+        context.selected_basemap.checksum
+    )
     assert _pixel_fraction(result.path, _is_blue_basemap) > 0.2
     assert _pixel_fraction(result.path, _is_red_epicenter) > 0.0001
 
@@ -211,6 +221,57 @@ async def test_renderer_rejects_nested_remote_source_url(
 
     with pytest.raises(RemoteAssetForbiddenError):
         await map_renderer.render(spec, tmp_path / "rejected-source.jpg")
+
+
+async def test_renderer_rejects_remote_url_inside_sprite_objects(
+    map_renderer,
+    seeded_artifact_assessment,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    spec = replace(
+        MapSpecBuilder().build(context),
+        layers=(
+            MapLayer(
+                id="remote-sprite",
+                url="local://artifact_maps/epicenter.geojson",
+                style={
+                    "sprite": [
+                        {
+                            "id": "basic",
+                            "url": "https://example.invalid/sprite.json",
+                        }
+                    ]
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(RemoteAssetForbiddenError):
+        await map_renderer.render(spec, tmp_path / "rejected-sprite.jpg")
+
+
+async def test_selected_basemap_checksum_mismatch_fails_hard(
+    map_renderer,
+    seeded_artifact_assessment,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    basemap_root = tmp_path / "basemaps"
+    _write_real_basemap_package(basemap_root)
+    monkeypatch.setattr(settings, "artifact_basemap_root", str(basemap_root))
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    spec = MapSpecBuilder().build(context)
+    spec = replace(
+        spec,
+        selected_basemap={
+            **spec.selected_basemap,
+            "checksum": "0" * 64,
+        },
+    )
+
+    with pytest.raises(FileNotFoundError):
+        await map_renderer.render(spec, tmp_path / "wrong-checksum.jpg")
 
 
 async def test_missing_selected_basemap_fails_hard(

@@ -218,6 +218,7 @@ class MapRenderSpec:
             "base_provider": basemap.get("provider"),
             "base_package_id": basemap.get("package_id"),
             "base_package_version": basemap.get("version"),
+            "base_package_checksum": basemap.get("checksum"),
             "base_style": self.base_style,
             "layer_versions": {
                 layer.id: str(layer.metadata.get("version", "v1"))
@@ -514,6 +515,7 @@ class LocalAssetRegistry:
             )
         package_id = selected.get("package_id")
         version = selected.get("version")
+        checksum = selected.get("checksum")
         if package_id and package.package_id != package_id:
             raise LocalAssetMissingError(
                 f"selected basemap package identity mismatch: "
@@ -523,6 +525,19 @@ class LocalAssetRegistry:
             raise LocalAssetMissingError(
                 f"selected basemap package version mismatch: "
                 f"expected {version}, loaded {package.version}"
+            )
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or checksum != checksum.lower()
+            or any(character not in "0123456789abcdef" for character in checksum)
+        ):
+            raise LocalAssetMissingError(
+                "selected basemap checksum must be a 64 character SHA-256 hex digest"
+            )
+        if package.checksum.lower() != checksum:
+            raise LocalAssetMissingError(
+                "selected basemap checksum does not match the loaded package"
             )
         return package
 
@@ -538,6 +553,13 @@ class LocalAssetRegistry:
             "minzoom": min(package.zoom_levels),
             "maxzoom": max(package.zoom_levels),
         }
+
+    def basemap_package_path(self, package: Any) -> str:
+        provider_dir = self._basemap_root / package.provider
+        if package.package_format == "directory":
+            return str(provider_dir / "tiles")
+        index_file = package.index_file or f"{package.provider}.{package.package_format}"
+        return str(provider_dir / index_file)
 
     def resolve(self, request_path: str) -> tuple[bytes, str] | None:
         path = request_path.lstrip("/")
@@ -678,6 +700,16 @@ class BrowserPool:
         package = self.require_selected_basemap(selected)
         return self._assets.basemap_source(package)
 
+    def selected_basemap_binding(
+        self,
+        selected: Mapping[str, Any] | None,
+    ) -> tuple[Any, dict[str, Any]]:
+        package = self.require_selected_basemap(selected)
+        return package, self._assets.basemap_source(package)
+
+    def basemap_package_path(self, package: Any) -> str:
+        return self._assets.basemap_package_path(package)
+
     async def reserve_slot(self, priority: int = 100) -> str:
         if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
             raise ValueError("browser slot priority must be a non-negative integer")
@@ -772,7 +804,9 @@ class MapRenderer:
     async def render(self, spec: MapRenderSpec, output_path: Path) -> RenderResult:
         _validate_spec(spec)
         self._browser_pool.reload_assets()
-        basemap_source = self._browser_pool.basemap_source(spec.selected_basemap)
+        package, basemap_source = self._browser_pool.selected_basemap_binding(
+            spec.selected_basemap
+        )
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         slot = await self._browser_pool.acquire_page(priority=100)
@@ -823,6 +857,11 @@ class MapRenderer:
                     "checksum": checksum,
                     "size_bytes": target.stat().st_size,
                     "non_empty_ratio": non_empty_ratio,
+                    "base_package_checksum": package.checksum,
+                    "base_package_format": package.package_format,
+                    "base_package_path": self._browser_pool.basemap_package_path(
+                        package
+                    ),
                 }
             )
             return RenderResult(
@@ -965,7 +1004,7 @@ def _validate_spec(spec: MapRenderSpec) -> None:
         _validate_resource_mapping(layer.style)
 
 
-_RESOURCE_KEYS = {"url", "tiles", "data", "sprite", "glyphs"}
+_RESOURCE_KEYS = {"url", "tiles", "data", "sprite", "glyphs", "source", "style"}
 
 
 def _validate_resource_mapping(value: Any) -> None:
@@ -984,6 +1023,9 @@ def _validate_resource_mapping(value: Any) -> None:
 def _validate_resource_value(value: Any) -> None:
     if isinstance(value, str):
         _validate_local_url(value)
+        return
+    if isinstance(value, Mapping):
+        _validate_resource_mapping(value)
         return
     if isinstance(value, (list, tuple)):
         for item in value:
