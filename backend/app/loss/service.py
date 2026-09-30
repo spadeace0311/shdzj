@@ -1516,6 +1516,42 @@ def _model_product_checksum(
     return _sha256(payload)
 
 
+def _metric_order_key(product_type: LossProductType):
+    scenario_order = {
+        scenario: index for index, scenario in enumerate(_SCENARIO_ORDER)
+    }
+    descriptor_order = {
+        descriptor.metric_key: index
+        for index, descriptor in enumerate(_metric_descriptors(product_type))
+    }
+    scope_order = {"town": 0, "county": 1, "city": 2}
+
+    def key(metric: LossMetricValueWrite):
+        return (
+            scenario_order[metric.value_type],
+            descriptor_order.get(metric.metric_key, len(descriptor_order)),
+            scope_order.get(metric.area_scope, 9),
+            metric.area_code,
+        )
+
+    return key
+
+
+def recompute_product_checksum(
+    product_type: LossProductType,
+    metrics: tuple[LossMetricValueWrite, ...] | list[LossMetricValueWrite],
+    statistics: dict,
+) -> str:
+    """Recompute a persisted loss product checksum using the production algorithm.
+
+    Persisted metric rows have no stable insertion-order guarantee, so this
+    canonicalizes them to the same scenario/descriptor/scope order emitted by
+    ``_build_metrics`` before feeding them through ``_model_product_checksum``.
+    """
+    ordered = sorted(metrics, key=_metric_order_key(product_type))
+    return _model_product_checksum(product_type, tuple(ordered), statistics)
+
+
 def _validation_issue_payload(issue) -> dict:
     return {
         "code": issue.code,

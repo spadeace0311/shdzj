@@ -474,7 +474,10 @@ def _collect_map_source_notes(
         if statement and verified_empty:
             notes.append(str(statement))
         elif layer.metadata.get("source_status") == "missing":
-            notes.append(f"{source_key} unavailable")
+            reason = layer.metadata.get("degradation_reason")
+            notes.append(
+                str(reason) if reason else f"{source_key} unavailable"
+            )
     return tuple(dict.fromkeys(notes))
 
 

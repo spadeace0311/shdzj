@@ -414,9 +414,16 @@ def _to_map_layer(
         if isinstance(source, Mapping)
         else getattr(source, "status", "missing")
     )
+    source_metadata = (
+        source.get("metadata")
+        if isinstance(source, Mapping)
+        else getattr(source, "metadata", None)
+    )
+    source_metadata = source_metadata if isinstance(source_metadata, Mapping) else {}
+    degradation_reason = source_metadata.get("degradation_reason")
     if source_status == "missing":
         if definition.optional:
-            return _missing_map_layer(definition)
+            return _missing_map_layer(definition, degradation_reason)
         raise MapSourceUnavailableError(
             f"required map source is unavailable: {definition.source_key}"
         )
@@ -435,6 +442,7 @@ def _to_map_layer(
         "data_kind": definition.data_kind,
         "verified_empty_statement": definition.verified_empty_statement,
         "verified_empty": source_status == "verified_empty",
+        "degradation_reason": degradation_reason,
         "source_checksum": (
             source.get("checksum")
             if isinstance(source, Mapping)
@@ -483,7 +491,10 @@ def _to_map_layer(
     )
 
 
-def _missing_map_layer(definition: LayerDefinition) -> Any:
+def _missing_map_layer(
+    definition: LayerDefinition,
+    degradation_reason: Any = None,
+) -> Any:
     from app.artifacts.renderers.map_renderer import MapLayer
 
     return MapLayer(
@@ -517,6 +528,7 @@ def _missing_map_layer(definition: LayerDefinition) -> Any:
             "source_status": "missing",
             "data_kind": definition.data_kind,
             "verified_empty": False,
+            "degradation_reason": degradation_reason,
         },
     )
 
@@ -599,12 +611,17 @@ class MapQualityPolicy:
                 and source_key == _TRANSPORT_OPTIONAL_ROAD
                 and optional
             ):
-                reasons.append("路网数据待复核")
+                reasons.append(
+                    str(metadata.get("degradation_reason") or "路网数据待复核")
+                )
                 continue
             if (
                 bool(metadata.get("verified_empty"))
                 or source_status == "verified_empty"
             ) and source_key == "shanghai.fault":
+                continue
+            if optional and metadata.get("degradation_reason"):
+                reasons.append(str(metadata["degradation_reason"]))
                 continue
             reasons.append(f"{source_key} is unavailable")
 

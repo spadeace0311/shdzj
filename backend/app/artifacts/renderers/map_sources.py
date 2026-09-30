@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import uuid
 from dataclasses import dataclass
@@ -20,13 +21,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.artifacts.models import ArtifactTaskDependencyBinding, ProductionRun, ProductionTask
 from app.artifacts.renderers.map_layers import LayerDefinition, MapLayerRegistry
 from app.config import settings
+from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.raster_repository import load_raster_version
 from app.data_assets.repository import AssetRecord, DataAssetRepository
 from app.data_assets.models import DataAsset, DataAssetVersion
+from app.data_assets.service import compute_table_checksum
 from app.intensity.repository import IntensityRepository
 from app.intensity.models import IntensityFieldProduct
-from app.loss.domain import LossProductType
+from app.loss.domain import (
+    LossMetricValueStatus,
+    LossProductType,
+    LossQualityGrade,
+    LossValueType,
+)
 from app.loss.models import LossMetricValue, LossProduct
+from app.loss.repository import LossMetricValueWrite
+from app.loss.service import recompute_product_checksum
 
 
 class MapSourceResolutionError(RuntimeError):
@@ -258,23 +268,18 @@ def _array_raster_source(
 
 
 async def _loss_metric_features(
-    session: AsyncSession,
     product: LossProduct,
     metric_bindings: tuple[tuple[str, str], ...],
     area_records: list[AssetRecord],
+    all_metric_rows: list[LossMetricValue],
 ) -> tuple[list[dict[str, Any]], str]:
+    _verify_loss_product_checksum(product, all_metric_rows)
     metric_keys = tuple(key for key, _ in metric_bindings)
-    rows = list(
-        (
-            await session.scalars(
-                select(LossMetricValue).where(
-                    LossMetricValue.product_id == product.id,
-                    LossMetricValue.value_type == "central",
-                    LossMetricValue.metric_key.in_(metric_keys),
-                )
-            )
-        ).all()
-    )
+    rows = [
+        row
+        for row in all_metric_rows
+        if row.value_type == "central" and row.metric_key in metric_keys
+    ]
     by_area_metric: dict[tuple[str, str], list[LossMetricValue]] = {}
     for row in rows:
         by_area_metric.setdefault(
@@ -310,6 +315,48 @@ async def _loss_metric_features(
         features.append(feature)
     status = "verified_empty" if not features else "bound"
     return features, status
+
+
+def _metric_write_from_row(row: LossMetricValue) -> LossMetricValueWrite:
+    numeric = row.numeric_value
+    if numeric is not None:
+        if row.metric_key.endswith(".quantity"):
+            numeric = int(round(float(numeric)))
+        else:
+            numeric = float(numeric)
+    return LossMetricValueWrite(
+        area_scope=str(row.area_scope),
+        area_code=str(row.area_code),
+        area_name=row.area_name,
+        metric_key=str(row.metric_key),
+        value_type=LossValueType(row.value_type),
+        value_status=LossMetricValueStatus(row.value_status),
+        numeric_value=numeric,
+        unit=str(row.unit),
+        precision=row.precision,
+        quality_grade=LossQualityGrade(row.quality_grade),
+        note=row.note,
+    )
+
+
+def _verify_loss_product_checksum(
+    product: LossProduct,
+    rows: list[LossMetricValue],
+) -> None:
+    if not product.output_checksum:
+        raise MapSourceResolutionError(
+            f"loss product {product.product_type} has no output checksum"
+        )
+    metrics = tuple(_metric_write_from_row(row) for row in rows)
+    computed = recompute_product_checksum(
+        LossProductType(product.product_type),
+        metrics,
+        dict(product.statistics or {}),
+    )
+    if computed != product.output_checksum:
+        raise MapSourceResolutionError(
+            f"loss product {product.product_type} checksum mismatch"
+        )
 
 
 def _merged_value_status(statuses: list[str]) -> str:
@@ -352,19 +399,43 @@ class MapSourceResolver:
         ).all()
         bindings_by_key = {item.dependency_key: item for item in bindings}
 
+        product_keys = {
+            dependency.key
+            for dependency in definition.depends_on
+            if dependency.kind.value == "assessment_product"
+        }
+        needs_town_records = task.artifact_key in {
+            "map.population",
+            "map.building_damage",
+        } or bool(
+            product_keys
+            & {"loss.casualties", "loss.economic", "loss.buildings"}
+        )
+        needs_city_records = "loss.resources" in product_keys
+
         town_asset = asset_versions.get("shanghai.admin.town")
         town_records: list[AssetRecord] = []
-        if town_asset is not None and town_asset.resolution_status == "bound":
-            town_records = await self._data_asset_repository.list_records(
+        if (
+            needs_town_records
+            and town_asset is not None
+            and town_asset.resolution_status == "bound"
+        ):
+            town_records = await self._load_frozen_asset_records(
                 session,
-                town_asset.asset_version_id,
+                "shanghai.admin.town",
+                town_asset,
             )
         city_asset = asset_versions.get("shanghai.admin.city")
         city_records: list[AssetRecord] = []
-        if city_asset is not None and city_asset.resolution_status == "bound":
-            city_records = await self._data_asset_repository.list_records(
+        if (
+            needs_city_records
+            and city_asset is not None
+            and city_asset.resolution_status == "bound"
+        ):
+            city_records = await self._load_frozen_asset_records(
                 session,
-                city_asset.asset_version_id,
+                "shanghai.admin.city",
+                city_asset,
             )
 
         registry_definitions = {
@@ -414,11 +485,13 @@ class MapSourceResolver:
                     layer_definition=layer_definition,
                     event=event,
                     town_records=town_records,
+                    optional=True,
                 )
-            except MapSourceResolutionError:
+            except Exception as error:
                 resolved[source_key] = self._unavailable_source(
                     source_key,
                     layer_definition,
+                    reason=f"可选增强层 {source_key} 部分数据不可用，待复核: {error}",
                 )
 
         for dependency in definition.depends_on:
@@ -464,6 +537,17 @@ class MapSourceResolver:
 
         return resolved
 
+    async def _load_frozen_asset_records(
+        self,
+        session: AsyncSession,
+        source_key: str,
+        asset_item: Any,
+    ) -> list[AssetRecord]:
+        version = await self._frozen_asset_version(session, asset_item, source_key)
+        records = await self._data_asset_repository.list_records(session, version.id)
+        self._verify_vector_content_checksum(version, records, source_key)
+        return records
+
     def _event_source(self, source_key: str, event: Any) -> ResolvedMapSource:
         feature = {
             "type": "Feature",
@@ -505,10 +589,16 @@ class MapSourceResolver:
         layer_definition: LayerDefinition,
         event: Any,
         town_records: list[AssetRecord],
+        optional: bool = False,
     ) -> ResolvedMapSource:
         version = await self._frozen_asset_version(session, asset_item, source_key)
         if layer_definition.data_kind == "raster":
             payload, _ = await load_raster_version(session, version.id)
+            payload_checksum = hashlib.sha256(payload).hexdigest()
+            if payload_checksum != version.checksum:
+                raise MapSourceResolutionError(
+                    f"raster asset {source_key} payload checksum mismatch"
+                )
             return _dataset_raster_source(
                 payload,
                 source_key=source_key,
@@ -517,11 +607,17 @@ class MapSourceResolver:
                 version=version.version,
             )
         records = await self._data_asset_repository.list_records(session, version.id)
-        records = self._join_geometry_records(
+        self._verify_vector_content_checksum(version, records, source_key)
+        records, missing_join = self._join_geometry_records(
             source_key,
             records,
             town_records,
         )
+        if missing_join and not optional:
+            raise MapSourceResolutionError(
+                f"asset {source_key} has {missing_join} records without "
+                "usable geometry"
+            )
         radius_filter = layer_definition.source_key in {
             "shanghai.fault",
             "shanghai.historical.earthquakes",
@@ -534,9 +630,10 @@ class MapSourceResolver:
             event=event,
             radius_filter=radius_filter,
         )
-        if bad_records and not features:
+        if bad_records:
             raise MapSourceResolutionError(
-                f"asset {source_key} contains records with invalid geometry"
+                f"asset {source_key} contains {bad_records} records with "
+                "invalid geometry"
             )
         if not radius_filter and not features:
             raise MapSourceResolutionError(
@@ -553,6 +650,42 @@ class MapSourceResolver:
             style=_style_for_definition(layer_definition),
             status=status,
         )
+
+    def _verify_vector_content_checksum(
+        self,
+        version: DataAssetVersion,
+        records: list[AssetRecord],
+        source_key: str,
+    ) -> None:
+        if not version.checksum:
+            raise MapSourceResolutionError(
+                f"frozen asset {source_key} has no content checksum"
+            )
+        summary = dict(version.schema_summary or {})
+        columns = summary.get("columns")
+        if not isinstance(columns, list) or not columns:
+            columns = sorted(
+                {key for record in records for key in (record.properties or {})}
+            )
+        normalized = NormalizedTableData(
+            columns=tuple(str(column) for column in columns),
+            records=tuple(
+                NormalizedRecord(
+                    row_number=record.row_number,
+                    business_key=record.business_key,
+                    properties=dict(record.properties or {}),
+                    geometry_wkt=record.geometry_wkt,
+                )
+                for record in records
+            ),
+            source_crs=version.source_crs or "EPSG:4326",
+            spatial_extent=None,
+        )
+        content_checksum = compute_table_checksum(normalized)
+        if content_checksum != version.checksum:
+            raise MapSourceResolutionError(
+                f"asset {source_key} content checksum mismatch"
+            )
 
     def _filtered_features(
         self,
@@ -622,16 +755,18 @@ class MapSourceResolver:
         source_key: str,
         records: list[AssetRecord],
         town_records: list[AssetRecord],
-    ) -> list[AssetRecord]:
+    ) -> tuple[list[AssetRecord], int]:
         if any(record.geometry_wkt for record in records):
-            return records
+            return records, 0
         if source_key not in {"shanghai.population.town", "shanghai.building.town"}:
-            return records
+            return records, 0
         town_by_key = {record.business_key: record for record in town_records}
         joined: list[AssetRecord] = []
+        missing = 0
         for record in records:
             town = town_by_key.get(record.business_key)
             if town is None or not town.geometry_wkt:
+                missing += 1
                 continue
             joined.append(
                 AssetRecord(
@@ -641,7 +776,7 @@ class MapSourceResolver:
                     geometry_wkt=town.geometry_wkt,
                 )
             )
-        return joined
+        return joined, missing
 
     async def _product_source(
         self,
@@ -667,6 +802,7 @@ class MapSourceResolver:
                 or intensity_product.run_id != run.assessment_run_id
                 or intensity_product.product_type != "fusion"
                 or intensity_product.output_checksum != binding.bound_checksum
+                or intensity_product.algorithm_version != binding.bound_version
             ):
                 raise MapSourceResolutionError(
                     "intensity product binding identity mismatch"
@@ -696,6 +832,7 @@ class MapSourceResolver:
             product.run_id != run.assessment_run_id
             or product.product_type != product_type.value
             or product.output_checksum != binding.bound_checksum
+            or product.algorithm_version != binding.bound_version
         ):
             raise MapSourceResolutionError(
                 f"loss product binding identity mismatch for {product_key}"
@@ -712,11 +849,20 @@ class MapSourceResolver:
                 f"map {artifact_key} has no product metric binding"
             )
         area_records = city_records if product_type is LossProductType.RESOURCE_DEMAND else town_records
+        all_metric_rows = list(
+            (
+                await session.scalars(
+                    select(LossMetricValue).where(
+                        LossMetricValue.product_id == product.id
+                    )
+                )
+            ).all()
+        )
         features, status = await _loss_metric_features(
-            session,
             product,
             metric_bindings,
             area_records,
+            all_metric_rows,
         )
         if not features:
             raise MapSourceResolutionError(
@@ -735,6 +881,8 @@ class MapSourceResolver:
         self,
         source_key: str,
         layer_definition: LayerDefinition,
+        *,
+        reason: str | None = None,
     ) -> ResolvedMapSource:
         return ResolvedMapSource(
             source_key=source_key,
@@ -746,7 +894,10 @@ class MapSourceResolver:
             checksum=None,
             version=None,
             feature_count=0,
-            metadata={"verified_empty": False},
+            metadata={
+                "verified_empty": False,
+                "degradation_reason": reason,
+            },
         )
 
     def _with_distances(
@@ -764,6 +915,34 @@ class MapSourceResolver:
             feature["properties"]["distance_km"] = round(distance, 2)
             feature["properties"]["value_status"] = "available"
         return features
+
+
+_METRIC_FILL_RANGES = {
+    "deaths": (0.0, 1000.0),
+    "injuries": (0.0, 1000.0),
+    "buried": (0.0, 1000.0),
+    "economic_loss": (0.0, 2_000_000.0),
+    "rescue_teams": (0.0, 100.0),
+    "damaged_buildings": (0.0, 10_000.0),
+    "tent": (0.0, 100.0),
+    "drinking_water": (0.0, 100.0),
+    "food": (0.0, 100.0),
+    "clothing": (0.0, 100.0),
+    "quilt": (0.0, 100.0),
+    "blanket": (0.0, 100.0),
+    "stretcher": (0.0, 100.0),
+    "sickbed": (0.0, 100.0),
+    "toilet": (0.0, 100.0),
+}
+_METRIC_FILL_LOW = "#244c8c"
+_METRIC_FILL_HIGH = "#d9261c"
+
+
+def _metric_fill_property(definition: LayerDefinition) -> str | None:
+    for binding in definition.attribute_bindings:
+        if binding.metric_key:
+            return binding.property_name or binding.field
+    return None
 
 
 def _style_for_definition(definition: LayerDefinition) -> dict[str, Any]:
@@ -786,10 +965,27 @@ def _style_for_definition(definition: LayerDefinition) -> dict[str, Any]:
                 "circle-stroke-width": 2,
             },
         }
+    metric_property = _metric_fill_property(definition)
+    if metric_property is not None:
+        minimum, maximum = _METRIC_FILL_RANGES.get(
+            metric_property,
+            (0.0, 1.0),
+        )
+        fill_color = [
+            "interpolate",
+            ["linear"],
+            ["get", metric_property],
+            minimum,
+            _METRIC_FILL_LOW,
+            maximum,
+            _METRIC_FILL_HIGH,
+        ]
+    else:
+        fill_color = "#c77b3b"
     return {
         "type": "fill",
         "paint": {
-            "fill-color": "#c77b3b",
-            "fill-opacity": 0.42,
+            "fill-color": fill_color,
+            "fill-opacity": 0.55,
         },
     }

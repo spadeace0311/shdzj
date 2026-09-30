@@ -418,11 +418,36 @@ class DataAssetService:
             )
             summary = dict(schema_summary)
             summary["normalized_checksum"] = checksum
+            summary["columns"] = list(normalized.columns)
             version.schema_summary = summary
             version.record_count = normalized.record_count
             version.spatial_extent = _bounds_wkt_element(
                 normalized.spatial_extent
             )
+            await session.flush()
+            persisted_records = await self._repository.list_records(
+                session,
+                version_id,
+            )
+            version.checksum = _table_checksum(
+                NormalizedTableData(
+                    columns=normalized.columns,
+                    records=tuple(
+                        NormalizedRecord(
+                            row_number=record.row_number,
+                            business_key=record.business_key,
+                            properties=dict(record.properties),
+                            geometry_wkt=record.geometry_wkt,
+                        )
+                        for record in persisted_records
+                    ),
+                    source_crs=normalized.source_crs,
+                    spatial_extent=None,
+                )
+            )
+            version.updated_at = datetime.now(UTC)
+            await session.flush()
+            return version
 
         version.updated_at = datetime.now(UTC)
         await session.flush()
@@ -1088,6 +1113,11 @@ def _table_checksum(normalized: NormalizedTableData) -> str:
         default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def compute_table_checksum(normalized: NormalizedTableData) -> str:
+    """Return the canonical content checksum for normalized table data."""
+    return _table_checksum(normalized)
 
 
 def build_aggregate_checks(

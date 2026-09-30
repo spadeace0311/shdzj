@@ -4,10 +4,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
+import numpy as np
+from geoalchemy2.elements import WKTElement
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.artifacts.basemap import MapViewportTileManifest, VIEWPORT_RADII_KM
 from app.artifacts.context import ProductionContextService
@@ -19,21 +22,32 @@ from app.artifacts.renderers.map_layers import (
 from app.artifacts.renderers.map_renderer import BrowserPool, MapRenderer, MapSpecBuilder
 from app.artifacts.renderers.map_sources import MapSourceResolutionError
 from app.artifacts.repository import ArtifactProductionRepository
+from app.artifacts.models import ArtifactTaskDependencyBinding
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.config import settings
 from app.db import engine
 from app.data_assets.domain import NormalizedRecord, NormalizedTableData
 from app.data_assets.import_jobs import QueueImportRequest, queue_import_job
-from app.data_assets.models import DataAssetVersion
+from app.data_assets.models import DataAsset, DataAssetRecord, DataAssetVersion
 from app.data_assets.raster_importer import GeoTiffAssetImporter
 from app.data_assets.raster_repository import save_raster_version
 from app.data_assets.registry import get_asset_definition
-from app.data_assets.service import DataAssetService
+from app.data_assets.repository import DataAssetRepository
+from app.data_assets.service import DataAssetService, compute_table_checksum
+from app.intensity.models import IntensityFieldProduct
+from app.loss.domain import (
+    LossMetricValueStatus,
+    LossProductType,
+    LossQualityGrade,
+    LossValueType,
+)
 from app.loss.models import LossMetricValue, LossProduct
+from app.loss.repository import LossMetricValueWrite
+from app.loss.service import recompute_product_checksum
 from tests.basemap_fixtures import make_in_memory_package, png_tile_bytes
 from tests.data_asset_helpers import (
-    _cleanup_fixture_data,
-    publish_new_population_version,
+    _population_records,
+    _town_records,
 )
 
 
@@ -67,6 +81,8 @@ LOSS_PRODUCT_TYPES = {
     "loss.resources": "resource_demand",
 }
 
+_CREATED_VERSION_IDS: set[UUID] = set()
+
 
 @pytest.fixture(autouse=True)
 async def _dispose_engine_between_tests():
@@ -78,16 +94,17 @@ async def _dispose_engine_between_tests():
 @pytest.fixture(autouse=True)
 async def _cleanup_maps_a_data_assets(session_factory):
     yield
+    version_ids = list(_CREATED_VERSION_IDS)
+    _CREATED_VERSION_IDS.clear()
+    if not version_ids:
+        return
     from sqlalchemy import delete
 
-    await _cleanup_fixture_data(session_factory)
     async with session_factory() as session:
         async with session.begin():
-            from app.data_assets.models import DataAssetVersion
-
             await session.execute(
                 delete(DataAssetVersion).where(
-                    DataAssetVersion.imported_by == "maps-a-fixture"
+                    DataAssetVersion.id.in_(version_ids)
                 )
             )
 
@@ -265,6 +282,7 @@ async def _render_product_map(
     production_renderer,
     tmp_path: Path,
     artifact_key: str,
+    product_key: str,
     product_type: str,
     metrics: tuple[tuple[str, float, str, str], ...],
     publish_towns: bool,
@@ -276,24 +294,21 @@ async def _render_product_map(
         spatial_extent=(121.2, 30.9, 121.8, 31.5),
     )
     if publish_towns:
-        await publish_new_population_version(session_factory, f"{artifact_key}-town")
-        await _publish_asset(
+        await _publish_population_asset(
             session_factory,
-            "shanghai.building.town",
-            records=(
-                NormalizedRecord(
-                    row_number=1,
-                    business_key="310115000001",
-                    properties={"building_count": 100},
-                    geometry_wkt=None,
-                ),
-            ),
+            f"{artifact_key}-town-{uuid4()}",
         )
+        if artifact_key == "map.building_damage":
+            await _publish_asset(
+                session_factory,
+                "shanghai.building.town",
+                records=_building_town_records(),
+            )
     product = await _create_loss_product(
         fixture,
         product_type=product_type,
         version=f"{product_type}-{artifact_key}",
-        checksum="e" * 64,
+        checksum=_loss_checksum(product_type, metrics),
     )
     for metric_key, numeric_value, value_status, unit in metrics:
         await _add_loss_metric(
@@ -341,23 +356,9 @@ async def _publish_asset(
     *,
     records: tuple[NormalizedRecord, ...] = (),
     spatial_extent: tuple[float, float, float, float] | None = None,
-) -> None:
-    definition = get_asset_definition(asset_key)
+) -> UUID:
     async with session_factory() as session:
         async with session.begin():
-            from app.data_assets.models import DataAsset
-
-            existing = await session.scalar(
-                select(DataAssetVersion)
-                .join(DataAsset, DataAssetVersion.asset_id == DataAsset.id)
-                .where(
-                    DataAsset.asset_key == asset_key,
-                    DataAsset.region_id == definition.region_id,
-                    DataAssetVersion.status == "published",
-                )
-            )
-            if existing is not None:
-                return
             job = await queue_import_job(
                 session,
                 QueueImportRequest(
@@ -395,26 +396,387 @@ async def _publish_asset(
                     "source_crs": normalized.source_crs,
                 },
             )
-            version = await session.get(DataAssetVersion, job.asset_version_id)
-            if version is None:
-                raise LookupError("maps-a candidate asset version not found")
-            version.status = "validated"
-            version.validated_at = datetime.now(UTC)
-            await session.flush()
-            version.status = "published"
-            version.published_at = datetime.now(UTC)
+            service = DataAssetService()
+            report = await service.validate_version(
+                session,
+                job.asset_version_id,
+                actor="maps-a-fixture",
+            )
+            if not report.publishable:
+                raise AssertionError(
+                    f"{asset_key} maps-a fixture failed validation: "
+                    f"{[issue.message for issue in report.errors]}"
+                )
+            version = await service.publish_version(
+                session,
+                job.asset_version_id,
+                "maps-a-fixture",
+                "maps-a production fixture",
+            )
+            _CREATED_VERSION_IDS.add(version.id)
+            return version.id
+
+
+async def _publish_population_asset(session_factory, version: str) -> UUID:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.town",
+        records=_town_records().records,
+        spatial_extent=(121.4, 31.1, 121.6, 31.4),
+    )
+    return await _publish_asset(
+        session_factory,
+        "shanghai.population.town",
+        records=_population_records().records,
+    )
+
+
+def _loss_checksum(
+    product_type: str,
+    metrics: tuple[tuple[str, float, str, str], ...],
+) -> str:
+    writes = tuple(
+        LossMetricValueWrite(
+            area_scope="city" if product_type == "resource_demand" else "town",
+            area_code="shanghai" if product_type == "resource_demand" else "310115000001",
+            area_name="fixture town",
+            metric_key=metric_key,
+            value_type=LossValueType.CENTRAL,
+            value_status=LossMetricValueStatus(value_status),
+            numeric_value=(
+                int(round(numeric_value))
+                if metric_key.endswith(".quantity")
+                else float(numeric_value)
+            ),
+            unit=unit,
+            precision=2,
+            quality_grade=LossQualityGrade.L1,
+            note=None,
+        )
+        for metric_key, numeric_value, value_status, unit in metrics
+    )
+    return recompute_product_checksum(
+        LossProductType(product_type),
+        writes,
+        {},
+    )
+
+
+async def _dependency_binding(
+    session_factory,
+    task_id: UUID,
+    product_key: str,
+) -> ArtifactTaskDependencyBinding:
+    async with session_factory() as session:
+        binding = await session.scalar(
+            select(ArtifactTaskDependencyBinding).where(
+                ArtifactTaskDependencyBinding.production_task_id == task_id,
+                ArtifactTaskDependencyBinding.dependency_key == product_key,
+            )
+        )
+        assert binding is not None
+        return binding
 
 
 def _admin_city_record() -> NormalizedRecord:
     return NormalizedRecord(
         row_number=1,
         business_key="shanghai",
-        properties={"name": "Shanghai"},
+        properties={"ID": "shanghai", "NAME": "Shanghai"},
         geometry_wkt=(
             "MULTIPOLYGON (((121.2 30.9, 121.8 30.9, "
             "121.8 31.5, 121.2 31.5, 121.2 30.9)))"
         ),
     )
+
+
+def _far_fault_record() -> NormalizedRecord:
+    return NormalizedRecord(
+        row_number=1,
+        business_key="1",
+        properties={"OBJECTID": 1, "name": "far fault", "LENGTH": 100.0},
+        geometry_wkt="MULTILINESTRING ((126.0 36.0, 126.6 36.6))",
+    )
+
+
+def _admin_city_records() -> tuple[NormalizedRecord, ...]:
+    return (
+        _admin_city_record(),
+        NormalizedRecord(
+            row_number=2,
+            business_key="shanghai-2",
+            properties={"ID": "shanghai-2", "NAME": "Shanghai East"},
+            geometry_wkt=(
+                "MULTIPOLYGON (((121.2 30.9, 121.8 30.9, "
+                "121.8 31.5, 121.2 31.5, 121.2 30.9)))"
+            ),
+        ),
+    )
+
+
+def _building_town_records() -> tuple[NormalizedRecord, ...]:
+    return tuple(
+        NormalizedRecord(
+            row_number=index,
+            business_key=town_code,
+            properties={
+                "id": town_code,
+                "name": f"town-{index}",
+                "TOTAL_AREA": 1000,
+                "HIGH_RISE": 200,
+                "RCFRAME": 300,
+                "BRICK_STRUCTURE": 250,
+                "SINGLE_AREA": 150,
+                "OTHER_STRUCTURE": 100,
+            },
+            geometry_wkt=None,
+        )
+        for index, town_code in enumerate(
+            (f"{310115000001 + offset}" for offset in range(212)),
+            start=1,
+        )
+    )
+
+
+def _road_records() -> tuple[NormalizedRecord, ...]:
+    return tuple(
+        NormalizedRecord(
+            row_number=index,
+            business_key=str(index),
+            properties={"road_class": "primary"},
+            geometry_wkt=(
+                f"MULTILINESTRING ((121.{index} 31.{index}, "
+                f"121.{index + 1} 31.{index + 1}))"
+            ),
+        )
+        for index in (1, 2)
+    )
+
+
+async def _publish_optional_road_network(
+    session_factory,
+    *,
+    corrupt: bool = False,
+) -> UUID:
+    records = _road_records()
+    normalized = NormalizedTableData(
+        columns=tuple(sorted({key for record in records for key in record.properties})),
+        records=records,
+        source_crs="EPSG:4326",
+        spatial_extent=(121.1, 31.1, 121.3, 31.3),
+    )
+    checksum = compute_table_checksum(normalized)
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(DataAssetVersion)
+                .where(
+                    DataAssetVersion.asset_id.in_(
+                        select(DataAsset.id).where(
+                            DataAsset.asset_key == "shanghai.road.network",
+                            DataAsset.region_id == "shanghai",
+                        )
+                    ),
+                    DataAssetVersion.status == "published",
+                )
+                .values(status="retired", retired_at=now)
+            )
+            asset = await session.scalar(
+                select(DataAsset).where(
+                    DataAsset.asset_key == "shanghai.road.network",
+                    DataAsset.region_id == "shanghai",
+                )
+            )
+            if asset is None:
+                asset = DataAsset(
+                    asset_key="shanghai.road.network",
+                    region_id="shanghai",
+                    name="上海市路网",
+                    data_type="vector",
+                    spatial_granularity="feature",
+                    responsibility_unit="fixture",
+                    update_interval_days=365,
+                    is_core=False,
+                    contract={"business_key_fields": [], "fields": []},
+                )
+                session.add(asset)
+                await session.flush()
+            version = DataAssetVersion(
+                asset_id=asset.id,
+                version=f"road-network-maps-a-{uuid4()}",
+                status="imported",
+                source_uri="https://example.gov.invalid/road-network",
+                source_crs="EPSG:4326",
+                checksum=checksum,
+                schema_summary={
+                    "columns": list(normalized.columns),
+                    "normalized_checksum": checksum,
+                },
+                imported_by="maps-a-fixture",
+                imported_at=now,
+                published_at=now,
+            )
+            session.add(version)
+            await session.flush()
+            for record in records:
+                geometry = (
+                    None
+                    if corrupt and record.business_key == "2"
+                    else WKTElement(record.geometry_wkt, srid=4326)
+                )
+                session.add(
+                    DataAssetRecord(
+                        version_id=version.id,
+                        row_number=record.row_number,
+                        business_key=record.business_key,
+                        properties=dict(record.properties),
+                        geom=geometry,
+                    )
+                )
+            await session.flush()
+            persisted_records = await DataAssetRepository().list_records(
+                session,
+                version.id,
+            )
+            persisted_checksum = compute_table_checksum(
+                NormalizedTableData(
+                    columns=normalized.columns,
+                    records=tuple(
+                        NormalizedRecord(
+                            row_number=item.row_number,
+                            business_key=item.business_key,
+                            properties=dict(item.properties),
+                            geometry_wkt=item.geometry_wkt,
+                        )
+                        for item in persisted_records
+                    ),
+                    source_crs="EPSG:4326",
+                    spatial_extent=None,
+                )
+            )
+            version.checksum = persisted_checksum
+            version.schema_summary = {
+                "columns": list(normalized.columns),
+                "normalized_checksum": persisted_checksum,
+            }
+            version.status = "validated"
+            version.validated_at = now
+            await session.flush()
+            version.status = "published"
+            version.published_at = now
+            await session.flush()
+            _CREATED_VERSION_IDS.add(version.id)
+            return version.id
+
+
+async def _publish_partially_corrupt_admin_city(session_factory) -> UUID:
+    definition = get_asset_definition("shanghai.admin.city")
+    records = _admin_city_records()
+    normalized = NormalizedTableData(
+        columns=tuple(sorted({key for record in records for key in record.properties})),
+        records=records,
+        source_crs="EPSG:4326",
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(DataAssetVersion)
+                .where(
+                    DataAssetVersion.asset_id.in_(
+                        select(DataAsset.id).where(
+                            DataAsset.asset_key == "shanghai.admin.city",
+                            DataAsset.region_id == definition.region_id,
+                        )
+                    ),
+                    DataAssetVersion.status == "published",
+                )
+                .values(status="retired", retired_at=now)
+            )
+            asset = await session.scalar(
+                select(DataAsset).where(
+                    DataAsset.asset_key == definition.asset_key,
+                    DataAsset.region_id == definition.region_id,
+                )
+            )
+            if asset is None:
+                asset = DataAsset(
+                    asset_key=definition.asset_key,
+                    region_id=definition.region_id,
+                    name=definition.name,
+                    data_type=definition.data_type.value,
+                    spatial_granularity=definition.spatial_granularity,
+                    responsibility_unit="fixture",
+                    update_interval_days=definition.update_interval_days,
+                    is_core=definition.is_core,
+                    contract={},
+                )
+                session.add(asset)
+                await session.flush()
+            version = DataAssetVersion(
+                asset_id=asset.id,
+                version=f"admin-city-corrupt-{uuid4()}",
+                status="imported",
+                source_uri="https://example.gov.invalid/admin-city-corrupt",
+                source_crs="EPSG:4326",
+                checksum="",
+                schema_summary={"columns": list(normalized.columns)},
+                imported_by="maps-a-fixture",
+                imported_at=now,
+                published_at=now,
+            )
+            session.add(version)
+            await session.flush()
+            for index, record in enumerate(records):
+                session.add(
+                    DataAssetRecord(
+                        version_id=version.id,
+                        row_number=record.row_number,
+                        business_key=record.business_key,
+                        properties=dict(record.properties),
+                        geom=(
+                            None
+                            if index == 1
+                            else WKTElement(record.geometry_wkt, srid=4326)
+                        ),
+                    )
+                )
+            await session.flush()
+            persisted_records = await DataAssetRepository().list_records(
+                session,
+                version.id,
+            )
+            checksum = compute_table_checksum(
+                NormalizedTableData(
+                    columns=normalized.columns,
+                    records=tuple(
+                        NormalizedRecord(
+                            row_number=item.row_number,
+                            business_key=item.business_key,
+                            properties=dict(item.properties),
+                            geometry_wkt=item.geometry_wkt,
+                        )
+                        for item in persisted_records
+                    ),
+                    source_crs="EPSG:4326",
+                    spatial_extent=None,
+                )
+            )
+            version.checksum = checksum
+            version.schema_summary = {
+                "columns": list(normalized.columns),
+                "normalized_checksum": checksum,
+            }
+            version.status = "validated"
+            version.validated_at = now
+            await session.flush()
+            version.status = "published"
+            version.published_at = now
+            await session.flush()
+            _CREATED_VERSION_IDS.add(version.id)
+            return version.id
 
 
 def _raster_source(source_key: str, tmp_path: Path) -> dict:
@@ -583,6 +945,13 @@ def _has_red_marker(path: Path) -> bool:
     )
 
 
+def _central_map_red_mean(path: Path) -> float:
+    with Image.open(path).convert("RGB") as image:
+        region = image.crop((1600, 1000, 3200, 2200))
+        pixels = np.asarray(region, dtype=np.uint8)
+    return float(pixels[:, :, 0].mean())
+
+
 async def _page_text(
     map_renderer,
     spec,
@@ -669,7 +1038,10 @@ async def test_production_population_context_resolves_published_vector(
     seeded_artifact_assessment,
     session_factory,
 ) -> None:
-    await publish_new_population_version(session_factory, f"maps-a-{id(seeded_artifact_assessment)}")
+    await _publish_population_asset(
+        session_factory,
+        f"maps-a-{id(seeded_artifact_assessment)}",
+    )
     service = ProductionContextService(
         repository=ArtifactProductionRepository(),
         offline_basemap_packages={
@@ -706,6 +1078,12 @@ async def test_production_gdp_context_resolves_published_raster(
     production_renderer,
     tmp_path: Path,
 ) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.city",
+        records=(_admin_city_record(),),
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
     descriptor = GeoTiffAssetImporter().load(
         seeded_imported_version.source_path,
         seeded_imported_version.definition,
@@ -823,7 +1201,12 @@ async def test_real_verified_empty_fault_source(
         records=(_admin_city_record(),),
         spatial_extent=(121.2, 30.9, 121.8, 31.5),
     )
-    await _publish_asset(session_factory, "shanghai.fault")
+    await _publish_asset(
+        session_factory,
+        "shanghai.fault",
+        records=(_far_fault_record(),),
+        spatial_extent=(126.0, 36.0, 126.6, 36.6),
+    )
     package, renderer = production_renderer
     service = ProductionContextService(
         repository=ArtifactProductionRepository(),
@@ -843,13 +1226,182 @@ async def test_real_verified_empty_fault_source(
     layers = MapLayerRegistry.build("map.active_faults", context)
     fault_layer = next(layer for layer in layers if layer.id == "active-faults")
     assert fault_layer.metadata["verified_empty"] is True
-    assert "检索范围内无活动断裂记录" in MapSpecBuilder().build(context).source_notes
+    spec = MapSpecBuilder().build(context)
+    assert "检索范围内无活动断裂记录" in spec.source_notes
+    page_text = await _page_text(renderer, spec, ".footer")
+    assert "检索范围内无活动断裂记录" in page_text
     result = await renderer.render(
-        MapSpecBuilder().build(context),
+        spec,
         tmp_path / "fault-empty.jpg",
     )
     assert result.non_empty_ratio > 0.2
     assert result.quality.grade == "A"
+
+
+async def test_required_asset_partial_corruption_fails_hard(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await _publish_partially_corrupt_admin_city(session_factory)
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.epicenter")
+    with pytest.raises(MapSourceResolutionError):
+        async with session_factory() as session:
+            async with session.begin():
+                await service.freeze_static_context(
+                    session,
+                    run.id,
+                    seeded_artifact_assessment.catalog,
+                )
+                await service.build_map_context(session, task.id)
+
+
+async def test_optional_asset_partial_corruption_degrades(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.city",
+        records=(_admin_city_record(),),
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
+    await _publish_optional_road_network(session_factory, corrupt=True)
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.transport")
+    async with session_factory() as session:
+        async with session.begin():
+            await service.freeze_static_context(
+                session,
+                run.id,
+                seeded_artifact_assessment.catalog,
+            )
+            context = await service.build_map_context(session, task.id)
+
+    layers = MapLayerRegistry.build("map.transport", context)
+    road_layer = next(layer for layer in layers if layer.id == "road-network")
+    assert road_layer.metadata["source_status"] == "missing"
+    quality = MapQualityPolicy.evaluate("map.transport", layers)
+    assert quality.needs_review is True
+    assert any("待复核" in reason for reason in quality.degradation_reasons)
+
+
+async def test_loss_product_version_mismatch_fails_closed(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.city",
+        records=(_admin_city_record(),),
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
+    await _publish_population_asset(session_factory, "loss-version-mismatch")
+    metrics = (("deaths", 12.0, "available", "count"),)
+    product = await _create_loss_product(
+        seeded_artifact_assessment,
+        product_type="casualties",
+        version="casualties-v1",
+        checksum=_loss_checksum("casualties", metrics),
+    )
+    await _add_loss_metric(
+        seeded_artifact_assessment,
+        product,
+        metric_key=metrics[0][0],
+        numeric_value=metrics[0][1],
+        value_status=metrics[0][2],
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.deaths")
+    async with session_factory() as session:
+        async with session.begin():
+            await ArtifactProductionRepository().prepare_dependencies(
+                session,
+                run.id,
+            )
+            await session.execute(
+                update(LossProduct)
+                .where(LossProduct.id == product.id)
+                .values(algorithm_version="wrong-version")
+            )
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    with pytest.raises(MapSourceResolutionError):
+        async with session_factory() as session:
+            async with session.begin():
+                await service.freeze_static_context(
+                    session,
+                    run.id,
+                    seeded_artifact_assessment.catalog,
+                )
+                await service.build_map_context(session, task.id)
+
+
+async def test_intensity_product_version_mismatch_fails_closed(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    await _publish_asset(
+        session_factory,
+        "shanghai.admin.city",
+        records=(_admin_city_record(),),
+        spatial_extent=(121.2, 30.9, 121.8, 31.5),
+    )
+    product = await seeded_artifact_assessment.create_fusion_product(
+        version="fusion-v1",
+    )
+    run = await seeded_artifact_assessment.create_full_run()
+    task = await seeded_artifact_assessment.first_task(run.id, "map.intensity")
+    async with session_factory() as session:
+        async with session.begin():
+            await ArtifactProductionRepository().prepare_dependencies(
+                session,
+                run.id,
+            )
+            await session.execute(
+                update(IntensityFieldProduct)
+                .where(IntensityFieldProduct.id == product.id)
+                .values(algorithm_version="wrong-version")
+            )
+
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={
+            "gaode": make_in_memory_package(_settings_manifests(), provider="gaode"),
+            "tianditu": make_in_memory_package(_settings_manifests(), provider="tianditu"),
+        },
+    )
+    with pytest.raises(MapSourceResolutionError):
+        async with session_factory() as session:
+            async with session.begin():
+                await service.freeze_static_context(
+                    session,
+                    run.id,
+                    seeded_artifact_assessment.catalog,
+                )
+                await service.build_map_context(session, task.id)
 
 
 async def test_product_metric_full_chain_render(
@@ -864,19 +1416,20 @@ async def test_product_metric_full_chain_render(
         records=(_admin_city_record(),),
         spatial_extent=(121.2, 30.9, 121.8, 31.5),
     )
-    await publish_new_population_version(session_factory, "product-metric-maps-a")
+    await _publish_population_asset(session_factory, "product-metric-maps-a")
+    metrics = (("deaths", 12.0, "available", "count"),)
     product = await _create_loss_product(
         seeded_artifact_assessment,
         product_type="casualties",
         version="casualties-maps-a",
-        checksum="e" * 64,
+        checksum=_loss_checksum("casualties", metrics),
     )
     await _add_loss_metric(
         seeded_artifact_assessment,
         product,
-        metric_key="deaths",
-        numeric_value=12,
-        value_status="available",
+        metric_key=metrics[0][0],
+        numeric_value=metrics[0][1],
+        value_status=metrics[0][2],
     )
 
     run = await seeded_artifact_assessment.create_full_run()
@@ -906,13 +1459,94 @@ async def test_product_metric_full_chain_render(
     layers = MapLayerRegistry.build("map.deaths", context)
     metric_layer = next(layer for layer in layers if layer.id == "deaths-town")
     assert metric_layer.source["data"]["features"][0]["properties"]["deaths"] == 12
+    assert metric_layer.style["paint"]["fill-color"][2] == ["get", "deaths"]
     assert result.quality.grade == "A"
     assert result.render_manifest["base_provider"] == "gaode"
+    binding = await _dependency_binding(
+        session_factory,
+        task.id,
+        "loss.casualties",
+    )
+    assert result.render_manifest["layer_versions"]["deaths-town"] == binding.bound_version
+    assert result.render_manifest["layer_checksums"]["deaths-town"] == binding.bound_checksum
+
+
+async def test_product_map_metric_encoding_changes_pixels(
+    seeded_artifact_assessment,
+    session_factory,
+    production_renderer,
+    tmp_path: Path,
+) -> None:
+    low_result, context = await _render_product_map(
+        fixture=seeded_artifact_assessment,
+        session_factory=session_factory,
+        production_renderer=production_renderer,
+        tmp_path=tmp_path,
+        artifact_key="map.deaths",
+        product_key="loss.casualties",
+        product_type="casualties",
+        metrics=(("deaths", 1.0, "available", "count"),),
+        publish_towns=True,
+    )
+    binding = await _dependency_binding(
+        session_factory,
+        context.production_task_id,
+        "loss.casualties",
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                update(LossMetricValue)
+                .where(
+                    LossMetricValue.product_id == binding.bound_entity_id,
+                    LossMetricValue.metric_key == "deaths",
+                    LossMetricValue.value_type == "central",
+                )
+                .values(numeric_value=900)
+            )
+            product = await session.get(LossProduct, binding.bound_entity_id)
+            assert product is not None
+            product.output_checksum = _loss_checksum(
+                "casualties",
+                (("deaths", 900.0, "available", "count"),),
+            )
+            await session.execute(
+                update(ArtifactTaskDependencyBinding)
+                .where(
+                    ArtifactTaskDependencyBinding.production_task_id
+                    == binding.production_task_id,
+                    ArtifactTaskDependencyBinding.dependency_key
+                    == "loss.casualties",
+                )
+                .values(bound_checksum=product.output_checksum)
+            )
+
+    package, renderer = production_renderer
+    service = ProductionContextService(
+        repository=ArtifactProductionRepository(),
+        offline_basemap_packages={"gaode": package},
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            high_context = await service.build_map_context(
+                session,
+                binding.production_task_id,
+            )
+    high_result = await renderer.render(
+        MapSpecBuilder().build(high_context),
+        tmp_path / "deaths-high.jpg",
+    )
+
+    assert _central_map_red_mean(high_result.path) > _central_map_red_mean(
+        low_result.path
+    )
 
 
 @pytest.mark.parametrize(
     (
         "artifact_key",
+        "product_key",
         "product_type",
         "metrics",
         "publish_towns",
@@ -922,6 +1556,7 @@ async def test_product_metric_full_chain_render(
     (
         (
             "map.economic_loss",
+            "loss.economic",
             "economic_loss",
             (("total_loss_yuan", 1_250_000, "available", "yuan"),),
             True,
@@ -930,6 +1565,7 @@ async def test_product_metric_full_chain_render(
         ),
         (
             "map.rescue_demand",
+            "loss.resources",
             "resource_demand",
             (("rescue_team.quantity", 5, "available", "count"),),
             False,
@@ -938,6 +1574,7 @@ async def test_product_metric_full_chain_render(
         ),
         (
             "map.material_demand",
+            "loss.resources",
             "resource_demand",
             tuple(
                 (f"{kind}.quantity", index, "available", "count")
@@ -962,6 +1599,7 @@ async def test_product_metric_full_chain_render(
         ),
         (
             "map.building_damage",
+            "loss.buildings",
             "building_damage",
             (("severe_or_collapsed_area_m2", 300.5, "available", "m2"),),
             True,
@@ -976,6 +1614,7 @@ async def test_product_map_matrix_renders_frozen_sources(
     production_renderer,
     tmp_path: Path,
     artifact_key,
+    product_key,
     product_type,
     metrics,
     publish_towns,
@@ -988,6 +1627,7 @@ async def test_product_map_matrix_renders_frozen_sources(
         production_renderer=production_renderer,
         tmp_path=tmp_path,
         artifact_key=artifact_key,
+        product_key=product_key,
         product_type=product_type,
         metrics=metrics,
         publish_towns=publish_towns,
@@ -997,10 +1637,21 @@ async def test_product_map_matrix_renders_frozen_sources(
     feature = metric_layer.source["data"]["features"][0]
     for property_name, expected_value in expected_properties.items():
         assert feature["properties"][property_name] == expected_value
+    metric_property = next(
+        binding["property_name"]
+        for binding in metric_layer.metadata["attribute_bindings"]
+        if binding.get("metric_key")
+    )
+    assert metric_layer.style["paint"]["fill-color"][2] == ["get", metric_property]
     assert result.non_empty_ratio > 0.2
     assert len(result.checksum) == 64
-    assert result.render_manifest["layer_checksums"][layer_id]
-    assert result.render_manifest["layer_versions"][layer_id] != "v1"
+    binding = await _dependency_binding(
+        session_factory,
+        context.production_task_id,
+        product_key,
+    )
+    assert result.render_manifest["layer_checksums"][layer_id] == binding.bound_checksum
+    assert result.render_manifest["layer_versions"][layer_id] == binding.bound_version
 
 
 @pytest.mark.parametrize(

@@ -348,6 +348,16 @@ async def save_raster_version(
         ),
         {"id": raster_id, "checksum": canonical_checksum},
     )
+    await session.execute(
+        text(
+            """
+            UPDATE data_asset_versions
+            SET checksum = :checksum
+            WHERE id = :version_id
+            """
+        ),
+        {"version_id": version_id, "checksum": canonical_checksum},
+    )
     await _verify_saved_raster(session, raster_id, descriptor)
     return raster_id
 

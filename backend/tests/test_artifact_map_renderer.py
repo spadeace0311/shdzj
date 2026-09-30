@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import pytest
 from PIL import Image
-from sqlalchemy import select
 
 from app.artifacts.basemap import (
     MapViewportTileManifest,
@@ -97,19 +96,6 @@ async def _publish_admin_city(session_factory) -> None:
     definition = get_asset_definition("shanghai.admin.city")
     async with session_factory() as session:
         async with session.begin():
-            from app.data_assets.models import DataAsset, DataAssetVersion
-
-            existing = await session.scalar(
-                select(DataAssetVersion)
-                .join(DataAsset, DataAssetVersion.asset_id == DataAsset.id)
-                .where(
-                    DataAsset.asset_key == definition.asset_key,
-                    DataAsset.region_id == definition.region_id,
-                    DataAssetVersion.status == "published",
-                )
-            )
-            if existing is not None:
-                return
             job = await queue_import_job(
                 session,
                 QueueImportRequest(
@@ -130,12 +116,12 @@ async def _publish_admin_city(session_factory) -> None:
                 ),
             )
             normalized = NormalizedTableData(
-                columns=("name",),
+                columns=("ID", "NAME"),
                 records=(
                     NormalizedRecord(
                         row_number=1,
                         business_key="shanghai",
-                        properties={"name": "Shanghai"},
+                        properties={"ID": "shanghai", "NAME": "Shanghai"},
                         geometry_wkt=(
                             "MULTIPOLYGON (((121.2 30.9, 121.8 30.9, "
                             "121.8 31.5, 121.2 31.5, 121.2 30.9)))"
@@ -155,15 +141,23 @@ async def _publish_admin_city(session_factory) -> None:
                     "source_crs": normalized.source_crs,
                 },
             )
-            version = await session.get(DataAssetVersion, job.asset_version_id)
-            if version is None:
-                raise LookupError("admin city candidate version not found")
-            version.status = "validated"
-            version.validated_at = datetime.now(UTC)
-            await session.flush()
-            version.status = "published"
-            version.reviewed_by = "map-renderer-fixture"
-            version.published_at = datetime.now(UTC)
+            service = DataAssetService()
+            report = await service.validate_version(
+                session,
+                job.asset_version_id,
+                actor="map-renderer-fixture",
+            )
+            if not report.publishable:
+                raise AssertionError(
+                    f"admin city fixture failed validation: "
+                    f"{[issue.message for issue in report.errors]}"
+                )
+            await service.publish_version(
+                session,
+                job.asset_version_id,
+                "map-renderer-fixture",
+                "map renderer admin city fixture",
+            )
 
 
 def _pixel_fraction(path: Path, predicate) -> float:
