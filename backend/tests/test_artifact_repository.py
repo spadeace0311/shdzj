@@ -13,6 +13,7 @@ from app.artifacts.models import (
     ProductionRun,
     ProductionTask,
 )
+from app.artifacts.domain import DependencyKind, DependencySpec
 from app.artifacts.repository import (
     ArtifactGenerationResult,
     ArtifactQuality,
@@ -352,6 +353,48 @@ async def test_complete_task_rejects_after_deadline(
         )
 
 
+@pytest.mark.parametrize("run_status", ["completed", "partial"])
+async def test_complete_task_rejects_terminal_run(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+    run_status,
+) -> None:
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "map.epicenter"
+    )
+    await artifact_repository.freeze_task_fingerprint(
+        session,
+        task.id,
+        "f" * 64,
+    )
+    await artifact_repository.start_task(session, task.id, "terminal-result")
+    run.status = run_status
+    await session.flush()
+
+    with pytest.raises(ValueError, match="terminal production run"):
+        await artifact_repository.complete_task(
+            session,
+            task.id,
+            ArtifactGenerationResult(
+                file_name="terminal.jpg",
+                format="jpg",
+                storage_path="objects/terminal.jpg",
+                checksum="c" * 64,
+                size_bytes=100,
+                quality=ArtifactQuality(grade="A"),
+                generated_at=run.deadline_at - timedelta(seconds=1),
+            ),
+            "succeeded",
+        )
+
+
 async def test_prepare_dependencies_binds_real_assessment_product(
     seeded_artifact_assessment,
     artifact_repository,
@@ -418,6 +461,94 @@ async def test_prepare_dependencies_omits_optional_artifacts_after_wait_cutoff(
     assert {binding.resolution_status for binding in bindings} == {
         "omitted_after_wait"
     }
+
+
+async def test_optional_dependencies_block_ready_and_fingerprint_until_cutoff(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session_factory,
+) -> None:
+    service = ArtifactProductionService(
+        session_factory=session_factory,
+        repository=artifact_repository,
+    )
+    optional_dependency = DependencySpec(
+        kind=DependencyKind.ARTIFACT,
+        key="map.epicenter",
+        output_profile="a3v-professional",
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            run = await artifact_repository.create_run(
+                session,
+                seeded_artifact_assessment.full_run_command(),
+            )
+            task = next(
+                item
+                for item in await artifact_repository.list_tasks(session, run.id)
+                if item.artifact_key == "doc.rapid_report"
+            )
+            task.depends_on = []
+            task.optional_depends_on = [optional_dependency.to_dict()]
+            task.optional_dependency_wait_cutoff_at = datetime.now(UTC) + timedelta(
+                seconds=60
+            )
+            await artifact_repository.create_input_snapshot(
+                session,
+                run.id,
+                context_fingerprint="a" * 64,
+                region_id="shanghai",
+                manifest={"fixture": "optional-cutoff"},
+            )
+            task_id = task.id
+
+    async with session_factory() as session:
+        async with session.begin():
+            await artifact_repository.prepare_dependencies(session, run.id)
+            task = await session.get(ProductionTask, task_id)
+            assert task is not None
+            assert task.status == "pending"
+            assert task.input_fingerprint is None
+            binding_count = await session.scalar(
+                select(func.count())
+                .select_from(ArtifactTaskDependencyBinding)
+                .where(
+                    ArtifactTaskDependencyBinding.production_task_id == task.id
+                )
+            )
+            assert binding_count == 0
+
+    with pytest.raises(ValueError, match="not ready"):
+        await service.prepare_task(task_id)
+
+    async with session_factory() as session:
+        async with session.begin():
+            task = await session.get(ProductionTask, task_id)
+            assert task is not None
+            task.optional_dependency_wait_cutoff_at = datetime.now(UTC) - timedelta(
+                seconds=1
+            )
+
+    async with session_factory() as session:
+        async with session.begin():
+            await artifact_repository.prepare_dependencies(session, run.id)
+            task = await session.get(ProductionTask, task_id)
+            assert task is not None
+            assert task.status == "ready"
+            bindings = (
+                await session.scalars(
+                    select(ArtifactTaskDependencyBinding).where(
+                        ArtifactTaskDependencyBinding.production_task_id
+                        == task.id
+                    )
+                )
+            ).all()
+            assert [binding.resolution_status for binding in bindings] == [
+                "omitted_after_wait"
+            ]
+
+    render_input = await service.prepare_task(task_id)
+    assert len(render_input.input_fingerprint) == 64
 
 
 async def test_bind_dependency_rejects_wrong_resolution_shape(
@@ -624,6 +755,117 @@ async def test_publish_database_failure_rolls_back_old_publication(
         )
     assert current is not None
     assert current.artifact_id == published.id
+
+
+async def test_finalize_before_deadline_rejects_unfinished_tasks(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    tasks = await artifact_repository.list_tasks(session, run.id)
+    await artifact_repository.mark_task_succeeded_for_test(
+        session,
+        tasks[0].id,
+        observed_at=run.deadline_at - timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="unfinished"):
+        await artifact_repository.finalize_run(
+            session,
+            run.id,
+            observed_at=run.deadline_at - timedelta(seconds=1),
+        )
+
+
+@pytest.mark.parametrize(
+    "run_status",
+    ["completed", "partial", "failed", "canceled"],
+)
+async def test_fail_task_rejects_terminal_run(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+    run_status,
+) -> None:
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "map.epicenter"
+    )
+    run.status = run_status
+    await session.flush()
+
+    with pytest.raises(ValueError, match="terminal production run"):
+        await artifact_repository.fail_task(
+            session,
+            task.id,
+            "render_failed",
+            "renderer exited",
+        )
+
+
+@pytest.mark.parametrize("task_status", ["timed_out", "canceled"])
+async def test_fail_task_rejects_terminal_task(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+    task_status,
+) -> None:
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "map.epicenter"
+    )
+    task.status = task_status
+    await session.flush()
+
+    with pytest.raises(ValueError, match="terminal task"):
+        await artifact_repository.fail_task(
+            session,
+            task.id,
+            "render_failed",
+            "renderer exited",
+        )
+
+
+async def test_timeout_run_does_not_mark_deadline_without_timeouts(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    tasks = await artifact_repository.list_tasks(session, run.id)
+    committed_at = run.deadline_at - timedelta(seconds=1)
+    for task in tasks:
+        await artifact_repository.mark_task_succeeded_for_test(
+            session,
+            task.id,
+            observed_at=committed_at,
+        )
+
+    finalized = await artifact_repository.timeout_run(
+        session,
+        run.id,
+        observed_at=run.deadline_at + timedelta(seconds=1),
+    )
+
+    assert finalized.status == "completed"
+    assert finalized.deadline_exceeded_at is None
 
 
 async def test_service_initial_run_preserves_assessment_deadlines(

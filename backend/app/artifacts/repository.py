@@ -621,6 +621,7 @@ class ArtifactProductionRepository:
         ).all()
         prepared: list[ProductionTask] = []
         for task in tasks:
+            now = datetime.now(UTC)
             existing = {
                 (
                     binding.dependency_kind,
@@ -637,6 +638,7 @@ class ArtifactProductionRepository:
                 ).all()
             }
             hard_satisfied = True
+            optional_satisfied = True
             for dependency, is_optional in (
                 *((item, False) for item in _task_dependencies(task.depends_on)),
                 *(
@@ -650,12 +652,21 @@ class ArtifactProductionRepository:
                     dependency.output_profile,
                 )
                 if identity in existing:
-                    if (
-                        not is_optional
-                        and existing[identity].resolution_status
-                        not in {"bound", "degraded"}
-                    ):
+                    resolution_status = existing[identity].resolution_status
+                    if not is_optional and resolution_status not in {
+                        "bound",
+                        "degraded",
+                    }:
                         hard_satisfied = False
+                    elif is_optional and resolution_status not in {
+                        "bound",
+                        "degraded",
+                        "failed",
+                        "timed_out",
+                        "canceled",
+                        "omitted_after_wait",
+                    }:
+                        optional_satisfied = False
                     continue
                 resolved = await self._resolve_dependency(session, run, dependency)
                 if resolved is None:
@@ -663,7 +674,7 @@ class ArtifactProductionRepository:
                         hard_satisfied = False
                     elif (
                         task.optional_dependency_wait_cutoff_at is not None
-                        and datetime.now(UTC)
+                        and now
                         >= task.optional_dependency_wait_cutoff_at
                     ):
                         await self.bind_dependency(
@@ -683,9 +694,11 @@ class ArtifactProductionRepository:
                                 resolution_detail={
                                     "reason": "optional dependency not ready"
                                 },
-                                resolved_at=datetime.now(UTC),
+                                resolved_at=now,
                             ),
                         )
+                    else:
+                        optional_satisfied = False
                     continue
                 await self.bind_dependency(
                     session,
@@ -704,12 +717,16 @@ class ArtifactProductionRepository:
                             else "bound"
                         ),
                         resolution_detail={"source": resolved["source"]},
-                        resolved_at=datetime.now(UTC),
+                        resolved_at=now,
                     ),
                 )
-            if hard_satisfied and task.status == "pending":
+            if (
+                hard_satisfied
+                and optional_satisfied
+                and task.status == "pending"
+            ):
                 task.status = "ready"
-                task.updated_at = datetime.now(UTC)
+                task.updated_at = now
             prepared.append(task)
         await session.flush()
         return tuple(prepared)
@@ -866,6 +883,8 @@ class ArtifactProductionRepository:
         if artifact_result.task_status != task_status:
             raise ValueError("artifact result task status does not match completion")
         task, run = await self._lock_task(session, task_id)
+        if run.status in {"completed", "partial", "failed", "canceled"}:
+            raise ValueError("terminal production run cannot commit artifacts")
         if task.status in {"succeeded", "degraded"} and task.final_artifact_id is not None:
             existing = await session.get(
                 GeneratedArtifact,
@@ -884,8 +903,6 @@ class ArtifactProductionRepository:
             raise ValueError("task must be running before it can complete")
         if not run.is_current or run.superseded_at is not None:
             raise ValueError("superseded production run cannot commit artifacts")
-        if run.status in {"canceled", "failed"}:
-            raise ValueError("terminal production run cannot commit artifacts")
 
         now = artifact_result.generated_at or datetime.now(UTC)
         now = _normalize_utc(now, "generated_at")
@@ -990,10 +1007,16 @@ class ArtifactProductionRepository:
         if not error_category.strip() or not error_summary.strip():
             raise ValueError("task error category and summary must not be empty")
         task, run = await self._lock_task(session, task_id)
-        if task.status in {"succeeded", "degraded"}:
-            raise ValueError("successful task cannot be failed")
-        if task.status == "canceled":
-            raise ValueError("canceled task cannot be failed")
+        if run.status in {"completed", "partial", "failed", "canceled"}:
+            raise ValueError("terminal production run cannot fail tasks")
+        if task.status in {
+            "succeeded",
+            "degraded",
+            "failed",
+            "timed_out",
+            "canceled",
+        }:
+            raise ValueError("terminal task cannot be failed")
         now = datetime.now(UTC)
         task.status = "failed"
         task.completed_at = now
@@ -1041,8 +1064,6 @@ class ArtifactProductionRepository:
             if task.deadline_exceeded_at is None:
                 task.deadline_exceeded_at = observed_at
             task.updated_at = observed_at
-        if run.deadline_exceeded_at is None:
-            run.deadline_exceeded_at = observed_at
         run.updated_at = observed_at
         await session.flush()
         return await self.finalize_run(session, run.id, observed_at)
@@ -1075,7 +1096,11 @@ class ArtifactProductionRepository:
             for task in tasks
             if task.status in {"pending", "ready", "running"}
         ]
-        if observed_at > run.deadline_at:
+        if unfinished and observed_at < run.deadline_at:
+            raise ValueError(
+                "cannot finalize production run with unfinished tasks before deadline"
+            )
+        if observed_at >= run.deadline_at:
             for task in unfinished:
                 task.status = "timed_out"
                 task.completed_at = observed_at

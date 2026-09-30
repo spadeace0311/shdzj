@@ -215,6 +215,8 @@ class ArtifactProductionService:
                 )
                 if task is None:
                     raise LookupError("artifact production task not found")
+                if task.status == "pending":
+                    raise ValueError("task dependencies are not ready")
                 bindings = (
                     await session.scalars(
                         select(ArtifactTaskDependencyBinding)
