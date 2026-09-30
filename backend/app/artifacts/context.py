@@ -24,6 +24,7 @@ from app.artifacts.basemap import (
 )
 from app.artifacts.domain import ArtifactCatalog, ArtifactKind, DependencyKind
 from app.artifacts.models import (
+    ArtifactTaskDependencyBinding,
     ArtifactTemplate,
     ArtifactTemplateVersion,
     GeneratedArtifact,
@@ -43,6 +44,8 @@ from app.data_assets.required_registry import (
     load_production_required_asset_registry,
 )
 from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.intensity.models import IntensityFieldProduct
+from app.loss.models import LossProduct
 from app.loss.region import load_region_loss_profile
 
 _RENDERER_VERSIONS = {
@@ -512,6 +515,12 @@ class ProductionContextService:
             production_task_id,
         )
         manifest = dict(snapshot.manifest)
+        manifest = await self._merge_task_document_manifest(
+            session,
+            task,
+            run,
+            manifest,
+        )
         artifact_paths, generated_assets = await self._resolve_generated_artifacts(
             session,
             run.id,
@@ -532,6 +541,165 @@ class ProductionContextService:
             marker=_mode_marker(run.production_mode),
             artifact_paths=artifact_paths,
         )
+
+    async def _merge_task_document_manifest(
+        self,
+        session: AsyncSession,
+        task: ProductionTask,
+        run: ProductionRun,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        bindings = (
+            await session.scalars(
+                select(ArtifactTaskDependencyBinding).where(
+                    ArtifactTaskDependencyBinding.production_task_id == task.id
+                )
+            )
+        ).all()
+        products: dict[str, dict[str, Any]] = {}
+        for binding in bindings:
+            if (
+                binding.dependency_kind != "assessment_product"
+                or binding.resolution_status not in {"bound", "degraded"}
+                or binding.bound_entity_id is None
+            ):
+                continue
+            if binding.dependency_key == "intensity.fusion":
+                product = await session.get(
+                    IntensityFieldProduct,
+                    binding.bound_entity_id,
+                )
+                if (
+                    product is None
+                    or product.run_id != run.assessment_run_id
+                    or product.output_checksum != binding.bound_checksum
+                ):
+                    continue
+                products[binding.dependency_key] = {
+                    "version": product.algorithm_version,
+                    "checksum": product.output_checksum,
+                    **dict(product.statistics or {}),
+                }
+                continue
+            loss_product_type = {
+                "loss.buildings": "building_damage",
+                "loss.population": "population_impact",
+                "loss.casualties": "casualties",
+                "loss.economic": "economic_loss",
+                "loss.resources": "resource_demand",
+                "loss.validate": "validation",
+            }.get(binding.dependency_key)
+            if loss_product_type is None:
+                continue
+            product = await session.get(LossProduct, binding.bound_entity_id)
+            if (
+                product is None
+                or product.run_id != run.assessment_run_id
+                or product.product_type != loss_product_type
+                or product.output_checksum != binding.bound_checksum
+            ):
+                continue
+            products[binding.dependency_key] = {
+                "version": product.algorithm_version,
+                "checksum": product.output_checksum,
+                **dict(product.statistics or {}),
+            }
+        if products:
+            assessment = dict(manifest.get("assessment") or {})
+            assessment["products"] = products
+            manifest["assessment"] = assessment
+
+        asset_versions = _frozen_asset_map(manifest.get("assets", ()))
+        manifest.update(
+            await self._build_background_payload(
+                session,
+                run,
+                asset_versions,
+            )
+        )
+        return manifest
+
+    async def _build_background_payload(
+        self,
+        session: AsyncSession,
+        run: ProductionRun,
+        asset_versions: Mapping[str, FrozenAssetVersion],
+    ) -> dict[str, Any]:
+        historical_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.historical.earthquakes",
+        )
+        historical = _background_historical_payload(historical_records)
+
+        distance_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.distance.reference_points",
+        )
+        spatial = _background_spatial_payload(distance_records)
+
+        target_definitions = (
+            ("shelter", "避难场所", "shanghai.shelter.emergency"),
+            ("school", "学校", "shanghai.education.school"),
+            ("hospital", "医院", "shanghai.health.hospital"),
+            ("hazard_source", "危险源", "shanghai.hazard_source"),
+            ("rescue_team", "救援队伍", "shanghai.rescue_team"),
+            ("cultural_relic", "文物单位", "shanghai.cultural_relic"),
+            ("key_target", "重点目标", "shanghai.key_target"),
+        )
+        targets: dict[str, str] = {}
+        for key, label, asset_key in target_definitions:
+            records, _ = await self._frozen_records(
+                session,
+                asset_versions,
+                asset_key,
+            )
+            if records:
+                targets[key] = f"{label} {len(records)} 处"
+            else:
+                targets[key] = f"数据不可用，待复核：{asset_key}"
+
+        admin_records, _ = await self._frozen_records(
+            session,
+            asset_versions,
+            "shanghai.admin.city",
+        )
+        if not admin_records:
+            admin_records, _ = await self._frozen_records(
+                session,
+                asset_versions,
+                "shanghai.admin.town",
+            )
+        area_overview = _background_overview_payload(
+            admin_records,
+            targets,
+        )
+        return {
+            "historical_earthquakes": historical,
+            "spatial_distances": spatial,
+            "targets": targets,
+            "area_overview": area_overview,
+        }
+
+    async def _frozen_records(
+        self,
+        session: AsyncSession,
+        asset_versions: Mapping[str, FrozenAssetVersion],
+        asset_key: str,
+    ) -> tuple[list[Any], FrozenAssetVersion | None]:
+        item = asset_versions.get(asset_key)
+        if (
+            item is None
+            or item.asset_version_id is None
+            or item.resolution_status != "bound"
+        ):
+            return [], item
+        records = await self._data_asset_repository.list_records(
+            session,
+            item.asset_version_id,
+        )
+        return records, item
 
     async def _resolve_generated_artifacts(
         self,
@@ -716,6 +884,87 @@ class ProductionContextService:
 
 def _isoformat(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _background_historical_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.historical.earthquakes"
+    if not records:
+        return {
+            "radius_km": f"数据不可用，待复核：{source}",
+            "magnitude_threshold": f"数据不可用，待复核：{source}",
+            "summary": f"数据不可用，待复核：{source}",
+            "disaster_summary": f"数据不可用，待复核：{source}",
+            "statistics": f"数据不可用，待复核：{source}",
+        }
+    properties = dict(records[0].properties or {})
+    return {
+        "radius_km": properties.get("radius_km", "数据不可用，待复核：radius_km"),
+        "magnitude_threshold": properties.get(
+            "magnitude_threshold",
+            "数据不可用，待复核：magnitude_threshold",
+        ),
+        "summary": properties.get("summary") or f"历史地震 {len(records)} 条",
+        "disaster_summary": properties.get("disaster_summary")
+        or f"灾害地震 {len(records)} 条",
+        "statistics": properties.get("statistics") or f"{len(records)} 条",
+    }
+
+
+def _background_spatial_payload(records: list[Any]) -> dict[str, Any]:
+    source = "shanghai.distance.reference_points"
+    if not records:
+        return {
+            key: f"数据不可用，待复核：{source}"
+            for key in (
+                "city_distance",
+                "county_distance",
+                "town_distance",
+                "major_city_distance",
+                "key_target_distance",
+                "fault_distance",
+            )
+        }
+    properties = dict(records[0].properties or {})
+    return {
+        key: properties.get(key, f"数据不可用，待复核：{source}.{key}")
+        for key in (
+            "city_distance",
+            "county_distance",
+            "town_distance",
+            "major_city_distance",
+            "key_target_distance",
+            "fault_distance",
+        )
+    }
+
+
+def _background_overview_payload(
+    admin_records: list[Any],
+    targets: Mapping[str, str],
+) -> dict[str, str]:
+    source = "shanghai.admin.city"
+    if not admin_records:
+        return {
+            "geography": f"数据不可用，待复核：{source}",
+            "administration": f"数据不可用，待复核：{source}",
+            "key_risks": f"数据不可用，待复核：{source}",
+        }
+    properties = dict(admin_records[0].properties or {})
+    key_risks = properties.get("key_risks")
+    if not key_risks:
+        key_risks = "；".join(
+            value
+            for value in targets.values()
+            if not value.startswith("数据不可用")
+        ) or f"数据不可用，待复核：{source}"
+    return {
+        "geography": properties.get("geography", f"数据不可用，待复核：{source}.geography"),
+        "administration": properties.get(
+            "administration",
+            f"数据不可用，待复核：{source}.administration",
+        ),
+        "key_risks": str(key_risks),
+    }
 
 
 def _assessment_product_types(catalog: ArtifactCatalog) -> list[str]:

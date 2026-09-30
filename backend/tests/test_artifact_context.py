@@ -14,6 +14,7 @@ from app.artifacts.basemap import (
 )
 from app.artifacts.context import ProductionContextService
 from app.artifacts.models import (
+    ArtifactTaskDependencyBinding,
     ArtifactTemplate,
     ArtifactTemplateVersion,
     GeneratedArtifact,
@@ -22,11 +23,12 @@ from app.artifacts.models import (
 )
 from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.storage import ArtifactStore
-from app.assessment.models import AssessmentRun
+from app.assessment.models import AssessmentRun, AssessmentTask
 from app.config import settings
-from app.data_assets.models import DataAsset, DataAssetVersion
+from app.data_assets.models import DataAsset, DataAssetRecord, DataAssetVersion
 from app.data_assets.registry import get_asset_definition
 from app.events.models import EarthquakeEvent
+from app.loss.models import LossProduct
 from app.loss.region import load_region_loss_profile
 from tests.basemap_fixtures import (
     make_in_memory_package,
@@ -39,6 +41,88 @@ from tests.data_asset_helpers import (
     _cleanup_fixture_data,
     publish_new_population_version,
 )
+
+
+async def _seed_document_data_asset(
+    session,
+    *,
+    asset_key: str,
+    properties: dict,
+) -> uuid.UUID:
+    try:
+        definition = get_asset_definition(asset_key)
+        region_id = definition.region_id
+        name = definition.name
+        data_type = definition.data_type.value
+        granularity = definition.spatial_granularity
+        responsibility = definition.responsibility_unit
+        update_interval = definition.update_interval_days
+        is_core = definition.is_core
+    except KeyError:
+        region_id = settings.data_asset_region_id
+        name = asset_key
+        data_type = "vector"
+        granularity = "point"
+        responsibility = "document-context-fixture"
+        update_interval = 365
+        is_core = False
+    asset = await session.scalar(
+        select(DataAsset).where(
+            DataAsset.asset_key == asset_key,
+            DataAsset.region_id == region_id,
+        )
+    )
+    if asset is None:
+        asset = DataAsset(
+            asset_key=asset_key,
+            region_id=region_id,
+            name=name,
+            data_type=data_type,
+            spatial_granularity=granularity,
+            responsibility_unit=responsibility,
+            update_interval_days=update_interval,
+            is_core=is_core,
+            contract={"business_key_fields": ["ID"]},
+        )
+        session.add(asset)
+        await session.flush()
+    version = DataAssetVersion(
+        asset_id=asset.id,
+        version=f"document-{uuid.uuid4()}",
+        status="imported",
+        source_uri="https://example.gov.invalid/document-data",
+        schema_summary={"columns": ["ID"]},
+        record_count=1,
+        source_crs="EPSG:4326",
+        checksum=hashlib.sha256(asset_key.encode()).hexdigest(),
+        imported_by=FIXTURE_ACTOR,
+        imported_at=datetime.now(UTC),
+    )
+    session.add(version)
+    await session.flush()
+    session.add(
+        DataAssetRecord(
+            version_id=version.id,
+            row_number=1,
+            business_key=f"{asset_key}-1",
+            properties=properties,
+            geom=None,
+        )
+    )
+    await session.flush()
+    return version.id
+
+
+def _snapshot_asset_entry(asset_key: str, version_id: uuid.UUID) -> dict:
+    return {
+        "asset_key": asset_key,
+        "role": "optional",
+        "resolution_status": "bound",
+        "asset_version_id": str(version_id),
+        "version": "document-v1",
+        "checksum": hashlib.sha256(asset_key.encode()).hexdigest(),
+        "coverage": {},
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -423,6 +507,176 @@ async def test_document_context_resolves_generated_artifact_path(
 
     assert context.artifact_paths["map.epicenter"] == stored.managed_path
     assert context.artifacts["map.epicenter"].checksum == stored.checksum
+
+
+async def test_document_context_merges_bound_assessment_products(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+    document_task = await seeded_artifact_assessment.first_task(
+        run.id,
+        "doc.housing",
+    )
+    assessment_task = AssessmentTask(
+        run_id=run.assessment_run_id,
+        task_key="loss.buildings",
+        task_type="loss",
+        component="document-context-fixture",
+        sequence=1,
+        status="succeeded",
+        deadline_at=run.deadline_at,
+    )
+    session.add(assessment_task)
+    await session.flush()
+    product = LossProduct(
+        run_id=run.assessment_run_id,
+        task_id=assessment_task.id,
+        product_type="building_damage",
+        status="complete",
+        quality_grade="L1",
+        calibration_status="calibrated",
+        coverage_ratio=1,
+        partial_scope=False,
+        needs_review=False,
+        spatialized_estimate=False,
+        algorithm_version="buildings-v1",
+        parameter_version="parameters-v1",
+        region_profile_version="region-v1",
+        input_fingerprint="a" * 64,
+        input_checksum="b" * 64,
+        output_checksum="c" * 64,
+        statistics={
+            "total": 10000,
+            "slight": 1200,
+            "moderate": 300,
+            "severe": 80,
+        },
+    )
+    session.add(product)
+    await session.flush()
+    session.add(
+        ArtifactTaskDependencyBinding(
+            production_task_id=document_task.id,
+            dependency_kind="assessment_product",
+            dependency_key="loss.buildings",
+            dependency_output_profile=None,
+            is_optional=False,
+            bound_entity_id=product.id,
+            bound_version=product.algorithm_version,
+            bound_checksum=product.output_checksum,
+            resolution_status="bound",
+            resolved_at=datetime.now(UTC),
+        )
+    )
+    await session.flush()
+
+    context = await production_context_service.build_document_context(
+        session,
+        document_task.id,
+        "docx",
+    )
+    products = context.manifest["assessment"]["products"]["loss.buildings"]
+
+    assert products["total"] == 10000
+    assert products["slight"] == 1200
+    assert products["moderate"] == 300
+    assert products["severe"] == 80
+
+
+async def test_document_context_builds_persisted_background_payload(
+    seeded_artifact_assessment,
+    production_context_service,
+    session,
+) -> None:
+    run = await seeded_artifact_assessment.create_full_run()
+    await production_context_service.freeze_static_context(
+        session,
+        run.id,
+        seeded_artifact_assessment.catalog,
+    )
+    snapshot = await session.scalar(
+        select(ProductionInputSnapshot).where(
+            ProductionInputSnapshot.production_run_id == run.id
+        )
+    )
+    assert snapshot is not None
+
+    historical_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.historical.earthquakes",
+        properties={
+            "radius_km": 50,
+            "magnitude_threshold": 3.0,
+            "summary": "半径内历史地震 12 条，最大震级 4.9",
+            "disaster_summary": "灾害地震 3 条，需复核",
+            "statistics": "12 条 / 3 条灾害",
+        },
+    )
+    distance_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.distance.reference_points",
+        properties={
+            "city_distance": 8.6,
+            "county_distance": 12.4,
+            "town_distance": 5.2,
+            "major_city_distance": 18.9,
+            "key_target_distance": 6.3,
+            "fault_distance": 21.7,
+        },
+    )
+    admin_version = await _seed_document_data_asset(
+        session,
+        asset_key="shanghai.admin.city",
+        properties={
+            "geography": "长江三角洲冲积平原，水网密集",
+            "administration": "上海市及邻近行政区",
+            "key_risks": "人口密集区、重点目标、危险源与断裂带",
+        },
+    )
+    assets = list(snapshot.manifest["assets"])
+    assets_by_key = {entry["asset_key"]: entry for entry in assets}
+    assets_by_key["shanghai.historical.earthquakes"] = _snapshot_asset_entry(
+        "shanghai.historical.earthquakes",
+        historical_version,
+    )
+    assets_by_key["shanghai.distance.reference_points"] = _snapshot_asset_entry(
+        "shanghai.distance.reference_points",
+        distance_version,
+    )
+    assets_by_key["shanghai.admin.city"] = _snapshot_asset_entry(
+        "shanghai.admin.city",
+        admin_version,
+    )
+    snapshot.manifest["assets"] = sorted(
+        assets_by_key.values(),
+        key=lambda item: item["asset_key"],
+    )
+    await session.flush()
+
+    document_task = await seeded_artifact_assessment.first_task(
+        run.id,
+        "doc.background",
+    )
+    context = await production_context_service.build_document_context(
+        session,
+        document_task.id,
+        "docx",
+    )
+
+    assert context.manifest["historical_earthquakes"]["summary"] == (
+        "半径内历史地震 12 条，最大震级 4.9"
+    )
+    assert context.manifest["spatial_distances"]["city_distance"] == 8.6
+    assert context.manifest["area_overview"]["administration"] == (
+        "上海市及邻近行政区"
+    )
 
 
 async def test_missing_but_optional_asset_is_recorded_not_invented(

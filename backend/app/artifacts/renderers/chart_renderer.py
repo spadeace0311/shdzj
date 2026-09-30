@@ -20,15 +20,19 @@ from app.config import settings
 
 CHART_RENDERER_VERSION = "artifact-chart-renderer-v1"
 FONT_FAMILY = "Noto Sans CJK SC"
+_RESOLVED_FONT_FAMILY = FONT_FAMILY
 
 
 def _configure_font() -> None:
+    global _RESOLVED_FONT_FAMILY
+
     font_path = Path(settings.artifact_font_path)
     if not font_path.is_file():
         raise FileNotFoundError(f"artifact font file does not exist: {font_path}")
     font_manager.fontManager.addfont(str(font_path))
     properties = font_manager.FontProperties(fname=str(font_path))
     family = properties.get_name() or FONT_FAMILY
+    _RESOLVED_FONT_FAMILY = family
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = [family, FONT_FAMILY, "DejaVu Sans"]
 
@@ -115,7 +119,7 @@ class ChartRenderer:
             "source_note": spec.source_note,
             "renderer_version": CHART_RENDERER_VERSION,
             "matplotlib_backend": "Agg",
-            "font_family": FONT_FAMILY,
+            "font_family": _RESOLVED_FONT_FAMILY,
             "marker_baked": spec.marker is not None,
             "marker": spec.marker,
             "quality": spec.quality.to_dict(),

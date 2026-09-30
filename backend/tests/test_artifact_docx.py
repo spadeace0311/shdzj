@@ -123,7 +123,16 @@ async def test_docx_contains_mode_marker_in_filename_body_manifest_and_chart(
     assert result.render_manifest["marker"] == marker
     chart_path = Path(result.render_manifest["image_paths"]["population-impact"])
     image = np.asarray(Image.open(chart_path).convert("RGB"))
-    assert np.any(image[40:100, 40:180] < 245)
+    height, width = image.shape[:2]
+    marker_region = image[
+        int(height * 0.70):height,
+        int(width * 0.60):width,
+    ]
+    assert np.any(
+        (marker_region[:, :, 0] > 120)
+        & (marker_region[:, :, 1] < 90)
+        & (marker_region[:, :, 2] < 90)
+    )
 
 
 async def test_docx_reuses_the_same_map_checksum_for_repeated_reference(
@@ -181,7 +190,7 @@ async def test_chart_renderer_generates_deterministic_local_png(
 
     assert first.checksum == second.checksum
     assert first.render_manifest["image_checksums"]["population-age"] == first.checksum
-    assert first.render_manifest["font_family"] == "Noto Sans CJK SC"
+    assert first.render_manifest["font_family"].startswith("Noto Sans CJK")
     assert first.render_manifest["marker_baked"] is True
     with Image.open(first_path) as image:
         assert image.size == (spec.width, spec.height)
@@ -363,3 +372,20 @@ async def test_background_documents_use_concrete_manifest_values(
 
     for expected in expected_values:
         assert expected in text
+
+
+async def test_doc_background_uses_administration_scalar_not_dict(
+    seeded_artifact_assessment,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await seeded_artifact_assessment.document_context("doc.background")
+    result = await docx_renderer.render(
+        build_background_document_spec(context, "doc.background"),
+        tmp_path / "background.docx",
+    )
+    text = "\n".join(paragraph.text for paragraph in Document(result.path).paragraphs)
+    normalized_text = text.replace("\n", "")
+
+    assert "上海市及邻近行政区" in normalized_text
+    assert "{'geography'" not in normalized_text

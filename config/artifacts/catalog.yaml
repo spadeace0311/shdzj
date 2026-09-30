@@ -692,6 +692,7 @@ artifacts:
       - {kind: artifact, key: doc.population, output_profile: a3v-professional}
       - {kind: artifact, key: doc.key_targets, output_profile: a3v-professional}
       - {kind: artifact, key: doc.spatial_distances, output_profile: a3v-professional}
+      - {kind: artifact, key: map.epicenter, output_profile: a3v-professional}
     optional_depends_on: []
     required_assets: []
     optional_assets: []

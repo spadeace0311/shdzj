@@ -354,6 +354,7 @@ def test_catalog_has_exact_document_dependencies() -> None:
         ("artifact", "doc.population", profile),
         ("artifact", "doc.key_targets", profile),
         ("artifact", "doc.spatial_distances", profile),
+        ("artifact", "map.epicenter", profile),
     }
     assert hard("doc.rapid_brief") == {
         ("assessment_product", "intensity.fusion", None),

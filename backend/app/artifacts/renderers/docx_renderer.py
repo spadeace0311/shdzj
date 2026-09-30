@@ -152,12 +152,16 @@ def _product_payload(manifest: Mapping[str, Any], product_key: str) -> Mapping[s
     return {}
 
 
-def _metric(payload: Mapping[str, Any], *keys: str) -> str:
+def _metric(
+    payload: Mapping[str, Any],
+    *keys: str,
+    source: str = "document context",
+) -> str:
     for key in keys:
         value = payload.get(key)
         if value is not None and str(value).strip():
             return str(value)
-    return "数据不可用，待复核"
+    return f"数据不可用，待复核：{source}"
 
 
 def _manifest_value(
@@ -613,12 +617,10 @@ def _background_sections(
                 "所在行政区",
                 (
                     _manifest_value(
-                        manifest,
-                        "area_overview",
+                        overview,
+                        "administration",
                         source="assessment manifest / area_overview.administration",
                     )
-                    if isinstance(manifest.get("area_overview"), Mapping)
-                    else "数据不可用，待复核：assessment manifest / area_overview",
                 ),
             ),
             DocumentSection(
