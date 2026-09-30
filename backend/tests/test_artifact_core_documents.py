@@ -199,6 +199,8 @@ async def _seed_assessment_products_and_bindings(
     seeded_artifact_assessment,
     run,
     tasks_by_key,
+    *,
+    product_version_overrides: dict[str, str] | None = None,
 ) -> None:
     now = datetime.now(UTC)
     assessment_run_id = seeded_artifact_assessment.assessment_run_id
@@ -226,6 +228,7 @@ async def _seed_assessment_products_and_bindings(
         return task
 
     product_ids: dict[str, uuid.UUID] = {}
+    product_rows: dict[str, IntensityFieldProduct | LossProduct] = {}
     intensity_task = await assessment_task("intensity.fusion", "intensity")
     intensity_checksum = EXPECTED_PRODUCT_METADATA["intensity.fusion"][1]
     intensity = IntensityFieldProduct(
@@ -248,6 +251,7 @@ async def _seed_assessment_products_and_bindings(
     session.add(intensity)
     await session.flush()
     product_ids["intensity.fusion"] = intensity.id
+    product_rows["intensity.fusion"] = intensity
 
     loss_products = (
         ("loss.buildings", "building_damage", {
@@ -303,8 +307,10 @@ async def _seed_assessment_products_and_bindings(
         session.add(product)
         await session.flush()
         product_ids[product_key] = product.id
+        product_rows[product_key] = product
 
     rapid_report_task_id = tasks_by_key["doc.rapid_report"].id
+    overrides = product_version_overrides or {}
     for product_key, (version, checksum) in EXPECTED_PRODUCT_METADATA.items():
         session.add(
             ArtifactTaskDependencyBinding(
@@ -320,6 +326,9 @@ async def _seed_assessment_products_and_bindings(
                 resolved_at=now,
             )
         )
+    await session.flush()
+    for product_key, wrong_version in overrides.items():
+        product_rows[product_key].algorithm_version = wrong_version
 
 
 async def _production_document_context(
@@ -327,6 +336,8 @@ async def _production_document_context(
     production_context_service: ProductionContextService,
     session_factory,
     artifact_key: str,
+    *,
+    product_version_overrides: dict[str, str] | None = None,
 ):
     run = await seeded_artifact_assessment.create_full_run()
     async with session_factory() as session:
@@ -388,6 +399,7 @@ async def _production_document_context(
                 seeded_artifact_assessment,
                 run,
                 tasks_by_key,
+                product_version_overrides=product_version_overrides,
             )
             for key in decision_map_keys:
                 stored = _store_artifact(
@@ -771,3 +783,25 @@ async def test_real_production_deck_renders_available_values(
     assert spec.quality.needs_review is False
     assert "数据不可用，待复核" not in all_text
     assert result.render_manifest["unresolved_placeholder_count"] == 0
+
+
+async def test_decision_report_rejects_bound_version_mismatch(
+    seeded_artifact_assessment,
+    production_context_service,
+    session_factory,
+    docx_renderer: DocxRenderer,
+    tmp_path: Path,
+) -> None:
+    context = await _production_document_context(
+        seeded_artifact_assessment,
+        production_context_service,
+        session_factory,
+        "doc.decision_report",
+        product_version_overrides={"loss.casualties": "wrong-version"},
+    )
+
+    with pytest.raises(FileNotFoundError, match="loss.casualties"):
+        await docx_renderer.render(
+            build_core_document_spec(context, "doc.decision_report"),
+            tmp_path / "decision.docx",
+        )

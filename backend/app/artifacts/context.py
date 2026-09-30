@@ -163,63 +163,6 @@ class DocumentRenderContext:
     def pptx_slide_count(self) -> int:
         return 8
 
-
-def _decision_report_products_from_artifact(
-    artifact: Any,
-    control_fields: object,
-) -> dict[str, dict[str, Any]]:
-    if not isinstance(control_fields, Mapping):
-        return {}
-    fields = dict(control_fields)
-    source_versions = str(fields.get("source_versions") or "")
-    products: dict[str, dict[str, Any]] = {}
-    for product_key, field_key in (
-        ("intensity.fusion", "intensity"),
-        ("loss.buildings", "buildings"),
-        ("loss.population", "population"),
-        ("loss.casualties", "casualties"),
-        ("loss.economic", "economy"),
-        ("loss.resources", "resources"),
-        ("loss.validate", "resources"),
-    ):
-        summary = fields.get(field_key)
-        if summary is None:
-            continue
-        payload: dict[str, Any] = {
-            "version": _source_version(source_versions, product_key)
-            or str(artifact.artifact_version),
-            "checksum": artifact.checksum,
-            "summary": summary,
-        }
-        if product_key == "intensity.fusion":
-            payload["grade"] = summary
-        elif product_key == "loss.buildings":
-            payload.update({"total": summary, "severe": summary})
-        elif product_key == "loss.population":
-            payload.update({"affected": summary, "resident": summary})
-        elif product_key == "loss.casualties":
-            payload.update({"deaths": summary, "injuries": summary})
-        elif product_key == "loss.economic":
-            payload.update({"loss": summary, "gdp": summary})
-        elif product_key == "loss.resources":
-            payload["demand"] = summary
-        elif product_key == "loss.validate":
-            payload["grade"] = summary
-        products[product_key] = payload
-    return products
-
-
-def _source_version(source_versions: str, product_key: str) -> str | None:
-    prefix = f"{product_key}: 版本 "
-    for line in source_versions.splitlines():
-        if not line.startswith(prefix):
-            continue
-        value = line[len(prefix):].split(" /", 1)[0].strip()
-        if value:
-            return value
-    return None
-
-
 def _merge_decision_background_fields(
     manifest: dict[str, Any],
     control_fields: object,
@@ -748,6 +691,7 @@ class ProductionContextService:
                     product is None
                     or product.run_id != run.assessment_run_id
                     or product.output_checksum != binding.bound_checksum
+                    or product.algorithm_version != binding.bound_version
                 ):
                     continue
                 products[binding.dependency_key] = {
@@ -772,6 +716,7 @@ class ProductionContextService:
                 or product.run_id != run.assessment_run_id
                 or product.product_type != loss_product_type
                 or product.output_checksum != binding.bound_checksum
+                or product.algorithm_version != binding.bound_version
             ):
                 continue
             products[binding.dependency_key] = {
