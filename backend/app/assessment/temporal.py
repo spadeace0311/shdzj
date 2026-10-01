@@ -18,6 +18,7 @@ from app.artifacts.workflow import (
     ArtifactProductionWorkflowInput,
     artifact_production_workflow_id,
 )
+from app.assessment.domain import AssessmentRevisionSupersededError
 
 if TYPE_CHECKING:
     from app.intensity.service import IntensityService
@@ -430,6 +431,8 @@ class AssessmentActivities:
         repository = AssessmentRepository()
         production_run_id = None
         artifact_workflow_input = None
+        stale_revision = False
+        stale_exception: AssessmentRevisionSupersededError | None = None
         async with self._session_factory() as session:
             async with session.begin():
                 run = await repository.ensure_run_from_outbox(
@@ -438,74 +441,106 @@ class AssessmentActivities:
                     revision_id=request.revision_id,
                     outbox_id=request.outbox_id,
                 )
-                await repository.start_run(session, run.id)
-                task_count = await repository.count_tasks(session, run.id)
-                task_deadlines = await repository.list_task_deadlines(
-                    session,
-                    run.id,
-                )
-                catalog = load_catalog(settings.artifact_catalog_path)
-                revision = await session.get(EarthquakeRevision, run.revision_id)
-                if revision is None:
-                    raise LookupError("assessment revision not found")
-                production_mode = {
-                    "formal": "live",
-                    "correction": "live",
-                    "manual": "manual",
-                    "test": "test",
-                    "drill": "drill",
-                    "replay": "replay",
-                }.get(revision.revision_kind)
-                if production_mode is None:
-                    raise ValueError(
-                        f"unsupported artifact production revision kind: "
-                        f"{revision.revision_kind}"
+                run = await repository.start_run(session, run.id)
+                if (
+                    run.status == "failed"
+                    and run.superseded_at is not None
+                ):
+                    stale_revision = True
+                    stale_exception = AssessmentRevisionSupersededError(
+                        run.revision_id
                     )
-                repository = ArtifactProductionRepository(catalog)
-                production = await repository.create_run(
-                    session,
-                    CreateProductionRunCommand(
-                        assessment_run_id=run.id,
-                        event_id=run.event_id,
-                        revision_id=run.revision_id,
-                        revision_no=revision.revision_no,
-                        production_mode=production_mode,
-                        launch_mode="assessment_child",
-                        deadline_basis_at=run.deadline_basis_at,
-                        deadline_at=run.deadline_at,
-                        deadline_kind="event_deadline",
-                        catalog_version=catalog.catalog_version,
-                        generation_scope="full",
-                        required_outputs=catalog.full_required_outputs(),
-                        snapshot={
-                            "launch": "assessment_child",
-                            "event_id": str(run.event_id),
-                            "revision_id": str(run.revision_id),
-                            "revision_no": revision.revision_no,
-                            "assessment_run_id": str(run.id),
-                        },
-                        reuse_existing=True,
-                    ),
-                )
-                tasks = await repository.list_tasks(session, production.id)
-                production_run_id = str(production.id)
-                artifact_workflow_input = ArtifactProductionWorkflowInput(
-                    production_run_id=production_run_id,
-                    assessment_run_id=str(run.id),
-                    event_id=str(run.event_id),
-                    revision_id=str(run.revision_id),
-                    deadline_at=production.deadline_at.isoformat(),
-                    catalog_version=catalog.catalog_version,
-                    context_fingerprint="",
-                    launch_mode="assessment_child",
-                    generation_seq=1,
-                    generation_scope="full",
-                    required_outputs=tuple(
-                        (task.artifact_key, task.output_profile)
-                        for task in tasks
-                    ),
-                    render_concurrency=settings.artifact_render_concurrency,
-                    deadline_basis_at=production.deadline_basis_at.isoformat(),
+                else:
+                    task_count = await repository.count_tasks(session, run.id)
+                    task_deadlines = await repository.list_task_deadlines(
+                        session,
+                        run.id,
+                    )
+                    catalog = load_catalog(settings.artifact_catalog_path)
+                    revision = await session.get(
+                        EarthquakeRevision,
+                        run.revision_id,
+                    )
+                    if revision is None:
+                        raise LookupError("assessment revision not found")
+                    production_mode = {
+                        "formal": "live",
+                        "correction": "live",
+                        "manual": "manual",
+                        "test": "test",
+                        "drill": "drill",
+                        "replay": "replay",
+                    }.get(revision.revision_kind)
+                    if production_mode is None:
+                        raise ValueError(
+                            "unsupported artifact production revision kind: "
+                            f"{revision.revision_kind}"
+                        )
+                    artifact_repository = ArtifactProductionRepository(catalog)
+                    try:
+                        production = await artifact_repository.create_run(
+                            session,
+                            CreateProductionRunCommand(
+                                assessment_run_id=run.id,
+                                event_id=run.event_id,
+                                revision_id=run.revision_id,
+                                revision_no=revision.revision_no,
+                                production_mode=production_mode,
+                                launch_mode="assessment_child",
+                                deadline_basis_at=run.deadline_basis_at,
+                                deadline_at=run.deadline_at,
+                                deadline_kind="event_deadline",
+                                catalog_version=catalog.catalog_version,
+                                generation_scope="full",
+                                required_outputs=catalog.full_required_outputs(),
+                                snapshot={
+                                    "launch": "assessment_child",
+                                    "event_id": str(run.event_id),
+                                    "revision_id": str(run.revision_id),
+                                    "revision_no": revision.revision_no,
+                                    "assessment_run_id": str(run.id),
+                                },
+                                reuse_existing=True,
+                            ),
+                        )
+                    except AssessmentRevisionSupersededError as exc:
+                        stale_revision = True
+                        await repository.terminalize_superseded_run(
+                            session,
+                            run,
+                        )
+                        production_run_id = None
+                        artifact_workflow_input = None
+                        stale_exception = exc
+                    else:
+                        tasks = await artifact_repository.list_tasks(
+                            session,
+                            production.id,
+                        )
+                        production_run_id = str(production.id)
+                        artifact_workflow_input = ArtifactProductionWorkflowInput(
+                            production_run_id=production_run_id,
+                            assessment_run_id=str(run.id),
+                            event_id=str(run.event_id),
+                            revision_id=str(run.revision_id),
+                            deadline_at=production.deadline_at.isoformat(),
+                            catalog_version=catalog.catalog_version,
+                            context_fingerprint="",
+                            launch_mode="assessment_child",
+                            generation_seq=1,
+                            generation_scope="full",
+                            required_outputs=tuple(
+                                (task.artifact_key, task.output_profile)
+                                for task in tasks
+                            ),
+                            render_concurrency=settings.artifact_render_concurrency,
+                            deadline_basis_at=production.deadline_basis_at.isoformat(),
+                        )
+            if stale_revision:
+                raise ApplicationError(
+                    str(stale_exception),
+                    type="assessment_revision_superseded",
+                    non_retryable=True,
                 )
         return PreparedAssessment(
             run_id=str(run.id),

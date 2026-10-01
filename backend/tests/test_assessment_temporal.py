@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import delete, func, select
 from temporalio import activity
+from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -20,9 +21,15 @@ from app.assessment.temporal import (
     AssessmentWorkflowInput,
     FinalizeAssessmentInput,
 )
+from app.artifacts.models import ProductionRun, ProductionTask
 from app.artifacts.worker import ArtifactActivities
-from app.artifacts.workflow import ArtifactProductionWorkflow
+from app.artifacts.workflow import (
+    ArtifactDependencyWaitInput,
+    ArtifactProductionWorkflow,
+    ArtifactTaskActivityInput,
+)
 from app.db import engine
+from app.config import settings
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, RawMessage
 from app.events.response_rules import ResponseInput
@@ -119,6 +126,331 @@ async def _create_workflow_input(session_factory) -> AssessmentWorkflowInput:
         revision_id=outcome.revision_id,
         outbox_id=str(outbox.id),
     )
+
+
+async def _ingest_superseding_correction(session_factory) -> None:
+    event = NormalizedEvent(
+        kind=EventKind.CORRECTION,
+        source="cenc",
+        source_event_id="CENC-TEMPORAL-1",
+        origin_time=datetime(2026, 9, 26, 3, 0, tzinfo=UTC),
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.3"),
+        place="上海测试位置",
+        report_time=datetime(2026, 9, 26, 3, 4, tzinfo=UTC),
+        report_number=2,
+    )
+    received_at = datetime(2026, 9, 26, 3, 5, tzinfo=UTC)
+    await EventService(session_factory).ingest_collected(
+        raw_payload={
+            "EventID": "CENC-TEMPORAL-1",
+            "type": "reviewed",
+            "number": 2,
+        },
+        event=event,
+        provider="fan",
+        lane="websocket",
+        received_at=received_at,
+        response_input=ResponseInput(
+            magnitude=event.magnitude,
+            depth_km=event.depth_km,
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            deaths=None,
+            max_intensity=Decimal("6"),
+        ),
+        region_context=RegionContext(
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            boundary_version="test-2026.1",
+            computed_at=received_at,
+        ),
+    )
+
+
+async def test_delayed_prepare_assessment_rejects_superseded_revision(
+    session_factory,
+) -> None:
+    request = await _create_workflow_input(session_factory)
+    await _ingest_superseding_correction(session_factory)
+
+    with pytest.raises(ApplicationError) as exc_info:
+        await AssessmentActivities(session_factory).prepare_assessment(request)
+
+    assert exc_info.value.type == "assessment_revision_superseded"
+    async with session_factory() as session:
+        assessment_run = await session.scalar(
+            select(AssessmentRun).where(
+                AssessmentRun.revision_id == UUID(request.revision_id)
+            )
+        )
+        assert assessment_run is not None
+        assessment_tasks = (
+            await session.scalars(
+                select(AssessmentTask).where(
+                    AssessmentTask.run_id == assessment_run.id
+                )
+            )
+        ).all()
+        production_runs = (
+            await session.scalars(
+                select(ProductionRun).where(
+                    ProductionRun.revision_id
+                    == UUID(request.revision_id)
+                )
+            )
+        ).all()
+        production_tasks = (
+            await session.scalars(
+                select(ProductionTask).join(
+                    ProductionRun,
+                    ProductionRun.id == ProductionTask.production_run_id,
+                ).where(
+                    ProductionRun.revision_id == UUID(request.revision_id)
+                )
+            )
+        ).all()
+
+    assert assessment_run.status == "failed"
+    assert assessment_run.superseded_at is not None
+    assert assessment_tasks
+    assert all(task.status == "failed" for task in assessment_tasks)
+    assert production_runs == []
+    assert production_tasks == []
+
+
+class _BlockingAssessmentRepository(AssessmentRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ensure_run_from_outbox(
+        self,
+        session,
+        *,
+        event_id,
+        revision_id,
+        outbox_id,
+    ):
+        self.entered.set()
+        await self.release.wait()
+        return await super().ensure_run_from_outbox(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            outbox_id=outbox_id,
+        )
+
+
+class _StaleArtifactActivities:
+    def __init__(self) -> None:
+        self.render_calls: list[str] = []
+        self.rendered = asyncio.Event()
+
+    @activity.defn(name="prepare_artifact_production")
+    async def prepare_artifact_production(self, request):
+        return {
+            "production_run_id": request.production_run_id,
+            "deadline_at": request.deadline_at,
+            "context_fingerprint": request.context_fingerprint,
+            "launch_mode": "standalone",
+            "background_outputs": [
+                list(item) for item in request.required_outputs
+            ],
+            "intensity_outputs": [],
+            "loss_core_outputs": [],
+            "loss_final_outputs": [],
+        }
+
+    @activity.defn(name="wait_for_artifact_dependencies")
+    async def wait_for_artifact_dependencies(
+        self,
+        request: ArtifactDependencyWaitInput,
+    ) -> ArtifactTaskActivityInput:
+        return ArtifactTaskActivityInput(
+            production_run_id=request.production_run_id,
+            production_task_id="00000000-0000-0000-0000-000000000001",
+            artifact_key=request.artifact_key,
+            output_profile=request.output_profile,
+            context_fingerprint="a" * 64,
+            input_fingerprint="b" * 64,
+            deadline_at=request.deadline_at,
+        )
+
+    @activity.defn(name="render_map_artifact")
+    async def render_map_artifact(self, request: ArtifactTaskActivityInput):
+        self.render_calls.append(request.artifact_key)
+        self.rendered.set()
+        return {"rendered": request.artifact_key}
+
+    @activity.defn(name="compose_docx_artifact")
+    async def compose_docx_artifact(self, request: ArtifactTaskActivityInput):
+        self.render_calls.append(request.artifact_key)
+        self.rendered.set()
+        return {"rendered": request.artifact_key}
+
+    @activity.defn(name="compose_pptx_artifact")
+    async def compose_pptx_artifact(self, request: ArtifactTaskActivityInput):
+        self.render_calls.append(request.artifact_key)
+        self.rendered.set()
+        return {"rendered": request.artifact_key}
+
+    @activity.defn(name="validate_artifact_production")
+    async def validate_artifact_production(self, request):
+        del request
+        return {"status": "completed"}
+
+    @activity.defn(name="publish_artifact_production")
+    async def publish_artifact_production(self, request):
+        del request
+        return {"status": "completed"}
+
+    @activity.defn(name="terminalize_artifact_production")
+    async def terminalize_artifact_production(self, request):
+        del request
+        return {"status": "failed"}
+
+    @activity.defn(name="cancel_artifact_production")
+    async def cancel_artifact_production(self, request):
+        del request
+        return {"status": "canceled"}
+
+    @activity.defn(name="mark_production_deadline_exceeded")
+    async def mark_production_deadline_exceeded(self, request):
+        del request
+        return None
+
+
+def _stale_assessment_activity(name: str):
+    @activity.defn(name=name)
+    async def _activity(*args, **kwargs):
+        del args, kwargs
+        return None
+
+    return _activity
+
+
+async def test_temporal_delayed_assessment_does_not_launch_stale_artifact_child(
+    session_factory,
+    monkeypatch,
+) -> None:
+    import app.assessment.repository as assessment_repository_module
+
+    request = await _create_workflow_input(session_factory)
+    blocking_repository = _BlockingAssessmentRepository()
+    monkeypatch.setattr(
+        assessment_repository_module,
+        "AssessmentRepository",
+        lambda: blocking_repository,
+    )
+    activities = AssessmentActivities(session_factory)
+    artifact_probe = _StaleArtifactActivities()
+    queue = f"assessment-stale-{uuid4()}"
+    client = await Client.connect(
+        settings.temporal_address,
+        namespace=settings.temporal_namespace,
+    )
+    try:
+        handle = await client.start_workflow(
+            AssessmentWorkflow.run,
+            request,
+            id=f"assessment-stale:{request.event_id}:{request.revision_id}",
+            task_queue=queue,
+        )
+        async with Worker(
+            client,
+            task_queue=queue,
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
+            activities=[
+                activities.prepare_assessment,
+                activities.mark_artifact_production_launched,
+                artifact_probe.prepare_artifact_production,
+                artifact_probe.wait_for_artifact_dependencies,
+                artifact_probe.render_map_artifact,
+                artifact_probe.compose_docx_artifact,
+                artifact_probe.compose_pptx_artifact,
+                artifact_probe.validate_artifact_production,
+                artifact_probe.publish_artifact_production,
+                artifact_probe.terminalize_artifact_production,
+                artifact_probe.cancel_artifact_production,
+                artifact_probe.mark_production_deadline_exceeded,
+                _stale_assessment_activity("run_intensity_model"),
+                _stale_assessment_activity("run_intensity_instrument"),
+                _stale_assessment_activity("run_intensity_fusion"),
+                _stale_assessment_activity("run_loss_buildings"),
+                _stale_assessment_activity("run_loss_population"),
+                _stale_assessment_activity("run_loss_casualties"),
+                _stale_assessment_activity("run_loss_economic"),
+                _stale_assessment_activity("run_loss_resources"),
+                _stale_assessment_activity("run_loss_validate"),
+                _stale_assessment_activity("mark_deadline_exceeded"),
+                _stale_assessment_activity("observe_task_deadlines"),
+                _stale_assessment_activity("finalize_assessment"),
+            ],
+            disable_eager_activity_execution=True,
+            graceful_shutdown_timeout=timedelta(seconds=5),
+        ):
+            await asyncio.wait_for(
+                blocking_repository.entered.wait(),
+                timeout=5,
+            )
+            await asyncio.wait_for(
+                _ingest_superseding_correction(session_factory),
+                timeout=5,
+            )
+            blocking_repository.release.set()
+            try:
+                await asyncio.wait_for(
+                    artifact_probe.rendered.wait(),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                pass
+            async with session_factory() as session:
+                stale_run = await session.scalar(
+                    select(ProductionRun).where(
+                        ProductionRun.revision_id
+                        == UUID(request.revision_id)
+                    )
+                )
+            if stale_run is not None:
+                try:
+                    await client.get_workflow_handle(
+                        f"artifact-production:{stale_run.id}"
+                    ).terminate(reason="stale race test cleanup")
+                except Exception:
+                    pass
+            try:
+                await handle.terminate(reason="stale race test cleanup")
+            except Exception:
+                pass
+    finally:
+        pass
+
+    assert artifact_probe.render_calls == []
+    async with session_factory() as session:
+        production_runs = (
+            await session.scalars(
+                select(ProductionRun).where(
+                    ProductionRun.revision_id == UUID(request.revision_id)
+                )
+            )
+        ).all()
+        production_tasks = (
+            await session.scalars(
+                select(ProductionTask).join(
+                    ProductionRun,
+                    ProductionRun.id == ProductionTask.production_run_id,
+                ).where(
+                    ProductionRun.revision_id == UUID(request.revision_id)
+                )
+            )
+        ).all()
+    assert production_runs == []
+    assert production_tasks == []
 
 
 def _test_intensity_service(session_factory):

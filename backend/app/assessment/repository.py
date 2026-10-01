@@ -519,13 +519,19 @@ class AssessmentRepository:
         )
         if run_event_id is None:
             raise LookupError("assessment run not found")
-        _, run = await self._lock_event_then_run(
+        event, run = await self._lock_event_then_run(
             session,
             run_event_id,
             run_id,
         )
         if run is None:
             raise LookupError("assessment run not found")
+        if (
+            event.current_revision_id != run.revision_id
+            or run.superseded_at is not None
+        ):
+            await self.terminalize_superseded_run(session, run)
+            return run
         if run.status in {"completed", "running"}:
             return run
         if run.status != "pending":
@@ -534,6 +540,34 @@ class AssessmentRepository:
         run.started_at = datetime.now(UTC)
         run.last_error = None
         return run
+
+    async def terminalize_superseded_run(
+        self,
+        session: AsyncSession,
+        run: AssessmentRun,
+    ) -> None:
+        now = datetime.now(UTC)
+        if run.status not in {"completed", "failed"}:
+            run.status = "failed"
+            run.completed_at = now
+            run.last_error = "assessment revision was superseded before production launch"
+        if run.superseded_at is None:
+            run.superseded_at = now
+        tasks = (
+            await session.scalars(
+                select(AssessmentTask)
+                .where(
+                    AssessmentTask.run_id == run.id,
+                    AssessmentTask.status.in_(("pending", "running")),
+                )
+                .with_for_update()
+            )
+        ).all()
+        for task in tasks:
+            task.status = "failed"
+            task.completed_at = now
+            task.last_error = run.last_error
+        await session.flush()
 
     async def complete_run(
         self,

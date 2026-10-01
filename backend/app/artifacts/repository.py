@@ -29,6 +29,7 @@ from app.artifacts.models import (
     ProductionTask,
 )
 from app.artifacts.workflow import artifact_production_workflow_id
+from app.assessment.domain import AssessmentRevisionSupersededError
 from app.assessment.models import AssessmentRun
 from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision
@@ -249,9 +250,18 @@ class ArtifactProductionRepository:
         )
         if event is None:
             raise LookupError("artifact production event not found")
-        revision = await session.get(EarthquakeRevision, command.revision_id)
+        revision = await session.get(
+            EarthquakeRevision,
+            command.revision_id,
+            with_for_update=True,
+        )
         if revision is None or revision.event_id != event.id:
             raise ValueError("artifact production revision does not belong to event")
+        if (
+            event.current_revision_id != revision.id
+            or not revision.is_current
+        ):
+            raise AssessmentRevisionSupersededError(revision.id)
         if revision.revision_no != command.revision_no:
             raise ValueError("artifact production revision number changed")
 
@@ -269,6 +279,8 @@ class ArtifactProductionRepository:
                 or assessment_run.revision_id != revision.id
             ):
                 raise ValueError("assessment run does not match event revision")
+            if assessment_run.superseded_at is not None:
+                raise AssessmentRevisionSupersededError(revision.id)
 
         expected_outputs = self.catalog.scope_required_outputs(
             command.generation_scope,
