@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 from app.artifacts import worker as artifact_worker
+from app.artifacts.renderers.base import RenderQuality, RenderResult
 from app.artifacts.worker import ArtifactActivities
-from app.artifacts.workflow import ArtifactDependencyWaitInput
+from app.artifacts.workflow import (
+    ArtifactDependencyWaitInput,
+    ArtifactTaskActivityInput,
+)
+
+
+class _NoopArtifactRepository:
+    async def complete_task(
+        self,
+        session,
+        task_id,
+        result,
+        task_status,
+    ):
+        del session, task_id, result, task_status
+        return None
 
 
 class BlockingReadySession:
@@ -120,6 +137,76 @@ async def test_dependency_waits_are_not_gated_by_render_slots(monkeypatch) -> No
     await asyncio.wait_for(asyncio.gather(*waits), timeout=1)
 
     assert session.entered == 4
+
+
+async def test_render_activity_heartbeats_during_long_render(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    heartbeats: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        artifact_worker.activity,
+        "heartbeat",
+        lambda *details: heartbeats.append(details),
+    )
+    monkeypatch.setattr(
+        artifact_worker,
+        "ArtifactProductionRepository",
+        _NoopArtifactRepository,
+    )
+    activities = ArtifactActivities(
+        lambda: None,
+        render_concurrency=1,
+        heartbeat_interval=0.01,
+    )
+    async def noop_commit(*args, **kwargs):
+        del args, kwargs
+
+    monkeypatch.setattr(
+        activities,
+        "_commit_rendered_artifact",
+        noop_commit,
+    )
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"image")
+    render_result = RenderResult(
+        path=source,
+        format="jpg",
+        width=10,
+        height=10,
+        dpi=72,
+        checksum="a" * 64,
+        quality=RenderQuality(grade="A", needs_review=False),
+        task_status="succeeded",
+        file_name="source.jpg",
+        render_manifest={"marker": None},
+        non_empty_ratio=0.5,
+        size_bytes=5,
+        generated_at=datetime.now(UTC),
+    )
+
+    async def slow_render(self, request, renderer):
+        del self, request, renderer
+        await asyncio.sleep(0.05)
+        return source, "source.jpg", render_result
+
+    monkeypatch.setattr(ArtifactActivities, "_render_map", slow_render)
+    request = ArtifactTaskActivityInput(
+        production_run_id=str(uuid4()),
+        production_task_id=str(uuid4()),
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        context_fingerprint="a" * 64,
+        input_fingerprint="b" * 64,
+        deadline_at=(datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+    )
+
+    await asyncio.wait_for(
+        activities.render_map_artifact(request),
+        timeout=2,
+    )
+
+    assert heartbeats
 
 
 async def test_artifact_worker_runs_retention_with_supplied_stop_event(

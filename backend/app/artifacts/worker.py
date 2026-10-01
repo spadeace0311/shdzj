@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 _DEPENDENCY_WAIT_SECONDS = 0.5
 _ACTIVITY_CONCURRENCY = 128
+_ARTIFACT_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 
 class ArtifactActivities:
@@ -83,18 +84,30 @@ class ArtifactActivities:
         store: ArtifactStore | None = None,
         validator: ArtifactValidator | None = None,
         renderer_factory: Callable[[], Any] | None = None,
+        heartbeat_interval: float = _ARTIFACT_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
+        if heartbeat_interval <= 0:
+            raise ValueError("heartbeat_interval must be positive")
         self._session_factory = session_factory
         self._context_service = context_service
         self._store = store
         self._validator = validator
         self._renderer_factory = renderer_factory
+        self._heartbeat_interval = heartbeat_interval
         self._render_slots = asyncio.Semaphore(
             render_concurrency
             if render_concurrency is not None
             else settings.artifact_render_concurrency
         )
         self._dependency_prepare_lock = asyncio.Lock()
+
+    async def _run_heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._heartbeat_interval)
+            try:
+                activity.heartbeat("artifact render in progress")
+            except RuntimeError:
+                return
 
     @property
     def _context(self) -> ProductionContextService:
@@ -298,6 +311,7 @@ class ArtifactActivities:
     async def render_map_artifact(self, request: ArtifactTaskActivityInput):
         pool: _TrackingBrowserPool | None = None
         staged: Path | None = None
+        heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
         try:
             async with self._render_slots:
                 pool = _TrackingBrowserPool()
@@ -343,12 +357,15 @@ class ArtifactActivities:
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
         finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
             if pool is not None:
                 await pool.close()
 
     @activity.defn(name="compose_docx_artifact")
     async def compose_docx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
+        heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
         try:
             async with self._render_slots:
                 staged, official_name, render_result = await self._render_document(
@@ -387,10 +404,14 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     @activity.defn(name="compose_pptx_artifact")
     async def compose_pptx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
+        heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
         try:
             async with self._render_slots:
                 staged, official_name, render_result = await self._render_document(
@@ -429,6 +450,9 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     @activity.defn(name="validate_artifact_production")
     async def validate_artifact_production(
