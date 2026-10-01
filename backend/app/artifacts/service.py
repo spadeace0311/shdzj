@@ -320,10 +320,27 @@ class ArtifactProductionService:
                 )
                 if production_run_id is None:
                     raise LookupError("artifact production task not found")
-                await self._repository.prepare_dependencies(
-                    session,
-                    production_run_id,
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:lock_key, 0))"
+                    ),
+                    {
+                        "lock_key": f"artifact-task-write:{production_run_id}",
+                    },
                 )
+                initial_status = await session.scalar(
+                    select(ProductionTask.status).where(
+                        ProductionTask.id == production_task_id
+                    )
+                )
+                if initial_status is None:
+                    raise LookupError("artifact production task not found")
+                if initial_status == "pending":
+                    await self._repository.prepare_dependencies(
+                        session,
+                        production_run_id,
+                    )
                 run = await session.get(
                     ProductionRun,
                     production_run_id,
@@ -331,13 +348,6 @@ class ArtifactProductionService:
                 )
                 if run is None:
                     raise LookupError("artifact production run not found")
-                if not run.is_current or run.superseded_at is not None:
-                    raise ValueError("superseded production run cannot prepare tasks")
-                if run.context_fingerprint is None:
-                    raise ValueError(
-                        "production input context must be frozen before task preparation"
-                    )
-
                 task = await session.get(
                     ProductionTask,
                     production_task_id,
@@ -345,6 +355,13 @@ class ArtifactProductionService:
                 )
                 if task is None:
                     raise LookupError("artifact production task not found")
+                if not run.is_current or run.superseded_at is not None:
+                    raise ValueError("superseded production run cannot prepare tasks")
+                if run.context_fingerprint is None:
+                    raise ValueError(
+                        "production input context must be frozen before task preparation"
+                    )
+
                 if task.status == "pending":
                     raise ValueError("task dependencies are not ready")
                 bindings = (
@@ -389,9 +406,9 @@ class ArtifactProductionService:
                     bindings=bindings,
                 )
                 if task.input_fingerprint is None:
-                    await self._repository.freeze_task_fingerprint(
+                    await self._repository.freeze_prepared_task_fingerprint(
                         session,
-                        task.id,
+                        task,
                         fingerprint,
                     )
                 elif task.input_fingerprint != fingerprint:

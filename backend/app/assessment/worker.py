@@ -20,6 +20,7 @@ from app.assessment.temporal import (
 from app.artifacts.worker import ArtifactActivities
 from app.artifacts.workflow import ArtifactProductionWorkflow
 from app.config import Settings, settings
+from app.artifacts.worker import _ACTIVITY_CONCURRENCY
 from app.db import SessionFactory
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,8 @@ def build_worker(
             artifact_activities.cancel_artifact_production,
             artifact_activities.mark_production_deadline_exceeded,
         ],
+        disable_eager_activity_execution=True,
+        max_concurrent_activities=_ACTIVITY_CONCURRENCY,
         graceful_shutdown_timeout=timedelta(seconds=10),
     )
 

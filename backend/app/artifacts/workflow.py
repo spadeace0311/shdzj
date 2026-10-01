@@ -160,6 +160,7 @@ class ArtifactProductionWorkflow:
         request: ArtifactProductionWorkflowInput,
     ) -> ArtifactProductionWorkflowResult:
         self._render_concurrency = request.render_concurrency
+        self._render_semaphore = asyncio.Semaphore(self._render_concurrency)
         prepared_payload = await workflow.execute_activity(
             "prepare_artifact_production",
             request,
@@ -379,14 +380,10 @@ class ArtifactProductionWorkflow:
         outputs: tuple[tuple[str, str], ...],
         prepared: ArtifactProductionPrepared,
     ) -> None:
-        semaphore = asyncio.Semaphore(self._render_concurrency)
-
-        async def _run_with_limit(artifact_key: str, output_profile: str) -> None:
-            async with semaphore:
-                await self._run_output(artifact_key, output_profile, prepared)
-
         tasks = [
-            asyncio.create_task(_run_with_limit(artifact_key, output_profile))
+            asyncio.create_task(
+                self._run_output(artifact_key, output_profile, prepared)
+            )
             for artifact_key, output_profile in outputs
         ]
         self._phase_tasks.extend(tasks)
@@ -427,30 +424,31 @@ class ArtifactProductionWorkflow:
                 non_retryable=True,
             )
 
-        if _is_map_artifact(artifact_key):
-            await workflow.execute_activity(
-                "render_map_artifact",
-                task_input,
-                start_to_close_timeout=timedelta(seconds=300),
-                heartbeat_timeout=timedelta(seconds=30),
-                retry_policy=_retry_policy(),
-            )
-        elif _is_pptx_artifact(artifact_key):
-            await workflow.execute_activity(
-                "compose_pptx_artifact",
-                task_input,
-                start_to_close_timeout=timedelta(seconds=300),
-                heartbeat_timeout=timedelta(seconds=30),
-                retry_policy=_retry_policy(),
-            )
-        else:
-            await workflow.execute_activity(
-                "compose_docx_artifact",
-                task_input,
-                start_to_close_timeout=timedelta(seconds=300),
-                heartbeat_timeout=timedelta(seconds=30),
-                retry_policy=_retry_policy(),
-            )
+        async with self._render_semaphore:
+            if _is_map_artifact(artifact_key):
+                await workflow.execute_activity(
+                    "render_map_artifact",
+                    task_input,
+                    start_to_close_timeout=timedelta(seconds=300),
+                    heartbeat_timeout=timedelta(seconds=30),
+                    retry_policy=_retry_policy(),
+                )
+            elif _is_pptx_artifact(artifact_key):
+                await workflow.execute_activity(
+                    "compose_pptx_artifact",
+                    task_input,
+                    start_to_close_timeout=timedelta(seconds=300),
+                    heartbeat_timeout=timedelta(seconds=30),
+                    retry_policy=_retry_policy(),
+                )
+            else:
+                await workflow.execute_activity(
+                    "compose_docx_artifact",
+                    task_input,
+                    start_to_close_timeout=timedelta(seconds=300),
+                    heartbeat_timeout=timedelta(seconds=30),
+                    retry_policy=_retry_policy(),
+                )
 
     async def _mark_deadline_when_due(
         self,

@@ -59,6 +59,8 @@ from app.loss.service import LossAssessmentService, LossChainPerformanceResult
 from app.main import app
 from app.regions.domain import RegionContext
 from app.regions.models import RegionBoundary
+from app.artifacts.worker import ArtifactActivities
+from app.artifacts.workflow import ArtifactProductionWorkflow
 
 
 LOSS_TEST_PREFIX = "LOSS-TEST-"
@@ -130,11 +132,12 @@ async def _execute_loss_workflow(
         loss_service_factory=loss_service_factory,
     )
     task_queue = f"loss-e2e-{uuid4()}"
+    artifact_activities = ArtifactActivities(session_factory)
     async with await WorkflowEnvironment.start_time_skipping() as environment:
         async with Worker(
             environment.client,
             task_queue=task_queue,
-            workflows=[AssessmentWorkflow],
+            workflows=[AssessmentWorkflow, ArtifactProductionWorkflow],
             activities=[
                 activities.prepare_assessment,
                 activities.run_intensity_model,
@@ -149,7 +152,19 @@ async def _execute_loss_workflow(
                 activities.mark_deadline_exceeded,
                 activities.observe_task_deadlines,
                 activities.finalize_assessment,
+                activities.mark_artifact_production_launched,
+                artifact_activities.prepare_artifact_production,
+                artifact_activities.wait_for_artifact_dependencies,
+                artifact_activities.render_map_artifact,
+                artifact_activities.compose_docx_artifact,
+                artifact_activities.compose_pptx_artifact,
+                artifact_activities.validate_artifact_production,
+                artifact_activities.publish_artifact_production,
+                artifact_activities.terminalize_artifact_production,
+                artifact_activities.cancel_artifact_production,
+                artifact_activities.mark_production_deadline_exceeded,
             ],
+            max_concurrent_activities=128,
         ):
             return await environment.client.execute_workflow(
                 AssessmentWorkflow.run,

@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from tests.data_asset_helpers import wait_for_import_job
@@ -126,7 +128,7 @@ async def test_rejected_import_job_exposes_validation_diagnostics(
     response = await data_asset_client.post(
         "/api/v1/data-assets/shanghai.admin.town/import",
         data={
-            "version": "rejected-diagnostics",
+            "version": f"rejected-diagnostics-{uuid4()}",
             "source_uri": "https://example.gov.invalid/town-invalid.geojson",
             "change_note": "invalid import",
         },

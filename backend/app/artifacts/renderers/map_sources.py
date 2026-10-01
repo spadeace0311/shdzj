@@ -462,6 +462,9 @@ class MapSourceResolver:
         } or bool(
             product_keys
             & {"loss.casualties", "loss.economic", "loss.buildings"}
+        ) or bool(
+            set(definition.required_assets)
+            & {"shanghai.building.town", "shanghai.population.town"}
         )
         needs_city_records = "loss.resources" in product_keys
 

@@ -18,15 +18,48 @@ from app.data_assets.import_jobs import (
     reject_import_job,
     sanitize_error,
 )
-from app.data_assets.models import DataAssetAuditLog, DataAssetImportJob
+from app.data_assets.models import (
+    DataAssetAuditLog,
+    DataAssetImportJob,
+    DataAssetVersion,
+)
 
 
 @pytest.fixture(autouse=True)
-async def _dispose_engine_between_tests():
+async def _dispose_engine_and_cleanup_tester_data_between_tests(session_factory):
+    from sqlalchemy import delete
+
     from app.db import engine
 
     await engine.dispose()
+    # This file tests the worker queue's oldest-job claim. Drain any queue
+    # rows left by unrelated acceptance fixtures before each test so the
+    # claim is scoped to the job created by this test.
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(DataAssetImportJob).where(
+                    DataAssetImportJob.status.in_(("queued", "running"))
+                )
+            )
     yield
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(DataAssetImportJob).where(
+                    DataAssetImportJob.requested_by == "tester"
+                )
+            )
+            await session.execute(
+                delete(DataAssetAuditLog).where(
+                    DataAssetAuditLog.actor == "tester"
+                )
+            )
+            await session.execute(
+                delete(DataAssetVersion).where(
+                    DataAssetVersion.imported_by == "tester"
+                )
+            )
     await engine.dispose()
 
 

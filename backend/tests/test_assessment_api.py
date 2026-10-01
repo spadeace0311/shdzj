@@ -245,7 +245,7 @@ async def test_get_current_assessment_returns_run_and_task_progress(session_fact
         "loss.economic",
         "loss.resources",
         "loss.validate",
-        "report.rapid_assessment",
+        "artifact.production",
         "workgroup.response_tasks",
     ]
     assert body["intensity"]["run_id"] == str(run_id)

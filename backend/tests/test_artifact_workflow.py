@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import os
 from uuid import uuid4
@@ -115,10 +115,27 @@ async def seeded_assessment_workflow(session_factory):
 
 
 class FakeArtifactActivities:
-    def __init__(self, *, block_keys: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        block_keys: set[str] | None = None,
+        wait_until_all: bool = False,
+        wait_expected_count: int = 0,
+        track_render_concurrency: bool = False,
+        render_concurrency: int = 1,
+    ) -> None:
         self.wait_calls: list[str] = []
         self.render_calls: list[str] = []
         self.block_keys = block_keys or set()
+        self.wait_until_all = wait_until_all
+        self.wait_expected_count = wait_expected_count
+        self.wait_entered_count = 0
+        self.wait_open = asyncio.Event()
+        self.track_render_concurrency = track_render_concurrency
+        self.render_concurrency = render_concurrency
+        self.render_active_count = 0
+        self.max_render_active_count = 0
+        self.render_cap_reached = asyncio.Event()
         self.terminalize_calls: list[str] = []
         self.cancel_calls: list[str] = []
 
@@ -155,6 +172,11 @@ class FakeArtifactActivities:
         self.wait_calls.append(key)
         if key in self.block_keys:
             await asyncio.Event().wait()
+        if self.wait_until_all:
+            self.wait_entered_count += 1
+            if self.wait_entered_count == self.wait_expected_count:
+                self.wait_open.set()
+            await self.wait_open.wait()
         return ArtifactTaskActivityInput(
             production_run_id=request.production_run_id,
             production_task_id=str(uuid4()),
@@ -167,32 +189,52 @@ class FakeArtifactActivities:
 
     @activity.defn(name="render_map_artifact")
     async def render_map_artifact(self, request: ArtifactTaskActivityInput):
-        self.render_calls.append(f"map:{request.artifact_key}")
-        return {"rendered": request.artifact_key}
+        await self._enter_render()
+        try:
+            self.render_calls.append(f"map:{request.artifact_key}")
+            return {"rendered": request.artifact_key}
+        finally:
+            self._leave_render()
 
     @activity.defn(name="compose_docx_artifact")
     async def compose_docx_artifact(self, request: ArtifactTaskActivityInput):
-        self.render_calls.append(f"docx:{request.artifact_key}")
-        return {"rendered": request.artifact_key}
+        await self._enter_render()
+        try:
+            self.render_calls.append(f"docx:{request.artifact_key}")
+            return {"rendered": request.artifact_key}
+        finally:
+            self._leave_render()
 
     @activity.defn(name="compose_pptx_artifact")
     async def compose_pptx_artifact(self, request: ArtifactTaskActivityInput):
-        self.render_calls.append(f"pptx:{request.artifact_key}")
-        return {"rendered": request.artifact_key}
+        await self._enter_render()
+        try:
+            self.render_calls.append(f"pptx:{request.artifact_key}")
+            return {"rendered": request.artifact_key}
+        finally:
+            self._leave_render()
 
     @activity.defn(name="validate_artifact_production")
     async def validate_artifact_production(
         self,
         request: ArtifactValidationInput,
     ):
-        return {"status": "completed", "completed_count": 4, "failed_count": 0}
+        return {
+            "status": "completed",
+            "completed_count": self.wait_expected_count or 4,
+            "failed_count": 0,
+        }
 
     @activity.defn(name="publish_artifact_production")
     async def publish_artifact_production(
         self,
         request: ArtifactPublicationInput,
     ):
-        return {"status": "completed", "completed_count": 4, "failed_count": 0}
+        return {
+            "status": "completed",
+            "completed_count": self.wait_expected_count or 4,
+            "failed_count": 0,
+        }
 
     @activity.defn(name="mark_production_deadline_exceeded")
     async def mark_production_deadline_exceeded(self, request):
@@ -208,6 +250,22 @@ class FakeArtifactActivities:
     async def cancel_artifact_production(self, request):
         self.cancel_calls.append(request["reason"])
         return {"status": "canceled", "completed_count": 0, "failed_count": 1}
+
+    async def _enter_render(self) -> None:
+        if not self.track_render_concurrency:
+            return
+        self.render_active_count += 1
+        self.max_render_active_count = max(
+            self.max_render_active_count,
+            self.render_active_count,
+        )
+        if self.render_active_count == self.render_concurrency:
+            self.render_cap_reached.set()
+        await self.render_cap_reached.wait()
+
+    def _leave_render(self) -> None:
+        if self.track_render_concurrency:
+            self.render_active_count -= 1
 
 
 def _fake_assessment_activity(name: str):
@@ -379,6 +437,65 @@ async def test_intensity_and_loss_signals_schedule_phases(
             task_queue="assessment-test",
         )
     assert "map.intensity:a3v-professional" in fake_artifacts.wait_calls
+
+
+async def test_dependency_waits_do_not_consume_render_concurrency(
+    temporal_env,
+) -> None:
+    outputs = tuple(
+        (f"map.test-{index}", "a3v-professional")
+        for index in range(8)
+    )
+    fake_artifacts = FakeArtifactActivities(
+        wait_until_all=True,
+        wait_expected_count=len(outputs),
+        track_render_concurrency=True,
+        render_concurrency=2,
+    )
+    request = ArtifactProductionWorkflowInput(
+        production_run_id=str(uuid4()),
+        assessment_run_id=str(uuid4()),
+        event_id=str(uuid4()),
+        revision_id=str(uuid4()),
+        deadline_at=(datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+        catalog_version="catalog-v1",
+        context_fingerprint="",
+        launch_mode="standalone",
+        generation_seq=1,
+        generation_scope="full",
+        required_outputs=outputs,
+        render_concurrency=2,
+    )
+
+    async with Worker(
+        temporal_env.client,
+        task_queue="assessment-test",
+        workflows=[ArtifactProductionWorkflow],
+        activities=[
+            fake_artifacts.prepare_artifact_production,
+            fake_artifacts.wait_for_artifact_dependencies,
+            fake_artifacts.render_map_artifact,
+            fake_artifacts.compose_docx_artifact,
+            fake_artifacts.compose_pptx_artifact,
+            fake_artifacts.validate_artifact_production,
+            fake_artifacts.publish_artifact_production,
+            fake_artifacts.terminalize_artifact_production,
+            fake_artifacts.cancel_artifact_production,
+            fake_artifacts.mark_production_deadline_exceeded,
+        ],
+        max_concurrent_activities=64,
+    ):
+        result = await temporal_env.client.execute_workflow(
+            ArtifactProductionWorkflow.run,
+            request,
+            id=f"artifact-concurrency:{request.production_run_id}",
+            task_queue="assessment-test",
+        )
+
+    assert result.status == "completed"
+    assert len(fake_artifacts.wait_calls) == len(outputs)
+    assert len(fake_artifacts.render_calls) == len(outputs)
+    assert fake_artifacts.max_render_active_count == 2
 
 
 def test_idempotency_key_is_exact() -> None:

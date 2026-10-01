@@ -136,12 +136,16 @@ class RecordingWorker:
         task_queue: str,
         workflows: list[object],
         activities: list[object],
+        disable_eager_activity_execution: bool,
+        max_concurrent_activities: int,
         graceful_shutdown_timeout: object,
     ) -> None:
         self.client = client
         self.task_queue = task_queue
         self.workflows = workflows
         self.activities = activities
+        self.disable_eager_activity_execution = disable_eager_activity_execution
+        self.max_concurrent_activities = max_concurrent_activities
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
 
 

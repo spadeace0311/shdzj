@@ -1071,6 +1071,10 @@ class ArtifactAcceptanceEnvironment:
         self._asset_ids: set[uuid.UUID] = set()
         self._version_ids: set[uuid.UUID] = set()
         self._seeded_runtime = False
+        self._task_queue = f"artifact-acceptance-{uuid.uuid4().hex}"
+        self._client = None
+        self._worker = None
+        self._worker_task = None
 
     async def seed(self) -> None:
         if self._seeded_runtime:
@@ -1158,7 +1162,6 @@ class ArtifactAcceptanceEnvironment:
                 return await repository.create_run(session, command)
 
     async def _execute_run(self, run: ProductionRun) -> ArtifactAcceptanceResult:
-        from temporalio.client import Client
         from temporalio.common import WorkflowIDConflictPolicy
 
         from app.artifacts.workflow import (
@@ -1191,16 +1194,13 @@ class ArtifactAcceptanceEnvironment:
                         for item in stored.required_outputs
                     ),
                 )
-        client = await Client.connect(
-            settings.temporal_address,
-            namespace=settings.temporal_namespace,
-        )
+        await self._ensure_worker()
         started = asyncio.get_running_loop().time()
-        handle = await client.start_workflow(
+        handle = await self._client.start_workflow(
             ArtifactProductionWorkflow.run,
             request,
             id=f"artifact-performance:{run.id}",
-            task_queue=settings.temporal_task_queue,
+            task_queue=self._task_queue,
             execution_timeout=timedelta(seconds=900),
             id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
         )
@@ -1210,7 +1210,10 @@ class ArtifactAcceptanceEnvironment:
                 timeout=360,
             )
         except asyncio.TimeoutError:
-            pass
+            try:
+                await handle.terminate(reason="artifact acceptance bounded timeout")
+            except Exception:
+                pass
         elapsed_seconds = asyncio.get_running_loop().time() - started
         async with self._session_factory() as session:
             async with session.begin():
@@ -1397,7 +1400,7 @@ class ArtifactAcceptanceEnvironment:
             tiles=tiles,
             zoom_levels=zoom_levels,
             coverage_bounds=bounds,
-            tile_bytes=png_tile_bytes(),
+            tile_bytes=png_tile_bytes(color=(70, 130, 180)),
             generated_at=datetime.now(UTC),
             package_id="gaode-offline-v1",
             version="v1",
@@ -1424,13 +1427,17 @@ class ArtifactAcceptanceEnvironment:
         )
         await self._publish_vector_asset(
             "shanghai.admin.town",
-            (
+            tuple(
                 _acceptance_record(
-                    1,
-                    _town_code(),
-                    {"ID": _town_code(), "NAME": "acceptance town"},
+                    index,
+                    town_code,
+                    {"ID": town_code, "NAME": f"acceptance town {index}"},
                     _town_geometry(),
-                ),
+                )
+                for index, town_code in enumerate(
+                    (f"{310115000001 + offset}" for offset in range(2)),
+                    start=1,
+                )
             ),
             spatial_extent=(121.4, 31.1, 121.6, 31.4),
         )
@@ -1727,8 +1734,9 @@ class ArtifactAcceptanceEnvironment:
     ) -> None:
         from geoalchemy2.elements import WKTElement
 
-        from app.data_assets.domain import NormalizedTableData
+        from app.data_assets.domain import NormalizedRecord, NormalizedTableData
         from app.data_assets.models import DataAsset, DataAssetRecord, DataAssetVersion
+        from app.data_assets.repository import DataAssetRepository
         from app.data_assets.service import compute_table_checksum
 
         columns = tuple(
@@ -1829,6 +1837,32 @@ class ArtifactAcceptanceEnvironment:
                             ),
                         )
                     )
+                await session.flush()
+                persisted_records = await DataAssetRepository().list_records(
+                    session,
+                    version.id,
+                )
+                persisted_checksum = compute_table_checksum(
+                    NormalizedTableData(
+                        columns=columns,
+                        records=tuple(
+                            NormalizedRecord(
+                                row_number=record.row_number,
+                                business_key=record.business_key,
+                                properties=dict(record.properties),
+                                geometry_wkt=record.geometry_wkt,
+                            )
+                            for record in persisted_records
+                        ),
+                        source_crs="EPSG:4326",
+                        spatial_extent=None,
+                    )
+                )
+                version.checksum = persisted_checksum
+                version.schema_summary = {
+                    "columns": list(columns),
+                    "normalized_checksum": persisted_checksum,
+                }
                 await session.flush()
                 version.status = "validated"
                 version.validated_at = now
@@ -2069,6 +2103,8 @@ class ArtifactAcceptanceEnvironment:
                     ("quilt.quantity", 500.0, "available", "count"),
                     ("blanket.quantity", 600.0, "available", "count"),
                     ("stretcher.quantity", 700.0, "available", "count"),
+                    ("sickbed.quantity", 800.0, "available", "count"),
+                    ("toilet.quantity", 900.0, "available", "count"),
                 ),
                 "quality": LossQualityGrade.L1,
             },
@@ -2180,6 +2216,7 @@ class ArtifactAcceptanceEnvironment:
     async def cleanup(self) -> None:
         from sqlalchemy import delete
 
+        await self._stop_worker()
         async with self._session_factory() as session:
             async with session.begin():
                 if self._version_ids:
@@ -2200,6 +2237,54 @@ class ArtifactAcceptanceEnvironment:
                     )
         self._version_ids.clear()
         self._asset_ids.clear()
+
+    async def _ensure_worker(self) -> None:
+        if self._worker is not None:
+            return
+        from temporalio.client import Client
+
+        from app.artifacts.worker import build_artifact_worker
+
+        self._client = await Client.connect(
+            settings.temporal_address,
+            namespace=settings.temporal_namespace,
+        )
+        await self._terminate_running_artifact_workflows()
+        configured = settings.model_copy(
+            update={"temporal_task_queue": self._task_queue}
+        )
+        self._worker = build_artifact_worker(
+            client=self._client,
+            session_factory=self._session_factory,
+            configured=configured,
+        )
+        self._worker_task = asyncio.create_task(self._worker.run())
+
+    async def _terminate_running_artifact_workflows(self) -> None:
+        async for item in self._client.list_workflows(
+            'WorkflowType="ArtifactProductionWorkflow"'
+        ):
+            if item.status.name != "RUNNING":
+                continue
+            try:
+                await self._client.get_workflow_handle(item.id).terminate(
+                    reason="artifact acceptance fixture preflight"
+                )
+            except Exception:
+                pass
+
+    async def _stop_worker(self) -> None:
+        if self._worker is None:
+            return
+        try:
+            await asyncio.wait_for(self._worker.shutdown(), timeout=10)
+        except asyncio.TimeoutError:
+            if self._worker_task is not None and not self._worker_task.done():
+                self._worker_task.cancel()
+        if self._worker_task is not None:
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+        self._worker = None
+        self._worker_task = None
 
 
 def _acceptance_grid():

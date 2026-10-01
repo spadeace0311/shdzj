@@ -18,6 +18,12 @@ async def test_test_event_completes_39_outputs_within_five_minutes(
         magnitude=5.1,
         production_mode="test",
     )
+    print(
+        "first_test_event_elapsed_seconds="
+        f"{result.elapsed_seconds:.3f} "
+        f"complete={result.complete_count} "
+        f"degraded={result.degraded_count}"
+    )
 
     assert result.required_output_count == 39
     assert result.complete_count + result.degraded_count == 39
@@ -39,6 +45,13 @@ async def test_three_preheated_runs_take_worst_case(
         )
         for _ in range(3)
     ]
+    for index, result in enumerate(results, start=1):
+        print(
+            f"preheated_run_{index}_elapsed_seconds="
+            f"{result.elapsed_seconds:.3f} "
+            f"complete={result.complete_count} "
+            f"degraded={result.degraded_count}"
+        )
 
     assert max(result.elapsed_seconds for result in results) <= 300
 
@@ -50,6 +63,12 @@ async def test_formal_replay_uses_t1_as_deadline_basis(
     result = await artifact_acceptance_environment.run_replay_event(
         t1_at="2026-09-30T07:00:00+00:00",
         production_mode="replay",
+    )
+    print(
+        "replay_elapsed_seconds="
+        f"{result.elapsed_seconds:.3f} "
+        f"complete={result.complete_count} "
+        f"degraded={result.degraded_count}"
     )
 
     assert result.deadline_basis_at == "2026-09-30T07:00:00+00:00"

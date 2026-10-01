@@ -1147,7 +1147,11 @@ def _validate_spec(spec: MapRenderSpec) -> None:
         raise ValueError("map output must use 300 DPI")
     for layer in spec.layers:
         _validate_local_url(layer.url)
-        _validate_resource_mapping(layer.source)
+        if not (
+            isinstance(layer.source, Mapping)
+            and layer.source.get("type") == "geojson"
+        ):
+            _validate_resource_mapping(layer.source)
         _validate_resource_mapping(layer.style)
 
 

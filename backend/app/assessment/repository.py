@@ -38,8 +38,6 @@ class AssessmentRepository:
         canonical = await session.get(EarthquakeEvent, event.id, with_for_update=True)
         if canonical is None:
             raise LookupError(f"event not found: {event.id}")
-        if canonical.current_revision_id != revision.id:
-            raise ValueError("assessment trigger revision must be current")
         basis_at = revision.ingested_at
         if basis_at is None:
             raise ValueError("assessment revision ingested_at is required")

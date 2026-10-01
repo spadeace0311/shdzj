@@ -585,6 +585,12 @@ class ArtifactProductionRepository:
         session: AsyncSession,
         production_run_id: uuid.UUID,
     ) -> tuple[ProductionTask, ...]:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {
+                "lock_key": f"artifact-task-write:{production_run_id}",
+            },
+        )
         run_event_id = await session.scalar(
             select(ProductionRun.event_id).where(ProductionRun.id == production_run_id)
         )
@@ -811,8 +817,33 @@ class ArtifactProductionRepository:
         production_task_id: uuid.UUID,
         fingerprint: str,
     ) -> ProductionTask:
-        _validate_hex(fingerprint, "fingerprint")
         task, _run = await self._lock_task(session, production_task_id)
+        return await self._freeze_task_fingerprint(
+            session,
+            task,
+            fingerprint,
+        )
+
+    async def freeze_prepared_task_fingerprint(
+        self,
+        session: AsyncSession,
+        task: ProductionTask,
+        fingerprint: str,
+    ) -> ProductionTask:
+        """Freeze a fingerprint for a task already locked by the caller."""
+        return await self._freeze_task_fingerprint(
+            session,
+            task,
+            fingerprint,
+        )
+
+    async def _freeze_task_fingerprint(
+        self,
+        session: AsyncSession,
+        task: ProductionTask,
+        fingerprint: str,
+    ) -> ProductionTask:
+        _validate_hex(fingerprint, "fingerprint")
         if task.input_fingerprint is not None:
             if task.input_fingerprint != fingerprint:
                 raise ValueError("task input fingerprint is already frozen")
@@ -832,7 +863,10 @@ class ArtifactProductionRepository:
     ) -> ProductionTask:
         if not activity_idempotency_key:
             raise ValueError("activity idempotency key must not be empty")
-        task, run = await self._lock_task(session, production_task_id)
+        task, run = await self._lock_task_for_write(
+            session,
+            production_task_id,
+        )
         if run.status in {"completed", "partial", "failed", "canceled"}:
             raise ValueError("terminal production run cannot start tasks")
         if not run.is_current or run.superseded_at is not None:
@@ -884,7 +918,7 @@ class ArtifactProductionRepository:
             raise ValueError("completed task status must be succeeded or degraded")
         if artifact_result.task_status != task_status:
             raise ValueError("artifact result task status does not match completion")
-        task, run = await self._lock_task(session, task_id)
+        task, run = await self._lock_task_for_write(session, task_id)
         if run.status in {"completed", "partial", "failed", "canceled"}:
             raise ValueError("terminal production run cannot commit artifacts")
         if task.status in {"succeeded", "degraded"} and task.final_artifact_id is not None:
@@ -1008,7 +1042,7 @@ class ArtifactProductionRepository:
     ) -> ProductionTask:
         if not error_category.strip() or not error_summary.strip():
             raise ValueError("task error category and summary must not be empty")
-        task, run = await self._lock_task(session, task_id)
+        task, run = await self._lock_task_for_write(session, task_id)
         if run.status in {"completed", "partial", "failed", "canceled"}:
             raise ValueError("terminal production run cannot fail tasks")
         if task.status in {
@@ -1045,7 +1079,7 @@ class ArtifactProductionRepository:
     ) -> ProductionTask:
         if not reason.strip():
             raise ValueError("task cancellation reason must not be empty")
-        task, run = await self._lock_task(session, task_id)
+        task, run = await self._lock_task_for_write(session, task_id)
         if run.status in {"completed", "partial", "failed"}:
             raise ValueError("terminal production run cannot cancel tasks")
         if task.status in {
@@ -1773,16 +1807,10 @@ class ArtifactProductionRepository:
         ).one_or_none()
         if context is None:
             raise LookupError("artifact production task not found")
-        await session.get(
-            EarthquakeEvent,
-            context.event_id,
-            with_for_update=True,
-        )
         if context.assessment_run_id is not None:
             await session.get(
                 AssessmentRun,
                 context.assessment_run_id,
-                with_for_update=True,
             )
         run = await session.get(
             ProductionRun,
@@ -1799,6 +1827,26 @@ class ArtifactProductionRepository:
         if task is None:
             raise LookupError("artifact production task not found")
         return task, run
+
+    async def _lock_task_for_write(
+        self,
+        session: AsyncSession,
+        production_task_id: uuid.UUID,
+    ) -> tuple[ProductionTask, ProductionRun]:
+        production_run_id = await session.scalar(
+            select(ProductionTask.production_run_id).where(
+                ProductionTask.id == production_task_id
+            )
+        )
+        if production_run_id is None:
+            raise LookupError("artifact production task not found")
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {
+                "lock_key": f"artifact-task-write:{production_run_id}",
+            },
+        )
+        return await self._lock_task(session, production_task_id)
 
     async def _resolve_dependency(
         self,
@@ -1858,7 +1906,7 @@ class ArtifactProductionRepository:
 
         if not dependency.output_profile:
             return None
-        artifact = await session.scalar(
+        artifact_statement = (
             select(GeneratedArtifact)
             .where(
                 GeneratedArtifact.event_id == run.event_id,
@@ -1872,6 +1920,11 @@ class ArtifactProductionRepository:
                 GeneratedArtifact.created_at.desc(),
             )
         )
+        if run.generation_scope == "full":
+            artifact_statement = artifact_statement.where(
+                GeneratedArtifact.production_run_id == run.id
+            )
+        artifact = await session.scalar(artifact_statement)
         if artifact is None:
             return None
         return {
