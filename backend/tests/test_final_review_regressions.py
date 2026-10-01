@@ -220,9 +220,11 @@ async def test_delayed_older_outbox_does_not_replace_newer_pointers(
     )
     async with session_factory() as session:
         async with session.begin():
-            await repository.start_run(session, delayed_older.id)
-            await _complete_required_tasks(session, delayed_older.id)
-            await repository.complete_run(session, delayed_older.id, "bundle-v1")
+            started = await repository.start_run(session, delayed_older.id)
+            delayed_tasks = await repository.list_tasks(
+                session,
+                delayed_older.id,
+            )
 
     async with session_factory() as session:
         event = await session.get(EarthquakeEvent, UUID(event_id))
@@ -232,6 +234,12 @@ async def test_delayed_older_outbox_does_not_replace_newer_pointers(
         assert older is not None
         assert current is not None
 
+    assert started.status == "failed"
+    assert started.superseded_at is not None
+    assert started.completed_at is not None
+    assert delayed_tasks
+    assert all(task.status == "failed" for task in delayed_tasks)
+    assert older.status == "failed"
     assert event.latest_assessment_run_id == newer.id
     assert event.effective_assessment_run_id == newer.id
     assert older.superseded_by_run_id == newer.id

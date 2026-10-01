@@ -506,16 +506,18 @@ async def test_old_run_cannot_overwrite_newer_effective_pointer(
 
     async with session_factory() as session:
         async with session.begin():
-            await repository.start_run(session, first.id)
-            await _complete_required_tasks(session, first.id)
-            completed = await repository.complete_run(
-                session,
-                first.id,
-                "bundle-1",
+            started = await repository.start_run(session, first.id)
+            tasks = await repository.list_tasks(session, first.id)
+            event = await session.get(
+                EarthquakeEvent,
+                first.event_id,
             )
-            event = await session.get(EarthquakeEvent, first.event_id)
 
-    assert completed.status == "completed"
+    assert started.status == "failed"
+    assert started.superseded_at is not None
+    assert started.superseded_by_run_id == second.id
+    assert tasks
+    assert all(task.status == "failed" for task in tasks)
     assert event.latest_assessment_run_id == second.id
     assert event.effective_assessment_run_id is None
 
