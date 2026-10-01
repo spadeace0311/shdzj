@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_ARTIFACT_RENDER_CONCURRENCY = 4
 
 
+def artifact_production_workflow_id(production_run_id: object) -> str:
+    return f"artifact-production:{production_run_id}"
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactProductionWorkflowInput:
     production_run_id: str

@@ -14,7 +14,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0016_artifact_context_freeze"
+LATEST_REVISION = "0017_production_cancel_outbox"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -35,6 +35,7 @@ ARTIFACT_TABLES = {
     "generated_artifacts",
     "artifact_publications",
     "artifact_override_requests",
+    "artifact_production_cancel_requests",
 }
 LOSS_TABLES = {
     "loss_model_definitions",

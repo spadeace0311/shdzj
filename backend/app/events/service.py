@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.artifacts.lifecycle import ArtifactProductionLifecycleController
 from app.config import settings
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.lifecycle import message_family, semantic_fingerprint
@@ -55,10 +56,15 @@ class EventService:
         session_factory: async_sessionmaker[AsyncSession],
         repository: EventRepository | None = None,
         region_repository: RegionRepository | None = None,
+        production_controller: ArtifactProductionLifecycleController | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._repository = repository or EventRepository(session_factory)
         self._region_repository = region_repository or RegionRepository(session_factory)
+        self._production_controller = (
+            production_controller
+            or ArtifactProductionLifecycleController()
+        )
 
     async def ingest(
         self,
@@ -83,7 +89,7 @@ class EventService:
                     provider="api",
                     ingest_lane="http",
                 )
-                return await self._repository.append_revision(
+                result = await self._repository.append_revision(
                     session,
                     raw,
                     event,
@@ -93,6 +99,15 @@ class EventService:
                     ingested_at=normalized_received_at,
                     region_context=None,
                 )
+                if result.is_new and result.is_current:
+                    await self._production_controller.apply_current_event_transition(
+                        session,
+                        event_id=result.event_id,
+                        revision_id=result.revision_id,
+                        revision_no=result.revision_no,
+                        event_kind=result.event_kind,
+                    )
+                return result
 
     async def ingest_with_response_suggestion(
         self,
@@ -163,6 +178,14 @@ class EventService:
                     ingested_at=normalized_received_at,
                     region_context=region_context,
                 )
+                if result.is_new and result.is_current:
+                    await self._production_controller.apply_current_event_transition(
+                        session,
+                        event_id=result.event_id,
+                        revision_id=result.revision_id,
+                        revision_no=result.revision_no,
+                        event_kind=result.event_kind,
+                    )
 
                 triggered_assessment = False
                 if (

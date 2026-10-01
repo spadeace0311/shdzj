@@ -16,6 +16,7 @@ from app.artifacts.workflow import (
     DEFAULT_ARTIFACT_RENDER_CONCURRENCY,
     ArtifactProductionWorkflow,
     ArtifactProductionWorkflowInput,
+    artifact_production_workflow_id,
 )
 
 if TYPE_CHECKING:
@@ -92,7 +93,9 @@ class AssessmentWorkflow:
             artifact_child_handle = await workflow.start_child_workflow(
                 ArtifactProductionWorkflow.run,
                 prepared.artifact_workflow_input,
-                id=f"artifact-production:{prepared.production_run_id}",
+                id=artifact_production_workflow_id(
+                    prepared.production_run_id
+                ),
                 parent_close_policy=ParentClosePolicy.ABANDON,
             )
             await workflow.execute_activity(

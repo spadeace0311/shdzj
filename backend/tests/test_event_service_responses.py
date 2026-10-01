@@ -272,6 +272,16 @@ class _AtomicRepository:
         return "formal_triggered", RECEIVED_AT
 
 
+class _NoopProductionController:
+    async def apply_current_event_transition(
+        self,
+        session: object,
+        **kwargs: object,
+    ) -> tuple[object, ...]:
+        del session, kwargs
+        return ()
+
+
 def _compiled(statement: object) -> tuple[str, dict[str, object]]:
     compiled = statement.compile(dialect=postgresql.dialect())
     return str(compiled), dict(compiled.params)
@@ -366,6 +376,7 @@ async def test_service_commits_revision_and_suggestion_in_one_transaction() -> N
         _AtomicSessionFactory(events),
         repository=repository,
         region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -406,6 +417,7 @@ async def test_service_rolls_back_revision_when_suggestion_persist_fails() -> No
         _AtomicSessionFactory(events),
         repository=repository,
         region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
     )
 
     with pytest.raises(RuntimeError, match="suggestion failure"):
@@ -436,6 +448,7 @@ async def test_service_without_context_returns_existing_current_suggestion() -> 
         _AtomicSessionFactory(events),
         repository=repository,
         region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -456,6 +469,7 @@ async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
         _AtomicSessionFactory(events),
         repository=repository,
         region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -486,6 +500,7 @@ async def test_non_current_formal_with_context_keeps_current_suggestion() -> Non
         _AtomicSessionFactory(events),
         repository=repository,
         region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
     )
 
     outcome = await service.ingest_with_response_suggestion(

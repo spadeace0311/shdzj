@@ -296,6 +296,63 @@ class ProductionRun(Base):
     )
 
 
+class ArtifactProductionCancelRequest(Base):
+    __tablename__ = "artifact_production_cancel_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "production_run_id",
+            name="uq_artifact_production_cancel_request_run",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'published', 'dead_letter')",
+            name="ck_artifact_production_cancel_request_status",
+        ),
+        Index(
+            "ix_artifact_production_cancel_requests_pending",
+            "status",
+            "available_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    production_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(
+            "artifact_production_runs.id",
+            ondelete="CASCADE",
+        ),
+    )
+    workflow_id: Mapped[str] = mapped_column(String(256))
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="pending",
+        server_default=text("'pending'"),
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("now()"),
+    )
+
+
 class ProductionTask(Base):
     __tablename__ = "artifact_production_tasks"
     __table_args__ = (

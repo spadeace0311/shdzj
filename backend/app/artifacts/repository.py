@@ -19,6 +19,7 @@ from app.artifacts.domain import (
     ResolutionStatus,
 )
 from app.artifacts.models import (
+    ArtifactProductionCancelRequest,
     ArtifactPublication,
     ArtifactTaskDependencyBinding,
     GeneratedArtifact,
@@ -27,6 +28,7 @@ from app.artifacts.models import (
     ProductionRun,
     ProductionTask,
 )
+from app.artifacts.workflow import artifact_production_workflow_id
 from app.assessment.models import AssessmentRun
 from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision
@@ -362,6 +364,7 @@ class ArtifactProductionRepository:
         if current is not None:
             current.superseded_by_run_id = run.id
             await session.flush()
+            await self._cancel_replaced_run(session, current, now)
 
         optional_cutoff = run.deadline_at - timedelta(
             seconds=settings.artifact_optional_dependency_reserve_seconds
@@ -629,8 +632,8 @@ class ArtifactProductionRepository:
             )
         ).all()
         prepared: list[ProductionTask] = []
+        now = _effective_now(run, datetime.now(UTC))
         for task in tasks:
-            now = datetime.now(UTC)
             existing = {
                 (
                     binding.dependency_kind,
@@ -806,7 +809,8 @@ class ArtifactProductionRepository:
             bound_checksum=binding.bound_checksum,
             resolution_status=binding.resolution_status,
             resolution_detail=_json_mapping(binding.resolution_detail),
-            resolved_at=binding.resolved_at or datetime.now(UTC),
+            resolved_at=binding.resolved_at
+            or _effective_now(run, datetime.now(UTC)),
         )
         session.add(row)
         await session.flush()
@@ -1055,7 +1059,7 @@ class ArtifactProductionRepository:
             "canceled",
         }:
             raise ValueError("terminal task cannot be failed")
-        now = datetime.now(UTC)
+        now = _effective_now(run, datetime.now(UTC))
         task.status = "failed"
         task.completed_at = now
         task.last_error = error_summary[:2000]
@@ -1092,7 +1096,7 @@ class ArtifactProductionRepository:
             "canceled",
         }:
             return task
-        now = datetime.now(UTC)
+        now = _effective_now(run, datetime.now(UTC))
         task.status = "canceled"
         task.completed_at = now
         task.last_error = reason[:2000]
@@ -1102,6 +1106,78 @@ class ArtifactProductionRepository:
         }
         task.updated_at = now
         run.updated_at = now
+        await session.flush()
+        return task
+
+    async def record_publication_failure(
+        self,
+        session: AsyncSession,
+        task_id: uuid.UUID,
+        error_category: str,
+        error_summary: str,
+        observed_at: datetime,
+    ) -> ProductionTask:
+        if not error_category.strip() or not error_summary.strip():
+            raise ValueError(
+                "publication error category and summary must not be empty"
+            )
+        observed_at = _normalize_utc(observed_at, "observed_at")
+        task, run = await self._lock_task_for_write(session, task_id)
+        if run.status in {"failed", "canceled"}:
+            raise ValueError(
+                "terminal production run cannot record publication failures"
+            )
+        if task.status in {"failed", "timed_out", "canceled"}:
+            if (
+                task.status == "failed"
+                and (task.result or {}).get("publication_status") == "failed"
+            ):
+                return task
+            raise ValueError(
+                "terminal task cannot record a publication failure"
+            )
+        task.status = "failed"
+        task.last_error = error_summary[:2000]
+        task.result = {
+            **dict(task.result or {}),
+            "publication_status": "failed",
+            "publication_error_category": error_category[:64],
+            "publication_error_summary": error_summary[:2000],
+            "publication_failed_at": observed_at.isoformat(),
+        }
+        task.updated_at = observed_at
+        if run.status == "completed":
+            successful_count = await session.scalar(
+                select(func.count())
+                .select_from(ProductionTask)
+                .where(
+                    ProductionTask.production_run_id == run.id,
+                    ProductionTask.status.in_(
+                        ("succeeded", "degraded")
+                    ),
+                )
+            )
+            run.status = "partial" if successful_count else "failed"
+        run.updated_at = observed_at
+        existing_error: dict[str, object] = {}
+        if run.last_error:
+            try:
+                existing_error = json.loads(run.last_error)
+            except json.JSONDecodeError:
+                existing_error = {"summary": run.last_error}
+        if not isinstance(existing_error, dict):
+            existing_error = {"summary": run.last_error}
+        failed_ids = existing_error.get("publication_failed_task_ids")
+        if not isinstance(failed_ids, list):
+            failed_ids = []
+        failed_ids.append(str(task.id))
+        existing_error["publication_failed_task_ids"] = sorted(
+            set(failed_ids)
+        )
+        run.last_error = json.dumps(
+            existing_error,
+            ensure_ascii=False,
+        )
         await session.flush()
         return task
 
@@ -1445,7 +1521,7 @@ class ArtifactProductionRepository:
                         "same generation sequence cannot replace publication"
                     )
 
-        now = datetime.now(UTC)
+        now = _effective_now(run, datetime.now(UTC))
         if current is not None:
             current.superseded_at = now
             if old_artifact is not None:
@@ -1526,6 +1602,12 @@ class ArtifactProductionRepository:
         now = datetime.now(UTC)
         canceled_ids: list[uuid.UUID] = []
         for run in runs:
+            should_enqueue = run.status not in {
+                "completed",
+                "partial",
+                "failed",
+                "canceled",
+            }
             run.is_current = False
             run.superseded_at = now
             run.cancel_requested_at = now
@@ -1537,6 +1619,13 @@ class ArtifactProductionRepository:
             run.updated_at = now
             canceled_ids.append(run.id)
             await session.flush()
+            if should_enqueue:
+                await self._enqueue_cancel_request(
+                    session,
+                    run,
+                    "revision_superseded",
+                    now,
+                )
 
         await self._cancel_unfinished_run_tasks(session, canceled_ids, now)
         old_revision_ids = set(
@@ -1607,6 +1696,12 @@ class ArtifactProductionRepository:
         now = datetime.now(UTC)
         canceled_ids: list[uuid.UUID] = []
         for run in runs:
+            should_enqueue = run.status not in {
+                "completed",
+                "partial",
+                "failed",
+                "canceled",
+            }
             run.is_current = False
             run.cancel_requested_at = now
             run.cancel_reason = "real_event_priority"
@@ -1616,6 +1711,13 @@ class ArtifactProductionRepository:
                 run.completed_at = now
             run.updated_at = now
             canceled_ids.append(run.id)
+            if should_enqueue:
+                await self._enqueue_cancel_request(
+                    session,
+                    run,
+                    "real_event_priority",
+                    now,
+                )
         await self._cancel_unfinished_run_tasks(session, canceled_ids, now)
         await session.flush()
         return tuple(canceled_ids)
@@ -1664,6 +1766,77 @@ class ArtifactProductionRepository:
             task.status = "canceled"
             task.completed_at = observed_at
             task.updated_at = observed_at
+
+    async def _cancel_replaced_run(
+        self,
+        session: AsyncSession,
+        run: ProductionRun,
+        observed_at: datetime,
+    ) -> None:
+        should_enqueue = run.status not in {
+            "completed",
+            "partial",
+            "failed",
+            "canceled",
+        }
+        run.cancel_requested_at = observed_at
+        run.cancel_reason = "same_scope_replacement"
+        run.priority = 0
+        if run.status not in {"completed", "partial", "failed", "canceled"}:
+            run.status = "canceled"
+            run.completed_at = observed_at
+        run.updated_at = observed_at
+        await self._cancel_unfinished_run_tasks(
+            session,
+            [run.id],
+            observed_at,
+        )
+        if should_enqueue:
+            await self._enqueue_cancel_request(
+                session,
+                run,
+                "same_scope_replacement",
+                observed_at,
+            )
+
+    async def _enqueue_cancel_request(
+        self,
+        session: AsyncSession,
+        run: ProductionRun,
+        reason: str,
+        observed_at: datetime,
+    ) -> ArtifactProductionCancelRequest:
+        existing = await session.scalar(
+            select(ArtifactProductionCancelRequest)
+            .where(
+                ArtifactProductionCancelRequest.production_run_id
+                == run.id,
+            )
+            .with_for_update()
+        )
+        if existing is None:
+            request = ArtifactProductionCancelRequest(
+                production_run_id=run.id,
+                workflow_id=artifact_production_workflow_id(run.id),
+                reason=reason,
+                status="pending",
+                attempt_count=0,
+                available_at=observed_at,
+                created_at=observed_at,
+            )
+            session.add(request)
+            await session.flush()
+            return request
+        if existing.status == "dead_letter":
+            existing.reason = reason
+            existing.status = "pending"
+            existing.attempt_count = 0
+            existing.available_at = observed_at
+            existing.lease_expires_at = None
+            existing.dispatched_at = None
+            existing.last_error = None
+            await session.flush()
+        return existing
 
     async def get_current_full_run(
         self,
@@ -1984,12 +2157,12 @@ def _normalize_utc(value: datetime, field_name: str) -> datetime:
 
 def _effective_now(run: ProductionRun, wall_clock_at: datetime) -> datetime:
     wall_clock_at = _normalize_utc(wall_clock_at, "wall_clock_at")
-    if (
-        run.production_mode != "replay"
-        or run.started_at is None
-        or run.deadline_basis_at is None
-    ):
+    if run.production_mode != "replay":
         return wall_clock_at
+    if run.deadline_basis_at is None:
+        return wall_clock_at
+    if run.started_at is None:
+        return run.deadline_basis_at
     execution_started_at = _normalize_utc(
         run.started_at,
         "run.started_at",

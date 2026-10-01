@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -74,3 +77,29 @@ def test_artifact_template_root_default_matches_runtime_contract() -> None:
     )
 
     assert configured.artifact_template_root == "/config/artifacts/templates"
+
+
+def test_artifact_browser_pool_defaults_stay_in_sync() -> None:
+    project_root = Path(
+        os.environ.get(
+            "PROJECT_ROOT",
+            Path(__file__).resolve().parents[2],
+        )
+    )
+    example = (project_root / ".env.example").read_text(encoding="utf-8")
+    compose = (project_root / "infra" / "compose.yaml").read_text(
+        encoding="utf-8"
+    )
+    configured = Settings(
+        _env_file=None,
+        database_url=VALID_DATABASE_URL,
+        jwt_secret=VALID_JWT_SECRET,
+        superadmin_initial_password=VALID_SUPERADMIN_PASSWORD,
+    )
+
+    assert "ARTIFACT_BROWSER_POOL_SIZE=2" in example
+    assert (
+        'ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-2}"'
+        in compose
+    )
+    assert configured.artifact_browser_pool_size == 2

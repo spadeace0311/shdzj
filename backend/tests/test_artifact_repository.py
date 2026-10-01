@@ -71,6 +71,36 @@ async def test_single_artifact_rebuild_does_not_replace_full_progress(
     ) == full
 
 
+async def test_same_scope_replacement_cancels_old_run_and_tasks(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    old = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(),
+    )
+    replacement = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(
+            generation_seq=2,
+            snapshot={"fixture": "same-scope-replacement"},
+            reuse_existing=False,
+        ),
+    )
+    old = await session.get(ProductionRun, old.id)
+    old_tasks = await artifact_repository.list_tasks(session, old.id)
+
+    assert replacement.id != old.id
+    assert old is not None
+    assert old.status == "canceled"
+    assert old.cancel_reason == "same_scope_replacement"
+    assert old.is_current is False
+    assert old.superseded_by_run_id == replacement.id
+    assert old_tasks
+    assert all(task.status == "canceled" for task in old_tasks)
+
+
 async def test_finalize_run_partial_keeps_successful_artifacts(
     seeded_artifact_assessment,
     artifact_repository,
@@ -549,6 +579,155 @@ async def test_optional_dependencies_block_ready_and_fingerprint_until_cutoff(
 
     render_input = await service.prepare_task(task_id)
     assert len(render_input.input_fingerprint) == 64
+
+
+async def test_replay_optional_dependency_uses_effective_run_clock(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    basis = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
+    deadline = basis + timedelta(seconds=300)
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(
+            production_mode="replay",
+            launch_mode="standalone",
+            deadline_basis_at=basis,
+            deadline_at=deadline,
+        ),
+    )
+    run.status = "running"
+    run.started_at = datetime.now(UTC)
+    await session.flush()
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "doc.rapid_report"
+    )
+    assert task.optional_dependency_wait_cutoff_at is not None
+
+    await artifact_repository.prepare_dependencies(session, run.id)
+    bindings = (
+        await session.scalars(
+            select(ArtifactTaskDependencyBinding).where(
+                ArtifactTaskDependencyBinding.production_task_id == task.id,
+                ArtifactTaskDependencyBinding.is_optional.is_(True),
+            )
+        )
+    ).all()
+
+    assert bindings == []
+    assert task.status == "pending"
+
+    run.started_at = datetime.now(UTC) - timedelta(seconds=301)
+    await session.flush()
+    await artifact_repository.prepare_dependencies(session, run.id)
+    bindings = (
+        await session.scalars(
+            select(ArtifactTaskDependencyBinding).where(
+                ArtifactTaskDependencyBinding.production_task_id == task.id,
+                ArtifactTaskDependencyBinding.is_optional.is_(True),
+            )
+        )
+    ).all()
+
+    assert bindings
+    assert {binding.resolution_status for binding in bindings} == {
+        "omitted_after_wait"
+    }
+
+
+async def test_replay_failure_before_logical_deadline_is_not_deadline_exceeded(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    basis = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
+    deadline = basis + timedelta(seconds=300)
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(
+            production_mode="replay",
+            launch_mode="standalone",
+            deadline_basis_at=basis,
+            deadline_at=deadline,
+        ),
+    )
+    run.status = "running"
+    run.started_at = datetime.now(UTC)
+    await session.flush()
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "map.epicenter"
+    )
+    await artifact_repository.freeze_task_fingerprint(
+        session,
+        task.id,
+        "a" * 64,
+    )
+    await artifact_repository.start_task(
+        session,
+        task.id,
+        f"replay-failure:{task.id}:{'a' * 64}",
+    )
+
+    failed = await artifact_repository.fail_task(
+        session,
+        task.id,
+        "render_failed",
+        "logical replay failure",
+    )
+
+    assert failed.deadline_exceeded_at is None
+    assert failed.completed_at is not None
+    assert failed.completed_at < deadline
+
+
+async def test_replay_cancel_audit_uses_effective_run_clock(
+    seeded_artifact_assessment,
+    artifact_repository,
+    session,
+) -> None:
+    basis = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
+    deadline = basis + timedelta(seconds=300)
+    run = await artifact_repository.create_run(
+        session,
+        seeded_artifact_assessment.full_run_command(
+            production_mode="replay",
+            launch_mode="standalone",
+            deadline_basis_at=basis,
+            deadline_at=deadline,
+        ),
+    )
+    run.status = "running"
+    run.started_at = datetime.now(UTC)
+    await session.flush()
+    task = next(
+        item
+        for item in await artifact_repository.list_tasks(session, run.id)
+        if item.artifact_key == "map.epicenter"
+    )
+    await artifact_repository.freeze_task_fingerprint(
+        session,
+        task.id,
+        "b" * 64,
+    )
+    await artifact_repository.start_task(
+        session,
+        task.id,
+        f"replay-cancel:{task.id}:{'b' * 64}",
+    )
+
+    canceled = await artifact_repository.cancel_task(
+        session,
+        task.id,
+        "replay cancellation",
+    )
+
+    assert canceled.completed_at is not None
+    assert canceled.completed_at < deadline
 
 
 async def test_bind_dependency_rejects_wrong_resolution_shape(

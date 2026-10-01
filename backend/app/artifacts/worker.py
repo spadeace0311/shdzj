@@ -21,6 +21,10 @@ from temporalio.worker import Worker
 from app.artifacts.catalog import load_catalog
 from app.artifacts.context import ProductionContextService
 from app.artifacts.domain import ArtifactKind, DependencyKind
+from app.artifacts.dispatcher import (
+    ArtifactProductionDispatcher,
+    TemporalArtifactCancellationStarter,
+)
 from app.artifacts.models import GeneratedArtifact, ProductionRun, ProductionTask
 from app.artifacts.repository import (
     ArtifactGenerationResult,
@@ -478,14 +482,9 @@ class ArtifactActivities:
                         type=exc.type or "validation_failed",
                         non_retryable=True,
                     ) from exc
-                finalized = await repository.finalize_run(
-                    session,
-                    run.id,
-                    observed,
-                )
                 tasks = await repository.list_tasks(session, run.id)
                 return {
-                    "status": finalized.status,
+                    "status": "validated",
                     "completed_count": sum(
                         task.status in {"succeeded", "degraded"}
                         for task in tasks
@@ -516,6 +515,7 @@ class ArtifactActivities:
                         )
                     )
                 ).all()
+                publication_failures: list[str] = []
                 for artifact_row in artifacts:
                     try:
                         await repository.publish_artifact(
@@ -524,9 +524,22 @@ class ArtifactActivities:
                             published_by=request.published_by,
                             forced=request.forced,
                         )
-                    except ValueError as exc:
+                    except (ValueError, RuntimeError) as exc:
+                        category = (
+                            "publication_concurrency"
+                            if isinstance(exc, RuntimeError)
+                            else "publication_conflict"
+                        )
+                        await repository.record_publication_failure(
+                            session,
+                            artifact_row.production_task_id,
+                            category,
+                            str(exc),
+                            observed,
+                        )
+                        publication_failures.append(artifact_row.artifact_key)
                         logger.warning(
-                            "artifact publish skipped run_id=%s artifact_id=%s error=%s",
+                            "artifact publish failed run_id=%s artifact_id=%s error=%s",
                             run.id,
                             artifact_row.id,
                             exc,
@@ -546,6 +559,16 @@ class ArtifactActivities:
                     "failed_count": sum(
                         task.status in {"failed", "timed_out", "canceled"}
                         for task in tasks
+                    ),
+                    "publication_failed_count": len(publication_failures),
+                    "publication_status": (
+                        "completed"
+                        if not publication_failures
+                        else (
+                            "partial"
+                            if len(publication_failures) < len(artifacts)
+                            else "failed"
+                        )
                     ),
                 }
 
@@ -1000,14 +1023,39 @@ async def run_artifact_dispatcher(
     configured: Settings = settings,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
-    del session_factory, sleep
-    # Task 13 owns standalone/override API dispatch. This process is
-    # intentionally a no-op in Task 12 so tests can exercise registration
-    # without publishing an incomplete production dispatcher.
     stop_event = stop_event or asyncio.Event()
     client = client or await _connect_temporal(configured)
     logger.info("artifact production dispatcher connected")
-    await stop_event.wait()
+    dispatcher = ArtifactProductionDispatcher(
+        session_factory=session_factory,
+        starter=TemporalArtifactCancellationStarter(client),
+        batch_size=configured.assessment_outbox_batch_size,
+        max_attempts=configured.assessment_outbox_max_attempts,
+        lease_seconds=configured.assessment_outbox_lease_seconds,
+    )
+    while not stop_event.is_set():
+        try:
+            await dispatcher.dispatch_once()
+        except Exception:
+            logger.exception("artifact production cancellation dispatch failed")
+        await _wait_for_stop_or_sleep(
+            stop_event,
+            configured.assessment_outbox_poll_seconds,
+            sleep,
+        )
+
+
+async def _wait_for_stop_or_sleep(
+    stop_event: asyncio.Event,
+    delay: float,
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    if stop_event.is_set():
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        await sleep(0)
 
 
 async def _connect_temporal(configured: Settings) -> Client:

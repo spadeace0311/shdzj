@@ -154,7 +154,7 @@ services:
       ASSESSMENT_DISPATCHER_ENABLED: "false"
       TEMPORAL_ADDRESS: temporal:7233
       ARTIFACT_RENDER_CONCURRENCY: "${ARTIFACT_RENDER_CONCURRENCY:-4}"
-      ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-8}"
+      ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-2}"
     command: ["python", "-m", "app.artifacts.worker", "worker"]
     restart: unless-stopped
     deploy:

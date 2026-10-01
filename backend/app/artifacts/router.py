@@ -49,6 +49,7 @@ from app.artifacts.storage import ArtifactStore
 from app.artifacts.workflow import (
     ArtifactProductionWorkflow,
     ArtifactProductionWorkflowInput,
+    artifact_production_workflow_id,
 )
 from app.auth.router import get_current_user, require_role
 from app.auth.service import AuthUser
@@ -88,7 +89,9 @@ class ArtifactWorkflowStarter:
             await client.start_workflow(
                 ArtifactProductionWorkflow.run,
                 request,
-                id=f"artifact-production:{request.production_run_id}",
+                id=artifact_production_workflow_id(
+                    request.production_run_id
+                ),
                 task_queue=settings.temporal_task_queue,
                 execution_timeout=timedelta(
                     seconds=settings.assessment_workflow_safety_timeout_seconds

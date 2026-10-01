@@ -9,6 +9,8 @@ import pytest
 from app.artifacts import worker as artifact_worker
 from app.artifacts.models import ArtifactPublication
 from app.artifacts.retention import ArtifactRetentionResult
+from app.artifacts.storage import ArtifactStore
+from app.config import settings
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +131,40 @@ async def test_retention_protects_current_and_superseded_publications(
         ArtifactPublication,
         superseded_publication.id,
     ) is not None
+
+
+async def test_retention_preserves_shared_object_referenced_by_live_artifact(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+) -> None:
+    expired = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    survivor = await seeded_artifact_assessment.generated_artifact(
+        "map.epicenter",
+        version=2,
+    )
+    stored_survivor = await session.get(type(survivor), survivor.id)
+    assert stored_survivor is not None
+    stored_survivor.storage_path = expired.storage_path
+    await session.flush()
+    store = ArtifactStore(settings.artifact_storage_root)
+    path = store.resolve(expired.storage_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"shared-object")
+
+    result = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+    )
+
+    assert result.test_deleted == 1
+    assert await session.get(type(expired), expired.id) is None
+    assert await session.get(type(survivor), survivor.id) is not None
+    assert path.is_file()
+    assert path.read_bytes() == b"shared-object"
 
 
 async def test_retention_retries_after_object_delete_failure(

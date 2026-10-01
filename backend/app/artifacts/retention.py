@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact, ProductionRun
@@ -63,19 +63,47 @@ class ArtifactRetentionService:
             ).all()
             expired.extend(rows)
 
-        expired_ids = [artifact.id for artifact in expired]
+        expired_by_id = {artifact.id: artifact for artifact in expired}
+        expired_paths = {artifact.storage_path for artifact in expired}
+        for storage_path in sorted(expired_paths):
+            await session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(:lock_key, 0))"
+                ),
+                {
+                    "lock_key": (
+                        f"artifact-retention-path:{storage_path}"
+                    )
+                },
+            )
+
+        path_artifacts = (
+            await session.scalars(
+                select(GeneratedArtifact)
+                .where(
+                    GeneratedArtifact.storage_path.in_(expired_paths)
+                )
+                .order_by(GeneratedArtifact.id)
+                .with_for_update()
+            )
+        ).all()
+        path_artifact_ids = [artifact.id for artifact in path_artifacts]
         publication_references = (
             await session.execute(
                 select(
                     ArtifactPublication.artifact_id,
                     ArtifactPublication.superseded_at,
                 ).where(
-                    ArtifactPublication.artifact_id.in_(expired_ids)
+                    ArtifactPublication.artifact_id.in_(
+                        path_artifact_ids
+                    )
                 )
             )
         ).all()
         protected_ids = {
-            artifact_id for artifact_id, _superseded_at in publication_references
+            artifact_id
+            for artifact_id, _superseded_at in publication_references
         }
         protection_reasons = {
             "current_publication": sum(
@@ -90,13 +118,31 @@ class ArtifactRetentionService:
 
         deletable: list[GeneratedArtifact] = []
         failed_deletions = 0
-        for artifact in expired:
-            if artifact.id in protected_ids:
+        for storage_path in sorted(expired_paths):
+            references = [
+                artifact
+                for artifact in path_artifacts
+                if artifact.storage_path == storage_path
+            ]
+            path_deletable = [
+                artifact
+                for artifact in references
+                if artifact.id in expired_by_id
+                and artifact.id not in protected_ids
+            ]
+            if not path_deletable:
                 continue
-            if not await self._delete_object(artifact):
+            has_survivor = any(
+                artifact.id not in {item.id for item in path_deletable}
+                for artifact in references
+            )
+            if has_survivor:
+                deletable.extend(path_deletable)
+                continue
+            if await self._delete_object(path_deletable[0]):
+                deletable.extend(path_deletable)
+            else:
                 failed_deletions += 1
-                continue
-            deletable.append(artifact)
 
         if deletable:
             ids = [artifact.id for artifact in deletable]
