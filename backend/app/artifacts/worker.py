@@ -25,6 +25,7 @@ from app.artifacts.repository import (
     ArtifactProductionRepository,
     ArtifactQuality,
 )
+from app.artifacts.retention import ArtifactRetentionService
 from app.artifacts.renderers.base import (
     LocalAssetMissingError,
     RemoteAssetForbiddenError,
@@ -79,6 +80,12 @@ class ArtifactActivities:
         self._store = store
         self._validator = validator
         self._renderer_factory = renderer_factory
+        self._render_slots = asyncio.Semaphore(
+            settings.artifact_render_concurrency
+        )
+        self._dependency_slots = asyncio.Semaphore(
+            settings.artifact_render_concurrency
+        )
 
     @property
     def _context(self) -> ProductionContextService:
@@ -123,11 +130,12 @@ class ArtifactActivities:
                 if run.status == "pending":
                     run.status = "running"
                     run.started_at = datetime.now(UTC)
-                await self._context.freeze_static_context(
+                frozen_context = await self._context.freeze_static_context(
                     session,
                     run.id,
                     catalog,
                 )
+                run.context_fingerprint = frozen_context.context_fingerprint
                 await repository.prepare_dependencies(session, run.id)
                 tasks = await repository.list_tasks(session, run.id)
                 groups = _phase_groups_from_tasks(tasks)
@@ -148,121 +156,126 @@ class ArtifactActivities:
         self,
         request: ArtifactDependencyWaitInput,
     ):
-        repository = ArtifactProductionRepository()
-        deadline = _as_utc(request.deadline_at, "deadline_at")
-        while True:
-            async with self._session_factory() as session:
-                async with session.begin():
-                    task = await session.scalar(
-                        select(ProductionTask).where(
-                            ProductionTask.production_run_id
-                            == request.production_run_id,
-                            ProductionTask.artifact_key == request.artifact_key,
-                            ProductionTask.output_profile
-                            == request.output_profile,
+        await self._dependency_slots.acquire()
+        try:
+            repository = ArtifactProductionRepository()
+            deadline = _as_utc(request.deadline_at, "deadline_at")
+            while True:
+                async with self._session_factory() as session:
+                    async with session.begin():
+                        task = await session.scalar(
+                            select(ProductionTask).where(
+                                ProductionTask.production_run_id
+                                == request.production_run_id,
+                                ProductionTask.artifact_key == request.artifact_key,
+                                ProductionTask.output_profile
+                                == request.output_profile,
+                            )
                         )
-                    )
-                    if task is None:
-                        raise LookupError("artifact production task not found")
-                    run = await session.get(ProductionRun, task.production_run_id)
-                    if run is None:
-                        raise LookupError("artifact production run not found")
-                    await repository.prepare_dependencies(session, run.id)
-                    await session.refresh(task)
+                        if task is None:
+                            raise LookupError("artifact production task not found")
+                        run = await session.get(ProductionRun, task.production_run_id)
+                        if run is None:
+                            raise LookupError("artifact production run not found")
+                        await repository.prepare_dependencies(session, run.id)
+                        await session.refresh(task)
 
-                    if task.status == "ready":
-                        service = ArtifactProductionService(
-                            session_factory=self._session_factory,
-                            repository=repository,
-                        )
-                        try:
-                            prepared = await service.prepare_task(task.id)
-                        except ValueError as exc:
+                        if task.status == "ready":
+                            service = ArtifactProductionService(
+                                session_factory=self._session_factory,
+                                repository=repository,
+                            )
+                            try:
+                                prepared = await service.prepare_task(task.id)
+                            except ValueError as exc:
+                                raise ApplicationError(
+                                    str(exc),
+                                    type="artifact_dependency_unavailable",
+                                    non_retryable=True,
+                                ) from exc
+                            idempotency_key = _idempotency_key(
+                                run.id,
+                                task.artifact_key,
+                                task.output_profile,
+                                prepared.input_fingerprint,
+                            )
+                            await repository.start_task(
+                                session,
+                                task.id,
+                                idempotency_key,
+                            )
+                            return ArtifactTaskActivityInput(
+                                production_run_id=str(run.id),
+                                production_task_id=str(task.id),
+                                artifact_key=task.artifact_key,
+                                output_profile=task.output_profile,
+                                context_fingerprint=run.context_fingerprint or "",
+                                input_fingerprint=task.input_fingerprint or "",
+                                deadline_at=task.deadline_at.isoformat(),
+                            )
+
+                        if task.status in {"succeeded", "degraded"}:
+                            if not task.input_fingerprint:
+                                raise ValueError(
+                                    "completed task has no input fingerprint"
+                                )
+                            return ArtifactTaskActivityInput(
+                                production_run_id=str(run.id),
+                                production_task_id=str(task.id),
+                                artifact_key=task.artifact_key,
+                                output_profile=task.output_profile,
+                                context_fingerprint=run.context_fingerprint or "",
+                                input_fingerprint=task.input_fingerprint,
+                                deadline_at=task.deadline_at.isoformat(),
+                                already_completed=True,
+                            )
+
+                        if task.status in {
+                            "failed",
+                            "timed_out",
+                            "canceled",
+                        }:
                             raise ApplicationError(
-                                str(exc),
+                                f"artifact task is {task.status}",
                                 type="artifact_dependency_unavailable",
                                 non_retryable=True,
-                            ) from exc
-                        idempotency_key = _idempotency_key(
-                            run.id,
-                            task.artifact_key,
-                            task.output_profile,
-                            prepared.input_fingerprint,
-                        )
-                        await repository.start_task(
-                            session,
-                            task.id,
-                            idempotency_key,
-                        )
-                        return ArtifactTaskActivityInput(
-                            production_run_id=str(run.id),
-                            production_task_id=str(task.id),
-                            artifact_key=task.artifact_key,
-                            output_profile=task.output_profile,
-                            context_fingerprint=run.context_fingerprint or "",
-                            input_fingerprint=task.input_fingerprint or "",
-                            deadline_at=task.deadline_at.isoformat(),
-                        )
-
-                    if task.status in {"succeeded", "degraded"}:
-                        if not task.input_fingerprint:
-                            raise ValueError(
-                                "completed task has no input fingerprint"
                             )
-                        return ArtifactTaskActivityInput(
-                            production_run_id=str(run.id),
-                            production_task_id=str(task.id),
-                            artifact_key=task.artifact_key,
-                            output_profile=task.output_profile,
-                            context_fingerprint=run.context_fingerprint or "",
-                            input_fingerprint=task.input_fingerprint,
-                            deadline_at=task.deadline_at.isoformat(),
-                            already_completed=True,
-                        )
 
-                    if task.status in {
-                        "failed",
-                        "timed_out",
-                        "canceled",
-                    }:
-                        raise ApplicationError(
-                            f"artifact task is {task.status}",
-                            type="artifact_dependency_unavailable",
-                            non_retryable=True,
-                        )
-
-                    observed = datetime.now(UTC)
-                    if await _assessment_failed_for_run(session, run):
-                        await repository.fail_task(
-                            session,
-                            task.id,
-                            "assessment_unavailable",
-                            "parent assessment failed before dependencies were available",
-                        )
-                        raise ApplicationError(
-                            "assessment unavailable",
-                            type="assessment_unavailable",
-                            non_retryable=True,
-                        )
-                    if observed >= deadline:
-                        await repository.fail_task(
-                            session,
-                            task.id,
-                            "deadline_exceeded",
-                            "artifact dependency wait exceeded production deadline",
-                        )
-                        raise ApplicationError(
-                            "artifact dependency wait exceeded production deadline",
-                            type="deadline_exceeded",
-                            non_retryable=True,
-                        )
-            await asyncio.sleep(_DEPENDENCY_WAIT_SECONDS)
+                        observed = datetime.now(UTC)
+                        if await _assessment_failed_for_run(session, run):
+                            await repository.fail_task(
+                                session,
+                                task.id,
+                                "assessment_unavailable",
+                                "parent assessment failed before dependencies were available",
+                            )
+                            raise ApplicationError(
+                                "assessment unavailable",
+                                type="assessment_unavailable",
+                                non_retryable=True,
+                            )
+                        if observed >= deadline:
+                            await repository.fail_task(
+                                session,
+                                task.id,
+                                "deadline_exceeded",
+                                "artifact dependency wait exceeded production deadline",
+                            )
+                            raise ApplicationError(
+                                "artifact dependency wait exceeded production deadline",
+                                type="deadline_exceeded",
+                                non_retryable=True,
+                            )
+                await asyncio.sleep(_DEPENDENCY_WAIT_SECONDS)
+        finally:
+            self._dependency_slots.release()
 
     @activity.defn(name="render_map_artifact")
     async def render_map_artifact(self, request: ArtifactTaskActivityInput):
         pool: _TrackingBrowserPool | None = None
         staged: Path | None = None
         try:
+            await self._render_slots.acquire()
             pool = _TrackingBrowserPool()
             renderer = MapRenderer(pool)
             staged, official_name, render_result = await self._render_map(
@@ -306,6 +319,7 @@ class ArtifactActivities:
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
         finally:
+            self._render_slots.release()
             if pool is not None:
                 await pool.close()
 
@@ -313,6 +327,7 @@ class ArtifactActivities:
     async def compose_docx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
         try:
+            await self._render_slots.acquire()
             staged, official_name, render_result = await self._render_document(
                 request,
                 ArtifactKind.DOCX,
@@ -349,11 +364,14 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
+        finally:
+            self._render_slots.release()
 
     @activity.defn(name="compose_pptx_artifact")
     async def compose_pptx_artifact(self, request: ArtifactTaskActivityInput):
         staged: Path | None = None
         try:
+            await self._render_slots.acquire()
             staged, official_name, render_result = await self._render_document(
                 request,
                 ArtifactKind.PPTX,
@@ -390,6 +408,8 @@ class ArtifactActivities:
                 staged.unlink(missing_ok=True)
             await self._fail_task_with_error(request, exc)
             raise _typed_application_error(exc) from exc
+        finally:
+            self._render_slots.release()
 
     @activity.defn(name="validate_artifact_production")
     async def validate_artifact_production(
@@ -523,11 +543,12 @@ class ArtifactActivities:
         observed = _as_utc(request.observed_at, "observed_at")
         async with self._session_factory() as session:
             async with session.begin():
-                return await repository.timeout_run(
+                await repository.timeout_run(
                     session,
                     request.production_run_id,
                     observed,
                 )
+                return None
 
     @activity.defn(name="terminalize_artifact_production")
     async def terminalize_artifact_production(
@@ -890,9 +911,54 @@ async def run_artifact_worker(
         configured=configured,
     )
     if stop_event is None:
-        await worker.run()
+        worker_task = asyncio.create_task(worker.run())
+        retention_task = asyncio.create_task(
+            _run_retention_loop(
+                session_factory=session_factory,
+                configured=configured,
+            )
+        )
+        done, pending = await asyncio.wait(
+            {worker_task, retention_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if worker_task in done:
+            await worker_task
+        elif retention_task in done:
+            await retention_task
         return
     await _run_until_stopped(worker.run(), stop_event)
+
+
+async def _run_retention_loop(
+    *,
+    session_factory: object,
+    configured: Settings,
+) -> None:
+    if not configured.artifact_retention_enabled:
+        return
+    service = ArtifactRetentionService()
+    while True:
+        await asyncio.sleep(configured.artifact_retention_interval_seconds)
+        observed_at = datetime.now(UTC)
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    result = await service.retain_expired(
+                        session,
+                        observed_at=observed_at,
+                    )
+            logger.info(
+                "artifact retention completed test=%s drill=%s failed=%s",
+                result.test_deleted,
+                result.drill_deleted,
+                result.failed_deletions,
+            )
+        except Exception:
+            logger.exception("artifact retention failed")
 
 
 async def run_artifact_dispatcher(

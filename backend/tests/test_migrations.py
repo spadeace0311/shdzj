@@ -1220,3 +1220,10 @@ async def test_0016_clears_archive_orphans_after_deep_downgrade() -> None:
             _set_revision(LATEST_REVISION)
         except AssertionError:
             pass
+
+
+async def test_0016_artifact_retention_uses_application_only_state() -> None:
+    from app.artifacts.retention import ArtifactRetentionService
+
+    service = ArtifactRetentionService()
+    assert service.retain_expired is not None

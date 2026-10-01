@@ -20,7 +20,10 @@ os.environ.setdefault(
 
 from app.db import SessionFactory  # noqa: E402
 
+from app.artifacts.retention import ArtifactRetentionService  # noqa: E402
+
 from tests.artifact_helpers import (  # noqa: E402, F401
+    artifact_acceptance_environment,
     artifact_repository,
     seeded_artifact_assessment,
     session,
@@ -42,6 +45,11 @@ os.environ["CENC_COLLECTOR_ENABLED"] = "false"
 @pytest.fixture
 def session_factory():
     return SessionFactory
+
+
+@pytest.fixture
+def artifact_retention_service():
+    return ArtifactRetentionService()
 
 
 def pytest_unconfigure(config: object) -> None:

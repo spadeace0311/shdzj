@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str
+    database_pool_size: int = 80
+    database_max_overflow: int = 40
     jwt_secret: SecretStr
     jwt_expire_minutes: int = 480
     superadmin_username: str = "superadmin"
@@ -67,6 +69,8 @@ class Settings(BaseSettings):
     artifact_render_concurrency: int = 4
     artifact_optional_dependency_reserve_seconds: int = 30
     artifact_browser_pool_size: int = 2
+    artifact_retention_enabled: bool = True
+    artifact_retention_interval_seconds: int = 86_400
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -181,6 +185,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ARTIFACT_OPTIONAL_DEPENDENCY_RESERVE_SECONDS must be positive "
                 "and less than 300"
+            )
+        if self.artifact_retention_interval_seconds < 60:
+            raise ValueError(
+                "ARTIFACT_RETENTION_INTERVAL_SECONDS must be at least 60"
             )
         return self
 

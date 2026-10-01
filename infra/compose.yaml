@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgis/postgis:16-3.4
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB is required}"
       POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
@@ -143,6 +144,64 @@ services:
         condition: service_healthy
       temporal:
         condition: service_started
+
+  artifact-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+      ARTIFACT_RENDER_CONCURRENCY: "${ARTIFACT_RENDER_CONCURRENCY:-4}"
+      ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-8}"
+    command: ["python", "-m", "app.artifacts.worker", "worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'app.artifacts.worker worker' >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  artifact-dispatcher:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+    command: ["python", "-m", "app.artifacts.worker", "dispatcher"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'app.artifacts.worker dispatcher' >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   collector:
     build:

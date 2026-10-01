@@ -43,6 +43,10 @@ RUN apt-get update \
         libopenjp2-7 \
         libpango-1.0-0 \
         libpng16-16 \
+        libxrender1 \
+        libxi6 \
+        libxtst6 \
+        libxss1 \
         libtiff6 \
         libwebp7 \
         libx11-6 \
@@ -55,6 +59,7 @@ RUN apt-get update \
         libxkbcommon0 \
         libxrandr2 \
         libxshmfence1 \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=maplibre-assets /build/package/dist /opt/maplibre/assets

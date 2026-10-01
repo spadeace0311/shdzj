@@ -26,6 +26,7 @@ class ArtifactProductionWorkflowInput:
     generation_seq: int
     generation_scope: str
     required_outputs: tuple[tuple[str, str], ...]
+    render_concurrency: int = 4
 
     def __post_init__(self) -> None:
         # Temporal's default dataclass converter does not serialize datetime.
@@ -33,6 +34,8 @@ class ArtifactProductionWorkflowInput:
         parsed = datetime.fromisoformat(self.deadline_at.replace("Z", "+00:00"))
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError("deadline_at must include timezone information")
+        if not 1 <= self.render_concurrency <= 8:
+            raise ValueError("render_concurrency must be between 1 and 8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +112,7 @@ class ArtifactProductionPrepared:
 class ArtifactProductionWorkflow:
     def __init__(self) -> None:
         self._status = "pending"
+        self._render_concurrency = 4
         self._deadline_exceeded_at: str | None = None
         self._intensity_ready = False
         self._loss_core_ready = False
@@ -155,6 +159,7 @@ class ArtifactProductionWorkflow:
         self,
         request: ArtifactProductionWorkflowInput,
     ) -> ArtifactProductionWorkflowResult:
+        self._render_concurrency = request.render_concurrency
         prepared_payload = await workflow.execute_activity(
             "prepare_artifact_production",
             request,
@@ -374,10 +379,14 @@ class ArtifactProductionWorkflow:
         outputs: tuple[tuple[str, str], ...],
         prepared: ArtifactProductionPrepared,
     ) -> None:
+        semaphore = asyncio.Semaphore(self._render_concurrency)
+
+        async def _run_with_limit(artifact_key: str, output_profile: str) -> None:
+            async with semaphore:
+                await self._run_output(artifact_key, output_profile, prepared)
+
         tasks = [
-            asyncio.create_task(
-                self._run_output(artifact_key, output_profile, prepared)
-            )
+            asyncio.create_task(_run_with_limit(artifact_key, output_profile))
             for artifact_key, output_profile in outputs
         ]
         self._phase_tasks.extend(tasks)
