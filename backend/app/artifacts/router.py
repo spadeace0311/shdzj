@@ -264,6 +264,8 @@ def _workflow_input(run: ProductionRun) -> ArtifactProductionWorkflowInput:
             (item["artifact_key"], item["output_profile"])
             for item in run.required_outputs
         ),
+        render_concurrency=settings.artifact_render_concurrency,
+        deadline_basis_at=run.deadline_basis_at.isoformat(),
     )
 
 

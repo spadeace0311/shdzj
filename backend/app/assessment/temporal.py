@@ -12,7 +12,11 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ParentClosePolicy
 
-from app.artifacts.workflow import ArtifactProductionWorkflow, ArtifactProductionWorkflowInput
+from app.artifacts.workflow import (
+    DEFAULT_ARTIFACT_RENDER_CONCURRENCY,
+    ArtifactProductionWorkflow,
+    ArtifactProductionWorkflowInput,
+)
 
 if TYPE_CHECKING:
     from app.intensity.service import IntensityService
@@ -354,6 +358,15 @@ def _as_artifact_workflow_input(value: object) -> ArtifactProductionWorkflowInpu
         required_outputs=tuple(
             (str(item[0]), str(item[1])) for item in value["required_outputs"]
         ),
+        render_concurrency=int(
+            value.get(
+                "render_concurrency",
+                DEFAULT_ARTIFACT_RENDER_CONCURRENCY,
+            )
+        ),
+        deadline_basis_at=str(
+            value.get("deadline_basis_at") or deadline
+        ),
     )
 
 
@@ -488,6 +501,8 @@ class AssessmentActivities:
                         (task.artifact_key, task.output_profile)
                         for task in tasks
                     ),
+                    render_concurrency=settings.artifact_render_concurrency,
+                    deadline_basis_at=production.deadline_basis_at.isoformat(),
                 )
         return PreparedAssessment(
             run_id=str(run.id),

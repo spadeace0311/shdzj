@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact, ProductionRun
@@ -19,6 +19,8 @@ class ArtifactRetentionResult:
     manual_deleted: int = 0
     replay_deleted: int = 0
     failed_deletions: int = 0
+    protected_publication_count: int = 0
+    protected_publication_reasons: tuple[tuple[str, int], ...] = ()
 
 
 class ArtifactRetentionService:
@@ -61,9 +63,36 @@ class ArtifactRetentionService:
             ).all()
             expired.extend(rows)
 
+        expired_ids = [artifact.id for artifact in expired]
+        publication_references = (
+            await session.execute(
+                select(
+                    ArtifactPublication.artifact_id,
+                    ArtifactPublication.superseded_at,
+                ).where(
+                    ArtifactPublication.artifact_id.in_(expired_ids)
+                )
+            )
+        ).all()
+        protected_ids = {
+            artifact_id for artifact_id, _superseded_at in publication_references
+        }
+        protection_reasons = {
+            "current_publication": sum(
+                superseded_at is None
+                for _artifact_id, superseded_at in publication_references
+            ),
+            "superseded_publication": sum(
+                superseded_at is not None
+                for _artifact_id, superseded_at in publication_references
+            ),
+        }
+
         deletable: list[GeneratedArtifact] = []
         failed_deletions = 0
         for artifact in expired:
+            if artifact.id in protected_ids:
+                continue
             if not await self._delete_object(artifact):
                 failed_deletions += 1
                 continue
@@ -71,11 +100,6 @@ class ArtifactRetentionService:
 
         if deletable:
             ids = [artifact.id for artifact in deletable]
-            await session.execute(
-                delete(ArtifactPublication).where(
-                    ArtifactPublication.artifact_id.in_(ids)
-                )
-            )
             await session.execute(
                 update(GeneratedArtifact)
                 .where(GeneratedArtifact.superseded_by_id.in_(ids))
@@ -102,6 +126,12 @@ class ArtifactRetentionService:
             manual_deleted=0,
             replay_deleted=0,
             failed_deletions=failed_deletions,
+            protected_publication_count=len(publication_references),
+            protected_publication_reasons=tuple(
+                (reason, count)
+                for reason, count in protection_reasons.items()
+                if count
+            ),
         )
 
     async def _delete_object(self, artifact: GeneratedArtifact) -> bool:

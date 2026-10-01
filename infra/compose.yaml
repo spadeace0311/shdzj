@@ -157,6 +157,8 @@ services:
       ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-8}"
     command: ["python", "-m", "app.artifacts.worker", "worker"]
     restart: unless-stopped
+    deploy:
+      replicas: 1
     volumes:
       - ../backend:/app
       - ../config:/config
@@ -169,7 +171,7 @@ services:
       temporal:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'app.artifacts.worker worker' >/dev/null || exit 1"]
+      test: ["CMD", "python", "-m", "app.process_health", "worker"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -197,7 +199,7 @@ services:
       temporal:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'app.artifacts.worker dispatcher' >/dev/null || exit 1"]
+      test: ["CMD", "python", "-m", "app.process_health", "dispatcher"]
       interval: 15s
       timeout: 5s
       retries: 10

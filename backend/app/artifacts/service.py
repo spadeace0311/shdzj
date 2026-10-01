@@ -207,6 +207,7 @@ class ArtifactProductionService:
                 return PreparedProductionRun(
                     production_run_id=run.id,
                     task_count=len(tasks),
+                    deadline_basis_at=run.deadline_basis_at,
                     deadline_at=run.deadline_at,
                     required_outputs=tuple(
                         (task.artifact_key, task.output_profile)
@@ -299,6 +300,7 @@ class ArtifactProductionService:
                 return PreparedProductionRun(
                     production_run_id=run.id,
                     task_count=len(tasks),
+                    deadline_basis_at=run.deadline_basis_at,
                     deadline_at=run.deadline_at,
                     required_outputs=tuple(
                         (task.artifact_key, task.output_profile)

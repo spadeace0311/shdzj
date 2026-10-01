@@ -120,3 +120,97 @@ async def test_dependency_waits_are_not_gated_by_render_slots(monkeypatch) -> No
     await asyncio.wait_for(asyncio.gather(*waits), timeout=1)
 
     assert session.entered == 4
+
+
+async def test_artifact_worker_runs_retention_with_supplied_stop_event(
+    monkeypatch,
+) -> None:
+    retention_started = asyncio.Event()
+    retention_stopped = asyncio.Event()
+
+    class BlockingWorker:
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+    async def retention_loop(**kwargs) -> None:
+        del kwargs
+        retention_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retention_stopped.set()
+
+    monkeypatch.setattr(
+        artifact_worker,
+        "build_artifact_worker",
+        lambda **_kwargs: BlockingWorker(),
+    )
+    monkeypatch.setattr(
+        artifact_worker,
+        "_run_retention_loop",
+        retention_loop,
+    )
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(
+        artifact_worker.run_artifact_worker(
+            stop_event,
+            client=object(),
+            configured=SimpleNamespace(
+                artifact_retention_enabled=True,
+                artifact_retention_interval_seconds=60,
+            ),
+        )
+    )
+
+    await asyncio.wait_for(retention_started.wait(), timeout=1)
+    stop_event.set()
+    await asyncio.wait_for(worker_task, timeout=1)
+
+    assert retention_stopped.is_set()
+
+
+async def test_production_worker_entry_starts_and_stops_retention(
+    monkeypatch,
+) -> None:
+    retention_started = asyncio.Event()
+    retention_stopped = asyncio.Event()
+    captured: list[asyncio.Event] = []
+
+    def install_signal_handlers(loop, stop_event: asyncio.Event) -> None:
+        del loop
+        captured.append(stop_event)
+
+    class BlockingWorker:
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+    async def retention_loop(**_kwargs) -> None:
+        retention_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retention_stopped.set()
+
+    monkeypatch.setattr(
+        artifact_worker,
+        "_install_signal_handlers",
+        install_signal_handlers,
+    )
+    monkeypatch.setattr(
+        artifact_worker,
+        "build_artifact_worker",
+        lambda **_kwargs: BlockingWorker(),
+    )
+    monkeypatch.setattr(
+        artifact_worker,
+        "_run_retention_loop",
+        retention_loop,
+    )
+
+    process_task = asyncio.create_task(artifact_worker._run_process("worker"))
+    await asyncio.wait_for(retention_started.wait(), timeout=1)
+    assert len(captured) == 1
+    captured[0].set()
+    await asyncio.wait_for(process_task, timeout=1)
+
+    assert retention_stopped.is_set()

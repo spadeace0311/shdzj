@@ -1147,15 +1147,56 @@ def _validate_spec(spec: MapRenderSpec) -> None:
         raise ValueError("map output must use 300 DPI")
     for layer in spec.layers:
         _validate_local_url(layer.url)
-        if not (
+        if (
             isinstance(layer.source, Mapping)
             and layer.source.get("type") == "geojson"
         ):
+            _validate_geojson_source(layer.source)
+        else:
             _validate_resource_mapping(layer.source)
         _validate_resource_mapping(layer.style)
 
 
 _RESOURCE_KEYS = {"url", "tiles", "data", "sprite", "glyphs", "source", "style"}
+
+
+def _validate_geojson_source(source: Mapping[str, Any]) -> None:
+    data = source.get("data")
+    if isinstance(data, str):
+        _validate_local_url(data)
+        return
+    if not isinstance(data, Mapping):
+        raise ValueError(
+            "geojson source data must be an inline FeatureCollection "
+            "or a local URL"
+        )
+    if data.get("type") != "FeatureCollection":
+        _reject_remote_geojson_urls(data)
+        raise ValueError("geojson source data must be a FeatureCollection")
+    _reject_remote_geojson_urls(data)
+
+
+def _reject_remote_geojson_urls(value: Any) -> None:
+    if isinstance(value, str):
+        parsed = urlparse(value)
+        if parsed.scheme.lower() in {"http", "https", "ftp", "ws", "wss"}:
+            raise RemoteAssetForbiddenError(
+                f"map render assets must use local:// or "
+                f"ARTIFACT_STORAGE_ROOT: {value}"
+            )
+        if value.startswith("//"):
+            raise RemoteAssetForbiddenError(
+                f"map render assets must use local:// or "
+                f"ARTIFACT_STORAGE_ROOT: {value}"
+            )
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _reject_remote_geojson_urls(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_remote_geojson_urls(item)
 
 
 def _validate_resource_mapping(value: Any) -> None:

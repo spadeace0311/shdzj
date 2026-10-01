@@ -757,6 +757,8 @@ class ArtifactAssessmentFixture:
             generation_scope=f"artifact:{run.required_outputs[0][0]}:"
             f"{run.required_outputs[0][1]}",
             required_outputs=run.required_outputs,
+            render_concurrency=settings.artifact_render_concurrency,
+            deadline_basis_at=run.deadline_basis_at.isoformat(),
         )
 
     async def create_correction_revision(
@@ -1009,6 +1011,10 @@ class ArtifactAssessmentFixture:
 class ArtifactAcceptanceArtifact:
     file_name: str
     context_fingerprint: str
+    artifact_key: str = ""
+    output_profile: str = ""
+    status: str = ""
+    degradation_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,6 +1026,7 @@ class ArtifactAcceptanceResult:
     timeout_count: int
     elapsed_seconds: float
     artifacts: tuple[ArtifactAcceptanceArtifact, ...]
+    production_run_id: str = ""
     deadline_basis_at: str = ""
     deadline_at: str = ""
 
@@ -1111,26 +1118,75 @@ class ArtifactAcceptanceEnvironment:
         await self.seed()
         deadline_basis_at = datetime.fromisoformat(t1_at)
         declared_deadline_at = deadline_basis_at + timedelta(seconds=300)
-        now = datetime.now(UTC)
+        await self._prepare_replay_context(
+            deadline_basis_at=deadline_basis_at,
+            deadline_at=declared_deadline_at,
+        )
         run = await self._create_standalone_run(
             production_mode=production_mode,
-            deadline_basis_at=now,
-            deadline_at=now + timedelta(seconds=300),
+            deadline_basis_at=deadline_basis_at,
+            deadline_at=declared_deadline_at,
         )
-        result = await self._execute_run(run)
+        return await self._execute_run(run)
+
+    async def _prepare_replay_context(
+        self,
+        *,
+        deadline_basis_at: datetime,
+        deadline_at: datetime,
+    ) -> None:
+        from app.assessment.models import AssessmentRun, AssessmentTask
+        from app.events.models import (
+            EarthquakeEvent,
+            EarthquakeRevision,
+            EventLifecycleOutbox,
+        )
+
         async with self._session_factory() as session:
             async with session.begin():
-                stored = await session.get(ProductionRun, run.id)
-                if stored is None:
-                    raise LookupError("replay production run was not persisted")
-                stored.deadline_basis_at = deadline_basis_at
-                stored.deadline_at = declared_deadline_at
-                await session.flush()
-                return await self._build_result(
-                    session,
-                    run.id,
-                    elapsed_seconds=result.elapsed_seconds,
+                assessment = await session.get(
+                    AssessmentRun,
+                    self._seeded.assessment_run_id,
+                    with_for_update=True,
                 )
+                event = await session.get(
+                    EarthquakeEvent,
+                    self._seeded.event_id,
+                    with_for_update=True,
+                )
+                revision = await session.get(
+                    EarthquakeRevision,
+                    self._seeded.revision_id,
+                )
+                if (
+                    assessment is None
+                    or event is None
+                    or revision is None
+                ):
+                    raise LookupError("replay assessment context is missing")
+                outbox = await session.get(
+                    EventLifecycleOutbox,
+                    assessment.outbox_id,
+                )
+                assessment.deadline_basis_at = deadline_basis_at
+                assessment.deadline_at = deadline_at
+                assessment.t1_at = deadline_basis_at
+                assessment.report_ingested_at = deadline_basis_at
+                event.t1_at = deadline_basis_at
+                revision.ingested_at = deadline_basis_at
+                if outbox is not None:
+                    outbox.created_at = deadline_basis_at
+                    outbox.available_at = deadline_basis_at
+                tasks = (
+                    await session.scalars(
+                        select(AssessmentTask).where(
+                            AssessmentTask.run_id == assessment.id
+                        )
+                    )
+                ).all()
+                for task in tasks:
+                    task.deadline_at = deadline_at
+                await session.flush()
 
     async def _set_event_magnitude(self, magnitude: float) -> None:
         from decimal import Decimal
@@ -1193,6 +1249,8 @@ class ArtifactAcceptanceEnvironment:
                         _required_output_pair(item)
                         for item in stored.required_outputs
                     ),
+                    render_concurrency=settings.artifact_render_concurrency,
+                    deadline_basis_at=stored.deadline_basis_at.isoformat(),
                 )
         await self._ensure_worker()
         started = asyncio.get_running_loop().time()
@@ -1267,6 +1325,7 @@ class ArtifactAcceptanceEnvironment:
             timeout_count=task_counts["timeout"],
             elapsed_seconds=elapsed_seconds,
             artifacts=artifacts,
+            production_run_id=str(run.id),
             deadline_basis_at=run.deadline_basis_at.isoformat(),
             deadline_at=run.deadline_at.isoformat(),
         )
@@ -1293,6 +1352,14 @@ class ArtifactAcceptanceEnvironment:
             ArtifactAcceptanceArtifact(
                 file_name=artifact.file_name,
                 context_fingerprint=context_fingerprint,
+                artifact_key=artifact.artifact_key,
+                output_profile=artifact.output_profile,
+                status=(
+                    "degraded"
+                    if artifact.status == "degraded"
+                    else "complete"
+                ),
+                degradation_reasons=_artifact_degradation_reasons(artifact),
             )
             for artifact in sorted(
                 artifacts,
@@ -2388,6 +2455,19 @@ def _required_output_pair(item: object) -> tuple[str, str]:
     if isinstance(item, dict):
         return str(item["artifact_key"]), str(item["output_profile"])
     return str(item[0]), str(item[1])
+
+
+def _artifact_degradation_reasons(
+    artifact: GeneratedArtifact,
+) -> tuple[str, ...]:
+    manifest = artifact.render_manifest or {}
+    quality = manifest.get("quality") if isinstance(manifest, dict) else None
+    if not isinstance(quality, dict):
+        quality = {}
+    reasons = quality.get("degradation_reasons", ())
+    if not reasons and artifact.status == "degraded":
+        return ("unspecified",)
+    return tuple(str(reason) for reason in reasons)
 
 
 async def _cleanup_fixture_data(session_factory, event_id: uuid.UUID) -> None:

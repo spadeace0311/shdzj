@@ -160,7 +160,15 @@ WHERE r.production_mode IN ('test', 'drill')
 ORDER BY g.generated_at;
 ```
 
-保留任务每日运行一次并记录各模式删除数量。对象删除失败时保留数据库记录，供下一轮重试。
+保留任务每日运行一次并记录 `test`、`drill`、`live`、`manual`、
+`replay`、失败数和受保护发布数的结构化计数。对象删除失败时保留数据库
+记录，供下一轮重试。
+
+任何仍被 `artifact_publications` 引用的成果都不会被静默删除，包括
+`superseded_at` 非空的旧发布。保留任务分别记录
+`current_publication` 和 `superseded_publication` 保护原因及计数，
+运维人员只有在明确确认不再需要该发布并完成发布关系处理后，才能清理
+对应对象。
 
 ## 9. 校验存储校验和与磁盘容量
 
@@ -181,3 +189,48 @@ docker compose --env-file .env -f infra/compose.yaml run --rm api df -h /var/lib
 ```
 
 如果校验和不一致，禁止把该对象作为当前发布继续使用。
+
+## 10. 渲染并发与 worker 拓扑
+
+成果渲染并发由单一 `artifact-worker` 进程内的全局信号量执行，
+`ARTIFACT_RENDER_CONCURRENCY` 的有效值就是该进程同时进行真实地图、
+文档和演示文稿渲染的上限。`temporal-worker` 只运行评估工作流和评估
+活动，不注册成果渲染活动；不要横向扩展 `artifact-worker` 来增加
+容量，否则每个进程会重新获得该上限。
+
+Compose 通过 `deploy.replicas: 1` 固定当前部署拓扑。若未来必须扩展
+渲染容量，应先引入跨进程分布式信号量或独立队列级容量控制，再调整
+该配置。
+
+## 11. 检查 worker 健康状态
+
+两个 Compose health check 都直接检查实际进程参数，不使用
+`pgrep -f`，避免健康检查命令行匹配自身。检查状态：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml ps artifact-worker artifact-dispatcher
+```
+
+在容器内验证缺失进程会失败：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm api python -m app.process_health worker
+```
+
+该命令应在没有真实 `artifact-worker` 进程时返回非零退出码；在运行中的
+artifact worker 容器内执行时，`python -m app.process_health worker`
+应返回零。dispatcher 使用同样的检查方式。
+
+## 12. 执行浏览器验收
+
+先设置一次性验收密码，再运行统一入口完成固定测试事件、39 项成果和
+浏览器下载验证。密码只从进程环境读取，不写入仓库：
+
+```powershell
+$env:E2E_SUPERADMIN_PASSWORD = "<一次性测试密码>"
+.\scripts\run-artifact-e2e.ps1 -Scope focused
+.\scripts\run-artifact-e2e.ps1 -Scope full
+```
+
+脚本先执行 `python -m tests.e2e_fixture`，再运行 Playwright。缺少密码、
+固定测试事件、成果或真实服务时，命令必须失败，不得以 skip 作为通过。

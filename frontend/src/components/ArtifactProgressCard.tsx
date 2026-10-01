@@ -36,12 +36,14 @@ export function buildArtifactProgressSummary(
   ).length;
   const requiredOutputCount = run.required_output_count || artifacts.length;
   const completeCount = run.complete_count || 0;
+  const degradedCount = run.degraded_count || 0;
+  const acceptedCount = completeCount + degradedCount;
 
   return {
     productionRunId: run.production_run_id || "",
     status: run.status || "",
     completeCount,
-    degradedCount: run.degraded_count || 0,
+    degradedCount,
     failedCount: run.failed_count || 0,
     timeoutCount: run.timeout_count || 0,
     needsReviewCount: run.needs_review_count || 0,
@@ -49,7 +51,7 @@ export function buildArtifactProgressSummary(
     mapCount,
     backgroundDocumentCount,
     coreDocumentCount,
-    progressText: `${completeCount}/${requiredOutputCount}`,
+    progressText: `${acceptedCount}/${requiredOutputCount}`,
   };
 }
 

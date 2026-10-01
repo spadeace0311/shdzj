@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -9,6 +11,7 @@ from PIL import Image, ImageDraw
 from sqlalchemy import select
 
 from app.artifacts.models import ProductionRun
+from app.artifacts.router import _workflow_input
 from app.artifacts.storage import ArtifactStore
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
@@ -35,6 +38,35 @@ def _jpeg_bytes(color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=35, dpi=(300, 300))
     return output.getvalue()
+
+
+def test_metadata_rebuild_workflow_input_passes_render_concurrency(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(settings, "artifact_render_concurrency", 3)
+    run = SimpleNamespace(
+        id=uuid4(),
+        assessment_run_id=uuid4(),
+        event_id=uuid4(),
+        revision_id=uuid4(),
+        deadline_at=datetime(2026, 9, 26, 3, 8, tzinfo=UTC),
+        deadline_basis_at=datetime(2026, 9, 26, 3, 3, tzinfo=UTC),
+        catalog_version="catalog-v1",
+        context_fingerprint="",
+        launch_mode="standalone",
+        generation_seq=2,
+        generation_scope="artifact:map.epicenter:a3v-professional",
+        required_outputs=[
+            {
+                "artifact_key": "map.epicenter",
+                "output_profile": "a3v-professional",
+            }
+        ],
+    )
+
+    request = _workflow_input(run)
+
+    assert request.render_concurrency == 3
 
 
 @pytest.fixture(autouse=True)

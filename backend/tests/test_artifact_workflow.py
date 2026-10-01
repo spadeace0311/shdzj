@@ -28,6 +28,7 @@ from app.assessment.temporal import (
     AssessmentActivities,
     AssessmentWorkflow,
     AssessmentWorkflowInput,
+    _as_artifact_workflow_input,
 )
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
@@ -767,6 +768,28 @@ def test_workflow_input_rejects_naive_deadline() -> None:
             generation_scope="full",
             required_outputs=(),
         )
+
+
+def test_artifact_workflow_input_conversion_preserves_render_concurrency() -> None:
+    request = _as_artifact_workflow_input(
+        {
+            "production_run_id": str(uuid4()),
+            "assessment_run_id": str(uuid4()),
+            "event_id": str(uuid4()),
+            "revision_id": str(uuid4()),
+            "deadline_at": "2026-09-26T03:08:00+00:00",
+            "catalog_version": "catalog-v1",
+            "context_fingerprint": "",
+            "launch_mode": "assessment_child",
+            "generation_seq": 1,
+            "generation_scope": "full",
+            "required_outputs": [["map.epicenter", "a3v-professional"]],
+            "render_concurrency": 2,
+        }
+    )
+
+    assert request is not None
+    assert request.render_concurrency == 2
 
 
 async def test_finalize_run_with_failure_persists_category(

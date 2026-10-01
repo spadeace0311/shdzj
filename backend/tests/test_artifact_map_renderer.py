@@ -25,6 +25,7 @@ from app.artifacts.renderers.map_renderer import (
     MapRenderer,
     MapSpecBuilder,
     RemoteAssetForbiddenError,
+    _validate_spec,
 )
 from tests.basemap_fixtures import (
     png_tile_bytes,
@@ -295,6 +296,97 @@ async def test_renderer_rejects_nested_remote_source_url(
 
     with pytest.raises(RemoteAssetForbiddenError):
         await map_renderer.render(spec, tmp_path / "rejected-source.jpg")
+
+
+async def test_spec_rejects_remote_geojson_data(
+    seeded_artifact_assessment,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    spec = replace(
+        MapSpecBuilder().build(context),
+        layers=(
+            MapLayer(
+                id="remote-geojson",
+                url="local://artifact_maps/epicenter.geojson",
+                source={
+                    "type": "geojson",
+                    "data": "https://example.invalid/remote.geojson",
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(RemoteAssetForbiddenError):
+        _validate_spec(spec)
+
+
+async def test_spec_rejects_nested_remote_url_in_geojson_feature(
+    seeded_artifact_assessment,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    spec = replace(
+        MapSpecBuilder().build(context),
+        layers=(
+            MapLayer(
+                id="nested-remote-geojson",
+                url="local://artifact_maps/epicenter.geojson",
+                source={
+                    "type": "geojson",
+                    "data": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "url": "https://example.invalid/nested"
+                                },
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [121.5, 31.2],
+                                },
+                            }
+                        ],
+                    },
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(RemoteAssetForbiddenError):
+        _validate_spec(spec)
+
+
+async def test_spec_accepts_inline_geojson_feature_collection(
+    seeded_artifact_assessment,
+) -> None:
+    context = await seeded_artifact_assessment.map_context("map.epicenter")
+    spec = replace(
+        MapSpecBuilder().build(context),
+        layers=(
+            MapLayer(
+                id="inline-geojson",
+                url="local://artifact_maps/epicenter.geojson",
+                source={
+                    "type": "geojson",
+                    "data": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {"kind": "epicenter"},
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [121.5, 31.2],
+                                },
+                            }
+                        ],
+                    },
+                },
+            ),
+        ),
+    )
+
+    _validate_spec(spec)
 
 
 async def test_renderer_rejects_remote_url_inside_sprite_objects(

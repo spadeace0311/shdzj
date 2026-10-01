@@ -15,6 +15,7 @@ from app.assessment.worker import (
     build_worker,
     run_dispatcher,
 )
+from app.artifacts.workflow import ArtifactProductionWorkflow
 from app.config import Settings
 from app.db import engine
 from app.events.domain import EventKind, NormalizedEvent
@@ -191,6 +192,37 @@ def test_worker_process_factory_uses_configured_task_queue(
     )
 
     assert worker.task_queue == configured.temporal_task_queue
+
+
+def test_assessment_worker_does_not_register_artifact_rendering(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configured_settings()
+    monkeypatch.setattr("app.assessment.worker.Worker", RecordingWorker)
+    worker = build_worker(
+        client=RecordingTemporalClient(),
+        session_factory=session_factory,
+        configured=configured,
+    )
+
+    assert ArtifactProductionWorkflow not in worker.workflows
+    assert {
+        activity.__name__ for activity in worker.activities
+    }.isdisjoint(
+        {
+            "prepare_artifact_production",
+            "wait_for_artifact_dependencies",
+            "render_map_artifact",
+            "compose_docx_artifact",
+            "compose_pptx_artifact",
+            "validate_artifact_production",
+            "publish_artifact_production",
+            "terminalize_artifact_production",
+            "cancel_artifact_production",
+            "mark_production_deadline_exceeded",
+        }
+    )
 
 
 async def test_temporal_starter_maps_outbox_payload_to_workflow_input() -> None:

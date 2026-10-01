@@ -1,7 +1,10 @@
 import { render, screen } from "@testing-library/react";
 import { expect, test } from "vitest";
 
-import { ArtifactProgressCard } from "../src/components/ArtifactProgressCard";
+import {
+  ArtifactProgressCard,
+  buildArtifactProgressSummary,
+} from "../src/components/ArtifactProgressCard";
 
 test("progress card uses latest full run and shows grouped counts", () => {
   render(
@@ -27,4 +30,23 @@ test("progress card uses latest full run and shows grouped counts", () => {
   expect(screen.getByText("图件")).toBeInTheDocument();
   expect(screen.getByText("背景文档")).toBeInTheDocument();
   expect(screen.getByText("核心文档")).toBeInTheDocument();
+});
+
+test("progress counts accepted degraded outputs as produced outputs", () => {
+  const summary = buildArtifactProgressSummary({
+    production_run_id: "run-2",
+    status: "completed",
+    required_output_count: 39,
+    complete_count: 28,
+    degraded_count: 11,
+    failed_count: 0,
+    timeout_count: 0,
+    artifacts: [
+      { artifact_key: "map.intensity" },
+      { artifact_key: "map.building_grid" },
+      { artifact_key: "doc.background" },
+    ],
+  } as never);
+
+  expect(summary?.progressText).toBe("39/39");
 });

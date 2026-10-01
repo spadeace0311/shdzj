@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import json
 import logging
 import os
 import signal
@@ -25,6 +26,7 @@ from app.artifacts.repository import (
     ArtifactGenerationResult,
     ArtifactProductionRepository,
     ArtifactQuality,
+    _effective_now,
 )
 from app.artifacts.retention import ArtifactRetentionService
 from app.artifacts.renderers.base import (
@@ -72,6 +74,7 @@ class ArtifactActivities:
         self,
         session_factory: object,
         *,
+        render_concurrency: int | None = None,
         context_service: ProductionContextService | None = None,
         store: ArtifactStore | None = None,
         validator: ArtifactValidator | None = None,
@@ -83,7 +86,9 @@ class ArtifactActivities:
         self._validator = validator
         self._renderer_factory = renderer_factory
         self._render_slots = asyncio.Semaphore(
-            settings.artifact_render_concurrency
+            render_concurrency
+            if render_concurrency is not None
+            else settings.artifact_render_concurrency
         )
         self._dependency_prepare_lock = asyncio.Lock()
 
@@ -143,6 +148,8 @@ class ArtifactActivities:
                 return {
                     "production_run_id": str(run.id),
                     "deadline_at": run.deadline_at,
+                    "deadline_basis_at": run.deadline_basis_at,
+                    "clock_started_at": run.started_at,
                     "context_fingerprint": run.context_fingerprint or "",
                     "launch_mode": run.launch_mode,
                     "background_outputs": groups["background"],
@@ -213,7 +220,10 @@ class ArtifactActivities:
                             non_retryable=True,
                         )
                     else:
-                        observed = datetime.now(UTC)
+                        observed = _effective_now(
+                            run,
+                            datetime.now(UTC),
+                        )
                         if await _assessment_failed_for_run(session, run):
                             await repository.fail_task(
                                 session,
@@ -881,7 +891,10 @@ def build_artifact_worker(
     session_factory: object,
     configured: Settings = settings,
 ) -> Worker:
-    activities = ArtifactActivities(session_factory)
+    activities = ArtifactActivities(
+        session_factory,
+        render_concurrency=configured.artifact_render_concurrency,
+    )
     return Worker(
         client,
         task_queue=configured.temporal_task_queue,
@@ -917,20 +930,20 @@ async def run_artifact_worker(
         session_factory=session_factory,
         configured=configured,
     )
-    if stop_event is None:
-        retention_task = asyncio.create_task(
-            _run_retention_loop(
-                session_factory=session_factory,
-                configured=configured,
-            )
+    retention_task = asyncio.create_task(
+        _run_retention_loop(
+            session_factory=session_factory,
+            configured=configured,
         )
-        try:
+    )
+    try:
+        if stop_event is None:
             await worker.run()
-        finally:
-            retention_task.cancel()
-            await asyncio.gather(retention_task, return_exceptions=True)
-        return
-    await _run_until_stopped(worker.run(), stop_event)
+        else:
+            await _run_until_stopped(worker.run(), stop_event)
+    finally:
+        retention_task.cancel()
+        await asyncio.gather(retention_task, return_exceptions=True)
 
 
 async def _run_retention_loop(
@@ -951,11 +964,29 @@ async def _run_retention_loop(
                         session,
                         observed_at=observed_at,
                     )
+            payload = {
+                "test": result.test_deleted,
+                "drill": result.drill_deleted,
+                "live": result.live_deleted,
+                "manual": result.manual_deleted,
+                "replay": result.replay_deleted,
+                "failed": result.failed_deletions,
+                "protected_publications": result.protected_publication_count,
+                "protection_reasons": dict(
+                    result.protected_publication_reasons
+                ),
+            }
             logger.info(
-                "artifact retention completed test=%s drill=%s failed=%s",
-                result.test_deleted,
-                result.drill_deleted,
-                result.failed_deletions,
+                "artifact retention completed counts=%s",
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                extra={
+                    "artifact_retention_counts": payload,
+                },
             )
         except Exception:
             logger.exception("artifact retention failed")

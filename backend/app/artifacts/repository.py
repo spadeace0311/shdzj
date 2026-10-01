@@ -204,6 +204,7 @@ class CreateProductionRunCommand:
 class PreparedProductionRun:
     production_run_id: uuid.UUID
     task_count: int
+    deadline_basis_at: datetime
     deadline_at: datetime
     required_outputs: tuple[tuple[str, str], ...]
     task_ids: tuple[uuid.UUID, ...] = ()
@@ -889,7 +890,7 @@ class ArtifactProductionRepository:
         if task.attempt_count >= task.max_attempts:
             raise ValueError("task retry budget exhausted")
 
-        now = datetime.now(UTC)
+        now = _effective_now(run, datetime.now(UTC))
         if now > task.deadline_at:
             raise ValueError("production task deadline has passed")
         task.status = "running"
@@ -940,8 +941,9 @@ class ArtifactProductionRepository:
         if not run.is_current or run.superseded_at is not None:
             raise ValueError("superseded production run cannot commit artifacts")
 
-        now = artifact_result.generated_at or datetime.now(UTC)
-        now = _normalize_utc(now, "generated_at")
+        observed_at = artifact_result.generated_at or datetime.now(UTC)
+        observed_at = _normalize_utc(observed_at, "generated_at")
+        now = _effective_now(run, observed_at)
         if now > run.deadline_at or now > task.deadline_at:
             raise ValueError("artifact write occurs after production deadline")
 
@@ -1978,6 +1980,23 @@ def _normalize_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must include timezone information")
     return value.astimezone(UTC)
+
+
+def _effective_now(run: ProductionRun, wall_clock_at: datetime) -> datetime:
+    wall_clock_at = _normalize_utc(wall_clock_at, "wall_clock_at")
+    if (
+        run.production_mode != "replay"
+        or run.started_at is None
+        or run.deadline_basis_at is None
+    ):
+        return wall_clock_at
+    execution_started_at = _normalize_utc(
+        run.started_at,
+        "run.started_at",
+    )
+    if wall_clock_at <= execution_started_at:
+        return run.deadline_basis_at
+    return run.deadline_basis_at + (wall_clock_at - execution_started_at)
 
 
 def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:

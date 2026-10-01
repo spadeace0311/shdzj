@@ -12,6 +12,8 @@ from temporalio.exceptions import ApplicationError
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ARTIFACT_RENDER_CONCURRENCY = 4
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactProductionWorkflowInput:
@@ -26,7 +28,8 @@ class ArtifactProductionWorkflowInput:
     generation_seq: int
     generation_scope: str
     required_outputs: tuple[tuple[str, str], ...]
-    render_concurrency: int = 4
+    render_concurrency: int = DEFAULT_ARTIFACT_RENDER_CONCURRENCY
+    deadline_basis_at: str = ""
 
     def __post_init__(self) -> None:
         # Temporal's default dataclass converter does not serialize datetime.
@@ -36,6 +39,14 @@ class ArtifactProductionWorkflowInput:
             raise ValueError("deadline_at must include timezone information")
         if not 1 <= self.render_concurrency <= 8:
             raise ValueError("render_concurrency must be between 1 and 8")
+        if self.deadline_basis_at:
+            basis = datetime.fromisoformat(
+                self.deadline_basis_at.replace("Z", "+00:00")
+            )
+            if basis.tzinfo is None or basis.utcoffset() is None:
+                raise ValueError(
+                    "deadline_basis_at must include timezone information"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,13 +117,15 @@ class ArtifactProductionPrepared:
     intensity_outputs: tuple[tuple[str, str], ...]
     loss_core_outputs: tuple[tuple[str, str], ...]
     loss_final_outputs: tuple[tuple[str, str], ...]
+    deadline_basis_at: datetime | None = None
+    clock_started_at: datetime | None = None
 
 
 @workflow.defn
 class ArtifactProductionWorkflow:
     def __init__(self) -> None:
         self._status = "pending"
-        self._render_concurrency = 4
+        self._render_concurrency = DEFAULT_ARTIFACT_RENDER_CONCURRENCY
         self._deadline_exceeded_at: str | None = None
         self._intensity_ready = False
         self._loss_core_ready = False
@@ -179,7 +192,7 @@ class ArtifactProductionWorkflow:
             else:
                 await self._run_assessment_child(prepared)
 
-            observed_at = workflow.now()
+            observed_at = self._logical_now(prepared)
             if observed_at >= prepared.deadline_at:
                 self._deadline_exceeded_at = observed_at.isoformat()
             early_reason = self._early_reason(prepared)
@@ -324,7 +337,7 @@ class ArtifactProductionWorkflow:
             return "cancel"
         if self._assessment_failed:
             return "assessment_failed"
-        if workflow.now() >= prepared.deadline_at:
+        if self._logical_now(prepared) >= prepared.deadline_at:
             return "deadline"
         return None
 
@@ -352,14 +365,14 @@ class ArtifactProductionWorkflow:
     ) -> None:
         delay = max(
             timedelta(seconds=0),
-            prepared.deadline_at - workflow.now(),
+            prepared.deadline_at - self._logical_now(prepared),
         )
         try:
             await workflow.wait_condition(
                 lambda: bool(predicate())
                 or self._assessment_failed
                 or self._cancel_reason is not None
-                or workflow.now() >= prepared.deadline_at,
+                or self._logical_now(prepared) >= prepared.deadline_at,
                 timeout=delay + timedelta(seconds=1),
             )
         except TimeoutError:
@@ -372,7 +385,7 @@ class ArtifactProductionWorkflow:
         return (
             self._assessment_failed
             or self._cancel_reason is not None
-            or workflow.now() >= prepared.deadline_at
+            or self._logical_now(prepared) >= prepared.deadline_at
         )
 
     async def _run_outputs(
@@ -454,10 +467,10 @@ class ArtifactProductionWorkflow:
         self,
         prepared: ArtifactProductionPrepared,
     ) -> None:
-        delay = prepared.deadline_at - workflow.now()
+        delay = prepared.deadline_at - self._logical_now(prepared)
         if delay.total_seconds() > 0:
             await workflow.sleep(delay)
-        self._deadline_exceeded_at = workflow.now().isoformat()
+        self._deadline_exceeded_at = self._logical_now(prepared).isoformat()
         await workflow.execute_activity(
             "mark_production_deadline_exceeded",
             ArtifactProductionDeadlineInput(
@@ -466,6 +479,16 @@ class ArtifactProductionWorkflow:
             ),
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=_retry_policy(),
+        )
+
+    def _logical_now(self, prepared: ArtifactProductionPrepared) -> datetime:
+        if (
+            prepared.deadline_basis_at is None
+            or prepared.clock_started_at is None
+        ):
+            return workflow.now()
+        return prepared.deadline_basis_at + (
+            workflow.now() - prepared.clock_started_at
         )
 
 
@@ -528,7 +551,23 @@ def _as_prepared(value: object) -> ArtifactProductionPrepared:
         intensity_outputs=_outputs(value.get("intensity_outputs", ())),
         loss_core_outputs=_outputs(value.get("loss_core_outputs", ())),
         loss_final_outputs=_outputs(value.get("loss_final_outputs", ())),
+        deadline_basis_at=_optional_datetime(
+            value.get("deadline_basis_at")
+        ),
+        clock_started_at=_optional_datetime(
+            value.get("clock_started_at")
+        ),
     )
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise TypeError("prepared artifact clock value must be a timestamp")
 
 
 def _outputs(value: object) -> tuple[tuple[str, str], ...]:
