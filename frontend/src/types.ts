@@ -223,6 +223,36 @@ export interface CommandHallGroup {
   updated_at: string;
 }
 
+export type CommandHallArtifactProductionMode =
+  | "live"
+  | "manual"
+  | "test"
+  | "drill"
+  | "replay";
+
+export interface CommandHallArtifact {
+  publication_id: string;
+  artifact_id: string;
+  artifact_key: string;
+  output_profile: string;
+  artifact_version: number;
+  status: ArtifactStatus;
+  quality_grade: string | null;
+  production_mode: CommandHallArtifactProductionMode | string;
+  publication_mode: ArtifactPublicationMode | string;
+  is_forced: boolean;
+  published_at: string;
+  file_name: string;
+  format: string;
+}
+
+export interface CommandHallArtifactSummary {
+  published_count: number;
+  status_counts: Record<string, number>;
+  production_modes?: Record<string, number>;
+  latest_artifacts: CommandHallArtifact[];
+}
+
 export interface CommandHallOverview {
   event_id: string;
   event: Record<string, unknown>;
@@ -230,10 +260,13 @@ export interface CommandHallOverview {
   groups: CommandHallGroup[];
   alerts: CommandHallAlert[];
   task_counts: CommandHallTaskCounts;
-  artifact_summary: Record<string, unknown>;
+  artifact_summary: CommandHallArtifactSummary;
   alert_summary: Record<string, number>;
   dual_version_count: number;
   projection_version: number;
+  sync_status: "current" | "syncing";
+  projection_lag_seconds: number;
+  projection_source_updated_at: string | null;
   updated_at: string;
 }
 

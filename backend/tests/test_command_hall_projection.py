@@ -21,8 +21,17 @@ from app.collaboration.models import (
     CollaborationOutbox,
     WorkgroupTask,
 )
-from app.collaboration.worker import run_worker_cycle
+from app.collaboration.worker import (
+    ProjectionOutboxDispatcher,
+    run_worker_cycle,
+)
 from app.config import settings
+from app.artifacts.models import (
+    ArtifactPublication,
+    GeneratedArtifact,
+    ProductionRun,
+    ProductionTask,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 
 
@@ -309,6 +318,268 @@ async def test_projection_recreates_derived_alerts(
     assert first_ids
     assert len(first_ids) == len(second_ids)
     assert first_ids.isdisjoint(second_ids)
+
+
+async def test_artifact_summary_exposes_publication_source_fields(
+    session,
+    event_factory,
+    revision_factory,
+):
+    event = await event_factory()
+    revision = await revision_factory(event)
+    now = datetime.now(UTC)
+    run = ProductionRun(
+        event_id=event.id,
+        revision_id=revision.id,
+        revision_no=revision.revision_no,
+        production_mode="live",
+        launch_mode="standalone",
+        status="completed",
+        priority=100,
+        deadline_basis_at=now,
+        deadline_at=now + timedelta(minutes=5),
+        deadline_kind="event_deadline",
+        catalog_version="test",
+        generation_seq=1,
+        generation_scope="artifact:map.epicenter",
+        required_outputs=[],
+        is_current=True,
+        completed_at=now,
+    )
+    session.add(run)
+    await session.flush()
+    task = ProductionTask(
+        production_run_id=run.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        kind="map",
+        priority=100,
+        sequence=1,
+        status="succeeded",
+        deadline_at=now + timedelta(minutes=5),
+        completed_at=now,
+    )
+    session.add(task)
+    await session.flush()
+    artifact = GeneratedArtifact(
+        production_run_id=run.id,
+        production_task_id=task.id,
+        event_id=event.id,
+        revision_id=revision.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        artifact_version=1,
+        is_final=True,
+        production_mode="live",
+        status="complete",
+        quality_grade="A",
+        publication_mode="automatic",
+        file_name="epicenter.png",
+        format="png",
+        storage_path="objects/epicenter.png",
+        checksum="a" * 64,
+        size_bytes=1024,
+        generated_at=now,
+    )
+    session.add(artifact)
+    await session.flush()
+    session.add(
+        ArtifactPublication(
+            event_id=event.id,
+            revision_id=revision.id,
+            revision_no=revision.revision_no,
+            production_mode="live",
+            artifact_key="map.epicenter",
+            output_profile="a3v-professional",
+            artifact_id=artifact.id,
+            production_run_id=run.id,
+            generation_seq=1,
+            published_by="system",
+            published_at=now,
+            is_forced=False,
+        )
+    )
+    await session.flush()
+    task.final_artifact_id = artifact.id
+
+    await CommandHallProjector().refresh_event(session, event.id)
+    overview = await CommandHallService().overview(session, event.id)
+    summary = overview.artifact_summary["latest_artifacts"][0]
+
+    assert summary["production_mode"] == "live"
+    assert summary["publication_mode"] == "automatic"
+    assert summary["is_forced"] is False
+
+
+async def test_overview_marks_projection_lag_only_after_five_seconds(
+    session,
+    collaboration_fixture,
+):
+    projector = CommandHallProjector()
+    service = CommandHallService()
+    event = collaboration_fixture.event
+    await projector.refresh_event(session, event.id)
+    observed_at = datetime.now(UTC)
+
+    session.add(
+        CommandHallAlertProjection(
+            event_id=event.id,
+            workgroup_code=None,
+            task_id=None,
+            alert_key="projection.lag",
+            alert_type="projection.lag",
+            severity="warning",
+            status="open",
+            title="数据同步中",
+            detail={
+                "projection_lag_seconds": 5.25,
+                "projection_version": 1,
+                "source_updated_at": (
+                    observed_at - timedelta(seconds=5.25)
+                ).isoformat(),
+            },
+            projection_version=1,
+            first_seen_at=observed_at - timedelta(seconds=5.25),
+            updated_at=observed_at - timedelta(seconds=5.25),
+        )
+    )
+    await session.flush()
+
+    lagged = await service.overview(session, event.id)
+
+    assert lagged.sync_status == "syncing"
+    assert lagged.projection_lag_seconds == pytest.approx(5.25)
+    assert any(
+        alert["alert_type"] == "projection.lag"
+        for alert in lagged.alerts
+    )
+
+    await session.execute(
+        delete(CommandHallAlertProjection).where(
+            CommandHallAlertProjection.event_id == event.id,
+            CommandHallAlertProjection.alert_key == "projection.lag",
+        )
+    )
+    await session.flush()
+
+    current = await service.overview(session, event.id)
+
+    assert current.sync_status == "current"
+    assert current.projection_lag_seconds == 0
+    assert all(
+        alert["alert_type"] != "projection.lag"
+        for alert in current.alerts
+    )
+
+
+async def test_projection_dispatcher_persists_lag_alert_only_after_five_seconds(
+    projection_session_factory,
+):
+    observed_at = datetime.now(UTC)
+    lagged_event_id = uuid.uuid4()
+    current_event_id = uuid.uuid4()
+
+    async with projection_session_factory() as session:
+        async with session.begin():
+            for event_id in (lagged_event_id, current_event_id):
+                session.add(
+                    EarthquakeEvent(
+                        id=event_id,
+                        source="command-hall-test",
+                        canonical_source_id=f"lag-{event_id}",
+                        event_type="formal",
+                        origin_time=observed_at - timedelta(minutes=1),
+                        longitude=Decimal("121.500000"),
+                        latitude=Decimal("31.200000"),
+                        depth_km=Decimal("10.00"),
+                        magnitude=Decimal("5.2"),
+                        place="projection lag fixture",
+                        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                        lifecycle_state="formal_triggered",
+                    )
+                )
+                await session.flush()
+                session.add(
+                    CommandHallEventProjection(
+                        event_id=event_id,
+                        event_snapshot={},
+                        task_counts={},
+                        artifact_summary={},
+                        alert_summary={},
+                        projection_version=1,
+                        updated_at=observed_at - timedelta(seconds=10),
+                    )
+                )
+            await session.flush()
+            session.add(
+                CollaborationOutbox(
+                    event_id=lagged_event_id,
+                    task_id=None,
+                    event_type="projection.test",
+                    payload={},
+                    status="pending",
+                    attempt_count=0,
+                    available_at=observed_at,
+                    created_at=observed_at - timedelta(seconds=5.25),
+                    updated_at=observed_at - timedelta(seconds=5.25),
+                )
+            )
+            session.add(
+                CollaborationOutbox(
+                    event_id=current_event_id,
+                    task_id=None,
+                    event_type="projection.test",
+                    payload={},
+                    status="pending",
+                    attempt_count=0,
+                    available_at=observed_at,
+                    created_at=observed_at - timedelta(seconds=5),
+                    updated_at=observed_at - timedelta(seconds=5),
+                )
+            )
+
+    async def no_op_handler(_session, _outbox) -> None:
+        return None
+
+    dispatcher = ProjectionOutboxDispatcher(
+        projection_session_factory,
+        handler=no_op_handler,
+        now=lambda: observed_at,
+    )
+    try:
+        assert await dispatcher.dispatch_once() == 2
+
+        async with projection_session_factory() as session:
+            lagged_alert = await session.scalar(
+                select(CommandHallAlertProjection).where(
+                    CommandHallAlertProjection.event_id == lagged_event_id,
+                    CommandHallAlertProjection.alert_key
+                    == "projection.lag",
+                )
+            )
+            current_alert = await session.scalar(
+                select(CommandHallAlertProjection).where(
+                    CommandHallAlertProjection.event_id == current_event_id,
+                    CommandHallAlertProjection.alert_key
+                    == "projection.lag",
+                )
+            )
+
+        assert lagged_alert is not None
+        assert lagged_alert.detail["projection_lag_seconds"] == pytest.approx(
+            5.25
+        )
+        assert current_alert is None
+    finally:
+        async with projection_session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(EarthquakeEvent).where(
+                        EarthquakeEvent.id.in_(
+                            (lagged_event_id, current_event_id)
+                        )
+                    )
+                )
 
 
 async def test_worker_default_dispatches_projection_outbox(

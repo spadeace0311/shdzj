@@ -30,11 +30,10 @@ const SEVERITY_LABELS: Record<string, string> = {
   info: "提示",
 };
 
-const PRODUCTION_MODE_LABELS: Record<string, string> = {
+const PUBLICATION_MODE_LABELS: Record<string, string> = {
   automatic: "自动版",
-  manual: "人工修订版",
+  rebuild: "人工修订版",
   superadmin_override: "超级管理员覆盖版",
-  test: "测试版",
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -173,6 +172,26 @@ function keyArtifacts(overview: CommandHallOverview): Record<string, unknown>[] 
   return asRecords(overview.artifact_summary.latest_artifacts).slice(0, 6);
 }
 
+function publicationSourceLabel(
+  artifact: Record<string, unknown>,
+): string {
+  if (
+    artifact.is_forced === true ||
+    artifact.publication_mode === "superadmin_override"
+  ) {
+    return PUBLICATION_MODE_LABELS.superadmin_override;
+  }
+  const mode = textValue(artifact.publication_mode, "");
+  return PUBLICATION_MODE_LABELS[mode] ?? "版本来源待确认";
+}
+
+function alertTypeLabel(alert: CommandHallOverview["alerts"][number]): string {
+  if (alert.alert_type === "projection.lag") {
+    return "投影延迟";
+  }
+  return SEVERITY_LABELS[alert.severity] ?? alert.severity;
+}
+
 export function CommandHallPage() {
   const { eventId: routeEventId } = useParams<{ eventId: string }>();
   const [resolvedEventId, setResolvedEventId] = useState<string | null>(null);
@@ -186,6 +205,8 @@ export function CommandHallPage() {
   const [syncMode, setSyncMode] = useState<"connecting" | "sse" | "polling">(
     "connecting",
   );
+  const [refreshEpoch, setRefreshEpoch] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const [selectedGroup, setSelectedGroup] = useState<CommandHallGroup | null>(
     null,
   );
@@ -193,6 +214,7 @@ export function CommandHallPage() {
   const generationRef = useRef(0);
   const overviewRequestRef = useRef(0);
   const resolvedEventRef = useRef<string | null>(null);
+  const readyEventRef = useRef<string | null>(null);
 
   async function refreshOverview(
     targetEventId: string,
@@ -214,6 +236,9 @@ export function CommandHallPage() {
       }
       setOverview(loaded);
       setReadyEventId(targetEventId);
+      readyEventRef.current = targetEventId;
+      setRefreshEpoch((current) => current + 1);
+      setNow(Date.now());
       setStatus("ready");
       setError("");
       setSyncNotice("");
@@ -228,6 +253,7 @@ export function CommandHallPage() {
       if (showLoading) {
         setOverview(null);
         setReadyEventId(null);
+        readyEventRef.current = null;
         setStatus("error");
         setError(errorMessage(caught));
       } else {
@@ -240,6 +266,7 @@ export function CommandHallPage() {
     const generation = ++generationRef.current;
     overviewRequestRef.current += 1;
     resolvedEventRef.current = null;
+    readyEventRef.current = null;
     setResolvedEventId(null);
     setReadyEventId(null);
     setOverview(null);
@@ -248,23 +275,18 @@ export function CommandHallPage() {
     setError("");
     setSyncNotice("");
     setSyncMode("connecting");
+    let activePollingTimer: number | null = null;
+    let activeRequestInFlight = false;
 
-    async function resolveEvent() {
+    async function resolveRouteEvent() {
+      const targetEventId = routeEventId;
+      if (!targetEventId) {
+        return;
+      }
       try {
-        let targetEventId = routeEventId ?? null;
-        if (!targetEventId) {
-          const active = await getCommandHallActiveEvent();
-          if (generation !== generationRef.current) {
-            return;
-          }
-          targetEventId = active.event_id;
-        }
-        if (!targetEventId) {
-          setStatus("empty");
-          return;
-        }
         resolvedEventRef.current = targetEventId;
         setResolvedEventId(targetEventId);
+        setSelectedGroup(null);
         await refreshOverview(targetEventId, true, generation);
       } catch (caught) {
         if (generation !== generationRef.current) {
@@ -275,7 +297,65 @@ export function CommandHallPage() {
       }
     }
 
-    void resolveEvent();
+    async function probeActiveEvent() {
+      if (
+        activeRequestInFlight ||
+        generation !== generationRef.current
+      ) {
+        return;
+      }
+      activeRequestInFlight = true;
+      try {
+        const active = await getCommandHallActiveEvent();
+        if (generation !== generationRef.current) {
+          return;
+        }
+        const targetEventId = active.event_id;
+        if (!targetEventId) {
+          resolvedEventRef.current = null;
+          readyEventRef.current = null;
+          setResolvedEventId(null);
+          setReadyEventId(null);
+          setOverview(null);
+          setSelectedGroup(null);
+          setStatus("empty");
+          setError("");
+          setSyncNotice("");
+          return;
+        }
+        if (
+          targetEventId === resolvedEventRef.current &&
+          targetEventId === readyEventRef.current
+        ) {
+          return;
+        }
+        resolvedEventRef.current = targetEventId;
+        setResolvedEventId(targetEventId);
+        setSelectedGroup(null);
+        await refreshOverview(targetEventId, true, generation);
+      } catch (caught) {
+        if (generation !== generationRef.current) {
+          return;
+        }
+        if (readyEventRef.current === null) {
+          setStatus("error");
+          setError(errorMessage(caught));
+        } else {
+          setSyncNotice(errorMessage(caught));
+        }
+      } finally {
+        activeRequestInFlight = false;
+      }
+    }
+
+    if (routeEventId) {
+      void resolveRouteEvent();
+    } else {
+      void probeActiveEvent();
+      activePollingTimer = globalThis.setInterval(() => {
+        void probeActiveEvent();
+      }, 5_000);
+    }
 
     return () => {
       if (generationRef.current === generation) {
@@ -283,8 +363,23 @@ export function CommandHallPage() {
       }
       overviewRequestRef.current += 1;
       resolvedEventRef.current = null;
+      readyEventRef.current = null;
+      if (activePollingTimer !== null) {
+        globalThis.clearInterval(activePollingTimer);
+      }
     };
   }, [reloadKey, routeEventId]);
+
+  useEffect(() => {
+    if (status !== "ready") {
+      return;
+    }
+    setNow(Date.now());
+    const timer = globalThis.setInterval(() => {
+      setNow(Date.now());
+    }, 1_000);
+    return () => globalThis.clearInterval(timer);
+  }, [status]);
 
   useEffect(() => {
     if (
@@ -407,6 +502,7 @@ export function CommandHallPage() {
   const originTime = textValue(event.origin_time, "");
   const t1At = textValue(event.t1_at, "");
   const currentRevision = asRecord(event.current_revision);
+  const projectionSyncing = overview.sync_status === "syncing";
 
   return (
     <div className="command-hall-shell">
@@ -437,6 +533,16 @@ export function CommandHallPage() {
           </div>
 
           <div className="command-hall__header-status">
+            <span
+              className={`command-hall__projection-sync${
+                projectionSyncing
+                  ? " command-hall__projection-sync--syncing"
+                  : ""
+              }`}
+              data-testid="command-hall-sync-status"
+            >
+              {projectionSyncing ? "数据同步中" : "数据已同步"}
+            </span>
             <span
               className={`command-hall__sync command-hall__sync--${syncMode}`}
             >
@@ -480,7 +586,7 @@ export function CommandHallPage() {
                   className={`command-hall__alert command-hall__alert--${alert.severity}`}
                   key={alert.id}
                 >
-                  <span>{SEVERITY_LABELS[alert.severity] ?? alert.severity}</span>
+                  <span>{alertTypeLabel(alert)}</span>
                   <strong>{alert.title}</strong>
                   <small>
                     {alert.workgroup_code ?? "全局"} ·{" "}
@@ -509,7 +615,7 @@ export function CommandHallPage() {
               </div>
               <div>
                 <dt>已运行</dt>
-                <dd>{formatDuration(originTime)}</dd>
+                <dd>{formatDuration(originTime, now)}</dd>
               </div>
             </dl>
           </article>
@@ -587,10 +693,6 @@ export function CommandHallPage() {
           ) : (
             <div className="command-hall__artifact-list">
               {artifacts.map((artifact) => {
-                const mode = textValue(
-                  artifact.production_mode ?? artifact.source_kind,
-                  "automatic",
-                );
                 return (
                   <article
                     className="command-hall__artifact"
@@ -605,7 +707,7 @@ export function CommandHallPage() {
                       )}
                     </strong>
                     <span>
-                      {PRODUCTION_MODE_LABELS[mode] ?? mode} ·{" "}
+                      {publicationSourceLabel(artifact)} ·{" "}
                       {textValue(artifact.status)}
                     </span>
                     <small>
@@ -646,6 +748,7 @@ export function CommandHallPage() {
           eventKind={eventKind}
           groupCode={selectedGroup.workgroup_code}
           groupName={selectedGroup.name}
+          refreshEpoch={refreshEpoch}
           onClose={() => setSelectedGroup(null)}
         />
       ) : null}

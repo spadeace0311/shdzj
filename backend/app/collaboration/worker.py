@@ -16,7 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.command_hall.projector import CommandHallProjector
 from app.collaboration.generation import CollaborationOutboxDispatcher
-from app.collaboration.models import CollaborationOutbox
+from app.collaboration.models import (
+    CollaborationOutbox,
+    CommandHallAlertProjection,
+    CommandHallEventProjection,
+)
 from app.collaboration.notifications import (
     DispatchResult,
     NotificationService,
@@ -111,6 +115,7 @@ class ProjectionOutboxDispatcher:
     async def dispatch_once(self) -> int:
         if self._handler is None:
             return 0
+        await self._persist_projection_lag_alerts()
         claimed = await self._claim_pending()
         published = 0
         for item in claimed:
@@ -143,6 +148,91 @@ class ProjectionOutboxDispatcher:
             else:
                 published += 1
         return published
+
+    async def _persist_projection_lag_alerts(self) -> None:
+        now = _as_utc(self._now())
+        cutoff = now - timedelta(seconds=5)
+        async with self._session_factory() as session:
+            async with session.begin():
+                rows = (
+                    await session.execute(
+                        select(
+                            CommandHallEventProjection.event_id,
+                            CommandHallEventProjection.projection_version,
+                            CollaborationOutbox.created_at,
+                        )
+                        .join(
+                            CommandHallEventProjection,
+                            CommandHallEventProjection.event_id
+                            == CollaborationOutbox.event_id,
+                        )
+                        .where(
+                            CollaborationOutbox.status.in_(
+                                ("pending", "processing", "dead_letter")
+                            ),
+                            CollaborationOutbox.created_at < cutoff,
+                            CollaborationOutbox.created_at
+                            > CommandHallEventProjection.updated_at,
+                        )
+                        .order_by(CollaborationOutbox.created_at)
+                    )
+                ).all()
+                if not rows:
+                    return
+
+                oldest_by_event: dict[uuid.UUID, tuple[int, datetime]] = {}
+                for event_id, projection_version, source_updated_at in rows:
+                    oldest_by_event.setdefault(
+                        event_id,
+                        (projection_version, source_updated_at),
+                    )
+
+                for event_id, (
+                    projection_version,
+                    source_updated_at,
+                ) in oldest_by_event.items():
+                    lag_seconds = max(
+                        0.0,
+                        (now - _as_utc(source_updated_at)).total_seconds(),
+                    )
+                    alert = await session.scalar(
+                        select(CommandHallAlertProjection)
+                        .where(
+                            CommandHallAlertProjection.event_id == event_id,
+                            CommandHallAlertProjection.alert_key
+                            == "projection.lag",
+                            CommandHallAlertProjection.status == "open",
+                        )
+                        .with_for_update()
+                    )
+                    detail = {
+                        "projection_lag_seconds": lag_seconds,
+                        "projection_version": projection_version,
+                        "source_updated_at": source_updated_at.astimezone(
+                            UTC
+                        ).isoformat(),
+                    }
+                    if alert is None:
+                        session.add(
+                            CommandHallAlertProjection(
+                                event_id=event_id,
+                                workgroup_code=None,
+                                task_id=None,
+                                alert_key="projection.lag",
+                                alert_type="projection.lag",
+                                severity="warning",
+                                status="open",
+                                title="数据同步中",
+                                detail=detail,
+                                projection_version=projection_version,
+                                first_seen_at=now,
+                                updated_at=now,
+                            )
+                        )
+                    else:
+                        alert.detail = detail
+                        alert.projection_version = projection_version
+                        alert.updated_at = now
 
     async def _claim_pending(self) -> list[_ClaimedProjection]:
         now = _as_utc(self._now())

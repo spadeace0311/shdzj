@@ -119,6 +119,7 @@ class CommandHallService:
             )
         )
         alerts = await self._alerts(session, projection.event_id)
+        projection_state = _projection_sync_state(alerts)
         groups = [
             {
                 **(row.group_snapshot or {}),
@@ -139,7 +140,7 @@ class CommandHallService:
             alerts=alerts,
             task_counts=task_counts,
             artifact_summary=projection.artifact_summary or {},
-            alert_summary=projection.alert_summary or {},
+            alert_summary=_alert_summary(alerts),
             dual_version_count=int(
                 (projection.task_counts or {}).get(
                     "dual_version_count",
@@ -147,6 +148,11 @@ class CommandHallService:
                 )
             ),
             projection_version=projection.projection_version,
+            sync_status=projection_state["sync_status"],
+            projection_lag_seconds=projection_state["lag_seconds"],
+            projection_source_updated_at=projection_state[
+                "source_updated_at"
+            ],
             updated_at=projection.updated_at,
         )
 
@@ -618,6 +624,54 @@ def _alert_dict(alert: CommandHallAlertProjection) -> dict[str, Any]:
             "updated_at": alert.updated_at,
         }
     )
+
+
+def _alert_summary(alerts: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {
+        "total": len(alerts),
+        "critical": 0,
+        "warning": 0,
+        "info": 0,
+    }
+    for alert in alerts:
+        severity = str(alert.get("severity") or "")
+        if severity in summary:
+            summary[severity] += 1
+    return summary
+
+
+def _projection_sync_state(alerts: list[dict[str, Any]]) -> dict[str, Any]:
+    alert = next(
+        (
+            item
+            for item in alerts
+            if item.get("alert_type") == "projection.lag"
+            and item.get("status") == "open"
+        ),
+        None,
+    )
+    if alert is None:
+        return {
+            "sync_status": "current",
+            "lag_seconds": 0,
+            "source_updated_at": None,
+        }
+
+    detail = alert.get("detail")
+    if not isinstance(detail, dict):
+        detail = {}
+    raw_lag = detail.get("projection_lag_seconds", 0)
+    try:
+        lag_seconds = max(0.0, float(raw_lag))
+    except (TypeError, ValueError):
+        lag_seconds = 0.0
+    return {
+        "sync_status": "syncing",
+        "lag_seconds": lag_seconds,
+        "source_updated_at": (
+            detail.get("source_updated_at") or alert.get("first_seen_at")
+        ),
+    }
 
 
 def _json_value(value: Any) -> Any:

@@ -72,6 +72,26 @@ function personName(person: unknown, fallback: string): string {
   );
 }
 
+function groupPersonName(
+  group: CommandHallGroup,
+  userId: unknown,
+  fallback: string,
+): string {
+  const normalizedUserId = textValue(userId, "");
+  if (!normalizedUserId) {
+    return fallback;
+  }
+  const people = [
+    group.leader,
+    ...asRecords(group.deputies),
+    ...asRecords(group.members),
+  ];
+  const person = people.find(
+    (candidate) => asRecord(candidate)?.user_id === normalizedUserId,
+  );
+  return person ? personName(person, fallback) : fallback;
+}
+
 function attendanceSummary(group: CommandHallGroup): string {
   const attendance = asRecords(group.attendance);
   if (attendance.length === 0) {
@@ -87,7 +107,7 @@ function authorityLabel(group: CommandHallGroup): string {
     return "代理待确认";
   }
   const role = authority.role === "deputy" ? "代理负责人" : "确认负责人";
-  return `${role}：${personName(authority, "待确认")}`;
+  return `${role}：${groupPersonName(group, authority.user_id, "待确认")}`;
 }
 
 function emptyGroup(

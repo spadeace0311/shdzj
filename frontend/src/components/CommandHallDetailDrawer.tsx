@@ -17,6 +17,7 @@ interface CommandHallDetailDrawerProps {
   eventKind: string | null;
   groupCode: string;
   groupName: string;
+  refreshEpoch: number;
   onClose: () => void;
 }
 
@@ -79,6 +80,27 @@ function personName(person: unknown, fallback = "待确认"): string {
     record.username ?? record.display_name ?? record.user_id,
     fallback,
   );
+}
+
+function groupPersonName(
+  group: Record<string, unknown>,
+  userId: unknown,
+  fallback = "待确认",
+): string {
+  const normalizedUserId = textValue(userId, "");
+  if (!normalizedUserId) {
+    return fallback;
+  }
+  const leader = asRecord(group.leader);
+  const people = [
+    ...(leader ? [leader] : []),
+    ...asRecords(group.deputies),
+    ...asRecords(group.members),
+  ];
+  const person = people.find(
+    (candidate) => candidate.user_id === normalizedUserId,
+  );
+  return person ? personName(person, fallback) : fallback;
 }
 
 function errorMessage(error: unknown): string {
@@ -265,6 +287,7 @@ export function CommandHallDetailDrawer({
   eventKind,
   groupCode,
   groupName,
+  refreshEpoch,
   onClose,
 }: CommandHallDetailDrawerProps) {
   const [detail, setDetail] = useState<CommandHallGroupDetail | null>(null);
@@ -282,10 +305,12 @@ export function CommandHallDetailDrawer({
   const [taskError, setTaskError] = useState("");
   const groupRequestRef = useRef(0);
   const taskRequestRef = useRef(0);
+  const detailRef = useRef<CommandHallGroupDetail | null>(null);
+  const taskDetailRef = useRef<CommandHallTaskDetail | null>(null);
 
   useEffect(() => {
-    const requestId = ++groupRequestRef.current;
-    taskRequestRef.current += 1;
+    detailRef.current = null;
+    taskDetailRef.current = null;
     setDetail(null);
     setDetailStatus("loading");
     setDetailError("");
@@ -293,12 +318,21 @@ export function CommandHallDetailDrawer({
     setTaskDetail(null);
     setTaskStatus("idle");
     setTaskError("");
+  }, [eventId, groupCode]);
+
+  useEffect(() => {
+    const requestId = ++groupRequestRef.current;
+    if (detailRef.current === null) {
+      setDetailStatus("loading");
+    }
+    setDetailError("");
 
     void getCommandHallGroup(eventId, groupCode)
       .then((loaded) => {
         if (requestId !== groupRequestRef.current) {
           return;
         }
+        detailRef.current = loaded;
         setDetail(loaded);
         setDetailStatus("ready");
       })
@@ -307,14 +341,57 @@ export function CommandHallDetailDrawer({
           return;
         }
         setDetailError(errorMessage(error));
-        setDetailStatus("error");
+        if (detailRef.current === null) {
+          setDetailStatus("error");
+        }
       });
 
     return () => {
       groupRequestRef.current += 1;
+    };
+  }, [eventId, groupCode, refreshEpoch]);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      taskRequestRef.current += 1;
+      taskDetailRef.current = null;
+      setTaskDetail(null);
+      setTaskStatus("idle");
+      setTaskError("");
+      return;
+    }
+
+    const requestId = ++taskRequestRef.current;
+    setTaskStatus("loading");
+    setTaskError("");
+    void getCommandHallTask(selectedTaskId)
+      .then((loaded) => {
+        if (requestId !== taskRequestRef.current) {
+          return;
+        }
+        if (loaded.event_id !== eventId) {
+          setTaskError("任务不属于当前事件");
+          setTaskStatus("error");
+          return;
+        }
+        taskDetailRef.current = loaded;
+        setTaskDetail(loaded);
+        setTaskStatus("ready");
+      })
+      .catch((error: unknown) => {
+        if (requestId !== taskRequestRef.current) {
+          return;
+        }
+        setTaskError(errorMessage(error));
+        if (taskDetailRef.current === null) {
+          setTaskStatus("error");
+        }
+      });
+
+    return () => {
       taskRequestRef.current += 1;
     };
-  }, [eventId, groupCode]);
+  }, [eventId, refreshEpoch, selectedTaskId]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -331,30 +408,7 @@ export function CommandHallDetailDrawer({
     if (!taskId) {
       return;
     }
-    const requestId = ++taskRequestRef.current;
     setSelectedTaskId(taskId);
-    setTaskDetail(null);
-    setTaskStatus("loading");
-    setTaskError("");
-    try {
-      const loaded = await getCommandHallTask(taskId);
-      if (requestId !== taskRequestRef.current) {
-        return;
-      }
-      if (loaded.event_id !== eventId) {
-        setTaskError("任务不属于当前事件");
-        setTaskStatus("error");
-        return;
-      }
-      setTaskDetail(loaded);
-      setTaskStatus("ready");
-    } catch (error) {
-      if (requestId !== taskRequestRef.current) {
-        return;
-      }
-      setTaskError(errorMessage(error));
-      setTaskStatus("error");
-    }
   }
 
   const group = detail?.group ?? {};
@@ -470,7 +524,10 @@ export function CommandHallDetailDrawer({
                   <dt>当前负责人</dt>
                   <dd>
                     {authority
-                      ? `${personName(authority)}${
+                      ? `${groupPersonName(
+                          group,
+                          authority.user_id,
+                        )}${
                           authority.role === "deputy" ? "（代理）" : ""
                         }`
                       : "待确认"}

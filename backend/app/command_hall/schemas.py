@@ -33,6 +33,9 @@ class EventOverview(BaseModel):
     alert_summary: dict[str, Any] = Field(default_factory=dict)
     dual_version_count: int = 0
     projection_version: int
+    sync_status: str = "current"
+    projection_lag_seconds: float = 0
+    projection_source_updated_at: datetime | None = None
     updated_at: datetime
 
 
@@ -62,4 +65,3 @@ class TaskDetail(BaseModel):
 class ProjectionUpdatedPayload(BaseModel):
     event_id: UUID
     projection_version: int
-

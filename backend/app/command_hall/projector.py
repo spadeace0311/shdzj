@@ -403,6 +403,8 @@ class CommandHallProjector:
                 "status": artifact.status,
                 "quality_grade": artifact.quality_grade,
                 "production_mode": publication.production_mode,
+                "publication_mode": artifact.publication_mode,
+                "is_forced": publication.is_forced,
                 "published_at": _json_value(publication.published_at),
                 "file_name": artifact.file_name,
                 "format": artifact.format,

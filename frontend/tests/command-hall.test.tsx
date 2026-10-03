@@ -12,6 +12,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
+import commandHallStyles from "../src/styles.css?raw";
 import {
   ApiError,
   getCommandHallActiveEvent,
@@ -164,12 +165,12 @@ function makeGroup(
         ? {
             user_id: "deputy-2",
             role: "deputy",
-            username: `${name}副组长`,
+            deputy_order: 1,
           }
         : {
             user_id: `leader-${displayOrder}`,
             role: "leader",
-            username: `${name}组长`,
+            deputy_order: null,
           },
     tasks,
     task_count: tasks.length,
@@ -253,7 +254,9 @@ const overview: CommandHallOverview = {
         artifact_version: 1,
         status: "complete",
         quality_grade: "A",
-        production_mode: "automatic",
+        production_mode: "live",
+        publication_mode: "automatic",
+        is_forced: false,
         published_at: "2026-10-03T01:20:00Z",
         file_name: "仪器烈度图.png",
         format: "png",
@@ -263,6 +266,9 @@ const overview: CommandHallOverview = {
   alert_summary: { critical: 1 },
   dual_version_count: 1,
   projection_version: 1,
+  sync_status: "current",
+  projection_lag_seconds: 0,
+  projection_source_updated_at: null,
   updated_at: "2026-10-03T01:31:00Z",
 };
 
@@ -421,7 +427,54 @@ test("renders seven stable group cards and opens the selected group drawer", asy
   expect(await screen.findByRole("dialog")).toBeInTheDocument();
   expect(await screen.findByText("趋势会商")).toBeInTheDocument();
   expect(
+    await screen.findByText("代理负责人：监测预报组副组长"),
+  ).toBeInTheDocument();
+  expect(
     await screen.findByText("1. 监测预报组副组长"),
+  ).toBeInTheDocument();
+});
+
+test("labels automatic, manual, and forced artifact publications from backend fields", async () => {
+  overviewMock.mockResolvedValue({
+    ...overview,
+    artifact_summary: {
+      ...overview.artifact_summary,
+      published_count: 3,
+      latest_artifacts: [
+        {
+          ...overview.artifact_summary.latest_artifacts[0],
+          publication_id: "publication-auto",
+          artifact_key: "map.intensity",
+          production_mode: "live",
+          publication_mode: "automatic",
+          is_forced: false,
+        },
+        {
+          ...overview.artifact_summary.latest_artifacts[0],
+          publication_id: "publication-manual",
+          artifact_key: "doc.damage",
+          production_mode: "live",
+          publication_mode: "rebuild",
+          is_forced: false,
+        },
+        {
+          ...overview.artifact_summary.latest_artifacts[0],
+          publication_id: "publication-forced",
+          artifact_key: "doc.decision",
+          production_mode: "live",
+          publication_mode: "superadmin_override",
+          is_forced: true,
+        },
+      ],
+    },
+  });
+
+  renderHall("/command-hall/event-1");
+
+  expect(await screen.findByText("自动版 · complete")).toBeInTheDocument();
+  expect(screen.getByText("人工修订版 · complete")).toBeInTheDocument();
+  expect(
+    screen.getByText("超级管理员覆盖版 · complete"),
   ).toBeInTheDocument();
 });
 
@@ -492,6 +545,153 @@ test("an SSE update refreshes the overview", async () => {
   expect(overviewMock).toHaveBeenCalledTimes(2);
 });
 
+test("SSE refresh updates an open group and task drawer without reopening it", async () => {
+  let onStreamEvent:
+    | ((event: CommandHallStreamEvent) => void)
+    | undefined;
+  const originalDeliverable = taskDetail.deliverables[0];
+  const originalVersions =
+    originalDeliverable.versions as Record<string, unknown>[];
+  streamMock.mockImplementation((_eventId, callback) => {
+    onStreamEvent = callback;
+    return new Promise<void>(() => undefined);
+  });
+  overviewMock
+    .mockResolvedValueOnce(overview)
+    .mockResolvedValueOnce({
+      ...overview,
+      projection_version: 2,
+      updated_at: "2026-10-03T01:32:00Z",
+    });
+  groupMock
+    .mockResolvedValueOnce(groupDetail)
+    .mockResolvedValueOnce({
+      ...groupDetail,
+      projection_version: 2,
+      updated_at: "2026-10-03T01:32:00Z",
+      tasks: [
+        {
+          ...hallTask,
+          title: "趋势会商（更新）",
+        },
+      ],
+    });
+  taskMock
+    .mockResolvedValueOnce(taskDetail)
+    .mockResolvedValueOnce({
+      ...taskDetail,
+      projection_version: 2,
+      task: {
+        ...hallTask,
+        instruction: "使用最新余震序列重新会商",
+      },
+      deliverables: [
+        {
+          ...originalDeliverable,
+          current_publication: {
+            ...(originalDeliverable.current_publication as Record<
+              string,
+              unknown
+            >),
+            version_id: "version-override",
+          },
+          versions: [
+            {
+              ...originalVersions[1],
+              id: "version-override",
+              source_kind: "superadmin_override",
+              file_name: "趋势会商意见-覆盖版.docx",
+            },
+          ],
+        },
+      ],
+    });
+
+  renderHall("/command-hall/event-1");
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: /监测预报组/ }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "查看任务详情：趋势会商",
+    }),
+  );
+  expect(
+    await screen.findByText("组织震后趋势会商并形成会商意见"),
+  ).toBeInTheDocument();
+
+  await waitFor(() => expect(onStreamEvent).toBeDefined());
+  await act(async () => {
+    onStreamEvent?.({
+      type: "projection.updated",
+      data: { event_id: "event-1", projection_version: 2 },
+    });
+  });
+
+  expect(
+    await screen.findByText("使用最新余震序列重新会商"),
+  ).toBeInTheDocument();
+  expect(screen.getByText("当前发布版 · 超级管理员覆盖版")).toBeInTheDocument();
+  expect(groupMock).toHaveBeenCalledTimes(2);
+  expect(taskMock).toHaveBeenCalledTimes(2);
+});
+
+test("five-second polling refresh also updates an open group and task drawer", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  streamMock.mockRejectedValue(new ApiError("事件流不可用", 0));
+  overviewMock
+    .mockResolvedValueOnce(overview)
+    .mockResolvedValueOnce({
+      ...overview,
+      projection_version: 2,
+    });
+  groupMock
+    .mockResolvedValueOnce(groupDetail)
+    .mockResolvedValueOnce({
+      ...groupDetail,
+      projection_version: 2,
+      tasks: [
+        {
+          ...hallTask,
+          title: "趋势会商（轮询更新）",
+        },
+      ],
+    });
+  taskMock
+    .mockResolvedValueOnce(taskDetail)
+    .mockResolvedValueOnce({
+      ...taskDetail,
+      projection_version: 2,
+      task: {
+        ...hallTask,
+        instruction: "轮询后的最新任务说明",
+      },
+    });
+
+  renderHall("/command-hall/event-1");
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: /监测预报组/ }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "查看任务详情：趋势会商",
+    }),
+  );
+  expect(
+    await screen.findByText("组织震后趋势会商并形成会商意见"),
+  ).toBeInTheDocument();
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+
+  expect(await screen.findByText("轮询后的最新任务说明")).toBeInTheDocument();
+  expect(groupMock).toHaveBeenCalledTimes(2);
+  expect(taskMock).toHaveBeenCalledTimes(2);
+});
+
 test("SSE failure falls back to five-second overview polling", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   streamMock.mockRejectedValue(new ApiError("事件流不可用", 0));
@@ -506,6 +706,138 @@ test("SSE failure falls back to five-second overview polling", async () => {
   });
 
   expect(overviewMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+});
+
+test("elapsed duration continues ticking without a projection update", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.setSystemTime(new Date("2026-10-03T01:00:05Z"));
+  overviewMock.mockResolvedValue({
+    ...overview,
+    event: {
+      ...overview.event,
+      origin_time: "2026-10-03T01:00:00Z",
+    },
+  });
+
+  renderHall("/command-hall/event-1");
+
+  expect(await screen.findByText("5秒")).toBeInTheDocument();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(3_000);
+  });
+  expect(screen.getByText("8秒")).toBeInTheDocument();
+});
+
+test("keeps probing active event after the empty state", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  activeEventMock
+    .mockResolvedValueOnce({ event_id: null })
+    .mockResolvedValue({ event_id: "event-1" });
+
+  renderHall();
+
+  expect(await screen.findByText("当前没有活跃事件")).toBeInTheDocument();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+
+  expect(await screen.findByText("上海浦东新区")).toBeInTheDocument();
+  expect(activeEventMock).toHaveBeenCalledTimes(2);
+});
+
+test("switches from a test event to a newly active formal event", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  activeEventMock
+    .mockResolvedValueOnce({ event_id: "test-event" })
+    .mockResolvedValue({ event_id: "formal-event" });
+  overviewMock.mockImplementation(async (eventId) => {
+    if (eventId === "formal-event") {
+      return {
+        ...overview,
+        event_id: "formal-event",
+        event: {
+          ...overview.event,
+          event_id: "formal-event",
+          event_kind: "formal",
+          event_type: "formal",
+          place: "正式事件震中",
+        },
+        groups: [],
+      };
+    }
+    return {
+      ...overview,
+      event_id: "test-event",
+      event: {
+        ...overview.event,
+        event_id: "test-event",
+        event_kind: "test",
+        event_type: "test",
+        place: "测试事件震中",
+      },
+    };
+  });
+
+  renderHall();
+
+  expect(await screen.findByText("测试事件震中")).toBeInTheDocument();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+
+  expect(await screen.findByText("正式事件震中")).toBeInTheDocument();
+  expect(overviewMock).toHaveBeenCalledWith("test-event");
+  expect(overviewMock).toHaveBeenCalledWith("formal-event");
+});
+
+test("shows syncing state and projection lag alert after five seconds", async () => {
+  overviewMock.mockResolvedValue({
+    ...overview,
+    sync_status: "syncing",
+    projection_lag_seconds: 5.25,
+    projection_source_updated_at: "2026-10-03T01:25:44.750Z",
+    alerts: [
+      ...overview.alerts,
+      {
+        id: "projection-lag",
+        event_id: "event-1",
+        workgroup_code: null,
+        task_id: null,
+        alert_key: "projection.lag",
+        alert_type: "projection.lag",
+        severity: "warning",
+        status: "open",
+        title: "数据同步中",
+        detail: { projection_lag_seconds: 5.25 },
+        first_seen_at: "2026-10-03T01:25:44.750Z",
+        resolved_at: null,
+        updated_at: "2026-10-03T01:25:50Z",
+      },
+    ],
+  });
+
+  renderHall("/command-hall/event-1");
+
+  expect(
+    await screen.findByTestId("command-hall-sync-status"),
+  ).toHaveTextContent("数据同步中");
+  expect(screen.getByText("投影延迟")).toBeInTheDocument();
+});
+
+test("keeps the current sync state at the five-second threshold", async () => {
+  overviewMock.mockResolvedValue({
+    ...overview,
+    sync_status: "current",
+    projection_lag_seconds: 5,
+    projection_source_updated_at: "2026-10-03T01:30:55Z",
+  });
+
+  renderHall("/command-hall/event-1");
+
+  expect(
+    await screen.findByTestId("command-hall-sync-status"),
+  ).toHaveTextContent("数据已同步");
+  expect(screen.queryByText("数据同步中")).not.toBeInTheDocument();
 });
 
 test("unmount aborts the command hall stream", async () => {
@@ -555,4 +887,17 @@ test("maps forbidden overview access to a stable error state", async () => {
     await screen.findByText("当前账号无权查看该事件指挥大厅"),
   ).toBeInTheDocument();
   expect(screen.getByRole("alert")).toBeInTheDocument();
+});
+
+test("uses full-height target-display tracks and a wide drill-down drawer", () => {
+  const hallRule = commandHallStyles.match(
+    /\.command-hall\s*\{([\s\S]*?)\n\}/,
+  )?.[1];
+  expect(hallRule).toContain("height: 100vh;");
+  expect(hallRule).toContain("box-sizing: border-box;");
+  expect(hallRule).toContain("min-height: 0;");
+  expect(commandHallStyles).toMatch(
+    /\.command-hall-drawer\s*\{[\s\S]*?width:\s*clamp\(820px,\s*52vw,\s*3200px\);/,
+  );
+  expect(commandHallStyles).toMatch(/@media \(max-height:\s*1200px\)/);
 });
