@@ -543,15 +543,22 @@ def _definition_applicable(
         distance=distance,
         intensity_threshold=intensity_threshold,
     )
+    if spatial_class is None:
+        return normal_scope
     if str(spatial_class) == "outside_assessment_scope":
         return not normal_scope
-    if spatial_class is not None and not _matches_spatial_class(
+    if not _matches_spatial_class(
         str(spatial_class),
         inside_shanghai=inside_shanghai,
         distance=distance,
     ):
         return False
-    return normal_scope
+    return _intensity_applicable(
+        applicability,
+        event,
+        revision,
+        intensity_threshold=intensity_threshold,
+    )
 
 
 def _normal_task_scope(
@@ -563,11 +570,24 @@ def _normal_task_scope(
     distance: Decimal | None,
     intensity_threshold: Decimal | str | None,
 ) -> bool:
-    if not _is_assessment_scope(
+    return _is_assessment_scope(
         inside_shanghai=inside_shanghai,
         distance=distance,
-    ):
-        return False
+    ) and _intensity_applicable(
+        applicability,
+        event,
+        revision,
+        intensity_threshold=intensity_threshold,
+    )
+
+
+def _intensity_applicable(
+    applicability: Mapping[str, object],
+    event: object,
+    revision: object,
+    *,
+    intensity_threshold: Decimal | str | None,
+) -> bool:
 
     effective_threshold = intensity_threshold
     if effective_threshold is None:

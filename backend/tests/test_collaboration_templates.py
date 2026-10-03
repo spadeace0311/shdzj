@@ -4,8 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.artifacts.catalog import load_catalog
+from app.collaboration.domain import WorkgroupCode
 from app.collaboration.templates import (
     ArtifactBinding,
+    TaskTemplateCatalog,
+    TaskTemplateDefinition,
     load_task_template_catalog,
 )
 
@@ -89,6 +92,83 @@ def test_catalog_applicability_splits_in_scope_and_out_of_scope_events() -> None
     assert [definition.template_code for definition in low_intensity] == [
         "news.external_event_record_notify"
     ]
+
+
+@pytest.mark.parametrize(
+    ("inside_shanghai", "distance_to_boundary_km", "expected"),
+    (
+        (
+            True,
+            None,
+            {
+                "selector.default",
+                "selector.any",
+                "selector.inside_shanghai",
+            },
+        ),
+        (
+            False,
+            10,
+            {
+                "selector.default",
+                "selector.any",
+                "selector.boundary_20km",
+                "selector.outside_shanghai",
+            },
+        ),
+        (
+            False,
+            50,
+            {
+                "selector.any",
+                "selector.outside_shanghai",
+                "selector.outside_assessment_scope",
+            },
+        ),
+    ),
+)
+def test_spatial_selectors_do_not_apply_the_default_scope_gate(
+    inside_shanghai: bool,
+    distance_to_boundary_km: int | None,
+    expected: set[str],
+) -> None:
+    catalog = TaskTemplateCatalog(
+        version="spatial-selector-test",
+        definitions=(
+            _selector_definition("default"),
+            _selector_definition("any"),
+            _selector_definition("inside_shanghai"),
+            _selector_definition("boundary_20km"),
+            _selector_definition("outside_shanghai"),
+            _selector_definition("outside_assessment_scope"),
+        ),
+    )
+    event = SimpleNamespace(event_type="formal")
+    revision = SimpleNamespace(
+        revision_kind="formal",
+        inside_shanghai=inside_shanghai,
+        distance_to_boundary_km=distance_to_boundary_km,
+    )
+
+    applicable = catalog.get_applicable(event, revision)
+
+    assert {definition.template_code for definition in applicable} == expected
+
+
+def _selector_definition(spatial_class: str) -> TaskTemplateDefinition:
+    applicability = (
+        {}
+        if spatial_class == "default"
+        else {"spatial_class": spatial_class}
+    )
+    return TaskTemplateDefinition(
+        template_code=f"selector.{spatial_class}",
+        workgroup_code=WorkgroupCode.NEWS_INFORMATION,
+        phase_code="within_30m",
+        title=spatial_class,
+        source="test",
+        applicability=applicability,
+    )
 
 
 @pytest.mark.parametrize(
