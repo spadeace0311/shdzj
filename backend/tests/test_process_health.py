@@ -35,6 +35,24 @@ def test_find_process_matches_exact_worker_argv(
     ) == 123
 
 
+def test_find_process_matches_collaboration_worker(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    process_dir = proc_root / "125"
+    process_dir.mkdir(parents=True)
+    _write_cmdline(
+        process_dir / "cmdline",
+        "python",
+        "-m",
+        "app.collaboration.worker",
+    )
+
+    assert process_health.find_process(
+        "collaboration",
+        proc_root=proc_root,
+        own_pid=999,
+    ) == 125
+
+
 def test_find_process_ignores_healthcheck_self_and_shell_pattern(
     tmp_path: Path,
 ) -> None:

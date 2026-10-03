@@ -9,13 +9,24 @@ from decimal import Decimal
 from uuid import UUID
 
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.assessment.models import AssessmentRun
 from app.artifacts.catalog import load_catalog
 from app.auth.models import User
-from app.auth.service import UserRepository
+from app.auth.service import UserRepository, ensure_superadmin
 from app.collector.models import CollectorRuntimeState
+from app.collaboration.artifact_link import ArtifactLinkService
+from app.collaboration.generation import CollaborationOutboxDispatcher
+from app.collaboration.models import (
+    CollaborationOutbox,
+    TaskDeliverable,
+    TaskDeliverableVersion,
+    WorkgroupTask,
+)
+from app.collaboration.roster import RosterService
+from app.collaboration.service import DeliverableService
+from app.command_hall.projector import CommandHallProjector
 from app.config import settings
 from app.db import SessionFactory
 from app.events.models import (
@@ -37,6 +48,9 @@ E2E_RAW_MESSAGE_ID = UUID("00000000-0000-4000-8000-000000000019")
 E2E_REVISION_ID = UUID("00000000-0000-4000-8000-000000000016")
 E2E_OUTBOX_ID = UUID("00000000-0000-4000-8000-000000000018")
 E2E_ASSESSMENT_RUN_ID = UUID("00000000-0000-4000-8000-000000000017")
+E2E_COLLABORATION_OUTBOX_ID = UUID(
+    "00000000-0000-4000-8000-00000000001a"
+)
 
 _PLACE = "上海成果中心验收测试事件"
 
@@ -45,7 +59,10 @@ def _checksum(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-async def seed_fixture() -> dict[str, object]:
+async def seed_fixture(
+    *,
+    preserve_data_assets: bool = True,
+) -> dict[str, object]:
     await _configure_e2e_login()
     now = datetime.now(UTC)
     deadline_at = now + timedelta(seconds=300)
@@ -203,6 +220,7 @@ async def seed_fixture() -> dict[str, object]:
                     runtime.reconnect_count = 0
                     runtime.last_error = None
                     runtime.updated_at = now
+        await _ensure_collaboration_acceptance(result.production_run_id)
         return {
             "event_id": str(E2E_EVENT_ID),
             "production_run_id": result.production_run_id,
@@ -214,7 +232,176 @@ async def seed_fixture() -> dict[str, object]:
             "elapsed_seconds": result.elapsed_seconds,
         }
     finally:
-        await environment._stop_worker()
+        if preserve_data_assets:
+            await environment._stop_worker()
+        else:
+            await environment.cleanup()
+
+
+async def _ensure_collaboration_acceptance(
+    production_run_id: str,
+) -> None:
+    now = datetime.now(UTC)
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(WorkgroupTask).where(
+                    WorkgroupTask.event_id == E2E_EVENT_ID
+                )
+            )
+            await session.execute(
+                delete(CollaborationOutbox).where(
+                    CollaborationOutbox.event_id == E2E_EVENT_ID,
+                    CollaborationOutbox.event_type == "artifact_linked",
+                )
+            )
+            outbox = await session.get(
+                EventLifecycleOutbox,
+                E2E_COLLABORATION_OUTBOX_ID,
+            )
+            if outbox is None:
+                outbox = EventLifecycleOutbox(
+                    id=E2E_COLLABORATION_OUTBOX_ID,
+                )
+                session.add(outbox)
+            outbox.event_id = E2E_EVENT_ID
+            outbox.revision_id = E2E_REVISION_ID
+            outbox.trigger_type = "collaboration.requested"
+            outbox.trigger_reason = "test"
+            outbox.payload = {
+                "event_id": str(E2E_EVENT_ID),
+                "revision_id": str(E2E_REVISION_ID),
+                "revision_no": 1,
+                "intensity_threshold": "2.0",
+            }
+            outbox.status = "pending"
+            outbox.attempt_count = 0
+            outbox.available_at = now
+            outbox.published_at = None
+            outbox.created_at = outbox.created_at or now
+            outbox.last_error = None
+            await RosterService().snapshot_for_event(
+                session,
+                E2E_EVENT_ID,
+            )
+
+    dispatcher = CollaborationOutboxDispatcher(
+        session_factory=SessionFactory,
+        catalog_path=settings.collaboration_task_template_path,
+        batch_size=settings.collaboration_worker_batch_size,
+    )
+    await dispatcher.dispatch_once()
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            await ArtifactLinkService().sync_run_publications(
+                session,
+                production_run_id,
+            )
+
+    await _ensure_dual_versions()
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            await CommandHallProjector().refresh_event(
+                session,
+                E2E_EVENT_ID,
+            )
+
+
+async def _ensure_dual_versions() -> None:
+    actor = await _ensure_superadmin()
+    service = DeliverableService()
+    async with SessionFactory() as session:
+        row = (
+            await session.execute(
+                select(TaskDeliverable, TaskDeliverableVersion)
+                .join(
+                    WorkgroupTask,
+                    WorkgroupTask.id == TaskDeliverable.task_id,
+                )
+                .join(
+                    TaskDeliverableVersion,
+                    TaskDeliverableVersion.deliverable_id
+                    == TaskDeliverable.id,
+                )
+                .where(
+                    WorkgroupTask.event_id == E2E_EVENT_ID,
+                    TaskDeliverable.deliverable_code == "doc.rapid_brief",
+                    TaskDeliverableVersion.source_kind == "automatic",
+                )
+                .order_by(TaskDeliverableVersion.version_no)
+                .limit(1)
+            )
+        ).first()
+        if row is None:
+            raise RuntimeError("collaboration fixture did not link rapid brief")
+        deliverable, automatic = row
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            current = await service.repository.get_current_publication(
+                session,
+                deliverable.id,
+            )
+            if current is None:
+                await service.publish(
+                    session,
+                    deliverable.id,
+                    actor,
+                    version_id=automatic.id,
+                    publication_note="E2E automatic publication",
+                )
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            manual_id = await session.scalar(
+                select(TaskDeliverableVersion.id)
+                .where(
+                    TaskDeliverableVersion.deliverable_id
+                    == deliverable.id,
+                    TaskDeliverableVersion.source_kind == "manual",
+                )
+                .order_by(TaskDeliverableVersion.version_no.desc())
+                .limit(1)
+            )
+            if manual_id is None:
+                manual = await service.add_text_version(
+                    session,
+                    deliverable.id,
+                    actor,
+                    text_result={
+                        "result": "人工校核后的快速评估简报",
+                    },
+                    basis_text="E2E fixture manual revision",
+                )
+                manual_id = manual.id
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            current = await service.repository.get_current_publication(
+                session,
+                deliverable.id,
+            )
+            if current is None or current.version_id != manual_id:
+                await service.publish(
+                    session,
+                    deliverable.id,
+                    actor,
+                    version_id=manual_id,
+                    publication_note="E2E manual publication",
+                )
+
+
+async def _ensure_superadmin() -> User:
+    async with SessionFactory() as session:
+        async with session.begin():
+            user = await ensure_superadmin(
+                session,
+                UserRepository(SessionFactory),
+            )
+            await session.refresh(user)
+            return user
 
 
 async def _configure_e2e_login() -> None:

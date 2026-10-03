@@ -27,7 +27,7 @@ def test_catalog_covers_all_groups_and_preplan_phases() -> None:
         "logistics",
         "center_station",
     }
-    assert catalog.version == "shanghai-2026.1"
+    assert catalog.version == "shanghai-2026.2"
     assert len(catalog.definitions) == 61
     assert catalog.get("technology.rapid_brief").artifact_bindings == (
         ArtifactBinding("doc.rapid_brief", "a3v-professional"),

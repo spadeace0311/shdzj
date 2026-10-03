@@ -1,6 +1,6 @@
 # 上海市地震应急辅助决策系统
 
-本仓库实现地震事件接入、响应研判与评估编排基础，并已贯通烈度与损失评估链。后端接收 CENC 报文并生成制度响应、服务响应建议；前端提供登录、事件列表、事件详情和人工事件录入。正式报与更正报可经 Outbox 和 Temporal 建立评估运行及 11 个任务，其中三个烈度任务和六个损失任务执行，报告与协同任务保持 `skipped`。
+本仓库实现上海市地震事件接入、响应研判、评估编排、专业成果生产、七个固定工作组协同和应急指挥大厅。后端接收 CENC 报文并生成制度响应、服务响应建议；正式报与更正报可经 Outbox 和 Temporal 建立评估运行，成果生产链生成既有 27 类图件和全部报告，`collaboration-worker` 负责工作组任务、期限、通知、成果版本和指挥大厅投影。
 
 ## 前置条件
 
@@ -111,7 +111,7 @@ collector 是独立于 API 的可选服务。FAN WebSocket 是主链路；Wolfx 
 - 快速评估报告。
 - 工作组响应任务。
 
-当前已实现 `intensity.model`、`intensity.instrument`、`intensity.fusion`，以及 `loss.population`、`loss.casualties`、`loss.buildings`、`loss.economic`、`loss.resources`、`loss.validate`。模型、融合和六个损失任务必须成功才能把运行标记为 `completed`；仪器缺失或失败会保存 `unavailable`/`invalid` 产品，并由融合回退到 `model_only`/`F3`，不会导致运行失败。报告文件、成果流转和 AI 问答仍不在本阶段范围内，对应任务保持 `skipped`。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
+当前已实现 `intensity.model`、`intensity.instrument`、`intensity.fusion`，以及 `loss.population`、`loss.casualties`、`loss.buildings`、`loss.economic`、`loss.resources`、`loss.validate`。模型、融合和六个损失任务必须成功才能把运行标记为 `completed`；仪器缺失或失败会保存 `unavailable`/`invalid` 产品，并由融合回退到 `model_only`/`F3`，不会导致运行失败。评估运行内的报告和协同占位任务保持 `skipped`，报告文件和成果流转由独立成果生产与协同子系统处理。Temporal 不可用时会阻塞 Outbox 发布并退避重试，不会阻止事件报文和正式报修订入库。
 
 损失结果通过以下只读 API 对外提供，并在事件详情页展示产品、指标、城镇/格网地图和融合烈度图层：
 
@@ -145,9 +145,17 @@ GET /api/v1/assessments/runs/{run_id}/intensity/artifact/{product_id}/{band}/{z}
 
 数据资产的部署、导入、发布、故障排查、快照核验、更新逾期和备份恢复请参阅 [数据资产中心运行手册](docs/runbooks/data-asset-center.md)。
 
+## 工作组协同与应急指挥大厅
+
+`collaboration-worker` 消费 `collaboration.requested` Outbox，按上海预案模板生成新闻信息值守、监测预报、综合协调、震害评估、应急技术、后勤保障和中心站七个工作组的固定任务。正式事件在满足适用范围时生成 60 条任务；自动成果、人工修订、组长确认、到岗状态、期限提醒和通知降级均保留版本链和审计记录。
+
+成果关联会保留自动版和人工修订版，当前发布版只有一个。指挥大厅投影通过事务 Outbox 刷新，前端优先使用带 Bearer 鉴权的 SSE，SSE 不可用时自动降级为 5 秒轮询。主屏验收覆盖 `7680 x 2430`，管理终端覆盖 `1920 x 1080`，测试和演练标识不可由任务或成果编辑移除。
+
+协同服务和 Compose 部署由 `collaboration-worker` 提供，健康检查、单事件投影重建、死信处理、通知降级、双版本核验和大屏验收请参阅 [工作组协同与指挥大厅运行手册](docs/runbooks/workgroup-collaboration-command-hall.md)。
+
 ## 端到端测试
 
-E2E 使用真实登录并提交一条正式 CENC 报文，再验证事件列表和详情页能独立显示制度响应与服务响应。测试不读取或写入浏览器存储，登录 token 仅保存在 React 内存中。
+E2E 使用真实登录和真实后端数据库，准备测试事件、39 项专业成果、七个工作组任务、自动/人工双版本和指挥大厅投影，再验证事件、任务、权限、错误状态、SSE 和轮询降级。测试不读取或写入浏览器存储，登录 token 仅保存在 React 内存中。
 
 环境变量：
 
@@ -164,6 +172,17 @@ docker compose --env-file .env -f infra/compose.yaml run --rm `
   -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
   frontend npm run test:e2e
 ```
+
+协同与指挥大厅专项验收：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm `
+  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
+  -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
+  frontend npm run test:e2e -- e2e/command-hall.spec.ts e2e/workgroup-tasks.spec.ts
+```
+
+该专项测试包含 `7680 x 2430` 主屏和 `1920 x 1080` 管理终端，检查七组卡片重叠、页面溢出、测试标识、自动/人工版本共存、SSE、5 秒轮询降级、权限错误和关键服务错误。
 
 需要让 Playwright 的 API 测试请求直连时，在 Compose 容器内应使用服务名 `http://api:8000`，不是容器内的 `localhost`：
 

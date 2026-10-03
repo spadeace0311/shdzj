@@ -205,6 +205,30 @@ services:
       retries: 10
       start_period: 20s
 
+  collaboration-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      COLLABORATION_WORKER_ENABLED: "true"
+    command: ["python", "-m", "app.collaboration.worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.process_health", "collaboration"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   collector:
     build:
       context: ../backend

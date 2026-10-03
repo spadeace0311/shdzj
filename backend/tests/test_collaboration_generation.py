@@ -223,7 +223,7 @@ async def test_formal_revision_generates_seven_group_tasks_once(
                     CollaborationTaskTemplateVersion.id,
                 ).where(
                     CollaborationTaskTemplateVersion.version
-                    == "shanghai-2026.1"
+                    == "shanghai-2026.2"
                 )
             )
         ).all()
