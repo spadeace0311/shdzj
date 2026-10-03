@@ -4,6 +4,7 @@ import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
 import { clearAccessToken, getCurrentUser } from "./api/client";
 import { ArtifactCenterRoute } from "./pages/ArtifactCenterPage";
 import { CollectorStatusPage } from "./pages/CollectorStatusPage";
+import { CommandHallPage } from "./pages/CommandHallPage";
 import { DataAssetsPage } from "./pages/DataAssetsPage";
 import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
@@ -66,6 +67,14 @@ function ConsoleShell({
               className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
             >
               采集状态
+            </NavLink>
+            <NavLink
+              to="/command-hall"
+              className={({ isActive }) =>
+                isActive ? "nav-link nav-link--active" : "nav-link"
+              }
+            >
+              指挥大厅
             </NavLink>
             <NavLink
               to="/data-assets"
@@ -140,6 +149,11 @@ function ConsoleShell({
                   workgroup={userWorkgroup}
                 />
               }
+            />
+            <Route path="/command-hall" element={<CommandHallPage />} />
+            <Route
+              path="/command-hall/:eventId"
+              element={<CommandHallPage />}
             />
           </Routes>
         </main>
