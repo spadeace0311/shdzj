@@ -14,6 +14,7 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.command_hall.projector import CommandHallProjector
 from app.collaboration.generation import CollaborationOutboxDispatcher
 from app.collaboration.models import CollaborationOutbox
 from app.collaboration.notifications import (
@@ -244,6 +245,7 @@ async def run_worker_cycle(
         projection_dispatcher
         or ProjectionOutboxDispatcher(
             session_factory,
+            handler=_refresh_command_hall_projection,
             batch_size=configured.collaboration_worker_batch_size,
             max_attempts=configured.collaboration_outbox_max_attempts,
             lease_seconds=configured.collaboration_outbox_lease_seconds,
@@ -288,6 +290,14 @@ async def run_worker_cycle(
     )
     _log_worker_cycle(result)
     return result
+
+
+async def _refresh_command_hall_projection(
+    session: AsyncSession,
+    outbox: CollaborationOutbox,
+) -> None:
+    projector = CommandHallProjector()
+    await projector.refresh_event(session, outbox.event_id)
 
 
 async def run_collaboration_worker(

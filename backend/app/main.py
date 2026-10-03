@@ -9,6 +9,7 @@ from app.auth.router import router as auth_router
 from app.auth.service import AuthService
 from app.collaboration.router import router as collaboration_router
 from app.collector.router import router as collector_router
+from app.command_hall.router import router as command_hall_router
 from app.data_assets.router import router as data_assets_router
 from app.db import SessionFactory
 from app.events.router import router as events_router
@@ -35,6 +36,7 @@ app.include_router(auth_router)
 app.include_router(collaboration_router)
 app.include_router(events_router)
 app.include_router(collector_router)
+app.include_router(command_hall_router)
 app.include_router(data_assets_router)
 
 
