@@ -1,0 +1,432 @@
+version: shanghai-2026.1
+tasks:
+  - code: news.takeover_duty
+    group: news_information
+    phase: within_30m
+    title: 接管行政值班室应急值守
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: news.release_quake_info
+    group: news_information
+    phase: within_30m
+    title: 发布震情速报信息
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+  - code: news.receive_directives
+    group: news_information
+    phase: within_30m
+    title: 接收并转呈上级指示批示
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: news.monitor_public_opinion
+    group: news_information
+    phase: within_30m
+    title: 开展热点敏感舆情监测
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: news.issue_duty_information
+    group: news_information
+    phase: within_30m
+    title: 编报值班信息并通知报送方式
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+  - code: news.meeting_support
+    group: news_information
+    phase: within_30m
+    title: 承办应急指挥部会议并编发纪要
+    source: 预案5.2（1）
+    due_offset_seconds: 1800
+  - code: news.summarize_group_reports
+    group: news_information
+    phase: 30m_to_60m
+    title: 汇总各工作组信息形成汇报材料
+    source: 预案5.2（1）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: news.spokesperson_materials
+    group: news_information
+    phase: 30m_to_60m
+    title: 准备新闻发言人和宣传口径材料
+    source: 预案5.2（1）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: news.website_topic
+    group: news_information
+    phase: 30m_to_60m
+    title: 建立事件专题并对外发布信息
+    source: 预案5.2（1）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: news.decision_compilation
+    group: news_information
+    phase: 1h_to_2h
+    title: 整理决策建议并视情上报
+    source: 预案5.2（1）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+    continuous: true
+  - code: news.public_opinion_report
+    group: news_information
+    phase: 1h_to_2h
+    title: 报送舆情监测报告
+    source: 预案5.2（1）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+  - code: news.dynamics_release
+    group: news_information
+    phase: 1h_to_2h
+    title: 汇总并发布应急处置动态
+    source: 预案5.2（1）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+    continuous: true
+  - code: news.media_interview
+    group: news_information
+    phase: 1h_to_2h
+    title: 组织专家采访和新闻通稿
+    source: 预案5.2（1）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+  - code: news.science_communication
+    group: news_information
+    phase: 2h_to_4h
+    title: 发布地震应急科普作品
+    source: 预案5.2（1）
+    start_offset_seconds: 7200
+    due_offset_seconds: 14400
+  - code: news.rumor_response
+    group: news_information
+    phase: 2h_to_4h
+    title: 开展传言和谣言应对
+    source: 预案5.2（1）
+    start_offset_seconds: 7200
+    due_offset_seconds: 14400
+    continuous: true
+  - code: news.press_conference
+    group: news_information
+    phase: 4h_to_end
+    title: 组织地震情况通报会
+    source: 预案5.2（1）
+    start_offset_seconds: 14400
+    continuous: true
+  - code: monitoring.epicenter_maps
+    group: monitoring_forecast
+    phase: within_30m
+    title: 提供震中、历史和仪器烈度图
+    source: 预案5.2（2）
+    due_offset_seconds: 1800
+    artifacts:
+      - [map.historical_earthquakes, a3v-professional]
+      - [map.intensity, a3v-professional]
+  - code: monitoring.sequence_tracking
+    group: monitoring_forecast
+    phase: 30m_to_60m
+    title: 跟踪序列并滚动提供余震目录
+    source: 预案5.2（2）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+    continuous: true
+  - code: monitoring.trend_consultation
+    group: monitoring_forecast
+    phase: 30m_to_60m
+    title: 开展紧急趋势会商
+    source: 预案5.2（2）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: monitoring.intensity_products
+    group: monitoring_forecast
+    phase: 30m_to_60m
+    title: 提供烈度速报等专业产出
+    source: 预案5.2（2）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: monitoring.geophysical_check
+    group: monitoring_forecast
+    phase: 1h_to_2h
+    title: 核实地球物理台网异常
+    source: 预案5.2（2）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+    continuous: true
+  - code: monitoring.station_and_mechanism
+    group: monitoring_forecast
+    phase: 1h_to_2h
+    title: 提供台站分布和震源机制
+    source: 预案5.2（2）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+    artifacts:
+      - [map.seismic_stations, a3v-professional]
+  - code: monitoring.special_reports
+    group: monitoring_forecast
+    phase: 1h_to_2h
+    title: 形成地震专报和震情专报
+    source: 预案5.2（2）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+  - code: monitoring.aftershock_catalog
+    group: monitoring_forecast
+    phase: 1h_to_2h
+    title: 编制余震序列并每两小时报送
+    source: 预案5.2（2）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: coordination.response_suggestion
+    group: comprehensive_coordination
+    phase: within_30m
+    title: 提出应急服务响应启动建议
+    source: 预案5.2（3）
+    due_offset_seconds: 1800
+  - code: coordination.collect_situation
+    group: comprehensive_coordination
+    phase: within_30m
+    title: 收集震情灾情社情并编报
+    source: 预案5.2（3）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: coordination.hotline
+    group: comprehensive_coordination
+    phase: within_30m
+    title: 处理12345热线工单
+    source: 预案5.2（3）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: coordination.dispatch_field_team
+    group: comprehensive_coordination
+    phase: within_30m
+    title: 协调先期处置并确定第一批出队人员
+    source: 预案5.2（3）
+    due_offset_seconds: 1800
+  - code: coordination.support_field_team
+    group: comprehensive_coordination
+    phase: 30m_to_60m
+    title: 前后方支撑现场队赶赴震区
+    source: 预案5.2（3）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+    continuous: true
+  - code: coordination.followup_team
+    group: comprehensive_coordination
+    phase: 1h_to_2h
+    title: 视情派出后续现场队并通报震情
+    source: 预案5.2（3）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+  - code: coordination.advanced_acts
+    group: comprehensive_coordination
+    phase: 1h_to_2h
+    title: 收集应急工作先进事迹
+    source: 预案5.2（3）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+    continuous: true
+  - code: coordination.field_management
+    group: comprehensive_coordination
+    phase: 2h_to_end
+    title: 做好现场队组织和保障
+    source: 预案5.2（3）
+    start_offset_seconds: 7200
+    continuous: true
+  - code: coordination.end_suggestion
+    group: comprehensive_coordination
+    phase: 2h_to_end
+    title: 提出应急服务响应结束建议
+    source: 预案5.2（3）
+    start_offset_seconds: 7200
+    continuous: true
+  - code: damage.field_survey_ready
+    group: damage_assessment
+    phase: within_30m
+    title: 确定现场调查人员并完成出队准备
+    source: 预案5.2（4）
+    due_offset_seconds: 1800
+  - code: damage.background_materials
+    group: damage_assessment
+    phase: 30m_to_60m
+    title: 提供构造、断裂和抗震设防资料
+    source: 预案5.2（4）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: damage.structural_array
+    group: damage_assessment
+    phase: 30m_to_60m
+    title: 提供结构台阵观测数据情况
+    source: 预案5.2（4）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: damage.field_investigation
+    group: damage_assessment
+    phase: 30m_to_60m
+    title: 开展现场破坏、地质灾害和烈度调查
+    source: 预案5.2（4）
+    start_offset_seconds: 1800
+    continuous: true
+  - code: damage.loss_assessment
+    group: damage_assessment
+    phase: 1h_to_end
+    title: 开展地震灾害损失评估
+    source: 预案5.2（4）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: damage.intensity_map
+    group: damage_assessment
+    phase: 1h_to_end
+    title: 开展地震烈度图绘制
+    source: 预案6.2（4）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: technology.open_command_hall
+    group: emergency_technology
+    phase: within_30m
+    title: 开启指挥大厅和视频会议系统
+    source: 预案5.2（5）
+    due_offset_seconds: 1800
+  - code: technology.rapid_brief
+    group: emergency_technology
+    phase: within_30m
+    title: 产出地震灾害快速评估简报
+    source: 预案5.2（5）
+    due_offset_seconds: 1800
+    artifacts:
+      - [doc.rapid_brief, a3v-professional]
+  - code: technology.network_security
+    group: emergency_technology
+    phase: within_30m
+    title: 保障网络、网站和系统运行
+    source: 预案5.2（5）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: technology.rapid_special
+    group: emergency_technology
+    phase: 30m_to_60m
+    title: 产出地震灾害快速评估专报
+    source: 预案5.2（5）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+    artifacts:
+      - [doc.rapid_report, a3v-professional]
+  - code: technology.professional_outputs
+    group: emergency_technology
+    phase: 1h_to_end
+    title: 持续产出专业图件和文字说明
+    source: 预案5.2（5）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: technology.system_operations
+    group: emergency_technology
+    phase: 1h_to_end
+    title: 保障应急技术系统正常运行
+    source: 预案5.2（5）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: technology.field_data_interpretation
+    group: emergency_technology
+    phase: 1h_to_end
+    title: 分析现场信息和动态灾情
+    source: 预案5.2（5）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: logistics.start_support
+    group: logistics
+    phase: within_30m
+    title: 启动指挥部保障工作
+    source: 预案5.2（6）
+    due_offset_seconds: 1800
+  - code: logistics.hall_seats
+    group: logistics
+    phase: within_30m
+    title: 在指挥大厅设立工作组席位
+    source: 预案5.2（6）
+    due_offset_seconds: 1800
+  - code: logistics.security
+    group: logistics
+    phase: within_30m
+    title: 做好局本部安保工作
+    source: 预案5.2（6）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: logistics.vehicle_materials
+    group: logistics
+    phase: 30m_to_60m
+    title: 提供车辆和物资保障
+    source: 预案5.2（6）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: logistics.vehicle_procurement
+    group: logistics
+    phase: 1h_to_2h
+    title: 保障应急用车并送人员赶赴现场
+    source: 预案5.2（6）
+    start_offset_seconds: 3600
+    due_offset_seconds: 7200
+  - code: logistics.lodging_food
+    group: logistics
+    phase: 2h_to_end
+    title: 做好现场人员食宿和物资保障
+    source: 预案5.2（6）
+    start_offset_seconds: 7200
+    continuous: true
+  - code: logistics.finance
+    group: logistics
+    phase: 2h_to_end
+    title: 管理应急经费支出
+    source: 预案5.2（6）
+    start_offset_seconds: 7200
+    continuous: true
+  - code: station.video_terminal
+    group: center_station
+    phase: within_30m
+    title: 开启视频会议终端
+    source: 预案5.2（7）
+    due_offset_seconds: 1800
+  - code: station.local_survey
+    group: center_station
+    phase: within_30m
+    title: 派就近人员开展现场调查
+    source: 预案5.2（7）
+    due_offset_seconds: 1800
+  - code: station.district_contact
+    group: center_station
+    phase: within_30m
+    title: 联系松江、崇明区应急局了解影响
+    source: 预案5.2（7）
+    due_offset_seconds: 1800
+  - code: station.observation_check
+    group: center_station
+    phase: within_30m
+    title: 检查辖区内观测仪器和设施
+    source: 预案5.2（7）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: station.security
+    group: center_station
+    phase: within_30m
+    title: 做好中心站安保工作
+    source: 预案5.2（7）
+    due_offset_seconds: 1800
+    continuous: true
+  - code: station.flow_observation_ready
+    group: center_station
+    phase: 30m_to_60m
+    title: 做好流动观测出队准备
+    source: 预案5.2（7）
+    start_offset_seconds: 1800
+    due_offset_seconds: 3600
+  - code: station.restore_and_observe
+    group: center_station
+    phase: 1h_to_end
+    title: 恢复监测设施并开展流动观测
+    source: 预案5.2（7）
+    start_offset_seconds: 3600
+    continuous: true
+  - code: news.external_event_record_notify
+    group: news_information
+    phase: within_30m
+    title: 登记外省或范围外事件并完成通知
+    source: 平台规则
+    due_offset_seconds: 300
+    applicability:
+      spatial_class: outside_assessment_scope

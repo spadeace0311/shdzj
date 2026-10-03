@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     artifact_browser_pool_size: int = 2
     artifact_retention_enabled: bool = True
     artifact_retention_interval_seconds: int = 86_400
+    collaboration_task_template_path: str = (
+        "/config/collaboration/shanghai-2026-tasks.yaml"
+    )
 
     @property
     def resolved_fan_app_id(self) -> str:
