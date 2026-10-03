@@ -2480,6 +2480,7 @@ a:hover {
 
 .collaboration-task-form,
 .collaboration-upload,
+.collaboration-text-version,
 .collaboration-publish-confirmation {
   display: grid;
   gap: 8px;
@@ -2491,6 +2492,7 @@ a:hover {
 
 .collaboration-task-form label,
 .collaboration-upload label,
+.collaboration-text-version label,
 .collaboration-publish-confirmation label {
   font-size: 13px;
   font-weight: 700;
@@ -2498,6 +2500,8 @@ a:hover {
 
 .collaboration-task-form textarea,
 .collaboration-upload input,
+.collaboration-text-version input,
+.collaboration-text-version textarea,
 .collaboration-publish-confirmation input {
   width: 100%;
   min-height: 38px;
@@ -2510,6 +2514,11 @@ a:hover {
 
 .collaboration-task-form textarea {
   min-height: 86px;
+  resize: vertical;
+}
+
+.collaboration-text-version textarea {
+  min-height: 76px;
   resize: vertical;
 }
 

@@ -150,6 +150,8 @@ export interface WorkgroupTask {
   created_at: string;
   updated_at: string;
   contributors: WorkgroupTaskContributor[];
+  can_work: boolean;
+  can_confirm: boolean;
 }
 
 export interface TaskSubmitInput {

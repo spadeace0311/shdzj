@@ -27,7 +27,7 @@ from app.collaboration.models import (
     WorkgroupTask,
 )
 from app.collaboration.repository import CollaborationRepository
-from app.collaboration.roster import RosterService
+from app.collaboration.roster import RosterService, snapshot_role_for_user
 from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 
@@ -95,9 +95,7 @@ class CollaborationTaskService:
         if already_applied:
             return task
         self._ensure_transition(task.status, TaskStatus.IN_PROGRESS)
-        if not await self._can_work_task(
-            session, actor_identity, task.workgroup_code
-        ):
+        if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
 
         now = datetime.now(UTC)
@@ -145,9 +143,7 @@ class CollaborationTaskService:
         if already_applied:
             return task
         self._ensure_transition(task.status, TaskStatus.PENDING_REVIEW)
-        if not await self._can_work_task(
-            session, actor_identity, task.workgroup_code
-        ):
+        if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
 
         now = datetime.now(UTC)
@@ -419,16 +415,28 @@ class CollaborationTaskService:
         self,
         session: AsyncSession,
         actor: _Actor,
-        group_code: str,
+        task: WorkgroupTask,
     ) -> bool:
         if actor.role == "superadmin":
             return True
         membership = await self.repository.get_active_membership(
-            session, group_code, actor.user_id
+            session, task.workgroup_code, actor.user_id
+        )
+        if (
+            membership is None
+            or membership.duty_role not in _GROUP_WORK_ROLES
+        ):
+            return False
+        snapshot = (
+            await self.roster_service.repository.get_roster_snapshot(
+                session,
+                task.event_id,
+                task.workgroup_code,
+            )
         )
         return (
-            membership is not None
-            and membership.duty_role in _GROUP_WORK_ROLES
+            snapshot_role_for_user(snapshot, actor.user_id)
+            in _GROUP_WORK_ROLES
         )
 
     async def _can_confirm(
@@ -439,10 +447,22 @@ class CollaborationTaskService:
     ) -> bool:
         if actor.role == "superadmin":
             return True
+        if not await self._can_work_task(session, actor, task):
+            return False
         authority = await self.roster_service.resolve_confirming_authority(
             session, task.event_id, task.workgroup_code
         )
-        return authority is not None and authority.user_id == actor.user_id
+        if authority is None or authority.user_id != actor.user_id:
+            return False
+        membership = await self.repository.get_active_membership(
+            session,
+            task.workgroup_code,
+            actor.user_id,
+        )
+        return (
+            membership is not None
+            and membership.duty_role == authority.role.value
+        )
 
     @staticmethod
     def _ensure_transition(
@@ -1045,9 +1065,7 @@ class DeliverableService:
             return await self._version_from_event(
                 session, task, idempotency_key
             )
-        if not await self._can_work_task(
-            session, actor_identity, task.workgroup_code
-        ):
+        if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
         if not isinstance(text_result, dict) or not text_result:
             raise ValueError("text_result must be a non-empty object")
@@ -1091,9 +1109,7 @@ class DeliverableService:
             return await self._version_from_event(
                 session, task, idempotency_key
             )
-        if not await self._can_work_task(
-            session, actor_identity, task.workgroup_code
-        ):
+        if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
 
         stored = self.artifact_store.store_immutable_stream(
@@ -1717,16 +1733,28 @@ class DeliverableService:
         self,
         session: AsyncSession,
         actor: _Actor,
-        group_code: str,
+        task: WorkgroupTask,
     ) -> bool:
         if actor.role == "superadmin":
             return True
         membership = await self.repository.get_active_membership(
-            session, group_code, actor.user_id
+            session, task.workgroup_code, actor.user_id
+        )
+        if (
+            membership is None
+            or membership.duty_role not in _GROUP_WORK_ROLES
+        ):
+            return False
+        snapshot = (
+            await self.roster_service.repository.get_roster_snapshot(
+                session,
+                task.event_id,
+                task.workgroup_code,
+            )
         )
         return (
-            membership is not None
-            and membership.duty_role in _GROUP_WORK_ROLES
+            snapshot_role_for_user(snapshot, actor.user_id)
+            in _GROUP_WORK_ROLES
         )
 
     async def _confirming_role(
@@ -1737,10 +1765,22 @@ class DeliverableService:
     ) -> str:
         if actor.role == "superadmin":
             return "superadmin"
+        if not await self._can_work_task(session, actor, task):
+            raise PermissionError("Insufficient permissions")
         authority = await self.roster_service.resolve_confirming_authority(
             session, task.event_id, task.workgroup_code
         )
         if authority is None or authority.user_id != actor.user_id:
+            raise PermissionError("Insufficient permissions")
+        membership = await self.repository.get_active_membership(
+            session,
+            task.workgroup_code,
+            actor.user_id,
+        )
+        if (
+            membership is None
+            or membership.duty_role != authority.role.value
+        ):
             raise PermissionError("Insufficient permissions")
         return authority.role.value
 

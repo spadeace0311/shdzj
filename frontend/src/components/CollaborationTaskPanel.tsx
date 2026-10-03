@@ -1,14 +1,17 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
+  addCollaborationTextVersion,
   ApiError,
+  cancelCollaborationTask,
   completeCollaborationTask,
-  getAccessToken,
   getCommandHallTask,
   newIdempotencyKey,
+  publishCollaborationDeliverableVersion,
   returnCollaborationTask,
   startCollaborationTask,
   submitCollaborationTask,
+  uploadCollaborationDeliverableVersion,
 } from "../api/client";
 import {
   formatDateTime,
@@ -125,90 +128,6 @@ function eventMarker(kind: string | null): {
   return null;
 }
 
-async function responseError(response: Response): Promise<ApiError> {
-  try {
-    const payload = (await response.json()) as { detail?: unknown };
-    if (typeof payload.detail === "string") {
-      return new ApiError(payload.detail, response.status);
-    }
-  } catch {
-    // Fall through to a stable message for non-JSON responses.
-  }
-  return new ApiError(`请求失败（HTTP ${response.status}）`, response.status);
-}
-
-async function uploadCandidateVersion(
-  deliverableId: string,
-  file: File,
-  basisText: string,
-  idempotencyKey: string,
-): Promise<DeliverableVersionRecord> {
-  const token = getAccessToken();
-  if (!token) {
-    throw new ApiError("请先登录后上传候选成果", 401);
-  }
-  const body = new FormData();
-  body.set("file", file);
-  if (file.type) {
-    body.set("mime_type", file.type);
-  }
-  if (basisText.trim()) {
-    body.set("basis_text", basisText.trim());
-  }
-  const response = await fetch(
-    `/api/v1/collaboration/deliverables/${encodeURIComponent(
-      deliverableId,
-    )}/versions/file`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Idempotency-Key": idempotencyKey,
-      },
-      body,
-    },
-  );
-  if (!response.ok) {
-    throw await responseError(response);
-  }
-  return (await response.json()) as DeliverableVersionRecord;
-}
-
-async function publishCandidateVersion(
-  deliverableId: string,
-  versionId: string,
-  taskVersion: number,
-  publicationNote: string,
-  idempotencyKey: string,
-): Promise<DeliverablePublicationRecord> {
-  const token = getAccessToken();
-  if (!token) {
-    throw new ApiError("请先登录后确认发布", 401);
-  }
-  const response = await fetch(
-    `/api/v1/collaboration/deliverables/${encodeURIComponent(
-      deliverableId,
-    )}/publish`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "If-Match": String(taskVersion),
-        "Idempotency-Key": idempotencyKey,
-      },
-      body: JSON.stringify({
-        version_id: versionId,
-        publication_note: publicationNote.trim() || null,
-      }),
-    },
-  );
-  if (!response.ok) {
-    throw await responseError(response);
-  }
-  return (await response.json()) as DeliverablePublicationRecord;
-}
-
 export function CollaborationTaskPanel({
   task,
   canWork,
@@ -238,15 +157,32 @@ export function CollaborationTaskPanel({
   const [publicationKeys, setPublicationKeys] = useState<Record<string, string>>(
     {},
   );
+  const [textVersionValues, setTextVersionValues] = useState<
+    Record<string, string>
+  >({});
+  const [textVersionBasis, setTextVersionBasis] = useState<
+    Record<string, string>
+  >({});
+  const [textVersionKeys, setTextVersionKeys] = useState<
+    Record<string, string>
+  >({});
+  const detailRequestRef = useRef(0);
 
   async function loadDetail() {
+    const requestId = ++detailRequestRef.current;
     setDetailStatus("loading");
     setError("");
     try {
       const loaded = await getCommandHallTask(task.id);
+      if (requestId !== detailRequestRef.current) {
+        return;
+      }
       setDetail(loaded);
       setDetailStatus("ready");
     } catch (caught) {
+      if (requestId !== detailRequestRef.current) {
+        return;
+      }
       setError(errorMessage(caught));
       setDetailStatus("error");
     }
@@ -254,6 +190,9 @@ export function CollaborationTaskPanel({
 
   useEffect(() => {
     void loadDetail();
+    return () => {
+      detailRequestRef.current += 1;
+    };
   }, [task.id, task.row_version]);
 
   async function afterMutation(message: string) {
@@ -363,7 +302,7 @@ export function CollaborationTaskPanel({
     }
     const succeeded = await runAction(
       () =>
-        uploadCandidateVersion(
+        uploadCollaborationDeliverableVersion(
           deliverable.id,
           file,
           uploadBasis[deliverable.id] ?? "",
@@ -382,6 +321,46 @@ export function CollaborationTaskPanel({
     }
   }
 
+  async function handleTextVersion(deliverable: DeliverableRecord) {
+    const text = textVersionValues[deliverable.id]?.trim() ?? "";
+    if (!text) {
+      setError(`请填写${deliverable.title}的文字版本`);
+      return;
+    }
+    const key = textVersionKeys[deliverable.id] ?? newIdempotencyKey();
+    if (!textVersionKeys[deliverable.id]) {
+      setTextVersionKeys((current) => ({
+        ...current,
+        [deliverable.id]: key,
+      }));
+    }
+    const succeeded = await runAction(
+      () =>
+        addCollaborationTextVersion(
+          deliverable.id,
+          { text },
+          textVersionBasis[deliverable.id] ?? "",
+          key,
+        ),
+      "文字版本已提交",
+    );
+    if (succeeded) {
+      setTextVersionValues((current) => ({
+        ...current,
+        [deliverable.id]: "",
+      }));
+      setTextVersionBasis((current) => ({
+        ...current,
+        [deliverable.id]: "",
+      }));
+      setTextVersionKeys((current) => {
+        const next = { ...current };
+        delete next[deliverable.id];
+        return next;
+      });
+    }
+  }
+
   async function handlePublish(
     deliverable: DeliverableRecord,
     version: DeliverableVersionRecord,
@@ -392,7 +371,7 @@ export function CollaborationTaskPanel({
     }
     const succeeded = await runAction(
       () =>
-        publishCandidateVersion(
+        publishCollaborationDeliverableVersion(
           deliverable.id,
           version.id,
           task.row_version,
@@ -409,6 +388,23 @@ export function CollaborationTaskPanel({
         delete next[version.id];
         return next;
       });
+    }
+  }
+
+  async function handleCancel() {
+    const key = reusableActionKey(`task-cancel:${task.id}`);
+    const succeeded = await runAction(
+      () =>
+        cancelCollaborationTask(
+          task.id,
+          task.row_version,
+          "平台标记不再需要",
+          key,
+        ),
+      "任务已标记为不再需要",
+    );
+    if (succeeded) {
+      clearActionKey(`task-cancel:${task.id}`);
     }
   }
 
@@ -518,40 +514,7 @@ export function CollaborationTaskPanel({
             className="secondary-button"
             type="button"
             disabled={busy}
-            onClick={() => {
-              const key = reusableActionKey(`task-cancel:${task.id}`);
-              void runAction(
-                async () => {
-                  const token = getAccessToken();
-                  if (!token) {
-                    throw new ApiError("请先登录后取消任务", 401);
-                  }
-                  const response = await fetch(
-                    `/api/v1/collaboration/tasks/${encodeURIComponent(
-                      task.id,
-                    )}/cancel`,
-                    {
-                      method: "POST",
-                      headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type": "application/json",
-                        "If-Match": String(task.row_version),
-                        "Idempotency-Key": key,
-                      },
-                      body: JSON.stringify({ reason: "平台标记不再需要" }),
-                    },
-                  );
-                  if (!response.ok) {
-                    throw await responseError(response);
-                  }
-                },
-                "任务已标记为不再需要",
-              ).then((succeeded) => {
-                if (succeeded) {
-                  clearActionKey(`task-cancel:${task.id}`);
-                }
-              });
-            }}
+            onClick={() => void handleCancel()}
           >
             标记不再需要
           </button>
@@ -695,6 +658,62 @@ export function CollaborationTaskPanel({
             ) : (
               <p className="collaboration-task-panel__empty">暂无候选版本</p>
             )}
+
+            {canWork &&
+            !["completed", "not_required", "failed"].includes(task.status) &&
+            ["manual_text", "manual_file_or_text"].includes(
+              deliverable.requirement_kind,
+            ) ? (
+              <div className="collaboration-text-version">
+                <label htmlFor={`text-version-${deliverable.id}`}>
+                  文字版本：{deliverable.title}
+                </label>
+                <textarea
+                  id={`text-version-${deliverable.id}`}
+                  value={textVersionValues[deliverable.id] ?? ""}
+                  onChange={(event) => {
+                    setTextVersionValues((current) => ({
+                      ...current,
+                      [deliverable.id]: event.target.value,
+                    }));
+                    setTextVersionKeys((current) => {
+                      const next = { ...current };
+                      delete next[deliverable.id];
+                      return next;
+                    });
+                  }}
+                />
+                <label htmlFor={`text-version-basis-${deliverable.id}`}>
+                  文字版本说明：{deliverable.title}
+                </label>
+                <input
+                  id={`text-version-basis-${deliverable.id}`}
+                  value={textVersionBasis[deliverable.id] ?? ""}
+                  onChange={(event) => {
+                    setTextVersionBasis((current) => ({
+                      ...current,
+                      [deliverable.id]: event.target.value,
+                    }));
+                    setTextVersionKeys((current) => {
+                      const next = { ...current };
+                      delete next[deliverable.id];
+                      return next;
+                    });
+                  }}
+                />
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={
+                    busy ||
+                    !(textVersionValues[deliverable.id] ?? "").trim()
+                  }
+                  onClick={() => void handleTextVersion(deliverable)}
+                >
+                  提交文字版本
+                </button>
+              </div>
+            ) : null}
 
             {canWork &&
             !["completed", "not_required", "failed"].includes(task.status) &&

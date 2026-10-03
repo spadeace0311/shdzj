@@ -1,19 +1,34 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useNavigate,
+} from "react-router-dom";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import {
   ApiError,
+  addCollaborationTextVersion,
+  cancelCollaborationTask,
   completeCollaborationTask,
   createTemporaryTask,
   getCollaborationTask,
   getCommandHallTask,
   getEvent,
   listCollaborationTasks,
+  publishCollaborationDeliverableVersion,
   returnCollaborationTask,
   setAccessToken,
   startCollaborationTask,
   submitCollaborationTask,
+  uploadCollaborationDeliverableVersion,
 } from "../src/api/client";
 import { WorkgroupTasksPage } from "../src/pages/WorkgroupTasksPage";
 import type {
@@ -26,15 +41,19 @@ vi.mock("../src/api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/api/client")>();
   return {
     ...actual,
+    addCollaborationTextVersion: vi.fn(),
+    cancelCollaborationTask: vi.fn(),
     completeCollaborationTask: vi.fn(),
     createTemporaryTask: vi.fn(),
     getCollaborationTask: vi.fn(),
     getCommandHallTask: vi.fn(),
     getEvent: vi.fn(),
     listCollaborationTasks: vi.fn(),
+    publishCollaborationDeliverableVersion: vi.fn(),
     returnCollaborationTask: vi.fn(),
     startCollaborationTask: vi.fn(),
     submitCollaborationTask: vi.fn(),
+    uploadCollaborationDeliverableVersion: vi.fn(),
   };
 });
 
@@ -78,6 +97,8 @@ const pendingTask: WorkgroupTask = {
   created_at: "2026-10-03T01:00:00Z",
   updated_at: "2026-10-03T01:00:00Z",
   contributors: [],
+  can_work: true,
+  can_confirm: false,
 };
 
 const inProgressTask: WorkgroupTask = {
@@ -194,19 +215,44 @@ const submitMock = vi.mocked(submitCollaborationTask);
 const returnMock = vi.mocked(returnCollaborationTask);
 const completeMock = vi.mocked(completeCollaborationTask);
 const createTemporaryMock = vi.mocked(createTemporaryTask);
-const fetchMock = vi.fn();
+const cancelMock = vi.mocked(cancelCollaborationTask);
+const uploadMock = vi.mocked(uploadCollaborationDeliverableVersion);
+const textVersionMock = vi.mocked(addCollaborationTextVersion);
+const publishMock = vi.mocked(publishCollaborationDeliverableVersion);
+
+function WorkgroupTasksHarness({
+  userRole,
+  workgroup,
+}: {
+  userRole: string;
+  workgroup: string | null;
+}) {
+  const navigate = useNavigate();
+  return (
+    <>
+      <WorkgroupTasksPage
+        userRole={userRole}
+        workgroup={workgroup}
+      />
+      <button type="button" onClick={() => navigate("/tasks/event-2")}>
+        切换到事件 B
+      </button>
+    </>
+  );
+}
 
 function renderPage(
   userRole: string,
   workgroup: string | null,
+  eventId = "event-1",
 ): ReturnType<typeof render> {
   return render(
-    <MemoryRouter initialEntries={["/tasks/event-1"]}>
+    <MemoryRouter initialEntries={[`/tasks/${eventId}`]}>
       <Routes>
         <Route
           path="/tasks/:eventId"
           element={
-            <WorkgroupTasksPage
+            <WorkgroupTasksHarness
               userRole={userRole}
               workgroup={workgroup}
             />
@@ -217,15 +263,7 @@ function renderPage(
   );
 }
 
-function jsonResponse(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
 beforeEach(() => {
-  vi.stubGlobal("fetch", fetchMock);
   setAccessToken("test-token");
   listMock.mockReset();
   getTaskMock.mockReset();
@@ -236,7 +274,10 @@ beforeEach(() => {
   returnMock.mockReset();
   completeMock.mockReset();
   createTemporaryMock.mockReset();
-  fetchMock.mockReset();
+  cancelMock.mockReset();
+  uploadMock.mockReset();
+  textVersionMock.mockReset();
+  publishMock.mockReset();
   getEventMock.mockResolvedValue(event);
   getHallTaskMock.mockResolvedValue(hallDetail);
 });
@@ -252,7 +293,8 @@ test("group member sees start and submit actions but not confirm", async () => {
 });
 
 test("leader can confirm a pending review task while member cannot", async () => {
-  listMock.mockResolvedValue([reviewTask]);
+  const confirmableReview = { ...reviewTask, can_confirm: true };
+  listMock.mockResolvedValue([confirmableReview]);
   const leaderRender = renderPage("group_leader", "监测预报组");
 
   expect(
@@ -266,6 +308,36 @@ test("leader can confirm a pending review task while member cannot", async () =>
   await screen.findByText(reviewTask.title);
   expect(
     screen.queryByRole("button", { name: "确认完成" }),
+  ).not.toBeInTheDocument();
+});
+
+test("deputy without effective authority cannot confirm or cancel", async () => {
+  listMock.mockResolvedValue([
+    {
+      ...reviewTask,
+      can_confirm: false,
+    },
+    {
+      ...inProgressTask,
+      can_confirm: false,
+    },
+  ]);
+
+  renderPage("group_deputy", "监测预报组");
+
+  await screen.findByText(reviewTask.title);
+  getTaskMock.mockResolvedValue(inProgressTask);
+  expect(
+    screen.queryByRole("button", { name: "确认完成" }),
+  ).not.toBeInTheDocument();
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: `查看任务详情：${inProgressTask.title}`,
+    }),
+  );
+  await screen.findByRole("heading", { name: inProgressTask.title });
+  expect(
+    screen.queryByRole("button", { name: "标记不再需要" }),
   ).not.toBeInTheDocument();
 });
 
@@ -320,6 +392,150 @@ test("shows the non-removable test marker on tasks and details", async () => {
   );
   await screen.findByRole("heading", { name: pendingTask.title });
   expect(screen.getAllByText("测试").length).toBeGreaterThan(0);
+});
+
+test("clears the previous event selection when navigating to another event", async () => {
+  const eventB = {
+    ...event,
+    id: "event-2",
+    place: "上海松江区",
+  };
+  const taskB: WorkgroupTask = {
+    ...pendingTask,
+    id: "task-b",
+    event_id: "event-2",
+    title: "松江震情处理",
+  };
+  getEventMock.mockImplementation(async (id) =>
+    id === "event-2" ? eventB : event,
+  );
+  listMock.mockImplementation(async (id) =>
+    id === "event-2" ? [taskB] : [pendingTask],
+  );
+  getTaskMock.mockResolvedValue(pendingTask);
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `查看任务详情：${pendingTask.title}`,
+    }),
+  );
+  await screen.findByRole("heading", { name: pendingTask.title });
+  fireEvent.click(screen.getByRole("button", { name: "切换到事件 B" }));
+
+  expect(await screen.findByText(taskB.title)).toBeInTheDocument();
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: pendingTask.title }),
+  ).not.toBeInTheDocument();
+});
+
+test("ignores a delayed list response from the previous event", async () => {
+  let resolveEventA!: (tasks: WorkgroupTask[]) => void;
+  const delayedEventA = new Promise<WorkgroupTask[]>((resolve) => {
+    resolveEventA = resolve;
+  });
+  const taskB: WorkgroupTask = {
+    ...pendingTask,
+    id: "task-b",
+    event_id: "event-2",
+    title: "事件 B 任务",
+  };
+  listMock.mockImplementation((id) =>
+    id === "event-1" ? delayedEventA : Promise.resolve([taskB]),
+  );
+
+  renderPage("group_member", "监测预报组");
+  fireEvent.click(screen.getByRole("button", { name: "切换到事件 B" }));
+
+  expect(await screen.findByText(taskB.title)).toBeInTheDocument();
+  await act(async () => {
+    resolveEventA([pendingTask]);
+  });
+
+  expect(screen.getByText(taskB.title)).toBeInTheDocument();
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+});
+
+test("ignores a previous event mutation refresh after navigation", async () => {
+  let resolveStart!: (task: WorkgroupTask) => void;
+  const delayedStart = new Promise<WorkgroupTask>((resolve) => {
+    resolveStart = resolve;
+  });
+  const eventB = {
+    ...event,
+    id: "event-2",
+    place: "上海松江区",
+  };
+  const taskB: WorkgroupTask = {
+    ...pendingTask,
+    id: "task-b",
+    event_id: "event-2",
+    title: "事件 B 任务",
+  };
+  getEventMock.mockImplementation(async (id) =>
+    id === "event-2" ? eventB : event,
+  );
+  listMock.mockImplementation(async (id) =>
+    id === "event-2" ? [taskB] : [pendingTask],
+  );
+  startMock.mockReturnValue(delayedStart);
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(await screen.findByRole("button", { name: "开始处理" }));
+  fireEvent.click(screen.getByRole("button", { name: "切换到事件 B" }));
+  expect(await screen.findByText(taskB.title)).toBeInTheDocument();
+
+  await act(async () => {
+    resolveStart({
+      ...pendingTask,
+      status: "in_progress",
+      row_version: 5,
+    });
+  });
+
+  expect(screen.getByText(taskB.title)).toBeInTheDocument();
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+  expect(listMock).toHaveBeenCalledTimes(2);
+});
+
+test("ignores a delayed task detail response after another task is opened", async () => {
+  let resolveTaskA!: (task: WorkgroupTask) => void;
+  const delayedTaskA = new Promise<WorkgroupTask>((resolve) => {
+    resolveTaskA = resolve;
+  });
+  listMock.mockResolvedValue([pendingTask, inProgressTask]);
+  getTaskMock.mockImplementation((taskId) =>
+    taskId === pendingTask.id
+      ? delayedTaskA
+      : Promise.resolve(inProgressTask),
+  );
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `查看任务详情：${pendingTask.title}`,
+    }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: `查看任务详情：${inProgressTask.title}`,
+    }),
+  );
+  await screen.findByRole("heading", { name: inProgressTask.title });
+  await act(async () => {
+    resolveTaskA(pendingTask);
+  });
+
+  expect(
+    screen.getByRole("heading", { name: inProgressTask.title }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: pendingTask.title }),
+  ).not.toBeInTheDocument();
 });
 
 test("shows the exact conflict message when a task was changed by someone else", async () => {
@@ -428,6 +644,10 @@ test("creates a temporary task with the fixed workgroup list and refreshes", asy
 });
 
 test("uploads a candidate file and confirms publication of that version", async () => {
+  const confirmableTask = {
+    ...inProgressTask,
+    can_confirm: true,
+  };
   const candidate = {
     ...manualVersion,
     id: "version-candidate",
@@ -452,27 +672,24 @@ test("uploads a candidate file and confirms publication of that version", async 
       },
     ],
   };
-  listMock.mockResolvedValue([inProgressTask]);
-  getTaskMock.mockResolvedValue(inProgressTask);
+  listMock.mockResolvedValue([confirmableTask]);
+  getTaskMock.mockResolvedValue(confirmableTask);
   getHallTaskMock
     .mockResolvedValueOnce(detailWithoutVersions)
     .mockResolvedValueOnce(detailWithCandidate)
     .mockResolvedValue(detailWithCandidate);
-  fetchMock
-    .mockResolvedValueOnce(jsonResponse(candidate))
-    .mockResolvedValueOnce(
-      jsonResponse({
-        id: "publication-2",
-        deliverable_id: "deliverable-1",
-        version_id: candidate.id,
-        published_by: "leader",
-        published_role: "leader",
-        published_at: "2026-10-03T01:30:00Z",
-        superseded_at: null,
-        publication_note: "确认发布",
-        created_at: "2026-10-03T01:30:00Z",
-      }),
-    );
+  uploadMock.mockResolvedValue(candidate);
+  publishMock.mockResolvedValue({
+    id: "publication-2",
+    deliverable_id: "deliverable-1",
+    version_id: candidate.id,
+    published_by: "leader",
+    published_role: "leader",
+    published_at: "2026-10-03T01:30:00Z",
+    superseded_at: null,
+    publication_note: "确认发布",
+    created_at: "2026-10-03T01:30:00Z",
+  });
 
   renderPage("group_leader", "监测预报组");
 
@@ -495,20 +712,11 @@ test("uploads a candidate file and confirms publication of that version", async 
   });
   fireEvent.click(screen.getAllByRole("button", { name: "上传候选文件" })[0]);
 
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  const [uploadPath, uploadInit] = fetchMock.mock.calls[0] as [
-    string,
-    RequestInit,
-  ];
-  expect(uploadPath).toBe(
-    "/api/v1/collaboration/deliverables/deliverable-1/versions/file",
-  );
-  expect(uploadInit.method).toBe("POST");
-  expect(new Headers(uploadInit.headers).get("Idempotency-Key")).toBeTruthy();
-  expect((uploadInit.body as FormData).get("basis_text")).toBe(
-    "补充人工审核结果",
-  );
-  expect((uploadInit.body as FormData).get("file")).toBe(file);
+  await waitFor(() => expect(uploadMock).toHaveBeenCalledTimes(1));
+  expect(uploadMock.mock.calls[0][0]).toBe("deliverable-1");
+  expect(uploadMock.mock.calls[0][1]).toBe(file);
+  expect(uploadMock.mock.calls[0][2]).toBe("补充人工审核结果");
+  expect(uploadMock.mock.calls[0][3]).toBeTruthy();
 
   expect(await screen.findByText("人工修订版")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "发布此版本" }));
@@ -517,18 +725,163 @@ test("uploads a candidate file and confirms publication of that version", async 
   });
   fireEvent.click(screen.getByRole("button", { name: "确认发布" }));
 
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-  const [publishPath, publishInit] = fetchMock.mock.calls[1] as [
-    string,
-    RequestInit,
-  ];
-  expect(publishPath).toBe(
-    "/api/v1/collaboration/deliverables/deliverable-1/publish",
+  await waitFor(() => expect(publishMock).toHaveBeenCalledTimes(1));
+  expect(publishMock.mock.calls[0]).toEqual([
+    "deliverable-1",
+    "version-candidate",
+    5,
+    "确认发布",
+    expect.any(String),
+  ]);
+});
+
+test("creates a text version before submitting and completing a manual_text task", async () => {
+  const textTask = {
+    ...inProgressTask,
+    can_confirm: true,
+  };
+  const textDeliverable = {
+    id: "deliverable-text",
+    task_id: textTask.id,
+    deliverable_code: "manual_text_result",
+    title: "人工文字结果",
+    is_required: true,
+    requirement_kind: "manual_text",
+    artifact_binding: null,
+    display_order: 1,
+    current_publication: null,
+    versions: [],
+  };
+  const textVersion = {
+    ...manualVersion,
+    id: "version-text",
+    deliverable_id: textDeliverable.id,
+    version_no: 1,
+    source_kind: "manual",
+    storage_key: null,
+    file_name: null,
+    text_result: { text: "已完成震情核对" },
+  };
+  const detailBefore: CommandHallTaskDetail = {
+    ...hallDetail,
+    id: textTask.id,
+    task: { ...textTask },
+    deliverables: [textDeliverable],
+  };
+  const detailAfterText: CommandHallTaskDetail = {
+    ...detailBefore,
+    deliverables: [{ ...textDeliverable, versions: [textVersion] }],
+  };
+  const submittedTask = {
+    ...textTask,
+    status: "pending_review" as const,
+    row_version: 6,
+  };
+  const completedTask = {
+    ...submittedTask,
+    status: "completed" as const,
+    row_version: 7,
+  };
+  listMock
+    .mockResolvedValueOnce([textTask])
+    .mockResolvedValueOnce([textTask])
+    .mockResolvedValueOnce([submittedTask])
+    .mockResolvedValueOnce([completedTask]);
+  getTaskMock.mockResolvedValue(textTask);
+  getHallTaskMock
+    .mockResolvedValueOnce(detailBefore)
+    .mockResolvedValueOnce(detailAfterText)
+    .mockResolvedValue(detailAfterText);
+  textVersionMock.mockResolvedValue(textVersion);
+  submitMock.mockResolvedValue(submittedTask);
+  completeMock.mockResolvedValue(completedTask);
+
+  renderPage("group_leader", "监测预报组");
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `查看任务详情：${textTask.title}`,
+    }),
   );
-  expect(new Headers(publishInit.headers).get("If-Match")).toBe("5");
-  expect(new Headers(publishInit.headers).get("Idempotency-Key")).toBeTruthy();
-  expect(JSON.parse(publishInit.body as string)).toEqual({
-    version_id: "version-candidate",
-    publication_note: "确认发布",
+  fireEvent.change(await screen.findByLabelText("文字版本：人工文字结果"), {
+    target: { value: "已完成震情核对" },
   });
+  fireEvent.change(screen.getByLabelText("文字版本说明：人工文字结果"), {
+    target: { value: "组长核验" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提交文字版本" }));
+
+  await waitFor(() => expect(textVersionMock).toHaveBeenCalledTimes(1));
+  expect(textVersionMock.mock.calls[0]).toEqual([
+    "deliverable-text",
+    { text: "已完成震情核对" },
+    "组长核验",
+    expect.any(String),
+  ]);
+  expect(await screen.findByText(/文字成果/)).toBeInTheDocument();
+
+  fireEvent.change(screen.getByLabelText("文字结果"), {
+    target: { value: "提交待确认" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提交成果" }));
+  await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+  const confirmButtons = await screen.findAllByRole("button", {
+    name: "确认完成",
+  });
+  fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+  await waitFor(() => expect(completeMock).toHaveBeenCalledTimes(1));
+  expect(listMock).toHaveBeenCalledTimes(4);
+});
+
+test("reuses one idempotency key when a timed-out text version is retried", async () => {
+  const textDeliverable = {
+    id: "deliverable-text",
+    task_id: inProgressTask.id,
+    deliverable_code: "manual_text_result",
+    title: "人工文字结果",
+    is_required: true,
+    requirement_kind: "manual_text",
+    artifact_binding: null,
+    display_order: 1,
+    current_publication: null,
+    versions: [],
+  };
+  listMock.mockResolvedValue([inProgressTask]);
+  getTaskMock.mockResolvedValue(inProgressTask);
+  getHallTaskMock.mockResolvedValue({
+    ...hallDetail,
+    deliverables: [textDeliverable],
+  });
+  textVersionMock
+    .mockRejectedValueOnce(new ApiError("请求超时，请稍后重试", 408))
+    .mockResolvedValueOnce({
+      ...manualVersion,
+      id: "version-text",
+      deliverable_id: textDeliverable.id,
+      file_name: null,
+      storage_key: null,
+      text_result: { text: "已完成" },
+    });
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `查看任务详情：${inProgressTask.title}`,
+    }),
+  );
+  fireEvent.change(await screen.findByLabelText("文字版本：人工文字结果"), {
+    target: { value: "已完成" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提交文字版本" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("请求超时");
+
+  fireEvent.click(screen.getByRole("button", { name: "提交文字版本" }));
+  await waitFor(() => expect(textVersionMock).toHaveBeenCalledTimes(2));
+
+  const firstKey = textVersionMock.mock.calls[0][3];
+  const secondKey = textVersionMock.mock.calls[1][3];
+  expect(firstKey).toBeTruthy();
+  expect(secondKey).toBe(firstKey);
 });

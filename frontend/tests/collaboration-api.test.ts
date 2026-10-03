@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
+  addCollaborationTextVersion,
   ApiError,
+  cancelCollaborationTask,
   clearAccessToken,
   completeCollaborationTask,
   createTemporaryTask,
@@ -12,11 +14,13 @@ import {
   getCommandHallTask,
   listCollaborationTasks,
   newIdempotencyKey,
+  publishCollaborationDeliverableVersion,
   returnCollaborationTask,
   setAccessToken,
   startCollaborationTask,
   streamCommandHall,
   submitCollaborationTask,
+  uploadCollaborationDeliverableVersion,
 } from "../src/api/client";
 import type { CommandHallStreamEvent, WorkgroupTask } from "../src/types";
 
@@ -43,6 +47,27 @@ const task: WorkgroupTask = {
   created_at: "2026-10-03T01:00:00Z",
   updated_at: "2026-10-03T01:00:00Z",
   contributors: [],
+  can_work: true,
+  can_confirm: false,
+};
+
+const taskVersion = {
+  id: "version-1",
+  deliverable_id: "deliverable-1",
+  version_no: 1,
+  source_kind: "manual",
+  artifact_id: null,
+  artifact_publication_id: null,
+  storage_key: "collaboration/result.pdf",
+  file_name: "result.pdf",
+  checksum: "a".repeat(64),
+  mime_type: "application/pdf",
+  size_bytes: 10,
+  text_result: null,
+  created_by: "operator",
+  basis_text: "人工成果",
+  supersedes_version_id: null,
+  created_at: "2026-10-03T01:10:00Z",
 };
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -195,6 +220,124 @@ test("completeCollaborationTask sends If-Match and idempotency key", async () =>
   const headers = new Headers(init.headers);
   expect(headers.get("If-Match")).toBe("4");
   expect(headers.get("Idempotency-Key")).toBeTruthy();
+});
+
+test("cancelCollaborationTask sends the reason with optimistic concurrency", async () => {
+  fetchMock.mockResolvedValue(jsonResponse({ ...task, status: "not_required" }));
+
+  await cancelCollaborationTask(
+    "task-1",
+    4,
+    "平台标记不再需要",
+    "cancel-key",
+  );
+
+  const [path, init] = mutationRequest();
+  const headers = new Headers(init.headers);
+  expect(path).toBe("/api/v1/collaboration/tasks/task-1/cancel");
+  expect(init.method).toBe("POST");
+  expect(headers.get("If-Match")).toBe("4");
+  expect(headers.get("Idempotency-Key")).toBe("cancel-key");
+  expect(JSON.parse(init.body as string)).toEqual({
+    reason: "平台标记不再需要",
+  });
+});
+
+test("uploadCollaborationDeliverableVersion posts multipart data", async () => {
+  fetchMock.mockResolvedValue(jsonResponse(taskVersion));
+  const file = new File(["result"], "result.pdf", {
+    type: "application/pdf",
+  });
+
+  await expect(
+    uploadCollaborationDeliverableVersion(
+      "deliverable-1",
+      file,
+      "人工修订依据",
+      "upload-key",
+    ),
+  ).resolves.toEqual(taskVersion);
+
+  const [path, init] = mutationRequest();
+  const headers = new Headers(init.headers);
+  expect(path).toBe(
+    "/api/v1/collaboration/deliverables/deliverable-1/versions/file",
+  );
+  expect(init.method).toBe("POST");
+  expect(headers.get("Authorization")).toBe("Bearer test-access-token");
+  expect(headers.get("Idempotency-Key")).toBe("upload-key");
+  expect(headers.get("Content-Type")).toBeNull();
+  expect((init.body as FormData).get("file")).toBe(file);
+  expect((init.body as FormData).get("mime_type")).toBe("application/pdf");
+  expect((init.body as FormData).get("basis_text")).toBe("人工修订依据");
+});
+
+test("addCollaborationTextVersion posts a structured text result", async () => {
+  fetchMock.mockResolvedValue(
+    jsonResponse({
+      ...taskVersion,
+      storage_key: null,
+      file_name: null,
+      mime_type: null,
+      text_result: { text: "已完成震情核对" },
+    }),
+  );
+
+  await addCollaborationTextVersion(
+    "deliverable-1",
+    { text: "已完成震情核对" },
+    "组长核验",
+    "text-version-key",
+  );
+
+  const [path, init] = mutationRequest();
+  const headers = new Headers(init.headers);
+  expect(path).toBe(
+    "/api/v1/collaboration/deliverables/deliverable-1/versions",
+  );
+  expect(init.method).toBe("POST");
+  expect(headers.get("Idempotency-Key")).toBe("text-version-key");
+  expect(JSON.parse(init.body as string)).toEqual({
+    text_result: { text: "已完成震情核对" },
+    basis_text: "组长核验",
+  });
+});
+
+test("publishCollaborationDeliverableVersion confirms the selected version", async () => {
+  fetchMock.mockResolvedValue(
+    jsonResponse({
+      id: "publication-2",
+      deliverable_id: "deliverable-1",
+      version_id: "version-1",
+      published_by: "leader",
+      published_role: "leader",
+      published_at: "2026-10-03T01:20:00Z",
+      superseded_at: null,
+      publication_note: "确认发布",
+      created_at: "2026-10-03T01:20:00Z",
+    }),
+  );
+
+  await publishCollaborationDeliverableVersion(
+    "deliverable-1",
+    "version-1",
+    4,
+    "确认发布",
+    "publish-key",
+  );
+
+  const [path, init] = mutationRequest();
+  const headers = new Headers(init.headers);
+  expect(path).toBe(
+    "/api/v1/collaboration/deliverables/deliverable-1/publish",
+  );
+  expect(init.method).toBe("POST");
+  expect(headers.get("If-Match")).toBe("4");
+  expect(headers.get("Idempotency-Key")).toBe("publish-key");
+  expect(JSON.parse(init.body as string)).toEqual({
+    version_id: "version-1",
+    publication_note: "确认发布",
+  });
 });
 
 test("createTemporaryTask posts the backend fields with an idempotency key", async () => {

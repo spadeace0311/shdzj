@@ -22,6 +22,7 @@ from app.collaboration.roster import (
     EventRosterGroup,
     MemberInput,
     RosterService,
+    snapshot_role_for_user,
 )
 from app.collaboration.schemas import (
     AttendanceResponse,
@@ -248,16 +249,38 @@ async def list_collaboration_tasks(
     event_id: UUID,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
-    _current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_current_user),
 ) -> list[WorkgroupTaskResponse]:
     try:
         tasks = await service.repository.list_tasks(session, event_id)
+        actor = await service.repository.get_user_by_username(
+            session,
+            current_user.username,
+        )
+        if actor is None:
+            return []
+        if actor.role != "superadmin":
+            memberships = (
+                await service.repository.list_active_memberships_for_user(
+                    session,
+                    actor.id,
+                )
+            )
+            allowed_groups = {
+                membership.workgroup_code
+                for membership in memberships
+            }
+            tasks = tuple(
+                task for task in tasks if task.workgroup_code in allowed_groups
+            )
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
     responses: list[WorkgroupTaskResponse] = []
     for task in tasks:
-        responses.append(await _task_response(session, service, task))
+        responses.append(
+            await _task_response(session, service, task, current_user)
+        )
     return responses
 
 
@@ -293,7 +316,7 @@ async def create_temporary_collaboration_task(
         )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.get(
@@ -304,17 +327,27 @@ async def get_collaboration_task(
     task_id: UUID,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
-    _current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_current_user),
 ) -> WorkgroupTaskResponse:
     try:
         task = await service.repository.get_task(session, task_id)
         if task is None:
             raise LookupError("task_not_found")
+        readable, _, _ = await _task_access(
+            session,
+            service,
+            task,
+            current_user,
+        )
+        if not readable:
+            raise PermissionError("Insufficient permissions")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.post(
@@ -343,7 +376,7 @@ async def start_collaboration_task(
         )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.post(
@@ -374,7 +407,7 @@ async def submit_collaboration_task(
         )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.post(
@@ -405,7 +438,7 @@ async def return_collaboration_task(
         )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.post(
@@ -434,7 +467,7 @@ async def complete_collaboration_task(
         )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.post(
@@ -481,7 +514,7 @@ async def cancel_collaboration_task(
             )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.patch(
@@ -537,7 +570,7 @@ async def update_collaboration_task(
             )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
-    return await _task_response(session, service, task)
+    return await _task_response(session, service, task, current_user)
 
 
 @router.get(
@@ -548,15 +581,25 @@ async def list_task_deliverables(
     task_id: UUID,
     session: AsyncSession = Depends(get_roster_session),
     service: DeliverableService = Depends(get_deliverable_service),
-    _current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_current_user),
 ) -> list[DeliverableResponse]:
     try:
         task = await service.repository.get_task(session, task_id)
         if task is None:
             raise LookupError("task_not_found")
+        readable, _, _ = await _task_access(
+            session,
+            service,
+            task,
+            current_user,
+        )
+        if not readable:
+            raise PermissionError("Insufficient permissions")
         deliverables = await service.repository.list_task_deliverables(
             session, task_id
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
@@ -889,9 +932,16 @@ async def _task_response(
     session: AsyncSession,
     service: CollaborationTaskService,
     task,
+    current_user: AuthUser,
 ) -> WorkgroupTaskResponse:
     contributors = await service.repository.list_contributors(
         session, task.id
+    )
+    _, can_work, can_confirm = await _task_access(
+        session,
+        service,
+        task,
+        current_user,
     )
     return WorkgroupTaskResponse(
         id=task.id,
@@ -923,7 +973,60 @@ async def _task_response(
             )
             for contributor, user in contributors
         ],
+        can_work=can_work,
+        can_confirm=can_confirm,
     )
+
+
+async def _task_access(
+    session: AsyncSession,
+    service: CollaborationTaskService,
+    task,
+    current_user: AuthUser,
+) -> tuple[bool, bool, bool]:
+    actor = await service.repository.get_user_by_username(
+        session,
+        current_user.username,
+    )
+    if actor is None:
+        return False, False, False
+    if actor.role == "superadmin":
+        return True, True, True
+
+    membership = await service.repository.get_active_membership(
+        session,
+        task.workgroup_code,
+        actor.id,
+    )
+    if membership is None:
+        return False, False, False
+
+    snapshot = (
+        await service.roster_service.repository.get_roster_snapshot(
+            session,
+            task.event_id,
+            task.workgroup_code,
+        )
+    )
+    snapshot_role = snapshot_role_for_user(snapshot, actor.id)
+    can_work = (
+        membership.duty_role in {"leader", "deputy", "member"}
+        and snapshot_role in {"leader", "deputy", "member"}
+    )
+    authority = (
+        await service.roster_service.resolve_confirming_authority(
+            session,
+            task.event_id,
+            task.workgroup_code,
+        )
+    )
+    can_confirm = (
+        can_work
+        and authority is not None
+        and authority.user_id == actor.id
+        and membership.duty_role == authority.role.value
+    )
+    return True, can_work, can_confirm
 
 
 async def _deliverable_response(

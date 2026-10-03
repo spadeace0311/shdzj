@@ -172,6 +172,7 @@ def user_factory(session):
         *,
         duty_role: str | None = None,
         group_code: str | None = None,
+        deputy_order: int | None = None,
     ) -> User:
         user = User(
             id=uuid.uuid4(),
@@ -190,9 +191,9 @@ def user_factory(session):
                     workgroup_code=group_code or workgroup,
                     duty_role=duty_role,
                     deputy_order=(
-                        1
-                        if duty_role == "deputy"
-                        else None
+                        deputy_order
+                        if deputy_order is not None
+                        else (1 if duty_role == "deputy" else None)
                     ),
                     is_active=True,
                     created_by="system",
@@ -275,6 +276,21 @@ async def _make_leader_authority(
     )
 
 
+async def _make_member_roster(
+    session,
+    event: EarthquakeEvent,
+    member: User,
+) -> None:
+    service = RosterService()
+    await service.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [MemberInput(member.id, DutyRole.MEMBER)],
+        actor="system",
+    )
+    await service.snapshot_for_event(session, event.id)
+
+
 async def test_task_state_machine_and_group_contribution(
     session,
     task_factory,
@@ -283,6 +299,11 @@ async def test_task_state_machine_and_group_contribution(
     task = await task_factory(status="pending")
     member = await group_member_user()
     service = CollaborationTaskService()
+    await _make_member_roster(
+        session,
+        await _task_event(session, task.id),
+        member,
+    )
 
     started = await service.start(
         session,
@@ -350,6 +371,23 @@ async def test_wrong_group_user_cannot_start_task(
         )
 
 
+async def test_task_writes_require_current_event_roster_snapshot(
+    session,
+    task_factory,
+    group_member_user,
+):
+    task = await task_factory(status="pending")
+    member = await group_member_user()
+
+    with pytest.raises(PermissionError):
+        await CollaborationTaskService().start(
+            session,
+            task.id,
+            actor=member,
+            expected_version=task.row_version,
+        )
+
+
 async def test_stale_version_is_rejected(
     session,
     task_factory,
@@ -374,6 +412,11 @@ async def test_idempotent_replay_requires_same_actor_and_operation(
     member = await group_member_user()
     other_member = await group_member_user()
     service = CollaborationTaskService()
+    await _make_member_roster(
+        session,
+        await _task_event(session, task.id),
+        member,
+    )
 
     started = await service.start(
         session,
@@ -423,6 +466,12 @@ async def test_return_to_work_and_cancel(
     member = await group_member_user()
     leader = await group_leader_user()
     service = CollaborationTaskService()
+    await _make_leader_authority(
+        session,
+        await _task_event(session, task.id),
+        leader,
+        member,
+    )
 
     started = await service.start(session, task.id, member, task.row_version)
     submitted = await service.submit(
@@ -679,6 +728,11 @@ async def test_task_routes_use_if_match_and_map_conflicts(
 ):
     task = await task_factory(workgroup_code="monitoring_forecast")
     member = await group_member_user()
+    await _make_member_roster(
+        session,
+        await _task_event(session, task.id),
+        member,
+    )
     client = await _client(
         session,
         AuthUser(member.username, member.role, member.workgroup),
@@ -787,6 +841,229 @@ async def test_list_and_detail_task_routes(
     assert detail.status_code == 200
     assert detail.json()["id"] == str(first.id)
     assert detail.json()["row_version"] == 1
+
+
+async def test_task_reads_are_scoped_to_effective_workgroup(
+    session,
+    event_factory,
+    task_factory,
+    group_member_user,
+    other_group_user,
+    user_factory,
+):
+    event = await event_factory()
+    own_task = await task_factory(
+        event=event,
+        workgroup_code="monitoring_forecast",
+    )
+    other_task = await task_factory(
+        event=event,
+        workgroup_code="news_information",
+    )
+    member = await group_member_user()
+    other_member = await other_group_user()
+    superadmin = await user_factory("read-admin", "superadmin", None)
+    outsider = await user_factory("read-outsider", "viewer", None)
+    await RosterService().snapshot_for_event(session, event.id)
+
+    member_client = await _client(
+        session,
+        AuthUser(member.username, member.role, member.workgroup),
+    )
+    try:
+        listed = await member_client.get(
+            f"/api/v1/events/{event.id}/collaboration/tasks"
+        )
+        own_detail = await member_client.get(
+            f"/api/v1/collaboration/tasks/{own_task.id}"
+        )
+        forbidden_detail = await member_client.get(
+            f"/api/v1/collaboration/tasks/{other_task.id}"
+        )
+    finally:
+        await member_client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [str(own_task.id)]
+    assert listed.json()[0]["can_work"] is True
+    assert listed.json()[0]["can_confirm"] is False
+    assert own_detail.status_code == 200
+    assert own_detail.json()["can_work"] is True
+    assert own_detail.json()["can_confirm"] is False
+    assert forbidden_detail.status_code == 403
+
+    other_client = await _client(
+        session,
+        AuthUser(
+            other_member.username,
+            other_member.role,
+            other_member.workgroup,
+        ),
+    )
+    try:
+        other_listed = await other_client.get(
+            f"/api/v1/events/{event.id}/collaboration/tasks"
+        )
+    finally:
+        await other_client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert other_listed.status_code == 200
+    assert [item["id"] for item in other_listed.json()] == [
+        str(other_task.id)
+    ]
+
+    admin_client = await _client(
+        session,
+        AuthUser(superadmin.username, superadmin.role, None),
+    )
+    try:
+        admin_listed = await admin_client.get(
+            f"/api/v1/events/{event.id}/collaboration/tasks"
+        )
+    finally:
+        await admin_client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert admin_listed.status_code == 200
+    assert {item["id"] for item in admin_listed.json()} == {
+        str(own_task.id),
+        str(other_task.id),
+    }
+
+    outsider_client = await _client(
+        session,
+        AuthUser(outsider.username, outsider.role, outsider.workgroup),
+    )
+    try:
+        outsider_listed = await outsider_client.get(
+            f"/api/v1/events/{event.id}/collaboration/tasks"
+        )
+        outsider_detail = await outsider_client.get(
+            f"/api/v1/collaboration/tasks/{own_task.id}"
+        )
+    finally:
+        await outsider_client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert outsider_listed.status_code == 200
+    assert outsider_listed.json() == []
+    assert outsider_detail.status_code == 403
+
+
+async def test_can_confirm_follows_leader_and_deputy_attendance_order(
+    session,
+    event_factory,
+    task_factory,
+    user_factory,
+):
+    event = await event_factory()
+    task = await task_factory(
+        event=event,
+        workgroup_code="monitoring_forecast",
+        status="pending_review",
+    )
+    leader = await user_factory(
+        "authority-leader",
+        "group_leader",
+        "monitoring_forecast",
+    )
+    first_deputy = await user_factory(
+        "authority-deputy-1",
+        "group_deputy",
+        "monitoring_forecast",
+    )
+    second_deputy = await user_factory(
+        "authority-deputy-2",
+        "group_deputy",
+        "monitoring_forecast",
+    )
+    roster = RosterService()
+    await roster.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [
+            MemberInput(leader.id, DutyRole.LEADER),
+            MemberInput(first_deputy.id, DutyRole.DEPUTY, deputy_order=1),
+            MemberInput(second_deputy.id, DutyRole.DEPUTY, deputy_order=2),
+        ],
+        actor="system",
+    )
+    await roster.snapshot_for_event(session, event.id)
+
+    async def read_as(user: User):
+        client = await _client(
+            session,
+            AuthUser(user.username, user.role, user.workgroup),
+        )
+        try:
+            return await client.get(
+                f"/api/v1/collaboration/tasks/{task.id}"
+            )
+        finally:
+            await client.aclose()
+            app.dependency_overrides.pop(get_roster_session, None)
+            app.dependency_overrides.pop(get_current_user, None)
+
+    await roster.set_attendance(
+        session,
+        event.id,
+        "monitoring_forecast",
+        leader.id,
+        "present",
+        "system",
+    )
+    leader_response = await read_as(leader)
+    first_deputy_response = await read_as(first_deputy)
+    assert leader_response.json()["can_confirm"] is True
+    assert first_deputy_response.json()["can_confirm"] is False
+
+    await roster.set_attendance(
+        session,
+        event.id,
+        "monitoring_forecast",
+        leader.id,
+        "absent",
+        "system",
+    )
+    await roster.set_attendance(
+        session,
+        event.id,
+        "monitoring_forecast",
+        first_deputy.id,
+        "present",
+        "system",
+    )
+    first_deputy_response = await read_as(first_deputy)
+    second_deputy_response = await read_as(second_deputy)
+    assert first_deputy_response.json()["can_confirm"] is True
+    assert second_deputy_response.json()["can_confirm"] is False
+
+    await roster.set_attendance(
+        session,
+        event.id,
+        "monitoring_forecast",
+        first_deputy.id,
+        "absent",
+        "system",
+    )
+    await roster.set_attendance(
+        session,
+        event.id,
+        "monitoring_forecast",
+        second_deputy.id,
+        "present",
+        "system",
+    )
+    first_deputy_response = await read_as(first_deputy)
+    second_deputy_response = await read_as(second_deputy)
+    assert first_deputy_response.json()["can_confirm"] is False
+    assert second_deputy_response.json()["can_confirm"] is True
 
 
 async def test_complete_route_is_idempotent(

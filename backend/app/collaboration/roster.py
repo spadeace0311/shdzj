@@ -669,6 +669,28 @@ def _snapshot_entries(
     return tuple(entries)
 
 
+def snapshot_role_for_user(
+    snapshot: WorkgroupRosterSnapshot | None,
+    user_id: uuid.UUID,
+) -> str | None:
+    if snapshot is None:
+        return None
+    if snapshot.leader_user_id == user_id:
+        return DutyRole.LEADER.value
+    for entry in (*snapshot.deputies, *snapshot.members):
+        if not isinstance(entry, dict) or entry.get("user_id") is None:
+            continue
+        try:
+            if uuid.UUID(str(entry["user_id"])) != user_id:
+                continue
+        except (TypeError, ValueError):
+            continue
+        duty_role = entry.get("duty_role")
+        if isinstance(duty_role, str):
+            return duty_role
+    return None
+
+
 def _optional_order(entry: dict[str, object]) -> int | None:
     value = entry.get("deputy_order")
     return int(value) if value is not None else None

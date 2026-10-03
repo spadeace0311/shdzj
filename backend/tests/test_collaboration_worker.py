@@ -197,6 +197,17 @@ def center_station_member(user_factory):
     )
 
 
+async def _snapshot_center_station_member(session, event, member) -> None:
+    roster = RosterService()
+    await roster.replace_group_members(
+        session,
+        "center_station",
+        [MemberInput(member.id, DutyRole.MEMBER)],
+        actor="system",
+    )
+    await roster.snapshot_for_event(session, event.id)
+
+
 async def _create_temporary_task(
     session,
     event,
@@ -556,6 +567,7 @@ async def test_temporary_task_uses_shared_lifecycle_and_version(
         creator,
     )
     member = await center_station_member()
+    await _snapshot_center_station_member(session, event, member)
 
     started = await CollaborationTaskService().start(
         session,
@@ -741,6 +753,7 @@ async def test_post_start_due_or_instruction_change_appends_event(
     creator = await coordination_user()
     task = await _create_temporary_task(session, event, creator)
     member = await center_station_member()
+    await _snapshot_center_station_member(session, event, member)
     started = await CollaborationTaskService().start(
         session,
         task.id,

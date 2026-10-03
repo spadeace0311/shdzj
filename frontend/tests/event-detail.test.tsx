@@ -132,6 +132,15 @@ test("renders the event lifecycle state and immutable T1", async () => {
   expect(screen.getByText("2026/09/17 10:31:00")).toBeInTheDocument();
 });
 
+test("links the event detail to its workgroup task console", async () => {
+  getEventMock.mockResolvedValue(baseDetail);
+
+  renderDetail("event-1");
+
+  const link = await screen.findByRole("link", { name: "工作组任务" });
+  expect(link).toHaveAttribute("href", "/tasks/event-1");
+});
+
 test("passes the first available fusion product into the loss map", async () => {
   const assessment: AssessmentRunStatus = {
     run_id: "run-1",

@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useParams } from "react-router-dom";
 
 import {
@@ -107,34 +107,6 @@ function eventMarker(kind: string | null): {
   return null;
 }
 
-function canWorkTasks(
-  userRole: string,
-  workgroup: string | null,
-  task: WorkgroupTask,
-): boolean {
-  if (userRole === "superadmin") {
-    return true;
-  }
-  if (!["group_leader", "group_deputy", "group_member"].includes(userRole)) {
-    return false;
-  }
-  return WORKGROUP_CODES[workgroup ?? ""] === task.workgroup_code;
-}
-
-function canConfirmTasks(
-  userRole: string,
-  workgroup: string | null,
-  task: WorkgroupTask,
-): boolean {
-  if (userRole === "superadmin") {
-    return true;
-  }
-  if (!["group_leader", "group_deputy"].includes(userRole)) {
-    return false;
-  }
-  return WORKGROUP_CODES[workgroup ?? ""] === task.workgroup_code;
-}
-
 function phaseForTask(task: WorkgroupTask): string {
   return task.phase_code && PHASE_LABELS[task.phase_code]
     ? task.phase_code
@@ -157,6 +129,10 @@ export function WorkgroupTasksPage({
   const [actionKeys, setActionKeys] = useState<Record<string, string>>({});
   const [temporaryKey, setTemporaryKey] = useState<string | null>(null);
   const [temporaryBusy, setTemporaryBusy] = useState(false);
+  const listRequestRef = useRef(0);
+  const detailRequestRef = useRef(0);
+  const eventIdRef = useRef(eventId);
+  eventIdRef.current = eventId;
   const [temporaryForm, setTemporaryForm] = useState({
     title: "",
     workgroupCode: "comprehensive_coordination",
@@ -167,12 +143,7 @@ export function WorkgroupTasksPage({
   });
 
   const currentWorkgroupCode = WORKGROUP_CODES[workgroup ?? ""] ?? null;
-  const visibleTasks =
-    userRole === "superadmin"
-      ? tasks
-      : currentWorkgroupCode
-        ? tasks.filter((task) => task.workgroup_code === currentWorkgroupCode)
-        : [];
+  const visibleTasks = tasks;
   const marker = eventMarker(eventKind);
   const canCreateTemporary =
     Boolean(eventId) &&
@@ -181,6 +152,7 @@ export function WorkgroupTasksPage({
         ["group_leader", "group_deputy", "group_member"].includes(userRole)));
 
   async function loadTasks() {
+    const requestId = ++listRequestRef.current;
     if (!eventId) {
       setStatus("ready");
       return;
@@ -192,21 +164,49 @@ export function WorkgroupTasksPage({
         listCollaborationTasks(eventId),
         getEvent(eventId).catch(() => null),
       ]);
+      if (
+        requestId !== listRequestRef.current ||
+        eventId !== eventIdRef.current
+      ) {
+        return;
+      }
       setTasks(taskList);
       setEventKind(eventDetail?.event_kind ?? null);
-      setSelectedTask((current) =>
-        current
-          ? (taskList.find((task) => task.id === current.id) ?? current)
+      setSelectedTaskId((current) =>
+        current && taskList.some((task) => task.id === current)
+          ? current
           : null,
       );
+      setSelectedTask((current) => {
+        if (!current) {
+          return null;
+        }
+        return taskList.find((task) => task.id === current.id) ?? null;
+      });
       setStatus("ready");
     } catch (caught) {
+      if (
+        requestId !== listRequestRef.current ||
+        eventId !== eventIdRef.current
+      ) {
+        return;
+      }
       setStatus("error");
       setError(errorMessage(caught));
     }
   }
 
   useEffect(() => {
+    listRequestRef.current += 1;
+    detailRequestRef.current += 1;
+    setTasks([]);
+    setEventKind(null);
+    setSelectedTaskId(null);
+    setSelectedTask(null);
+    setError("");
+    setSuccess("");
+    setActionKeys({});
+    setTemporaryKey(null);
     void loadTasks();
   }, [eventId]);
 
@@ -214,23 +214,46 @@ export function WorkgroupTasksPage({
     if (!eventId) {
       return;
     }
-    const taskList = await listCollaborationTasks(eventId);
+    const requestEventId = eventId;
+    const requestId = ++listRequestRef.current;
+    const taskList = await listCollaborationTasks(requestEventId);
+    if (
+      requestId !== listRequestRef.current ||
+      requestEventId !== eventIdRef.current
+    ) {
+      return;
+    }
     setTasks(taskList);
-    setSelectedTask((current) =>
-      current
-        ? (taskList.find((task) => task.id === current.id) ?? current)
+    setSelectedTaskId((current) =>
+      current && taskList.some((task) => task.id === current)
+        ? current
         : null,
     );
+    setSelectedTask((current) => {
+      if (!current) {
+        return null;
+      }
+      return taskList.find((task) => task.id === current.id) ?? null;
+    });
   }
 
   async function openTask(taskId: string) {
+    const requestId = ++detailRequestRef.current;
     setSelectedTaskId(taskId);
+    setSelectedTask(null);
+    setActionKeys({});
     setError("");
     setSuccess("");
     try {
       const detail = await getCollaborationTask(taskId);
+      if (requestId !== detailRequestRef.current) {
+        return;
+      }
       setSelectedTask(detail);
     } catch (caught) {
+      if (requestId !== detailRequestRef.current) {
+        return;
+      }
       setError(errorMessage(caught));
     }
   }
@@ -259,18 +282,35 @@ export function WorkgroupTasksPage({
     operation: (idempotencyKey: string) => Promise<unknown>,
     successMessage: string,
   ) {
+    const requestEventId = eventIdRef.current;
     setBusyTaskId(task.id);
     setError("");
     setSuccess("");
     try {
       await operation(reusableKey(operationKey));
+      if (
+        eventIdRef.current !== requestEventId ||
+        eventIdRef.current !== task.event_id
+      ) {
+        return;
+      }
       clearKey(operationKey);
       await refreshTasks();
+      if (
+        eventIdRef.current !== requestEventId ||
+        eventIdRef.current !== task.event_id
+      ) {
+        return;
+      }
       setSuccess(successMessage);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (eventIdRef.current === requestEventId) {
+        setError(errorMessage(caught));
+      }
     } finally {
-      setBusyTaskId(null);
+      if (eventIdRef.current === requestEventId) {
+        setBusyTaskId(null);
+      }
     }
   }
 
@@ -299,6 +339,7 @@ export function WorkgroupTasksPage({
     if (!temporaryKey) {
       setTemporaryKey(idempotencyKey);
     }
+    const requestEventId = eventId;
     setTemporaryBusy(true);
     setError("");
     setSuccess("");
@@ -319,6 +360,9 @@ export function WorkgroupTasksPage({
         },
         idempotencyKey,
       );
+      if (eventIdRef.current !== requestEventId) {
+        return;
+      }
       setTemporaryKey(null);
       setTemporaryForm({
         title: "",
@@ -331,9 +375,13 @@ export function WorkgroupTasksPage({
       await refreshTasks();
       setSuccess("临时任务已创建");
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (eventIdRef.current === requestEventId) {
+        setError(errorMessage(caught));
+      }
     } finally {
-      setTemporaryBusy(false);
+      if (eventIdRef.current === requestEventId) {
+        setTemporaryBusy(false);
+      }
     }
   }
 
@@ -435,12 +483,8 @@ export function WorkgroupTasksPage({
                     </header>
                     <div className="workgroup-task-rows">
                       {phaseTasks.map((task) => {
-                        const canWork = canWorkTasks(userRole, workgroup, task);
-                        const canConfirm = canConfirmTasks(
-                          userRole,
-                          workgroup,
-                          task,
-                        );
+                        const canWork = task.can_work;
+                        const canConfirm = task.can_confirm;
                         return (
                           <article
                             className={`workgroup-task-row${
@@ -554,13 +598,10 @@ export function WorkgroupTasksPage({
           <div className="workgroup-task-detail">
             {selectedTask ? (
               <CollaborationTaskPanel
+                key={selectedTask.id}
                 task={selectedTask}
-                canWork={canWorkTasks(userRole, workgroup, selectedTask)}
-                canConfirm={canConfirmTasks(
-                  userRole,
-                  workgroup,
-                  selectedTask,
-                )}
+                canWork={selectedTask.can_work}
+                canConfirm={selectedTask.can_confirm}
                 eventKind={eventKind}
                 onRefresh={refreshTasks}
               />

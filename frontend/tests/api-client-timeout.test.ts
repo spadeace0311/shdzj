@@ -3,7 +3,9 @@ import { afterEach, expect, test, vi } from "vitest";
 import {
   importDataAsset,
   listDataAssets,
+  publishCollaborationDeliverableVersion,
   setAccessToken,
+  uploadCollaborationDeliverableVersion,
 } from "../src/api/client";
 
 
@@ -80,5 +82,64 @@ test("multipart imports are not aborted by the ordinary request timeout", async 
 
   await expect(request).resolves.toEqual(
     expect.objectContaining({ job_id: "job-1" }),
+  );
+});
+
+
+test("deliverable uploads use a finite long timeout", async () => {
+  vi.useFakeTimers();
+  setAccessToken("token");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((_path: string, init: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    }),
+  );
+
+  const request = uploadCollaborationDeliverableVersion(
+    "deliverable-1",
+    new File(["result"], "result.pdf", { type: "application/pdf" }),
+    "",
+    "upload-key",
+  );
+  const rejection = request.catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(120_000);
+
+  await expect(rejection).resolves.toEqual(
+    expect.objectContaining({ status: 408 }),
+  );
+});
+
+
+test("publish requests keep the ordinary finite timeout", async () => {
+  vi.useFakeTimers();
+  setAccessToken("token");
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((_path: string, init: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    }),
+  );
+
+  const request = publishCollaborationDeliverableVersion(
+    "deliverable-1",
+    "version-1",
+    4,
+    "确认发布",
+    "publish-key",
+  );
+  const rejection = request.catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(10_000);
+
+  await expect(rejection).resolves.toEqual(
+    expect.objectContaining({ status: 408 }),
   );
 });

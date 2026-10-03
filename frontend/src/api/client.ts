@@ -35,6 +35,7 @@ import type {
 import { matchesArtifactFilters } from "../types";
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const COLLABORATION_UPLOAD_TIMEOUT_MS = 120_000;
 
 let accessToken: string | null = null;
 
@@ -447,6 +448,95 @@ export async function completeCollaborationTask(
     {
       method: "POST",
       headers: mutationHeaders(version, idempotencyKey),
+    },
+  );
+}
+
+export async function cancelCollaborationTask(
+  taskId: string,
+  version: number,
+  reason: string,
+  idempotencyKey?: string,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/cancel`,
+    {
+      method: "POST",
+      headers: mutationHeaders(version, idempotencyKey),
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+export async function uploadCollaborationDeliverableVersion(
+  deliverableId: string,
+  file: File,
+  basisText: string,
+  idempotencyKey?: string,
+): Promise<Record<string, unknown>> {
+  const body = new FormData();
+  body.set("file", file);
+  if (file.type) {
+    body.set("mime_type", file.type);
+  }
+  if (basisText.trim()) {
+    body.set("basis_text", basisText.trim());
+  }
+  return requestJson<Record<string, unknown>>(
+    `/api/v1/collaboration/deliverables/${encodeURIComponent(
+      deliverableId,
+    )}/versions/file`,
+    {
+      method: "POST",
+      headers: {
+        ...collaborationHeaders("请先登录后上传候选成果"),
+        "Idempotency-Key": idempotencyKey ?? newIdempotencyKey(),
+      },
+      body,
+    },
+    COLLABORATION_UPLOAD_TIMEOUT_MS,
+  );
+}
+
+export async function addCollaborationTextVersion(
+  deliverableId: string,
+  textResult: Record<string, unknown>,
+  basisText: string,
+  idempotencyKey?: string,
+): Promise<Record<string, unknown>> {
+  return requestJson<Record<string, unknown>>(
+    `/api/v1/collaboration/deliverables/${encodeURIComponent(
+      deliverableId,
+    )}/versions`,
+    {
+      method: "POST",
+      headers: idempotentMutationHeaders(idempotencyKey),
+      body: JSON.stringify({
+        text_result: textResult,
+        basis_text: basisText.trim() || null,
+      }),
+    },
+  );
+}
+
+export async function publishCollaborationDeliverableVersion(
+  deliverableId: string,
+  versionId: string,
+  taskVersion: number,
+  note: string,
+  idempotencyKey?: string,
+): Promise<Record<string, unknown>> {
+  return requestJson<Record<string, unknown>>(
+    `/api/v1/collaboration/deliverables/${encodeURIComponent(
+      deliverableId,
+    )}/publish`,
+    {
+      method: "POST",
+      headers: mutationHeaders(taskVersion, idempotencyKey),
+      body: JSON.stringify({
+        version_id: versionId,
+        publication_note: note.trim() || null,
+      }),
     },
   );
 }

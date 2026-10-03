@@ -91,10 +91,19 @@ async def task_detail(
     task_id: UUID,
     session: AsyncSession = Depends(get_command_hall_session),
     service: CommandHallService = Depends(get_command_hall_service),
-    _current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_current_user),
 ) -> TaskDetail:
     try:
-        return await service.task_detail(session, task_id)
+        include_private = await service.can_view_private_task(
+            session,
+            task_id,
+            current_user,
+        )
+        return await service.task_detail(
+            session,
+            task_id,
+            include_private=include_private,
+        )
     except LookupError as exc:
         raise _not_found(exc) from exc
     except SQLAlchemyError as exc:

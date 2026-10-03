@@ -231,9 +231,43 @@ async def superadmin_user(user_factory):
     return await user_factory("admin", "superadmin", None)
 
 
+async def _make_group_roster(
+    session,
+    event: EarthquakeEvent,
+    leader: User,
+    member: User,
+    deputy: User,
+) -> None:
+    service = RosterService()
+    await service.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [
+            MemberInput(leader.id, DutyRole.LEADER),
+            MemberInput(member.id, DutyRole.MEMBER),
+            MemberInput(deputy.id, DutyRole.DEPUTY, deputy_order=1),
+        ],
+        actor="system",
+    )
+    await service.snapshot_for_event(session, event.id)
+
+
 @pytest.fixture
-async def task_with_automatic_deliverable(session, task_factory):
+async def task_with_automatic_deliverable(
+    session,
+    task_factory,
+    group_leader_user,
+    group_member_user,
+    group_deputy_user,
+):
     task = await task_factory(status="pending_review")
+    await _make_group_roster(
+        session,
+        await _task_event(session, task.id),
+        group_leader_user,
+        group_member_user,
+        group_deputy_user,
+    )
     deliverable = TaskDeliverable(
         task_id=task.id,
         deliverable_code="result.v1",
@@ -259,8 +293,21 @@ async def task_with_automatic_deliverable(session, task_factory):
 
 
 @pytest.fixture
-async def deliverable(session, task_factory):
+async def deliverable(
+    session,
+    task_factory,
+    group_leader_user,
+    group_member_user,
+    group_deputy_user,
+):
     task = await task_factory(status="pending_review")
+    await _make_group_roster(
+        session,
+        await _task_event(session, task.id),
+        group_leader_user,
+        group_member_user,
+        group_deputy_user,
+    )
     deliverable = TaskDeliverable(
         task_id=task.id,
         deliverable_code="result.v1",

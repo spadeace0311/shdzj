@@ -12,6 +12,8 @@ from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import User
+from app.auth.service import AuthUser
+from app.collaboration.roster import snapshot_role_for_user
 from app.collaboration.models import (
     CollaborationTaskEvent,
     CommandHallAlertProjection,
@@ -21,6 +23,8 @@ from app.collaboration.models import (
     TaskDeliverable,
     TaskDeliverablePublication,
     TaskDeliverableVersion,
+    WorkgroupMembership,
+    WorkgroupRosterSnapshot,
     WorkgroupTask,
     WorkgroupTaskContributor,
 )
@@ -186,6 +190,8 @@ class CommandHallService:
         self,
         session: AsyncSession,
         task_id: object,
+        *,
+        include_private: bool = True,
     ) -> TaskDetail:
         task_uuid = _coerce_uuid(task_id, "task_id")
         task = await session.scalar(
@@ -243,19 +249,39 @@ class CommandHallService:
                     publication.deliverable_id,
                     publication,
                 )
-        task_events = list(
-            await session.scalars(
-                select(CollaborationTaskEvent)
-                .where(CollaborationTaskEvent.task_id == task.id)
-                .order_by(CollaborationTaskEvent.event_seq)
+        if not include_private:
+            for deliverable in deliverables:
+                publication = publications_by_deliverable.get(deliverable.id)
+                if publication is None:
+                    versions_by_deliverable[deliverable.id] = []
+                    continue
+                versions_by_deliverable[deliverable.id] = [
+                    version
+                    for version in versions_by_deliverable[deliverable.id]
+                    if version.id == publication.version_id
+                ]
+
+        task_events = (
+            list(
+                await session.scalars(
+                    select(CollaborationTaskEvent)
+                    .where(CollaborationTaskEvent.task_id == task.id)
+                    .order_by(CollaborationTaskEvent.event_seq)
+                )
             )
+            if include_private
+            else []
         )
-        notifications = list(
-            await session.scalars(
-                select(NotificationDelivery)
-                .where(NotificationDelivery.task_id == task.id)
-                .order_by(NotificationDelivery.created_at)
+        notifications = (
+            list(
+                await session.scalars(
+                    select(NotificationDelivery)
+                    .where(NotificationDelivery.task_id == task.id)
+                    .order_by(NotificationDelivery.created_at)
+                )
             )
+            if include_private
+            else []
         )
         projection = await session.scalar(
             select(CommandHallEventProjection)
@@ -326,6 +352,59 @@ class CommandHallService:
                 projection.projection_version if projection is not None else None
             ),
         )
+
+    async def can_view_private_task(
+        self,
+        session: AsyncSession,
+        task_id: object,
+        actor: AuthUser,
+    ) -> bool:
+        task_uuid = _coerce_uuid(task_id, "task_id")
+        task = await session.scalar(
+            select(WorkgroupTask).where(WorkgroupTask.id == task_uuid)
+        )
+        if task is None:
+            raise LookupError("task_not_found")
+        user = await session.scalar(
+            select(User).where(
+                User.username == actor.username,
+                User.is_active.is_(True),
+            )
+        )
+        if user is None:
+            return False
+        if user.role == "superadmin":
+            return True
+        membership = await session.scalar(
+            select(WorkgroupMembership).where(
+                WorkgroupMembership.user_id == user.id,
+                WorkgroupMembership.workgroup_code == task.workgroup_code,
+                WorkgroupMembership.is_active.is_(True),
+                WorkgroupMembership.effective_to.is_(None),
+            )
+        )
+        if (
+            membership is None
+            or membership.duty_role not in {"leader", "deputy", "member"}
+        ):
+            return False
+        snapshot = await session.scalar(
+            select(WorkgroupRosterSnapshot)
+            .where(
+                WorkgroupRosterSnapshot.event_id == task.event_id,
+                WorkgroupRosterSnapshot.workgroup_code
+                == task.workgroup_code,
+            )
+            .order_by(WorkgroupRosterSnapshot.roster_version.desc())
+            .limit(1)
+        )
+        if snapshot is None:
+            return False
+        return snapshot_role_for_user(snapshot, user.id) in {
+            "leader",
+            "deputy",
+            "member",
+        }
 
     async def get_event_projection(
         self,

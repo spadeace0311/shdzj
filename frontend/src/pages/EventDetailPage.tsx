@@ -162,6 +162,12 @@ export function EventDetailPage() {
         >
           成果中心
         </Link>
+        <Link
+          className="secondary-button"
+          to={`/tasks/${eventId}`}
+        >
+          工作组任务
+        </Link>
       </header>
 
       {status === "loading" ? (

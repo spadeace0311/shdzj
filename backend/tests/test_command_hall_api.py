@@ -13,6 +13,7 @@ from sqlalchemy.pool import NullPool
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
+from app.auth.models import User
 from app.command_hall.projector import CommandHallProjector
 from app.command_hall.router import (
     get_command_hall_service,
@@ -20,8 +21,21 @@ from app.command_hall.router import (
     get_command_hall_session,
 )
 from app.command_hall.service import CommandHallService
-from app.collaboration.domain import WorkgroupCode
-from app.collaboration.models import WorkgroupTask
+from app.collaboration.domain import (
+    DeliverableRequirementKind,
+    DeliverableSourceKind,
+    DutyRole,
+    WorkgroupCode,
+)
+from app.collaboration.models import (
+    CollaborationTaskEvent,
+    NotificationDelivery,
+    TaskDeliverable,
+    TaskDeliverablePublication,
+    TaskDeliverableVersion,
+    WorkgroupTask,
+)
+from app.collaboration.roster import MemberInput, RosterService
 from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 from app.main import app
@@ -288,6 +302,202 @@ async def test_command_hall_read_routes(
     assert group.json()["group"]["workgroup_code"] == "monitoring_forecast"
     assert detail.status_code == 200
     assert detail.json()["id"] == str(task.id)
+
+
+async def test_command_hall_task_detail_filters_private_versions_and_audit(
+    session,
+    event_factory,
+    task_factory,
+):
+    event = await event_factory()
+    task = await task_factory(event)
+    leader = User(
+        id=uuid.uuid4(),
+        username=f"hall-leader-{uuid.uuid4().hex[:8]}",
+        password_hash="not-used",
+        role="group_leader",
+        workgroup="monitoring_forecast",
+        is_active=True,
+    )
+    member = User(
+        id=uuid.uuid4(),
+        username=f"hall-member-{uuid.uuid4().hex[:8]}",
+        password_hash="not-used",
+        role="group_member",
+        workgroup="monitoring_forecast",
+        is_active=True,
+    )
+    viewer = User(
+        id=uuid.uuid4(),
+        username=f"hall-viewer-{uuid.uuid4().hex[:8]}",
+        password_hash="not-used",
+        role="viewer",
+        workgroup="monitoring_forecast",
+        is_active=True,
+    )
+    session.add_all([leader, member, viewer])
+    await session.flush()
+    roster = RosterService()
+    await roster.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [
+            MemberInput(leader.id, DutyRole.LEADER),
+            MemberInput(member.id, DutyRole.MEMBER),
+            MemberInput(viewer.id, DutyRole.VIEWER),
+        ],
+        actor="system",
+    )
+    await roster.snapshot_for_event(session, event.id)
+
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="manual.result",
+        title="人工成果",
+        is_required=True,
+        requirement_kind=DeliverableRequirementKind.MANUAL_FILE_OR_TEXT,
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+    candidate = TaskDeliverableVersion(
+        deliverable_id=deliverable.id,
+        version_no=1,
+        source_kind=DeliverableSourceKind.MANUAL,
+        text_result={"text": "未发布候选"},
+        created_by=leader.username,
+        basis_text="candidate",
+    )
+    published = TaskDeliverableVersion(
+        deliverable_id=deliverable.id,
+        version_no=2,
+        source_kind=DeliverableSourceKind.MANUAL,
+        storage_key="collaboration/published.pdf",
+        file_name="published.pdf",
+        created_by=leader.username,
+        basis_text="published",
+    )
+    session.add_all([candidate, published])
+    await session.flush()
+    session.add(
+        TaskDeliverablePublication(
+            deliverable_id=deliverable.id,
+            version_id=published.id,
+            published_by=leader.username,
+            published_role="leader",
+            published_at=datetime.now(UTC),
+        )
+    )
+    session.add(
+        CollaborationTaskEvent(
+            task_id=task.id,
+            event_seq=1,
+            event_type="task_updated",
+            actor=leader.username,
+            business_version=1,
+            idempotency_key="do-not-leak-idempotency-key",
+            payload={"audit": "private"},
+        )
+    )
+    session.add(
+        NotificationDelivery(
+            event_id=event.id,
+            task_id=task.id,
+            recipient_user_id=leader.id,
+            intent_type="assigned",
+            channel="in_app",
+            dedupe_key="do-not-leak-dedupe-key",
+            status="sent",
+            sent_at=datetime.now(UTC),
+        )
+    )
+    await session.flush()
+
+    async def task_detail_as(actor: AuthUser) -> httpx.Response:
+        async def override_session():
+            yield session
+
+        app.dependency_overrides[get_command_hall_session] = override_session
+        app.dependency_overrides[get_current_user] = lambda: actor
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+            ) as test_client:
+                return await test_client.get(
+                    f"/api/v1/command-hall/tasks/{task.id}"
+                )
+        finally:
+            app.dependency_overrides.pop(get_command_hall_session, None)
+            app.dependency_overrides.pop(get_current_user, None)
+
+    public = await task_detail_as(
+        AuthUser(
+            username="hall-reader",
+            role="viewer",
+            workgroup=None,
+        )
+    )
+    assert public.status_code == 200
+    public_payload = public.json()
+    assert [
+        item["id"]
+        for item in public_payload["deliverables"][0]["versions"]
+    ] == [str(published.id)]
+    assert public_payload["task_events"] == []
+    assert public_payload["notifications"] == []
+    assert "do-not-leak-idempotency-key" not in public.text
+    assert "do-not-leak-dedupe-key" not in public.text
+    assert "未发布候选" not in public.text
+
+    private = await task_detail_as(
+        AuthUser(
+            username=leader.username,
+            role=leader.role,
+            workgroup=leader.workgroup,
+        )
+    )
+    assert private.status_code == 200
+    private_payload = private.json()
+    assert {
+        item["id"]
+        for item in private_payload["deliverables"][0]["versions"]
+    } == {str(candidate.id), str(published.id)}
+    assert len(private_payload["task_events"]) == 1
+    assert len(private_payload["notifications"]) == 1
+
+    same_group_member = await task_detail_as(
+        AuthUser(
+            username=member.username,
+            role=member.role,
+            workgroup=member.workgroup,
+        )
+    )
+    assert same_group_member.status_code == 200
+    member_payload = same_group_member.json()
+    assert {
+        item["id"]
+        for item in member_payload["deliverables"][0]["versions"]
+    } == {str(candidate.id), str(published.id)}
+    assert len(member_payload["task_events"]) == 1
+    assert len(member_payload["notifications"]) == 1
+
+    read_only_viewer = await task_detail_as(
+        AuthUser(
+            username=viewer.username,
+            role=viewer.role,
+            workgroup=viewer.workgroup,
+        )
+    )
+    assert read_only_viewer.status_code == 200
+    viewer_payload = read_only_viewer.json()
+    assert [
+        item["id"]
+        for item in viewer_payload["deliverables"][0]["versions"]
+    ] == [str(published.id)]
+    assert viewer_payload["task_events"] == []
+    assert viewer_payload["notifications"] == []
 
 
 async def test_projection_stream_emits_change_heartbeat_and_stops_on_disconnect():

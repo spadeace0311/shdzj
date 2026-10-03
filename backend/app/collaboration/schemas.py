@@ -111,6 +111,8 @@ class WorkgroupTaskResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     contributors: list[TaskContributorResponse] = Field(default_factory=list)
+    can_work: bool = False
+    can_confirm: bool = False
 
 
 class TaskSubmitRequest(BaseModel):
