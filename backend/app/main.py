@@ -7,6 +7,7 @@ from app.artifacts.router import router as artifacts_router
 from app.assessment.router import router as assessment_router
 from app.auth.router import router as auth_router
 from app.auth.service import AuthService
+from app.collaboration.router import router as collaboration_router
 from app.collector.router import router as collector_router
 from app.data_assets.router import router as data_assets_router
 from app.db import SessionFactory
@@ -31,6 +32,7 @@ app.include_router(artifacts_router)
 app.include_router(assessment_router)
 app.include_router(loss_router)
 app.include_router(auth_router)
+app.include_router(collaboration_router)
 app.include_router(events_router)
 app.include_router(collector_router)
 app.include_router(data_assets_router)
