@@ -1,6 +1,8 @@
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import delete, select
@@ -538,6 +540,306 @@ tasks:
     )
     assert v1 is not None
     assert tasks[0].template_version_id == v1.id
+
+
+@pytest.mark.parametrize(
+    "dispatch_order",
+    ("formal_first", "correction_first"),
+)
+async def test_pending_correction_reuses_event_template_baseline(
+    session,
+    session_factory,
+    tmp_path,
+    dispatch_order,
+):
+    catalog_path = tmp_path / "event-baseline.yaml"
+    catalog_path.write_text(
+        """
+version: generation-baseline.1
+tasks:
+  - code: generation.baseline
+    group: emergency_technology
+    phase: within_30m
+    title: baseline v1
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    suffix = uuid.uuid4().hex
+    event, formal_revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="5.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=suffix,
+        report_number=1,
+        task_template_catalog_path=str(catalog_path),
+    )
+
+    catalog_path.write_text(
+        """
+version: generation-baseline.2
+tasks:
+  - code: generation.upgraded_without_request
+    group: emergency_technology
+    phase: within_30m
+    title: baseline v2
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    _event, correction_revision = await _ingest(
+        session_factory,
+        kind=EventKind.CORRECTION,
+        magnitude="5.3",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=suffix,
+        received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
+        report_number=2,
+        task_template_catalog_path=str(catalog_path),
+    )
+
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            ordinary_outboxes = (
+                await write_session.scalars(
+                    select(EventLifecycleOutbox)
+                    .where(
+                        EventLifecycleOutbox.event_id == event.id,
+                        EventLifecycleOutbox.trigger_type
+                        == "collaboration.requested",
+                    )
+                    .order_by(EventLifecycleOutbox.created_at)
+                )
+            ).all()
+            assert len(ordinary_outboxes) == 2
+            assert {
+                outbox.payload["template_catalog"]["version"]
+                for outbox in ordinary_outboxes
+            } == {"generation-baseline.1"}
+
+            formal_outbox = next(
+                outbox
+                for outbox in ordinary_outboxes
+                if outbox.revision_id == formal_revision.id
+            )
+            correction_outbox = next(
+                outbox
+                for outbox in ordinary_outboxes
+                if outbox.revision_id == correction_revision.id
+            )
+            if dispatch_order == "correction_first":
+                formal_outbox.available_at = BASE_RECEIVED_AT + timedelta(
+                    minutes=20
+                )
+                correction_outbox.available_at = BASE_RECEIVED_AT + timedelta(
+                    minutes=5
+                )
+
+    dispatcher = CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    )
+    assert await dispatcher.dispatch_once() == 2
+
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    assert [task.task_code for task in tasks] == ["generation.baseline"]
+    baseline_version = await session.scalar(
+        select(CollaborationTaskTemplateVersion).where(
+            CollaborationTaskTemplateVersion.version
+            == "generation-baseline.1",
+            CollaborationTaskTemplateVersion.template_code
+            == "generation.baseline",
+        )
+    )
+    assert baseline_version is not None
+    assert tasks[0].template_version_id == baseline_version.id
+    assert not any(
+        task.task_code == "generation.upgraded_without_request"
+        for task in tasks
+    )
+
+
+async def test_legacy_outbox_without_snapshot_uses_active_catalog(
+    session,
+    session_factory,
+    tmp_path,
+):
+    catalog_path = tmp_path / "legacy-payload.yaml"
+    catalog_path.write_text(
+        """
+version: generation-legacy.1
+tasks:
+  - code: generation.legacy_v1
+    group: emergency_technology
+    phase: within_30m
+    title: legacy v1
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    event, revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="5.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=uuid.uuid4().hex,
+        report_number=1,
+        task_template_catalog_path=str(catalog_path),
+    )
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            outbox = await write_session.scalar(
+                select(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.event_id == event.id,
+                    EventLifecycleOutbox.revision_id == revision.id,
+                    EventLifecycleOutbox.trigger_type
+                    == "collaboration.requested",
+                )
+            )
+            assert outbox is not None
+            outbox.payload = {
+                key: value
+                for key, value in outbox.payload.items()
+                if key not in {"template_catalog", "template_version"}
+            }
+
+    catalog_path.write_text(
+        """
+version: generation-legacy.2
+tasks:
+  - code: generation.legacy_v2
+    group: emergency_technology
+    phase: within_30m
+    title: legacy v2
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    assert [task.task_code for task in tasks] == ["generation.legacy_v2"]
+
+
+async def test_concurrent_first_ordinary_outboxes_share_one_template_baseline(
+    session,
+    session_factory,
+    tmp_path,
+):
+    v1_path = tmp_path / "concurrent-baseline-v1.yaml"
+    v1_path.write_text(
+        """
+version: generation-concurrent.1
+tasks:
+  - code: generation.concurrent_v1
+    group: emergency_technology
+    phase: within_30m
+    title: concurrent v1
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    v2_path = tmp_path / "concurrent-baseline-v2.yaml"
+    v2_path.write_text(
+        """
+version: generation-concurrent.2
+tasks:
+  - code: generation.concurrent_v2
+    group: emergency_technology
+    phase: within_30m
+    title: concurrent v2
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    suffix = uuid.uuid4().hex
+    event, formal_revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="5.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=suffix,
+        report_number=1,
+        task_template_catalog_path=str(v1_path),
+    )
+    _event, correction_revision = await _ingest(
+        session_factory,
+        kind=EventKind.CORRECTION,
+        magnitude="5.3",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=suffix,
+        received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
+        report_number=2,
+        task_template_catalog_path=str(v2_path),
+    )
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            await write_session.execute(
+                delete(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.event_id == event.id,
+                    EventLifecycleOutbox.trigger_type
+                    == "collaboration.requested",
+                )
+            )
+
+    async def enqueue(revision_id, catalog_path: Path) -> None:
+        async with session_factory() as write_session:
+            async with write_session.begin():
+                await EventRepository(
+                    session_factory,
+                    task_template_catalog_path=str(catalog_path),
+                ).enqueue_collaboration(
+                    write_session,
+                    event_id=event.id,
+                    revision_id=revision_id,
+                    revision_no=1,
+                    trigger_reason="test",
+                    created_at=BASE_RECEIVED_AT,
+                )
+
+    await asyncio.gather(
+        enqueue(formal_revision.id, v1_path),
+        enqueue(correction_revision.id, v2_path),
+    )
+
+    outboxes = (
+        await session.scalars(
+            select(EventLifecycleOutbox).where(
+                EventLifecycleOutbox.event_id == event.id,
+                EventLifecycleOutbox.trigger_type
+                == "collaboration.requested",
+            )
+        )
+    ).all()
+    assert len(outboxes) == 2
+    assert len(
+        {
+            outbox.payload["template_catalog"]["version"]
+            for outbox in outboxes
+        }
+    ) == 1
 
 
 async def test_correction_upgrade_adds_tasks_and_downgrade_cancels_only_pending(

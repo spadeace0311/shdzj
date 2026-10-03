@@ -397,7 +397,11 @@ class EventRepository:
         if existing is not None:
             return False
 
-        event = await session.get(EarthquakeEvent, event_uuid, with_for_update=True)
+        event = await session.scalar(
+            select(EarthquakeEvent)
+            .where(EarthquakeEvent.id == event_uuid)
+            .with_for_update()
+        )
         if event is None:
             raise LookupError(f"event not found: {event_uuid}")
         revision = await session.get(
@@ -447,6 +451,10 @@ class EventRepository:
         session: AsyncSession,
         event_id: uuid.UUID,
     ) -> dict[str, object]:
+        baseline = await self._event_template_baseline(session, event_id)
+        if baseline is not None:
+            return baseline
+
         existing_version = await session.scalar(
             select(CollaborationTaskTemplateVersion.version)
             .join(
@@ -470,6 +478,46 @@ class EventRepository:
         return {
             "template_catalog": self.task_template_catalog.to_snapshot(),
         }
+
+    async def _event_template_baseline(
+        self,
+        session: AsyncSession,
+        event_id: uuid.UUID,
+    ) -> dict[str, object] | None:
+        # The caller holds the event row lock, so concurrent first writers
+        # cannot insert separate baselines before this ordered read.
+        rows = (
+            await session.execute(
+                select(
+                    EventLifecycleOutbox.trigger_type,
+                    EventLifecycleOutbox.payload,
+                )
+                .where(
+                    EventLifecycleOutbox.event_id == event_id,
+                    EventLifecycleOutbox.trigger_type.in_(
+                        (
+                            "collaboration.requested",
+                            "collaboration.upgrade_requested",
+                        )
+                    ),
+                )
+                .order_by(
+                    EventLifecycleOutbox.created_at,
+                    EventLifecycleOutbox.id,
+                )
+            )
+        ).all()
+
+        baseline: dict[str, object] | None = None
+        for trigger_type, payload in rows:
+            candidate = _frozen_template_payload(payload)
+            if candidate is None:
+                continue
+            if trigger_type == "collaboration.upgrade_requested":
+                baseline = candidate
+            elif baseline is None:
+                baseline = candidate
+        return baseline
 
     async def enqueue_collaboration_upgrade(
         self,
@@ -541,7 +589,11 @@ class EventRepository:
         if existing is not None:
             return False
 
-        event = await session.get(EarthquakeEvent, event_uuid, with_for_update=True)
+        event = await session.scalar(
+            select(EarthquakeEvent)
+            .where(EarthquakeEvent.id == event_uuid)
+            .with_for_update()
+        )
         if event is None:
             raise LookupError(f"event not found: {event_uuid}")
         existing = await session.scalar(
@@ -868,6 +920,20 @@ def _coerce_uuid(value: object) -> object:
     if isinstance(value, str):
         return uuid.UUID(value)
     return value
+
+
+def _frozen_template_payload(
+    payload: object,
+) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    snapshot = payload.get("template_catalog")
+    if snapshot is not None:
+        return {"template_catalog": snapshot}
+    version = payload.get("template_version")
+    if isinstance(version, str) and version.strip():
+        return {"template_version": version}
+    return None
 
 
 def _apply_suggestion_to_revision(
