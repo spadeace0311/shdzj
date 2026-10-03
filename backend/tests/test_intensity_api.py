@@ -91,7 +91,9 @@ async def _seed_product(session_factory) -> UUID:
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             run = await AssessmentRepository().ensure_run_from_outbox(
@@ -173,7 +175,9 @@ async def _seed_superseding_run(session_factory) -> UUID:
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             run = await AssessmentRepository().ensure_run_from_outbox(

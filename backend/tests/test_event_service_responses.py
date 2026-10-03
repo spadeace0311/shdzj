@@ -170,12 +170,14 @@ class _AtomicRepository:
         current_levels: tuple[str | None, int | None] = ("major", 2),
         append_is_current: bool = True,
         enqueue_result: bool = True,
+        collaboration_enqueue_result: bool = True,
     ) -> None:
         self.events = events
         self.suggestion_error = suggestion_error
         self.current_levels = current_levels
         self.append_is_current = append_is_current
         self.enqueue_result = enqueue_result
+        self.collaboration_enqueue_result = collaboration_enqueue_result
         self.suggestion_calls = 0
 
     async def acquire_ingest_lock(self, session: object, source: str) -> None:
@@ -219,8 +221,8 @@ class _AtomicRepository:
         del session, raw
         self.events.append("append_revision")
         return EventIngestResult(
-            event_id="event-1",
-            revision_id="revision-1",
+            event_id=str(uuid.uuid4()),
+            revision_id=str(uuid.uuid4()),
             revision_no=1,
             event_kind=event.kind,
             is_current=self.append_is_current,
@@ -239,6 +241,27 @@ class _AtomicRepository:
         del session, event_id, revision_id, revision_no, trigger_reason, created_at
         self.events.append("enqueue_assessment")
         return self.enqueue_result
+
+    async def enqueue_collaboration(
+        self,
+        session: object,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        trigger_reason: str,
+        created_at: datetime,
+    ) -> bool:
+        del (
+            session,
+            event_id,
+            revision_id,
+            revision_no,
+            trigger_reason,
+            created_at,
+        )
+        self.events.append("enqueue_collaboration")
+        return self.collaboration_enqueue_result
 
     async def set_revision_suggestion(
         self,
@@ -279,6 +302,20 @@ class _NoopProductionController:
         **kwargs: object,
     ) -> tuple[object, ...]:
         del session, kwargs
+        return ()
+
+
+class _NoopRosterService:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def snapshot_for_event(
+        self,
+        session: object,
+        event_id: uuid.UUID,
+    ) -> tuple[object, ...]:
+        del session, event_id
+        self.events.append("snapshot_for_event")
         return ()
 
 
@@ -377,6 +414,7 @@ async def test_service_commits_revision_and_suggestion_in_one_transaction() -> N
         repository=repository,
         region_repository=_AtomicRegionRepository(),
         production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -400,6 +438,8 @@ async def test_service_commits_revision_and_suggestion_in_one_transaction() -> N
         "get_or_create_raw_message",
         "append_revision",
         "set_revision_suggestion",
+        "enqueue_collaboration",
+        "snapshot_for_event",
         "enqueue_assessment",
         "get_current_response_levels",
         "get_event_lifecycle_snapshot",
@@ -418,6 +458,7 @@ async def test_service_rolls_back_revision_when_suggestion_persist_fails() -> No
         repository=repository,
         region_repository=_AtomicRegionRepository(),
         production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
     )
 
     with pytest.raises(RuntimeError, match="suggestion failure"):
@@ -449,6 +490,7 @@ async def test_service_without_context_returns_existing_current_suggestion() -> 
         repository=repository,
         region_repository=_AtomicRegionRepository(),
         production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -470,6 +512,7 @@ async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
         repository=repository,
         region_repository=_AtomicRegionRepository(),
         production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
     )
 
     outcome = await service.ingest_with_response_suggestion(
@@ -489,6 +532,96 @@ async def test_triggered_assessment_reflects_enqueue_noop_result() -> None:
     assert outcome.triggered_assessment is False
 
 
+async def test_collaboration_enqueue_is_independent_of_assessment_applicability() -> None:
+    events: list[str] = []
+    repository = _AtomicRepository(events)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
+    )
+
+    await service.ingest_with_response_suggestion(
+        _payload(),
+        _event(EventKind.FORMAL),
+        ResponseInput(
+            magnitude=Decimal("2.0"),
+            depth_km=Decimal("12"),
+            inside_shanghai=False,
+            distance_to_boundary_km=Decimal("50"),
+            deaths=None,
+            max_intensity=Decimal("1"),
+        ),
+    )
+
+    assert "enqueue_collaboration" in events
+    assert "snapshot_for_event" in events
+    assert "enqueue_assessment" not in events
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        EventKind.CORRECTION,
+        EventKind.MANUAL,
+        EventKind.TEST,
+        EventKind.DRILL,
+    ),
+)
+async def test_current_reviewed_kinds_enqueue_collaboration(
+    kind: EventKind,
+) -> None:
+    events: list[str] = []
+    repository = _AtomicRepository(events)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
+    )
+
+    await service.ingest_with_response_suggestion(
+        _payload(),
+        _event(kind),
+        ResponseInput(
+            magnitude=Decimal("5.2"),
+            depth_km=Decimal("10"),
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            deaths=None,
+            max_intensity=Decimal("6"),
+        ),
+    )
+
+    assert "enqueue_collaboration" in events
+    assert "snapshot_for_event" in events
+
+
+async def test_auto_event_does_not_enqueue_collaboration_or_snapshot() -> None:
+    events: list[str] = []
+    repository = _AtomicRepository(events)
+    service = EventService(
+        _AtomicSessionFactory(events),
+        repository=repository,
+        region_repository=_AtomicRegionRepository(),
+        production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
+    )
+
+    await service.ingest_with_response_suggestion(
+        _payload(),
+        _event(EventKind.AUTO),
+        None,
+    )
+
+    assert "enqueue_collaboration" not in events
+    assert "snapshot_for_event" not in events
+    assert "enqueue_assessment" not in events
+
+
 async def test_non_current_formal_with_context_keeps_current_suggestion() -> None:
     events: list[str] = []
     repository = _AtomicRepository(
@@ -501,6 +634,7 @@ async def test_non_current_formal_with_context_keeps_current_suggestion() -> Non
         repository=repository,
         region_repository=_AtomicRegionRepository(),
         production_controller=_NoopProductionController(),
+        roster_service=_NoopRosterService(events),
     )
 
     outcome = await service.ingest_with_response_suggestion(

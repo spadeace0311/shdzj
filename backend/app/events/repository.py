@@ -11,6 +11,7 @@ from geoalchemy2.elements import WKTElement
 from sqlalchemy import case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.collaboration.models import CollaborationSettings
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
 from app.events.models import (
     EarthquakeEvent,
@@ -328,13 +329,38 @@ class EventRepository:
         trigger_reason: str,
         created_at: datetime,
     ) -> bool:
+        return await self._enqueue_lifecycle_trigger(
+            session,
+            event_id=event_id,
+            revision_id=revision_id,
+            revision_no=revision_no,
+            trigger_reason=trigger_reason,
+            trigger_type="assessment.requested",
+            payload={
+                "event_id": str(_coerce_uuid(event_id)),
+                "revision_id": str(_coerce_uuid(revision_id)),
+                "revision_no": revision_no,
+            },
+            created_at=created_at,
+        )
+
+    async def enqueue_collaboration(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        trigger_reason: str,
+        created_at: datetime,
+    ) -> bool:
         event_uuid = _coerce_uuid(event_id)
         revision_uuid = _coerce_uuid(revision_id)
         existing = await session.scalar(
             select(EventLifecycleOutbox.id).where(
                 EventLifecycleOutbox.event_id == event_uuid,
                 EventLifecycleOutbox.revision_id == revision_uuid,
-                EventLifecycleOutbox.trigger_type == "assessment.requested",
+                EventLifecycleOutbox.trigger_type == "collaboration.requested",
             )
         )
         if existing is not None:
@@ -343,18 +369,87 @@ class EventRepository:
         event = await session.get(EarthquakeEvent, event_uuid, with_for_update=True)
         if event is None:
             raise LookupError(f"event not found: {event_uuid}")
+        revision = await session.get(
+            EarthquakeRevision,
+            revision_uuid,
+            with_for_update=True,
+        )
+        if revision is None or revision.event_id != event_uuid:
+            raise LookupError(f"revision not found: {revision_uuid}")
+        policy = await session.scalar(
+            select(CollaborationSettings)
+            .order_by(
+                CollaborationSettings.created_at,
+                CollaborationSettings.id,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if policy is None:
+            raise LookupError("collaboration settings not found")
+
+        return await self._enqueue_lifecycle_trigger(
+            session,
+            event_id=event_uuid,
+            revision_id=revision_uuid,
+            revision_no=revision_no,
+            trigger_reason=trigger_reason,
+            trigger_type="collaboration.requested",
+            payload={
+                "event_id": str(event_uuid),
+                "revision_id": str(revision_uuid),
+                "revision_no": revision_no,
+                "intensity_threshold": str(policy.intensity_threshold),
+                "policy_version": policy.row_version,
+                "region_boundary_version": revision.region_boundary_version,
+            },
+            created_at=created_at,
+        )
+
+    async def _enqueue_lifecycle_trigger(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        trigger_reason: str,
+        trigger_type: str,
+        payload: dict[str, object],
+        created_at: datetime,
+    ) -> bool:
+        event_uuid = _coerce_uuid(event_id)
+        revision_uuid = _coerce_uuid(revision_id)
+        existing = await session.scalar(
+            select(EventLifecycleOutbox.id).where(
+                EventLifecycleOutbox.event_id == event_uuid,
+                EventLifecycleOutbox.revision_id == revision_uuid,
+                EventLifecycleOutbox.trigger_type == trigger_type,
+            )
+        )
+        if existing is not None:
+            return False
+
+        event = await session.get(EarthquakeEvent, event_uuid, with_for_update=True)
+        if event is None:
+            raise LookupError(f"event not found: {event_uuid}")
+        existing = await session.scalar(
+            select(EventLifecycleOutbox.id).where(
+                EventLifecycleOutbox.event_id == event_uuid,
+                EventLifecycleOutbox.revision_id == revision_uuid,
+                EventLifecycleOutbox.trigger_type == trigger_type,
+            )
+        )
+        if existing is not None:
+            return False
 
         session.add(
             EventLifecycleOutbox(
                 event_id=event_uuid,
                 revision_id=revision_uuid,
-                trigger_type="assessment.requested",
+                trigger_type=trigger_type,
                 trigger_reason=trigger_reason,
-                payload={
-                    "event_id": str(event_uuid),
-                    "revision_id": str(revision_uuid),
-                    "revision_no": revision_no,
-                },
+                payload=payload,
                 status="pending",
                 attempt_count=0,
                 created_at=created_at,

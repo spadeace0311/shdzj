@@ -121,7 +121,8 @@ async def _ingest(
     async with session_factory() as session:
         outbox = await session.scalar(
             select(EventLifecycleOutbox).where(
-                EventLifecycleOutbox.revision_id == outcome.revision_id
+                EventLifecycleOutbox.revision_id == outcome.revision_id,
+                EventLifecycleOutbox.trigger_type == "assessment.requested",
             )
         )
         assert outbox is not None
@@ -445,6 +446,9 @@ async def test_direct_formal_ingestion_resolves_active_boundary_before_outbox(
         revision = await session.get(EarthquakeRevision, UUID(outcome.revision_id))
         outbox_count = await session.scalar(
             select(text("COUNT(*)")).select_from(EventLifecycleOutbox)
+            .where(
+                EventLifecycleOutbox.trigger_type == "assessment.requested"
+            )
         )
         assert revision is not None
 
@@ -482,6 +486,9 @@ async def test_direct_formal_ingestion_rejects_missing_active_boundary_before_ou
     async with session_factory() as session:
         outbox_count = await session.scalar(
             select(text("COUNT(*)")).select_from(EventLifecycleOutbox)
+            .where(
+                EventLifecycleOutbox.trigger_type == "assessment.requested"
+            )
         )
     assert int(outbox_count) == 0
 
@@ -547,6 +554,9 @@ async def test_direct_formal_endpoint_resolves_active_boundary_before_outbox(
         )
         outbox_count = await session.scalar(
             select(text("COUNT(*)")).select_from(EventLifecycleOutbox)
+            .where(
+                EventLifecycleOutbox.trigger_type == "assessment.requested"
+            )
         )
         assert revision is not None
 
@@ -683,7 +693,9 @@ async def _seed_run_and_task(session_factory, boundary_version: str):
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             run = await AssessmentRepository().ensure_run_from_outbox(

@@ -117,7 +117,9 @@ async def _create_workflow_input(session_factory) -> AssessmentWorkflowInput:
     async with session_factory() as session:
         outbox = await session.scalar(
             select(EventLifecycleOutbox).where(
-                EventLifecycleOutbox.revision_id == outcome.revision_id
+                EventLifecycleOutbox.revision_id == outcome.revision_id,
+                EventLifecycleOutbox.trigger_type
+                == "assessment.requested",
             )
         )
     assert outbox is not None

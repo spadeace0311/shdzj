@@ -130,6 +130,8 @@ class TaskTemplateCatalog:
         self,
         event: object,
         revision: object,
+        *,
+        intensity_threshold: Decimal | str | None = None,
     ) -> tuple[TaskTemplateDefinition, ...]:
         event_kind = _event_kind(event, revision)
         if event_kind is EventKind.AUTO:
@@ -142,6 +144,7 @@ class TaskTemplateCatalog:
                 event,
                 revision,
                 event_kind=event_kind,
+                intensity_threshold=intensity_threshold,
             )
         )
 
@@ -470,6 +473,7 @@ def _definition_applicable(
     revision: object,
     *,
     event_kind: EventKind | None,
+    intensity_threshold: Decimal | str | None = None,
 ) -> bool:
     applicability = definition.applicability
     if event_kind is not None:
@@ -537,10 +541,15 @@ def _definition_applicable(
     ):
         return False
 
-    minimum_intensity = applicability.get(
-        "minimum_max_intensity",
-        applicability.get("intensity_threshold"),
+    has_configured_threshold = (
+        "minimum_max_intensity" in applicability
+        or "intensity_threshold" in applicability
     )
+    minimum_intensity = applicability.get("minimum_max_intensity")
+    if minimum_intensity is None:
+        minimum_intensity = applicability.get("intensity_threshold")
+    if has_configured_threshold and intensity_threshold is not None:
+        minimum_intensity = intensity_threshold
     if minimum_intensity is not None:
         max_intensity = _response_max_intensity(revision, event)
         if (

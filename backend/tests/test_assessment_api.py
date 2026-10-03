@@ -78,7 +78,9 @@ async def _seed_assessment(session_factory) -> tuple[UUID, UUID]:
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             assert outbox is not None
@@ -131,7 +133,9 @@ async def _seed_superseding_assessment(session_factory) -> UUID:
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == outcome.revision_id
+                    EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             assert outbox is not None

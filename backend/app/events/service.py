@@ -2,10 +2,12 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import logging
 from decimal import Decimal
+import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.artifacts.lifecycle import ArtifactProductionLifecycleController
+from app.collaboration.roster import RosterService
 from app.config import settings
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.lifecycle import message_family, semantic_fingerprint
@@ -57,6 +59,7 @@ class EventService:
         repository: EventRepository | None = None,
         region_repository: RegionRepository | None = None,
         production_controller: ArtifactProductionLifecycleController | None = None,
+        roster_service: RosterService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._repository = repository or EventRepository(session_factory)
@@ -65,6 +68,7 @@ class EventService:
             production_controller
             or ArtifactProductionLifecycleController()
         )
+        self._roster_service = roster_service or RosterService()
 
     async def ingest(
         self,
@@ -206,12 +210,28 @@ class EventService:
                         suggestion = engine.suggest(response_input)
                         suggestion_payload = asdict(suggestion)
                         suggestion_payload["causes"] = list(suggestion.causes)
+                        if response_input.max_intensity is not None:
+                            suggestion_payload["max_intensity"] = str(
+                                response_input.max_intensity
+                            )
                         await self._repository.set_revision_suggestion(
                             session,
                             result.revision_id,
                             suggestion,
                             suggestion_payload,
                         )
+                    await self._repository.enqueue_collaboration(
+                        session,
+                        event_id=result.event_id,
+                        revision_id=result.revision_id,
+                        revision_no=result.revision_no,
+                        trigger_reason=trigger_reason,
+                        created_at=normalized_received_at,
+                    )
+                    await self._roster_service.snapshot_for_event(
+                        session,
+                        uuid.UUID(result.event_id),
+                    )
                     if _assessment_applicable(
                         event,
                         region_context,

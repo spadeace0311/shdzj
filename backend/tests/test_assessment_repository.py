@@ -227,6 +227,8 @@ async def test_repository_increments_run_number_for_each_trigger(session_factory
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
                     EventLifecycleOutbox.revision_id == outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             assert event is not None

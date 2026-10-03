@@ -101,7 +101,30 @@ async def outbox_count(session_factory, event_id: str) -> int:
             await session.scalar(
                 select(func.count())
                 .select_from(EventLifecycleOutbox)
-                .where(EventLifecycleOutbox.event_id == event_id)
+                .where(
+                    EventLifecycleOutbox.event_id == event_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
+                )
+            )
+            or 0
+        )
+
+
+async def collaboration_outbox_count(
+    session_factory,
+    event_id: str,
+) -> int:
+    async with session_factory() as session:
+        return int(
+            await session.scalar(
+                select(func.count())
+                .select_from(EventLifecycleOutbox)
+                .where(
+                    EventLifecycleOutbox.event_id == event_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "collaboration.requested",
+                )
             )
             or 0
         )
@@ -129,6 +152,13 @@ async def test_auto_then_formal_creates_one_event_and_one_outbox(session_factory
     assert formal_result.event_id == auto_result.event_id
     assert formal_result.t1_at == formal["received_at"]
     assert await outbox_count(session_factory, auto_result.event_id) == 1
+    assert (
+        await collaboration_outbox_count(
+            session_factory,
+            auto_result.event_id,
+        )
+        == 1
+    )
 
 
 async def test_equivalent_fan_and_wolfx_reviewed_messages_do_not_duplicate(session_factory) -> None:
@@ -173,6 +203,7 @@ async def test_equivalent_fan_and_wolfx_reviewed_messages_do_not_duplicate(sessi
     assert first.is_new is True
     assert second.is_new is False
     assert await outbox_count(session_factory, first.event_id) == 1
+    assert await collaboration_outbox_count(session_factory, first.event_id) == 1
 
 
 async def test_changed_reviewed_message_creates_correction_and_second_outbox(session_factory) -> None:
@@ -191,6 +222,13 @@ async def test_changed_reviewed_message_creates_correction_and_second_outbox(ses
     assert second.t1_at == first.t1_at
     assert second.triggered_assessment is True
     assert await outbox_count(session_factory, first.event_id) == 2
+    assert (
+        await collaboration_outbox_count(
+            session_factory,
+            first.event_id,
+        )
+        == 2
+    )
 
 
 async def test_recovery_trigger_reason_is_persisted(session_factory) -> None:
@@ -212,6 +250,13 @@ async def test_first_reviewed_correction_is_classified_as_formal(session_factory
     assert result.t1_at is not None
     assert result.triggered_assessment is True
     assert await outbox_count(session_factory, result.event_id) == 1
+    assert (
+        await collaboration_outbox_count(
+            session_factory,
+            result.event_id,
+        )
+        == 1
+    )
 
     async with session_factory() as session:
         event = await session.get(EarthquakeEvent, uuid.UUID(result.event_id))
@@ -241,6 +286,13 @@ async def test_enqueue_assessment_is_guarded_noop(session_factory) -> None:
 
     assert added is False
     assert await outbox_count(session_factory, result.event_id) == 1
+    assert (
+        await collaboration_outbox_count(
+            session_factory,
+            result.event_id,
+        )
+        == 1
+    )
 
 
 async def test_late_older_reviewed_revision_is_stored_without_new_outbox(
@@ -261,3 +313,4 @@ async def test_late_older_reviewed_revision_is_stored_without_new_outbox(
     assert second.is_current is False
     assert second.triggered_assessment is False
     assert await outbox_count(session_factory, first.event_id) == 1
+    assert await collaboration_outbox_count(session_factory, first.event_id) == 1

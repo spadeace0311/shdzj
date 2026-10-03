@@ -111,7 +111,10 @@ async def test_correction_supersedes_old_run_but_keeps_fallback(session_factory)
         async with session.begin():
             first_outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == first_outcome.revision_id
+                    EventLifecycleOutbox.revision_id
+                    == first_outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             first_run = await repository.ensure_run_from_outbox(
@@ -195,7 +198,10 @@ async def test_correction_supersedes_old_run_but_keeps_fallback(session_factory)
         async with session.begin():
             outbox = await session.scalar(
                 select(EventLifecycleOutbox).where(
-                    EventLifecycleOutbox.revision_id == second_outcome.revision_id
+                    EventLifecycleOutbox.revision_id
+                    == second_outcome.revision_id,
+                    EventLifecycleOutbox.trigger_type
+                    == "assessment.requested",
                 )
             )
             second_run = await repository.ensure_run_from_outbox(

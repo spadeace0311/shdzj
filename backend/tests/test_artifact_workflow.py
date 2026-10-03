@@ -100,7 +100,9 @@ async def seeded_assessment_workflow(session_factory):
     async with session_factory() as session:
         outbox = await session.scalar(
             select(EventLifecycleOutbox).where(
-                EventLifecycleOutbox.revision_id == outcome.revision_id
+                EventLifecycleOutbox.revision_id == outcome.revision_id,
+                EventLifecycleOutbox.trigger_type
+                == "assessment.requested",
             )
         )
     assert outbox is not None
