@@ -848,6 +848,169 @@ async def test_version_and_publish_retries_are_idempotent_and_append_events(
     ]
 
 
+async def test_idempotency_key_rejects_other_deliverable_and_version(
+    session,
+    task_factory,
+    superadmin_user,
+):
+    task = await task_factory(status="pending_review")
+    first = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="first.result",
+        title="First result",
+        is_required=True,
+        requirement_kind=DeliverableRequirementKind.MANUAL_TEXT,
+        display_order=1,
+    )
+    second = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="second.result",
+        title="Second result",
+        is_required=True,
+        requirement_kind=DeliverableRequirementKind.MANUAL_TEXT,
+        display_order=2,
+    )
+    session.add_all([first, second])
+    await session.flush()
+
+    service = DeliverableService()
+    first_version = await service.add_text_version(
+        session,
+        first.id,
+        actor=superadmin_user,
+        text_result={"result": "first candidate"},
+        idempotency_key="shared-add-key",
+    )
+    with pytest.raises(ValueError):
+        await service.add_text_version(
+            session,
+            second.id,
+            actor=superadmin_user,
+            text_result={"result": "wrong deliverable"},
+            idempotency_key="shared-add-key",
+        )
+
+    second_version = await service.add_text_version(
+        session,
+        second.id,
+        actor=superadmin_user,
+        text_result={"result": "second candidate"},
+    )
+    await service.publish(
+        session,
+        first.id,
+        version_id=first_version.id,
+        actor=superadmin_user,
+        idempotency_key="shared-publish-key",
+    )
+    with pytest.raises(ValueError):
+        await service.publish(
+            session,
+            second.id,
+            version_id=second_version.id,
+            actor=superadmin_user,
+            idempotency_key="shared-publish-key",
+        )
+
+
+async def test_delete_retry_after_success_is_idempotent(
+    session,
+    deliverable,
+    group_member_user,
+):
+    service = DeliverableService()
+    version = await service.add_text_version(
+        session,
+        deliverable.id,
+        actor=group_member_user,
+        text_result={"result": "delete me"},
+        basis_text="delete candidate",
+    )
+
+    await service.delete_candidate(
+        session,
+        version.id,
+        actor=group_member_user,
+        idempotency_key="delete-once",
+    )
+    await service.delete_candidate(
+        session,
+        version.id,
+        actor=group_member_user,
+        idempotency_key="delete-once",
+    )
+    assert await session.get(TaskDeliverableVersion, version.id) is None
+
+
+async def test_delete_candidate_cleans_unreferenced_manual_object(
+    session,
+    deliverable,
+    group_member_user,
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path, max_override_bytes=1024)
+    service = DeliverableService(artifact_store=store)
+    version = await service.add_manual_version(
+        session,
+        deliverable.id,
+        actor=group_member_user,
+        source=BytesIO(b"delete-me"),
+        file_name="delete.txt",
+        mime_type="text/plain",
+    )
+    path = store.resolve(version.storage_key)
+    assert path.is_file()
+
+    await service.delete_candidate(
+        session,
+        version.id,
+        actor=group_member_user,
+    )
+    assert not path.exists()
+
+
+async def test_delete_candidate_keeps_shared_storage_object(
+    session,
+    deliverable,
+    group_member_user,
+    tmp_path,
+):
+    store = ArtifactStore(tmp_path, max_override_bytes=1024)
+    service = DeliverableService(artifact_store=store)
+    first = await service.add_manual_version(
+        session,
+        deliverable.id,
+        actor=group_member_user,
+        source=BytesIO(b"shared-content"),
+        file_name="shared.txt",
+        mime_type="text/plain",
+    )
+    second = await service.add_manual_version(
+        session,
+        deliverable.id,
+        actor=group_member_user,
+        source=BytesIO(b"shared-content"),
+        file_name="shared.txt",
+        mime_type="text/plain",
+    )
+    assert first.storage_key == second.storage_key
+    path = store.resolve(first.storage_key)
+
+    await service.delete_candidate(
+        session,
+        first.id,
+        actor=group_member_user,
+    )
+    assert path.is_file()
+
+    await service.delete_candidate(
+        session,
+        second.id,
+        actor=group_member_user,
+    )
+    assert not path.exists()
+
+
 async def test_deliverable_list_and_publish_routes(
     session,
     deliverable,

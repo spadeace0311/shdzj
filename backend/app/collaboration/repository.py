@@ -146,6 +146,20 @@ class CollaborationRepository:
             )
         )
 
+    async def get_event_by_idempotency_key_any(
+        self,
+        session: AsyncSession,
+        idempotency_key: str,
+    ) -> CollaborationTaskEvent | None:
+        return await session.scalar(
+            select(CollaborationTaskEvent)
+            .where(
+                CollaborationTaskEvent.idempotency_key == idempotency_key,
+            )
+            .order_by(CollaborationTaskEvent.occurred_at)
+            .limit(1)
+        )
+
     async def required_deliverables_satisfied(
         self,
         session: AsyncSession,
@@ -337,3 +351,33 @@ class CollaborationRepository:
             )
             .limit(1)
         )
+
+    async def storage_key_reference_count(
+        self,
+        session: AsyncSession,
+        storage_key: str,
+        *,
+        exclude_version_id: uuid.UUID,
+    ) -> int:
+        version_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(TaskDeliverableVersion)
+                .where(
+                    TaskDeliverableVersion.storage_key == storage_key,
+                    TaskDeliverableVersion.id != exclude_version_id,
+                )
+            )
+            or 0
+        )
+        from app.artifacts.models import GeneratedArtifact
+
+        artifact_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(GeneratedArtifact)
+                .where(GeneratedArtifact.storage_path == storage_key)
+            )
+            or 0
+        )
+        return version_count + artifact_count

@@ -9,7 +9,7 @@ from typing import Any, BinaryIO
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.artifacts.storage import ArtifactStore
+from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.collaboration.domain import (
     DeliverableSourceKind,
     TaskStatus,
@@ -495,11 +495,15 @@ def _validate_idempotent_replay(
     previous: CollaborationTaskEvent,
     actor: _Actor,
     event_type: str,
+    *,
+    resource_identity: dict[str, object] | None = None,
 ) -> None:
     if previous.event_type != event_type:
         raise ValueError(
             "idempotency key was used for a different operation"
         )
+    if resource_identity is not None:
+        _validate_resource_identity(previous, resource_identity)
     stored_actor_id = previous.payload.get("actor_id")
     if stored_actor_id is not None:
         try:
@@ -510,6 +514,18 @@ def _validate_idempotent_replay(
         return
     if previous.actor != actor.username:
         raise PermissionError("Insufficient permissions")
+
+
+def _validate_resource_identity(
+    previous: CollaborationTaskEvent,
+    resource_identity: dict[str, object],
+) -> None:
+    for field, expected in resource_identity.items():
+        actual = previous.payload.get(field)
+        if actual is None or str(actual) != str(expected):
+            raise ValueError(
+                "idempotency key was used for a different resource"
+            )
 
 
 async def _append_ledger(
@@ -792,6 +808,24 @@ class DeliverableService:
         idempotency_key: str | None = None,
         expected_version: int | None = None,
     ) -> None:
+        if idempotency_key is not None:
+            previous = (
+                await self.repository.get_event_by_idempotency_key_any(
+                    session, idempotency_key
+                )
+            )
+            if previous is not None:
+                actor_identity = await _resolve_actor(
+                    session, self.repository, actor
+                )
+                _validate_idempotent_replay(
+                    previous,
+                    actor_identity,
+                    "deliverable_candidate_deleted",
+                    resource_identity={"version_id": version_id},
+                )
+                return
+
         deliverable, task, version, actor_identity, previous = (
             await self._lock_version(
                 session,
@@ -822,6 +856,26 @@ class DeliverableService:
         if not can_delete:
             raise PermissionError("Insufficient permissions")
 
+        stored_for_cleanup: StoredArtifactFile | None = None
+        if version.storage_key is not None:
+            reference_count = (
+                await self.repository.storage_key_reference_count(
+                    session,
+                    version.storage_key,
+                    exclude_version_id=version.id,
+                )
+            )
+            if reference_count == 0:
+                stored_for_cleanup = StoredArtifactFile(
+                    file_name=version.file_name or "",
+                    relative_path=version.storage_key,
+                    managed_path=self.artifact_store.resolve(
+                        version.storage_key
+                    ),
+                    size_bytes=version.size_bytes or 0,
+                    checksum=version.checksum or "",
+                )
+
         now = datetime.now(UTC)
         await session.delete(version)
         deliverable.updated_at = now
@@ -845,6 +899,8 @@ class DeliverableService:
             occurred_at=now,
         )
         await session.flush()
+        if stored_for_cleanup is not None:
+            self.artifact_store.delete_unreferenced(stored_for_cleanup)
 
     async def current_version_id(
         self,
@@ -878,6 +934,10 @@ class DeliverableService:
             )
         )
         if previous is not None:
+            _validate_resource_identity(
+                previous,
+                {"version_id": version_id},
+            )
             return await self._publication_from_event(
                 session, task, idempotency_key
             )
@@ -1111,7 +1171,12 @@ class DeliverableService:
             )
             if previous is not None:
                 _validate_idempotent_replay(
-                    previous, actor_identity, event_type
+                    previous,
+                    actor_identity,
+                    event_type,
+                    resource_identity={
+                        "deliverable_id": deliverable_id,
+                    },
                 )
                 return deliverable, task, actor_identity, previous
         if expected_version is not None and int(task.row_version) != int(
@@ -1168,7 +1233,12 @@ class DeliverableService:
             )
             if previous is not None:
                 _validate_idempotent_replay(
-                    previous, actor_identity, event_type
+                    previous,
+                    actor_identity,
+                    event_type,
+                    resource_identity={
+                        "version_id": version_id,
+                    },
                 )
                 return deliverable, task, version, actor_identity, previous
         if expected_version is not None and int(task.row_version) != int(
