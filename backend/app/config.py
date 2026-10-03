@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     collaboration_task_template_path: str = (
         "/config/collaboration/shanghai-2026-tasks.yaml"
     )
+    collaboration_worker_enabled: bool = False
+    collaboration_worker_poll_seconds: float = 1.0
+    collaboration_worker_batch_size: int = 50
+    collaboration_outbox_max_attempts: int = 10
+    collaboration_outbox_lease_seconds: int = 60
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -192,6 +197,26 @@ class Settings(BaseSettings):
         if self.artifact_retention_interval_seconds < 60:
             raise ValueError(
                 "ARTIFACT_RETENTION_INTERVAL_SECONDS must be at least 60"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_collaboration_configuration(self) -> "Settings":
+        if self.collaboration_worker_poll_seconds <= 0:
+            raise ValueError(
+                "COLLABORATION_WORKER_POLL_SECONDS must be positive"
+            )
+        if not 1 <= self.collaboration_worker_batch_size <= 1_000:
+            raise ValueError(
+                "COLLABORATION_WORKER_BATCH_SIZE must be between 1 and 1000"
+            )
+        if not 1 <= self.collaboration_outbox_max_attempts <= 100:
+            raise ValueError(
+                "COLLABORATION_OUTBOX_MAX_ATTEMPTS must be between 1 and 100"
+            )
+        if self.collaboration_outbox_lease_seconds <= 0:
+            raise ValueError(
+                "COLLABORATION_OUTBOX_LEASE_SECONDS must be positive"
             )
         return self
 

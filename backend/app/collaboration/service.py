@@ -7,12 +7,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.collaboration.domain import (
     DeliverableSourceKind,
+    TaskSourceType,
     TaskStatus,
+    WorkgroupCode,
 )
 from app.collaboration.models import (
     CollaborationOutbox,
@@ -20,11 +23,13 @@ from app.collaboration.models import (
     TaskDeliverable,
     TaskDeliverablePublication,
     TaskDeliverableVersion,
+    WorkgroupDefinition,
     WorkgroupTask,
 )
 from app.collaboration.repository import CollaborationRepository
 from app.collaboration.roster import RosterService
 from app.config import settings
+from app.events.models import EarthquakeEvent, EarthquakeRevision
 
 
 class StaleTaskVersion(Exception):
@@ -587,6 +592,385 @@ async def _append_ledger(
         )
     )
     await session.flush()
+
+
+class TemporaryTaskService(CollaborationTaskService):
+    async def create(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: object,
+        workgroup_code: str,
+        title: str,
+        instruction: str,
+        priority: int,
+        due_at: datetime | None = None,
+        continues_until_cancelled: bool = False,
+        actor: object,
+        source_ref: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> WorkgroupTask:
+        event_uuid = _coerce_uuid(event_id, "event_id")
+        actor_identity = await _resolve_actor(
+            session,
+            self.repository,
+            actor,
+        )
+        if not await self._can_create_temporary_task(
+            session,
+            actor_identity,
+        ):
+            raise PermissionError("Insufficient permissions")
+
+        _require_non_empty(title, "title")
+        _require_non_empty(instruction, "instruction")
+        if priority < 0:
+            raise ValueError("priority must be non-negative")
+        try:
+            WorkgroupCode(workgroup_code)
+        except ValueError as exc:
+            raise ValueError("unknown workgroup_code") from exc
+
+        due_at = await self._resolve_due(
+            due_at,
+            continues_until_cancelled,
+        )
+        effective_key = idempotency_key or _temporary_task_identity_key(
+            event_uuid,
+            workgroup_code,
+            title,
+            instruction,
+            priority,
+            due_at,
+            continues_until_cancelled,
+        )
+        previous = await self.repository.get_event_by_idempotency_key_any(
+            session,
+            effective_key,
+        )
+        if previous is not None:
+            task = await self.repository.get_task(
+                session,
+                previous.task_id,
+                for_update=True,
+            )
+            if task is None or task.source_type != TaskSourceType.AD_HOC.value:
+                raise ValueError(
+                    "idempotency key was used for a different operation"
+                )
+            _validate_idempotent_replay(
+                previous,
+                actor_identity,
+                "task_created",
+                resource_identity={
+                    "event_id": event_uuid,
+                    "workgroup_code": workgroup_code,
+                    "title": title,
+                    "instruction": instruction,
+                    "priority": priority,
+                    "due_at": (
+                        due_at.isoformat()
+                        if due_at is not None
+                        else None
+                    ),
+                    "continues_until_cancelled": continues_until_cancelled,
+                },
+            )
+            return task
+
+        event = await session.get(
+            EarthquakeEvent,
+            event_uuid,
+            with_for_update=True,
+        )
+        if event is None:
+            raise LookupError("event_not_found")
+        definition = await session.scalar(
+            select(WorkgroupDefinition).where(
+                WorkgroupDefinition.code == workgroup_code,
+                WorkgroupDefinition.is_active.is_(True),
+            )
+        )
+        if definition is None:
+            raise ValueError("unknown workgroup_code")
+        revision = await self._current_revision(
+            session,
+            event_uuid,
+        )
+
+        now = datetime.now(UTC)
+        task = WorkgroupTask(
+            event_id=event.id,
+            trigger_revision_id=revision.id,
+            template_version_id=None,
+            task_code=_temporary_task_code(
+                event_uuid,
+                workgroup_code,
+                effective_key,
+            ),
+            source_type=TaskSourceType.AD_HOC.value,
+            source_ref=(source_ref or "")[:256] or None,
+            workgroup_code=workgroup_code,
+            title=title,
+            instruction=instruction,
+            priority=priority,
+            status=TaskStatus.PENDING.value,
+            timeliness_state="on_time",
+            phase_code=None,
+            activated_at=now,
+            due_at=due_at,
+            row_version=1,
+            created_by=actor_identity.username,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(task)
+        await session.flush()
+        await _append_ledger(
+            session,
+            self.repository,
+            task,
+            event_type="task_created",
+            actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
+            from_status=None,
+            to_status=task.status,
+            payload={
+                "event_id": str(event.id),
+                "workgroup_code": workgroup_code,
+                "title": title,
+                "instruction": instruction,
+                "priority": priority,
+                "due_at": due_at.isoformat() if due_at is not None else None,
+                "continues_until_cancelled": continues_until_cancelled,
+                "source_ref": task.source_ref,
+            },
+            idempotency_key=effective_key,
+            occurred_at=now,
+        )
+        await session.flush()
+        return task
+
+    async def update(
+        self,
+        session: AsyncSession,
+        task_id: uuid.UUID,
+        actor: object,
+        expected_version: int,
+        *,
+        title: str | None = None,
+        instruction: str | None = None,
+        priority: int | None = None,
+        due_at: datetime | None = None,
+        continues_until_cancelled: bool | None = None,
+        idempotency_key: str | None = None,
+    ) -> WorkgroupTask:
+        task, actor_identity, already_applied = await self._lock_task(
+            session,
+            task_id,
+            actor,
+            expected_version,
+            idempotency_key=idempotency_key,
+            event_type="task_updated",
+        )
+        if already_applied:
+            return task
+        self._ensure_ad_hoc(task)
+        if not await self._can_manage_temporary_task(
+            task,
+            actor_identity,
+        ):
+            raise PermissionError("Insufficient permissions")
+
+        if task.status != TaskStatus.PENDING.value:
+            if title is not None or priority is not None:
+                raise ValueError(
+                    "title and priority cannot change after a task starts"
+                )
+
+        changes: dict[str, Any] = {}
+        if title is not None:
+            _require_non_empty(title, "title")
+            task.title = title
+            changes["title"] = title
+        if instruction is not None:
+            _require_non_empty(instruction, "instruction")
+            task.instruction = instruction
+            changes["instruction"] = instruction
+        if priority is not None:
+            if priority < 0:
+                raise ValueError("priority must be non-negative")
+            task.priority = priority
+            changes["priority"] = priority
+
+        if continues_until_cancelled is not None or due_at is not None:
+            resolved_due = await self._resolve_due_update(
+                due_at,
+                continues_until_cancelled,
+            )
+            task.due_at = resolved_due
+            changes["due_at"] = (
+                resolved_due.isoformat()
+                if resolved_due is not None
+                else None
+            )
+            changes["continues_until_cancelled"] = (
+                resolved_due is None
+            )
+
+        if not changes:
+            raise ValueError("no changes supplied")
+
+        now = datetime.now(UTC)
+        task.row_version += 1
+        task.updated_at = now
+        await _append_ledger(
+            session,
+            self.repository,
+            task,
+            event_type="task_updated",
+            actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
+            from_status=task.status,
+            to_status=task.status,
+            payload={"changes": changes},
+            idempotency_key=idempotency_key,
+            occurred_at=now,
+        )
+        await session.flush()
+        return task
+
+    async def cancel(
+        self,
+        session: AsyncSession,
+        task_id: uuid.UUID,
+        actor: object,
+        expected_version: int,
+        *,
+        reason: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> WorkgroupTask:
+        task, actor_identity, already_applied = await self._lock_task(
+            session,
+            task_id,
+            actor,
+            expected_version,
+            idempotency_key=idempotency_key,
+            event_type="task_cancelled",
+        )
+        if already_applied:
+            return task
+        self._ensure_ad_hoc(task)
+        if task.status != TaskStatus.PENDING.value:
+            raise ValueError("temporary task has already started")
+        if not await self._can_manage_temporary_task(
+            task,
+            actor_identity,
+        ):
+            raise PermissionError("Insufficient permissions")
+
+        now = datetime.now(UTC)
+        previous_status = task.status
+        self._ensure_transition(task.status, TaskStatus.NOT_REQUIRED)
+        self._apply_transition(task, TaskStatus.NOT_REQUIRED, now=now)
+        task.closed_at = now
+        await _append_ledger(
+            session,
+            self.repository,
+            task,
+            event_type="task_cancelled",
+            actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
+            from_status=previous_status,
+            to_status=TaskStatus.NOT_REQUIRED.value,
+            payload={"reason": reason},
+            idempotency_key=idempotency_key,
+            occurred_at=now,
+        )
+        await session.flush()
+        return task
+
+    async def _can_create_temporary_task(
+        self,
+        session: AsyncSession,
+        actor: _Actor,
+    ) -> bool:
+        if actor.role == "superadmin":
+            return True
+        membership = await self.repository.get_active_membership(
+            session,
+            WorkgroupCode.COMPREHENSIVE_COORDINATION.value,
+            actor.user_id,
+        )
+        return (
+            membership is not None
+            and membership.duty_role in _GROUP_WORK_ROLES
+        )
+
+    @staticmethod
+    async def _can_manage_temporary_task(
+        task: WorkgroupTask,
+        actor: _Actor,
+    ) -> bool:
+        return actor.role == "superadmin" or task.created_by == actor.username
+
+    @staticmethod
+    async def _current_revision(
+        session: AsyncSession,
+        event_id: uuid.UUID,
+    ) -> EarthquakeRevision:
+        revision = await session.scalar(
+            select(EarthquakeRevision)
+            .where(
+                EarthquakeRevision.event_id == event_id,
+                EarthquakeRevision.is_current.is_(True),
+            )
+            .order_by(EarthquakeRevision.revision_no.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        if revision is None:
+            raise LookupError("current_revision_not_found")
+        return revision
+
+    @staticmethod
+    def _ensure_ad_hoc(task: WorkgroupTask) -> None:
+        if task.source_type != TaskSourceType.AD_HOC.value:
+            raise ValueError("task is not an ad hoc task")
+
+    @staticmethod
+    async def _resolve_due(
+        due_at: datetime | None,
+        continues_until_cancelled: bool,
+    ) -> datetime | None:
+        if due_at is not None and continues_until_cancelled:
+            raise ValueError(
+                "due_at cannot be combined with continues_until_cancelled"
+            )
+        if due_at is None and not continues_until_cancelled:
+            raise ValueError(
+                "due_at or continues_until_cancelled is required"
+            )
+        return _normalize_utc(due_at)
+
+    @staticmethod
+    async def _resolve_due_update(
+        due_at: datetime | None,
+        continues_until_cancelled: bool | None,
+    ) -> datetime | None:
+        if due_at is not None and continues_until_cancelled is True:
+            raise ValueError(
+                "due_at cannot be combined with continues_until_cancelled"
+            )
+        if continues_until_cancelled is True:
+            return None
+        if due_at is not None:
+            return _normalize_utc(due_at)
+        if continues_until_cancelled is False:
+            raise ValueError(
+                "due_at is required when continues_until_cancelled is false"
+            )
+        return _normalize_utc(due_at)
 
 
 class DeliverableService:
@@ -1372,6 +1756,62 @@ def _sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a UUID") from exc
+
+
+def _normalize_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must include timezone information")
+    return value.astimezone(UTC)
+
+
+def _require_non_empty(value: str, field_name: str) -> None:
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be empty")
+
+
+def _temporary_task_identity_key(
+    event_id: uuid.UUID,
+    workgroup_code: str,
+    title: str,
+    instruction: str,
+    priority: int,
+    due_at: datetime | None,
+    continues_until_cancelled: bool,
+) -> str:
+    material = "|".join(
+        (
+            "temporary-task",
+            str(event_id),
+            workgroup_code,
+            title,
+            instruction,
+            str(priority),
+            due_at.isoformat() if due_at is not None else "",
+            "1" if continues_until_cancelled else "0",
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _temporary_task_code(
+    event_id: uuid.UUID,
+    workgroup_code: str,
+    idempotency_key: str,
+) -> str:
+    material = f"{event_id}:{workgroup_code}:{idempotency_key}"
+    suffix = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return f"ad_hoc-{suffix}"
 
 
 def _event_key(task_id: uuid.UUID, event_seq: int) -> str:

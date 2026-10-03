@@ -42,7 +42,8 @@ from app.collaboration.schemas import (
     TaskContributorResponse,
     TaskReturnRequest,
     TaskSubmitRequest,
-    TaskUpdateRequest,
+    TemporaryTaskCreateRequest,
+    TemporaryTaskUpdateRequest,
     WorkgroupResponse,
     WorkgroupTaskResponse,
 )
@@ -51,6 +52,7 @@ from app.collaboration.service import (
     DeliverableService,
     MissingRequiredDeliverableError,
     StaleTaskVersion,
+    TemporaryTaskService,
 )
 from app.db import SessionFactory
 
@@ -69,6 +71,13 @@ def get_roster_service() -> RosterService:
 
 def get_task_service() -> CollaborationTaskService:
     return CollaborationTaskService(
+        repository=CollaborationRepository(),
+        roster_service=RosterService(),
+    )
+
+
+def get_temporary_task_service() -> TemporaryTaskService:
+    return TemporaryTaskService(
         repository=CollaborationRepository(),
         roster_service=RosterService(),
     )
@@ -252,6 +261,41 @@ async def list_collaboration_tasks(
     return responses
 
 
+@router.post(
+    "/events/{event_id}/collaboration/tasks",
+    response_model=WorkgroupTaskResponse,
+    status_code=201,
+)
+async def create_temporary_collaboration_task(
+    event_id: UUID,
+    request: TemporaryTaskCreateRequest,
+    session: AsyncSession = Depends(get_roster_session),
+    service: TemporaryTaskService = Depends(get_temporary_task_service),
+    current_user: AuthUser = Depends(get_current_user),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> WorkgroupTaskResponse:
+    try:
+        task = await service.create(
+            session,
+            event_id=event_id,
+            workgroup_code=request.workgroup_code,
+            title=request.title,
+            instruction=request.instruction,
+            priority=request.priority,
+            due_at=request.due_at,
+            continues_until_cancelled=request.continues_until_cancelled,
+            source_ref=request.source_ref,
+            actor=current_user,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return await _task_response(session, service, task)
+
+
 @router.get(
     "/collaboration/tasks/{task_id}",
     response_model=WorkgroupTaskResponse,
@@ -402,6 +446,9 @@ async def cancel_collaboration_task(
     request: TaskCancelRequest,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
+    temporary_service: TemporaryTaskService = Depends(
+        get_temporary_task_service
+    ),
     current_user: AuthUser = Depends(get_current_user),
     if_match: str = Header(alias="If-Match"),
     idempotency_key: str | None = Header(
@@ -411,14 +458,27 @@ async def cancel_collaboration_task(
 ) -> WorkgroupTaskResponse:
     version = _parse_if_match(if_match)
     try:
-        task = await service.cancel(
-            session,
-            task_id,
-            current_user,
-            version,
-            reason=request.reason,
-            idempotency_key=idempotency_key,
-        )
+        task = await service.repository.get_task(session, task_id)
+        if task is None:
+            raise LookupError("task_not_found")
+        if task.source_type == "ad_hoc" and task.status == "pending":
+            task = await temporary_service.cancel(
+                session,
+                task_id,
+                current_user,
+                version,
+                reason=request.reason,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            task = await service.cancel(
+                session,
+                task_id,
+                current_user,
+                version,
+                reason=request.reason,
+                idempotency_key=idempotency_key,
+            )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
     return await _task_response(session, service, task)
@@ -430,9 +490,12 @@ async def cancel_collaboration_task(
 )
 async def update_collaboration_task(
     task_id: UUID,
-    request: TaskUpdateRequest,
+    request: TemporaryTaskUpdateRequest,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
+    temporary_service: TemporaryTaskService = Depends(
+        get_temporary_task_service
+    ),
     current_user: AuthUser = Depends(get_current_user),
     if_match: str = Header(alias="If-Match"),
     idempotency_key: str | None = Header(
@@ -442,17 +505,36 @@ async def update_collaboration_task(
 ) -> WorkgroupTaskResponse:
     version = _parse_if_match(if_match)
     try:
-        task = await service.update(
-            session,
-            task_id,
-            current_user,
-            version,
-            title=request.title,
-            instruction=request.instruction,
-            priority=request.priority,
-            due_at=request.due_at,
-            idempotency_key=idempotency_key,
-        )
+        task = await service.repository.get_task(session, task_id)
+        if task is None:
+            raise LookupError("task_not_found")
+        if task.source_type == "ad_hoc":
+            task = await temporary_service.update(
+                session,
+                task_id,
+                current_user,
+                version,
+                title=request.title,
+                instruction=request.instruction,
+                priority=request.priority,
+                due_at=request.due_at,
+                continues_until_cancelled=(
+                    request.continues_until_cancelled
+                ),
+                idempotency_key=idempotency_key,
+            )
+        else:
+            task = await service.update(
+                session,
+                task_id,
+                current_user,
+                version,
+                title=request.title,
+                instruction=request.instruction,
+                priority=request.priority,
+                due_at=request.due_at,
+                idempotency_key=idempotency_key,
+            )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
     return await _task_response(session, service, task)

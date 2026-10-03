@@ -132,6 +132,24 @@ class TaskUpdateRequest(BaseModel):
     due_at: datetime | None = None
 
 
+class TemporaryTaskCreateRequest(BaseModel):
+    workgroup_code: str
+    title: str = Field(min_length=1, max_length=256)
+    instruction: str = Field(min_length=1)
+    priority: int = Field(ge=0)
+    due_at: datetime | None = None
+    continues_until_cancelled: bool = False
+    source_ref: str | None = Field(default=None, max_length=256)
+
+
+class TemporaryTaskUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=256)
+    instruction: str | None = Field(default=None, min_length=1)
+    priority: int | None = Field(default=None, ge=0)
+    due_at: datetime | None = None
+    continues_until_cancelled: bool | None = None
+
+
 class DeliverableVersionResponse(BaseModel):
     id: UUID
     deliverable_id: UUID
