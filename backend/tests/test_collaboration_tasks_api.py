@@ -22,6 +22,7 @@ from app.collaboration.models import (
     CollaborationOutbox,
     CollaborationTaskEvent,
     TaskDeliverable,
+    TaskDeliverablePublication,
     TaskDeliverableVersion,
     WorkgroupMembership,
     WorkgroupTask,
@@ -364,6 +365,54 @@ async def test_stale_version_is_rejected(
         )
 
 
+async def test_idempotent_replay_requires_same_actor_and_operation(
+    session,
+    task_factory,
+    group_member_user,
+):
+    task = await task_factory(status="pending")
+    member = await group_member_user()
+    other_member = await group_member_user()
+    service = CollaborationTaskService()
+
+    started = await service.start(
+        session,
+        task.id,
+        member,
+        task.row_version,
+        idempotency_key="shared-start",
+    )
+    assert started.row_version == 2
+
+    with pytest.raises(PermissionError):
+        await service.start(
+            session,
+            task.id,
+            other_member,
+            started.row_version,
+            idempotency_key="shared-start",
+        )
+
+    with pytest.raises(ValueError):
+        await service.submit(
+            session,
+            task.id,
+            member,
+            started.row_version,
+            result_text="different operation",
+            idempotency_key="shared-start",
+        )
+
+    events = (
+        await session.scalars(
+            select(CollaborationTaskEvent).where(
+                CollaborationTaskEvent.task_id == task.id
+            )
+        )
+    ).all()
+    assert len(events) == 1
+
+
 async def test_return_to_work_and_cancel(
     session,
     task_factory,
@@ -468,6 +517,76 @@ async def test_complete_requires_required_deliverable(
             text_result={"result": "已完成"},
             created_by=leader.username,
             basis_text="manual result",
+        )
+    )
+    await session.flush()
+
+    completed = await CollaborationTaskService().complete(
+        session,
+        task.id,
+        leader,
+        task.row_version,
+    )
+    assert completed.status == TaskStatus.COMPLETED
+
+
+async def test_complete_ignores_historical_text_result(
+    session,
+    task_factory,
+    group_leader_user,
+):
+    task = await task_factory(status="pending_review")
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="manual.result",
+        title="Required result",
+        is_required=True,
+        requirement_kind=DeliverableRequirementKind.MANUAL_FILE_OR_TEXT,
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+    leader = await group_leader_user()
+    await _make_leader_authority(session, await _task_event(session, task.id), leader)
+
+    old_version = TaskDeliverableVersion(
+        deliverable_id=deliverable.id,
+        version_no=1,
+        source_kind=DeliverableSourceKind.MANUAL,
+        text_result={"result": "old result"},
+        created_by=leader.username,
+        basis_text="old",
+    )
+    current_version = TaskDeliverableVersion(
+        deliverable_id=deliverable.id,
+        version_no=2,
+        source_kind=DeliverableSourceKind.MANUAL,
+        storage_key="manual/current.txt",
+        file_name="current.txt",
+        checksum="checksum",
+        mime_type="text/plain",
+        size_bytes=1,
+        created_by=leader.username,
+        basis_text="current file",
+    )
+    session.add_all([old_version, current_version])
+    await session.flush()
+
+    with pytest.raises(MissingRequiredDeliverableError):
+        await CollaborationTaskService().complete(
+            session,
+            task.id,
+            leader,
+            task.row_version,
+        )
+
+    session.add(
+        TaskDeliverablePublication(
+            deliverable_id=deliverable.id,
+            version_id=current_version.id,
+            published_by=leader.username,
+            published_role="leader",
+            published_at=datetime.now(UTC),
         )
     )
     await session.flush()

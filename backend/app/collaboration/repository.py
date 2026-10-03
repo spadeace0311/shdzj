@@ -175,14 +175,17 @@ class CollaborationRepository:
             )
             if published is not None:
                 continue
-            text_result = await session.scalar(
-                select(TaskDeliverableVersion.id)
+            latest_version = await session.scalar(
+                select(TaskDeliverableVersion)
                 .where(
                     TaskDeliverableVersion.deliverable_id == deliverable_id,
-                    TaskDeliverableVersion.text_result.is_not(None),
                 )
+                .order_by(TaskDeliverableVersion.version_no.desc())
                 .limit(1)
             )
-            if text_result is None:
+            if (
+                latest_version is None
+                or latest_version.text_result is None
+            ):
                 return False
         return True

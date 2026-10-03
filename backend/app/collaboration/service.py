@@ -76,6 +76,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_started",
         )
         if already_applied:
             return task
@@ -98,6 +99,7 @@ class CollaborationTaskService:
             task,
             event_type="task_started",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=TaskStatus.PENDING.value,
             to_status=TaskStatus.IN_PROGRESS.value,
             payload={},
@@ -123,6 +125,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_submitted",
         )
         if already_applied:
             return task
@@ -145,6 +148,7 @@ class CollaborationTaskService:
             task,
             event_type="task_submitted",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=TaskStatus.IN_PROGRESS.value,
             to_status=TaskStatus.PENDING_REVIEW.value,
             payload={"result_text": result_text},
@@ -170,6 +174,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_returned",
         )
         if already_applied:
             return task
@@ -186,6 +191,7 @@ class CollaborationTaskService:
             task,
             event_type="task_returned",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=TaskStatus.PENDING_REVIEW.value,
             to_status=TaskStatus.IN_PROGRESS.value,
             payload={"reason": reason},
@@ -210,6 +216,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_completed",
         )
         if already_applied:
             return task
@@ -233,6 +240,7 @@ class CollaborationTaskService:
             task,
             event_type="task_completed",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=TaskStatus.PENDING_REVIEW.value,
             to_status=TaskStatus.COMPLETED.value,
             payload={},
@@ -258,6 +266,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_cancelled",
         )
         if already_applied:
             return task
@@ -276,6 +285,7 @@ class CollaborationTaskService:
             task,
             event_type="task_cancelled",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=previous_status,
             to_status=TaskStatus.NOT_REQUIRED.value,
             payload={"reason": reason},
@@ -304,6 +314,7 @@ class CollaborationTaskService:
             actor,
             expected_version,
             idempotency_key=idempotency_key,
+            event_type="task_updated",
         )
         if already_applied:
             return task
@@ -336,6 +347,7 @@ class CollaborationTaskService:
             task,
             event_type="task_updated",
             actor=actor_identity.username,
+            actor_id=actor_identity.user_id,
             from_status=task.status,
             to_status=task.status,
             payload={"changes": changes},
@@ -353,36 +365,54 @@ class CollaborationTaskService:
         expected_version: int,
         *,
         idempotency_key: str | None,
+        event_type: str,
     ) -> tuple[WorkgroupTask, _Actor, bool]:
-        if idempotency_key is not None:
-            previous = await self.repository.get_event_by_idempotency_key(
-                session, task_id, idempotency_key
-            )
-            if previous is not None:
-                task = await self.repository.get_task(
-                    session, task_id, for_update=True
-                )
-                if task is None:
-                    raise LookupError("task_not_found")
-                return task, _Actor(
-                    user_id=uuid.UUID(int=0),
-                    username="",
-                    role="",
-                    workgroup=None,
-                ), True
-
         task = await self.repository.get_task(
             session, task_id, for_update=True
         )
         if task is None:
             raise LookupError("task_not_found")
         actor_identity = await self._resolve_actor(session, actor)
+
+        if idempotency_key is not None:
+            previous = await self.repository.get_event_by_idempotency_key(
+                session, task_id, idempotency_key
+            )
+            if previous is not None:
+                self._validate_idempotent_replay(
+                    previous,
+                    actor_identity,
+                    event_type,
+                )
+                return task, actor_identity, True
+
         if int(task.row_version) != int(expected_version):
             raise StaleTaskVersion(
                 expected_version=int(expected_version),
                 actual_version=task.row_version,
             )
         return task, actor_identity, False
+
+    @staticmethod
+    def _validate_idempotent_replay(
+        previous: CollaborationTaskEvent,
+        actor: _Actor,
+        event_type: str,
+    ) -> None:
+        if previous.event_type != event_type:
+            raise ValueError(
+                "idempotency key was used for a different operation"
+            )
+        stored_actor_id = previous.payload.get("actor_id")
+        if stored_actor_id is not None:
+            try:
+                if uuid.UUID(str(stored_actor_id)) != actor.user_id:
+                    raise PermissionError("Insufficient permissions")
+            except ValueError as exc:
+                raise PermissionError("Insufficient permissions") from exc
+            return
+        if previous.actor != actor.username:
+            raise PermissionError("Insufficient permissions")
 
     async def _resolve_actor(
         self,
@@ -470,6 +500,7 @@ class CollaborationTaskService:
         *,
         event_type: str,
         actor: str,
+        actor_id: uuid.UUID,
         from_status: str | None,
         to_status: str | None,
         payload: dict[str, Any],
@@ -484,6 +515,7 @@ class CollaborationTaskService:
             **payload,
             "task_code": task.task_code,
             "row_version": task.row_version,
+            "actor_id": str(actor_id),
         }
         session.add(
             CollaborationTaskEvent(
