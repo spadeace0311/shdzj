@@ -246,6 +246,43 @@ class RosterService:
             session, normalized_code
         )
 
+    async def list_task_notification_recipients(
+        self,
+        session: AsyncSession,
+        event_id: uuid.UUID,
+        group_code: str,
+    ) -> tuple[uuid.UUID, ...]:
+        normalized_code = _workgroup_code(group_code)
+        snapshot = await self.repository.get_roster_snapshot(
+            session,
+            event_id,
+            normalized_code,
+        )
+        if snapshot is None:
+            return ()
+
+        memberships = await self.repository.list_active_memberships(
+            session,
+            normalized_code,
+        )
+        recipient_ids: list[uuid.UUID] = []
+        for membership, user in memberships:
+            if not user.is_active:
+                continue
+            if membership.duty_role not in {
+                DutyRole.LEADER.value,
+                DutyRole.DEPUTY.value,
+                DutyRole.MEMBER.value,
+            }:
+                continue
+            if (
+                snapshot_role_for_user(snapshot, user.id)
+                != membership.duty_role
+            ):
+                continue
+            recipient_ids.append(user.id)
+        return tuple(recipient_ids)
+
     async def replace_group_members(
         self,
         session: AsyncSession,
@@ -508,6 +545,8 @@ class RosterService:
                 deputy_order=None,
             )
         for deputy in sorted(roster.deputies, key=_entry_order):
+            if _optional_order(deputy) is None:
+                continue
             user_id = uuid.UUID(str(deputy["user_id"]))
             if attendance.get(user_id) == "present":
                 return ConfirmingAuthority(

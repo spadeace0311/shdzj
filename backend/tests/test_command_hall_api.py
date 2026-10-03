@@ -536,3 +536,49 @@ async def test_projection_stream_emits_change_heartbeat_and_stops_on_disconnect(
     await anext(stream)
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
+
+
+async def test_projection_stream_emits_named_lifecycle_and_alert_events():
+    service = CommandHallService()
+    state = {
+        "version": 1,
+        "lifecycle": "active",
+        "alert_summary": {"total": 0, "critical": 0},
+    }
+    now_value = datetime(2026, 10, 3, 0, 0, tzinfo=UTC)
+
+    async def read_projection():
+        return SimpleNamespace(
+            projection_version=state["version"],
+            event_snapshot={"lifecycle_state": state["lifecycle"]},
+            alert_summary=state["alert_summary"],
+        )
+
+    async def fake_sleep(_seconds):
+        return None
+
+    stream = service.stream_projection(
+        uuid.uuid4(),
+        read_projection=read_projection,
+        poll_seconds=1,
+        heartbeat_seconds=0,
+        sleep=fake_sleep,
+        now=lambda: now_value,
+    )
+
+    assert (await anext(stream)).startswith(": heartbeat")
+
+    state["version"] = 2
+    state["lifecycle"] = "response_ended"
+    state["alert_summary"] = {"total": 1, "warning": 1}
+
+    updated = await anext(stream)
+    lifecycle = await anext(stream)
+    alert = await anext(stream)
+
+    assert "event: projection.updated" in updated
+    assert "event: event.lifecycle.changed" in lifecycle
+    assert '"previous_lifecycle_state":"active"' in lifecycle
+    assert '"lifecycle_state":"response_ended"' in lifecycle
+    assert "event: task.alert.created" in alert
+    assert '"total":1' in alert

@@ -291,6 +291,113 @@ async def _seed_notification_task(
     return task, leader, event
 
 
+async def _seed_scheduler_roster_task(
+    session,
+    *,
+    event: EarthquakeEvent,
+    workgroup_code: str = "monitoring_forecast",
+    status: str = "pending",
+    assigned_offset: timedelta = timedelta(minutes=-1),
+    due_offset: timedelta = timedelta(minutes=10),
+    members: list[tuple[str, DutyRole, int | None, str]],
+    observed_at: datetime,
+) -> dict[str, User]:
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source="scheduler-recipient-test",
+        source_message_id=uuid.uuid4().hex,
+        message_kind=event.event_type,
+        checksum=uuid.uuid4().hex,
+        payload={"event_id": str(event.id)},
+    )
+    session.add(raw)
+    await session.flush()
+    revision = EarthquakeRevision(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        raw_message_id=raw.id,
+        revision_no=1,
+        revision_kind=event.event_type,
+        origin_time=event.origin_time,
+        longitude=event.longitude,
+        latitude=event.latitude,
+        depth_km=event.depth_km,
+        magnitude=event.magnitude,
+        place=event.place,
+        is_current=True,
+        ingested_at=observed_at,
+    )
+    session.add(revision)
+    await session.flush()
+
+    users: dict[str, User] = {}
+    member_inputs: list[MemberInput] = []
+    for label, duty_role, deputy_order, state in members:
+        user = User(
+            id=uuid.uuid4(),
+            username=f"notification-{label}-{uuid.uuid4().hex[:8]}",
+            password_hash="not-used",
+            role=(
+                "group_leader"
+                if duty_role is DutyRole.LEADER
+                else (
+                    "group_deputy"
+                    if duty_role is DutyRole.DEPUTY
+                    else "group_member"
+                )
+            ),
+            workgroup=workgroup_code,
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        users[label] = user
+        member_inputs.append(MemberInput(user.id, duty_role, deputy_order))
+
+    roster = RosterService()
+    await roster.replace_group_members(
+        session,
+        workgroup_code,
+        member_inputs,
+        actor="system",
+    )
+    await roster.snapshot_for_event(session, event.id)
+    for label, _duty_role, _deputy_order, state in members:
+        if state == "unknown":
+            continue
+        await roster.set_attendance(
+            session,
+            event.id,
+            workgroup_code,
+            users[label].id,
+            state,
+            "system",
+        )
+
+    task = WorkgroupTask(
+        event_id=event.id,
+        trigger_revision_id=revision.id,
+        task_code=f"scheduler-recipient-{uuid.uuid4().hex}",
+        source_type="ad_hoc",
+        workgroup_code=workgroup_code,
+        title="Scheduler recipient fixture",
+        instruction="Complete the task.",
+        priority=100,
+        status=status,
+        timeliness_state="on_time",
+        phase_code="within_30m",
+        activated_at=observed_at + assigned_offset,
+        due_at=observed_at + due_offset,
+        row_version=1,
+        created_by="system",
+        created_at=observed_at,
+        updated_at=observed_at,
+    )
+    session.add(task)
+    await session.flush()
+    return users
+
+
 async def _deliveries_for(session, task_id: uuid.UUID) -> list[NotificationDelivery]:
     rows = await session.scalars(
         select(NotificationDelivery).where(
@@ -344,6 +451,101 @@ async def test_assignment_due_soon_and_due_deliveries_are_scheduled_once(
     rows = await _deliveries_for(session, task.id)
     assert {row.intent_type for row in rows} >= {"assigned", "due_soon"}
     assert {row.channel for row in rows} >= {"in_app", "wecom"}
+
+
+async def test_todo_notifications_continue_without_confirmation_authority(
+    session,
+    event_factory,
+):
+    observed_at = datetime(2026, 10, 3, 1, 0, tzinfo=UTC)
+    event = await event_factory()
+    users = await _seed_scheduler_roster_task(
+        session,
+        event=event,
+        members=[("member", DutyRole.MEMBER, None, "present")],
+        observed_at=observed_at,
+    )
+    task = await session.scalar(
+        select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+    )
+    assert task is not None
+
+    result = await DeadlineScheduler(channels=("in_app",)).run_once(
+        session,
+        observed_at=observed_at,
+    )
+
+    assert result.assigned_created == 1
+    assert result.due_soon_created == 1
+    rows = await _deliveries_for(session, task.id)
+    assert {
+        (row.recipient_user_id, row.intent_type)
+        for row in rows
+    } == {
+        (users["member"].id, "assigned"),
+        (users["member"].id, "due_soon"),
+    }
+    assert not any(row.intent_type == "status_changed" for row in rows)
+
+
+async def test_todo_notifications_cover_all_members_and_confirmation_uses_first_deputy(
+    session,
+    event_factory,
+):
+    observed_at = datetime(2026, 10, 3, 1, 0, tzinfo=UTC)
+    event = await event_factory()
+    users = await _seed_scheduler_roster_task(
+        session,
+        event=event,
+        status="pending_review",
+        assigned_offset=timedelta(minutes=-1),
+        due_offset=timedelta(hours=1),
+        members=[
+            ("leader", DutyRole.LEADER, None, "absent"),
+            ("deputy-1", DutyRole.DEPUTY, 1, "present"),
+            ("deputy-2", DutyRole.DEPUTY, 2, "present"),
+            ("member-1", DutyRole.MEMBER, None, "present"),
+            ("member-2", DutyRole.MEMBER, None, "unknown"),
+        ],
+        observed_at=observed_at,
+    )
+    task = await session.scalar(
+        select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+    )
+    assert task is not None
+
+    first = await DeadlineScheduler(channels=("in_app",)).run_once(
+        session,
+        observed_at=observed_at,
+    )
+    second = await DeadlineScheduler(channels=("in_app",)).run_once(
+        session,
+        observed_at=observed_at,
+    )
+
+    rows = await _deliveries_for(session, task.id)
+    todo_recipients = {
+        row.recipient_user_id
+        for row in rows
+        if row.intent_type == "assigned"
+    }
+    confirmation_recipients = {
+        row.recipient_user_id
+        for row in rows
+        if row.intent_type == "status_changed"
+    }
+    assert first.assigned_created == len(todo_recipients) == 5
+    assert confirmation_recipients == {users["deputy-1"].id}
+    assert len(
+        [
+            row
+            for row in rows
+            if row.intent_type == "status_changed"
+            and row.recipient_user_id == users["deputy-1"].id
+        ]
+    ) == 1
+    assert second.assigned_created == 0
+    assert len(rows) == (len(todo_recipients) + 1)
 
 
 async def test_overdue_task_emits_initial_and_thirty_minute_reminders(
@@ -462,8 +664,14 @@ async def test_test_drill_external_channels_are_suppressed_during_active_formal(
     formal = await event_factory(event_type="formal", lifecycle_state="formal_triggered")
     test_event = await event_factory(event_type="test", lifecycle_state="not_applicable")
     drill_event = await event_factory(event_type="drill", lifecycle_state="not_applicable")
-    test_task, _test_leader = await task_factory(event=test_event)
-    drill_task, _drill_leader = await task_factory(event=drill_event)
+    test_task, _test_leader = await task_factory(
+        event=test_event,
+        workgroup_code="news_information",
+    )
+    drill_task, _drill_leader = await task_factory(
+        event=drill_event,
+        workgroup_code="damage_assessment",
+    )
 
     await DeadlineScheduler(
         channels=("in_app", "wecom", "email", "phone")

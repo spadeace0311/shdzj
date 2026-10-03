@@ -27,19 +27,29 @@ from app.artifacts.repository import (
 from app.artifacts.worker import ArtifactActivities
 from app.artifacts.workflow import ArtifactPublicationInput
 from app.collaboration.artifact_link import ArtifactLinkService
+from app.collaboration.domain import WorkgroupCode
+from app.collaboration.generation import CollaborationTaskGenerator
 from app.collaboration.models import (
     CollaborationOutbox,
+    CollaborationTaskEvent,
     CollaborationTaskTemplate,
     CollaborationTaskTemplateVersion,
     TaskDeliverable,
     TaskDeliverableVersion,
     WorkgroupTask,
 )
+from app.collaboration.templates import (
+    ArtifactBinding,
+    TaskTemplateCatalog,
+    TaskTemplateDefinition,
+)
+from app.collaboration.worker import ProjectionOutboxDispatcher
 from app.config import settings
 from app.db import engine
 from app.events.models import (
     EarthquakeEvent,
     EarthquakeRevision,
+    EventLifecycleOutbox,
     RawMessage,
 )
 
@@ -247,6 +257,56 @@ async def _published_artifact(
         )
     )
     assert publication is not None
+    return artifact, publication
+
+
+async def _publish_artifact_in_existing_run(
+    session,
+    *,
+    production_run_id: uuid.UUID,
+    artifact_key: str,
+    output_profile: str,
+) -> tuple[GeneratedArtifact, ArtifactPublication]:
+    repository = ArtifactProductionRepository()
+    task = await session.scalar(
+        select(ProductionTask).where(
+            ProductionTask.production_run_id == production_run_id,
+            ProductionTask.artifact_key == artifact_key,
+            ProductionTask.output_profile == output_profile,
+        )
+    )
+    assert task is not None
+    fingerprint = hashlib.sha256(
+        f"partial-publication:{task.id}:{uuid.uuid4()}".encode()
+    ).hexdigest()
+    await repository.freeze_task_fingerprint(session, task.id, fingerprint)
+    await repository.start_task(
+        session,
+        task.id,
+        f"partial-publication:{task.id}:{fingerprint}",
+    )
+    artifact = await repository.complete_task(
+        session,
+        task.id,
+        ArtifactGenerationResult(
+            file_name=f"{artifact_key}.bin",
+            format="bin",
+            storage_path=f"fixtures/artifact-link/{artifact_key}.bin",
+            checksum=hashlib.sha256(
+                f"partial-artifact:{task.id}:{uuid.uuid4()}".encode()
+            ).hexdigest(),
+            size_bytes=2048,
+            quality=ArtifactQuality(grade="A", needs_review=False),
+            generated_at=datetime.now(UTC),
+        ),
+        "succeeded",
+    )
+    publication = await repository.publish_artifact(
+        session,
+        artifact.id,
+        published_by="artifact-link-test",
+        forced=False,
+    )
     return artifact, publication
 
 
@@ -606,6 +666,389 @@ async def test_repeated_sync_does_not_create_duplicate_version_or_outbox(
     )
     assert version_count == 1
     assert outbox_count == 1
+
+
+async def test_publication_before_task_is_reconciled_by_worker_and_retry_is_idempotent(
+    seeded_artifact_assessment,
+    task_factory,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        artifact, publication = await _published_artifact(
+            session,
+            seeded_artifact_assessment,
+        )
+    async with session_factory() as session:
+        async with session.begin():
+            first = await ArtifactLinkService().sync_run_publications(
+                session,
+                artifact.production_run_id,
+            )
+            assert first.linked_count == 0
+            assert first.pending_reconciliation_count == 1
+            outbox = await session.scalar(
+                select(CollaborationOutbox).where(
+                    CollaborationOutbox.event_id
+                    == seeded_artifact_assessment.event_id
+                )
+            )
+            assert outbox is not None
+            assert outbox.status == "pending"
+            assert outbox.payload["needs_reconcile"] is True
+
+    handler_calls: list[str] = []
+
+    async def handler(session, outbox):
+        del session
+        handler_calls.append(str(outbox.id))
+
+    dispatcher = ProjectionOutboxDispatcher(
+        session_factory,
+        handler=handler,
+    )
+    assert await dispatcher.dispatch_once() == 0
+    assert handler_calls == []
+
+    task_fixture = await task_factory(
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        create_deliverables=True,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            reconciled = (
+                await ArtifactLinkService().reconcile_pending_run_requests(
+                    session,
+                    seeded_artifact_assessment.event_id,
+                )
+            )
+    assert reconciled == 1
+    assert await dispatcher.dispatch_once() == 1
+    assert len(handler_calls) == 1
+
+    async with session_factory() as session:
+        async with session.begin():
+            retry = await ArtifactLinkService().reconcile_pending_run_requests(
+                session,
+                seeded_artifact_assessment.event_id,
+            )
+            assert retry == 0
+    assert await dispatcher.dispatch_once() == 0
+
+    async with session_factory() as session:
+        version_count = await session.scalar(
+            select(func.count())
+            .select_from(TaskDeliverableVersion)
+            .where(
+                TaskDeliverableVersion.deliverable_id
+                == task_fixture.deliverable_id,
+                TaskDeliverableVersion.artifact_publication_id
+                == publication.id,
+            )
+        )
+        publication_count = await session.scalar(
+            select(func.count())
+            .select_from(ArtifactPublication)
+            .where(ArtifactPublication.id == publication.id)
+        )
+        outbox_rows = (
+            await session.scalars(
+                select(CollaborationOutbox).where(
+                    CollaborationOutbox.event_id
+                    == seeded_artifact_assessment.event_id
+                )
+            )
+        ).all()
+    assert version_count == 1
+    assert publication_count == 1
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].idempotency_key is not None
+
+
+async def test_task_generation_reconciles_an_existing_publication(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        artifact, publication = await _published_artifact(
+            session,
+            seeded_artifact_assessment,
+        )
+    async with session_factory() as session:
+        async with session.begin():
+            pending = await ArtifactLinkService().sync_run_publications(
+                session,
+                artifact.production_run_id,
+            )
+            assert pending.pending_reconciliation_count == 1
+
+    suffix = uuid.uuid4().hex
+    template_code = f"generated-artifact-link-{suffix}"
+    catalog = TaskTemplateCatalog(
+        version=f"generated-artifact-link-{suffix}",
+        definitions=(
+            TaskTemplateDefinition(
+                template_code=template_code,
+                workgroup_code=WorkgroupCode.DAMAGE_ASSESSMENT,
+                phase_code="within_30m",
+                title="Generated artifact link",
+                source="artifact-link-test",
+                due_offset_seconds=3600,
+                artifact_bindings=(
+                    ArtifactBinding(
+                        artifact_key="map.epicenter",
+                        output_profile="a3v-professional",
+                    ),
+                ),
+            ),
+        ),
+    )
+    now = datetime.now(UTC)
+    lifecycle_outbox_id: uuid.UUID | None = None
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                outbox = EventLifecycleOutbox(
+                    event_id=seeded_artifact_assessment.event_id,
+                    revision_id=seeded_artifact_assessment.revision_id,
+                    trigger_type="collaboration.requested",
+                    trigger_reason="live",
+                    payload={},
+                    status="pending",
+                    attempt_count=0,
+                    available_at=now,
+                    created_at=now,
+                )
+                session.add(outbox)
+                await session.flush()
+                lifecycle_outbox_id = outbox.id
+
+                await CollaborationTaskGenerator(
+                    catalog=catalog
+                ).generate_for_revision(
+                    session,
+                    seeded_artifact_assessment.event_id,
+                    seeded_artifact_assessment.revision_id,
+                    outbox.id,
+                )
+
+                task = await session.scalar(
+                    select(WorkgroupTask).where(
+                        WorkgroupTask.event_id
+                        == seeded_artifact_assessment.event_id,
+                        WorkgroupTask.task_code == template_code,
+                    )
+                )
+                assert task is not None
+                deliverable = await session.scalar(
+                    select(TaskDeliverable).where(
+                        TaskDeliverable.task_id == task.id,
+                        TaskDeliverable.deliverable_code == "map.epicenter",
+                    )
+                )
+                assert deliverable is not None
+                version = await session.scalar(
+                    select(TaskDeliverableVersion).where(
+                        TaskDeliverableVersion.deliverable_id == deliverable.id,
+                        TaskDeliverableVersion.artifact_publication_id
+                        == publication.id,
+                    )
+                )
+                request = await session.scalar(
+                    select(CollaborationOutbox).where(
+                        CollaborationOutbox.event_id
+                        == seeded_artifact_assessment.event_id,
+                        CollaborationOutbox.idempotency_key
+                        == hashlib.sha256(
+                            (
+                                "artifact-link-run:"
+                                f"{artifact.production_run_id}"
+                            ).encode()
+                        ).hexdigest(),
+                    )
+                )
+                assert version is not None
+                assert request is not None
+                assert request.event_type == "artifact_linked"
+                assert request.payload["needs_reconcile"] is False
+    finally:
+        async with session_factory() as session:
+            async with session.begin():
+                task_ids = list(
+                    await session.scalars(
+                        select(WorkgroupTask.id).where(
+                            WorkgroupTask.event_id
+                            == seeded_artifact_assessment.event_id,
+                            WorkgroupTask.task_code == template_code,
+                        )
+                    )
+                )
+                if task_ids:
+                    deliverable_ids = list(
+                        await session.scalars(
+                            select(TaskDeliverable.id).where(
+                                TaskDeliverable.task_id.in_(task_ids)
+                            )
+                        )
+                    )
+                    if deliverable_ids:
+                        await session.execute(
+                            delete(TaskDeliverableVersion).where(
+                                TaskDeliverableVersion.deliverable_id.in_(
+                                    deliverable_ids
+                                )
+                            )
+                        )
+                    await session.execute(
+                        delete(TaskDeliverable).where(
+                            TaskDeliverable.task_id.in_(task_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(CollaborationTaskEvent).where(
+                            CollaborationTaskEvent.task_id.in_(task_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(WorkgroupTask).where(
+                            WorkgroupTask.id.in_(task_ids)
+                        )
+                    )
+                await session.execute(
+                    delete(CollaborationOutbox).where(
+                        CollaborationOutbox.event_id
+                        == seeded_artifact_assessment.event_id
+                    )
+                )
+                if lifecycle_outbox_id is not None:
+                    await session.execute(
+                        delete(EventLifecycleOutbox).where(
+                            EventLifecycleOutbox.id == lifecycle_outbox_id
+                        )
+                    )
+                await session.execute(
+                    delete(CollaborationTaskTemplateVersion).where(
+                        CollaborationTaskTemplateVersion.template_code
+                        == template_code
+                    )
+                )
+                await session.execute(
+                    delete(CollaborationTaskTemplate).where(
+                        CollaborationTaskTemplate.code == template_code
+                    )
+                )
+
+
+async def test_partial_publication_reuses_run_outbox_and_links_later_artifact(
+    seeded_artifact_assessment,
+    task_factory,
+    session_factory,
+) -> None:
+    first_task = await task_factory(
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        create_deliverables=True,
+    )
+    second_task = await task_factory(
+        artifact_key="doc.rapid_report",
+        output_profile="a3v-professional",
+        create_deliverables=True,
+    )
+    first_artifact = await seeded_artifact_assessment.published_artifact(
+        "map.epicenter",
+        version=1,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            first = await ArtifactLinkService().sync_run_publications(
+                session,
+                first_artifact.production_run_id,
+            )
+            assert first.linked_count == 1
+            outbox = await session.scalar(
+                select(CollaborationOutbox).where(
+                    CollaborationOutbox.event_id
+                    == seeded_artifact_assessment.event_id
+                )
+            )
+            assert outbox is not None
+            first_key = outbox.idempotency_key
+
+    async with session_factory() as session:
+        async with session.begin():
+            _second_artifact, second_publication = (
+                await _publish_artifact_in_existing_run(
+                    session,
+                    production_run_id=first_artifact.production_run_id,
+                    artifact_key="doc.rapid_report",
+                    output_profile="a3v-professional",
+                )
+            )
+            second = await ArtifactLinkService().sync_run_publications(
+                session,
+                first_artifact.production_run_id,
+            )
+            assert second.linked_count == 1
+            assert second.pending_reconciliation_count == 0
+
+    async with session_factory() as session:
+        async with session.begin():
+            third = await ArtifactLinkService().sync_run_publications(
+                session,
+                first_artifact.production_run_id,
+            )
+            assert third.linked_count == 0
+            outbox_rows = (
+                await session.scalars(
+                    select(CollaborationOutbox).where(
+                        CollaborationOutbox.event_id
+                        == seeded_artifact_assessment.event_id
+                    )
+                )
+            ).all()
+            versions = (
+                await session.scalars(
+                    select(TaskDeliverableVersion).where(
+                        TaskDeliverableVersion.deliverable_id.in_(
+                            (
+                                first_task.deliverable_id,
+                                second_task.deliverable_id,
+                            )
+                        )
+                    )
+                )
+            ).all()
+            publication_count = await session.scalar(
+                select(func.count())
+                .select_from(ArtifactPublication)
+                .where(
+                    ArtifactPublication.production_run_id
+                    == first_artifact.production_run_id
+                )
+            )
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].idempotency_key == first_key
+    assert len(versions) == 2
+    first_versions = [
+        version
+        for version in versions
+        if version.deliverable_id == first_task.deliverable_id
+    ]
+    second_versions = [
+        version
+        for version in versions
+        if version.deliverable_id == second_task.deliverable_id
+    ]
+    assert len(first_versions) == 1
+    assert len(second_versions) == 1
+    assert {
+        version.artifact_publication_id for version in versions
+    } == {
+        first_versions[0].artifact_publication_id,
+        second_publication.id,
+    }
+    assert publication_count == 2
+    assert second_versions[0].artifact_publication_id == second_publication.id
 
 
 async def test_concurrent_syncs_are_idempotent(

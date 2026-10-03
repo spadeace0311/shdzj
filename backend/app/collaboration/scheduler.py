@@ -64,13 +64,6 @@ class DeadlineScheduler:
             event = await session.get(EarthquakeEvent, task.event_id)
             if event is None:
                 continue
-            recipient = await self._roster_service.resolve_confirming_authority(
-                session,
-                task.event_id,
-                task.workgroup_code,
-            )
-            if recipient is None:
-                continue
 
             timeliness_changed, newly_overdue = self._apply_timeliness(
                 task,
@@ -84,17 +77,61 @@ class DeadlineScheduler:
 
             allowed_channels = self._allowed_channels(event, active_formal)
             existing = await self._existing_delivery_keys(session, task.id)
-            created_counts = await self._schedule_for_task(
-                session,
-                task,
-                recipient.user_id,
-                observed_at,
-                allowed_channels=allowed_channels,
-                existing=existing,
+            recipients = (
+                await self._roster_service.list_task_notification_recipients(
+                    session,
+                    task.event_id,
+                    task.workgroup_code,
+                )
             )
+            created_counts = {
+                "assigned": 0,
+                "due_soon": 0,
+                "overdue": 0,
+            }
+            created_total = 0
+            for recipient_user_id in recipients:
+                recipient_counts = await self._schedule_for_task(
+                    session,
+                    task,
+                    recipient_user_id,
+                    observed_at,
+                    allowed_channels=allowed_channels,
+                    existing=existing,
+                )
+                for field, value in recipient_counts.items():
+                    created_counts[field] += value
+                created_total += sum(recipient_counts.values())
+
+            if task.status == "pending_review":
+                authority = (
+                    await self._roster_service.resolve_confirming_authority(
+                        session,
+                        task.event_id,
+                        task.workgroup_code,
+                    )
+                )
+                if (
+                    authority is not None
+                    and authority.user_id in recipients
+                ):
+                    created_total += await self._ensure_deliveries(
+                        session,
+                        task,
+                        authority.user_id,
+                        intent_type="status_changed",
+                        dedupe_key=(
+                            "confirmation:pending_review:"
+                            f"{task.row_version}"
+                        ),
+                        observed_at=observed_at,
+                        allowed_channels=allowed_channels,
+                        existing=existing,
+                    )
+
             for field, value in created_counts.items():
                 counts[field] += value
-            if timeliness_changed or any(created_counts.values()):
+            if timeliness_changed or created_total:
                 affected_event_ids.add(task.event_id)
 
         return SchedulerResult(

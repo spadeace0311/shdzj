@@ -170,6 +170,7 @@ class ProjectionOutboxDispatcher:
                             CollaborationOutbox.status.in_(
                                 ("pending", "processing", "dead_letter")
                             ),
+                            _projection_ready(),
                             CollaborationOutbox.created_at < cutoff,
                             CollaborationOutbox.created_at
                             > CommandHallEventProjection.updated_at,
@@ -246,6 +247,7 @@ class ProjectionOutboxDispatcher:
                             CollaborationOutbox.status.in_(
                                 ("pending", "processing")
                             ),
+                            _projection_ready(),
                             CollaborationOutbox.available_at <= now,
                         )
                         .order_by(
@@ -507,6 +509,14 @@ def _as_utc(value: datetime) -> datetime:
 
 def _safe_error_text(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:2_000]
+
+
+def _projection_ready():
+    return (
+        CollaborationOutbox.payload["needs_reconcile"]
+        .as_boolean()
+        .is_not(True)
+    )
 
 
 if __name__ == "__main__":

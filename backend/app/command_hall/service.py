@@ -32,8 +32,10 @@ from app.command_hall.schemas import (
     ActiveEventResponse,
     EventOverview,
     GroupDetail,
+    LifecycleChangedPayload,
     ProjectionTaskCounts,
     ProjectionUpdatedPayload,
+    TaskAlertCreatedPayload,
     TaskDetail,
 )
 
@@ -467,6 +469,8 @@ class CommandHallService:
     ) -> AsyncIterator[str]:
         event_uuid = _coerce_uuid(event_id, "event_id")
         last_version: int | None = None
+        last_lifecycle_state: str | None = None
+        last_alert_count = 0
         last_heartbeat = now()
         while True:
             if is_disconnected is not None and await is_disconnected():
@@ -476,13 +480,48 @@ class CommandHallService:
                 return
             if last_version is None:
                 last_version = projection.projection_version
+                last_lifecycle_state = _lifecycle_state(projection)
+                last_alert_count = _alert_count(projection)
             elif projection.projection_version != last_version:
+                lifecycle_state = _lifecycle_state(projection)
+                alert_count = _alert_count(projection)
                 payload = ProjectionUpdatedPayload(
                     event_id=event_uuid,
                     projection_version=projection.projection_version,
                 ).model_dump_json()
                 yield f"event: projection.updated\ndata: {payload}\n\n"
+
+                if lifecycle_state != last_lifecycle_state:
+                    lifecycle_payload = LifecycleChangedPayload(
+                        event_id=event_uuid,
+                        projection_version=projection.projection_version,
+                        previous_lifecycle_state=last_lifecycle_state,
+                        lifecycle_state=lifecycle_state,
+                    ).model_dump_json()
+                    yield (
+                        "event: event.lifecycle.changed\n"
+                        f"data: {lifecycle_payload}\n\n"
+                    )
+
+                if alert_count > last_alert_count:
+                    alert_payload = TaskAlertCreatedPayload(
+                        event_id=event_uuid,
+                        projection_version=projection.projection_version,
+                        alert_summary=getattr(
+                            projection,
+                            "alert_summary",
+                            {},
+                        )
+                        or {},
+                    ).model_dump_json()
+                    yield (
+                        "event: task.alert.created\n"
+                        f"data: {alert_payload}\n\n"
+                    )
+
                 last_version = projection.projection_version
+                last_lifecycle_state = lifecycle_state
+                last_alert_count = alert_count
 
             current_time = now()
             if (
@@ -704,3 +743,21 @@ def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:
         return uuid.UUID(str(value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a UUID") from exc
+
+
+def _lifecycle_state(projection: object) -> str | None:
+    event_snapshot = getattr(projection, "event_snapshot", None)
+    if not isinstance(event_snapshot, dict):
+        return None
+    value = event_snapshot.get("lifecycle_state")
+    return str(value) if value is not None else None
+
+
+def _alert_count(projection: object) -> int:
+    alert_summary = getattr(projection, "alert_summary", None)
+    if not isinstance(alert_summary, dict):
+        return 0
+    try:
+        return max(0, int(alert_summary.get("total", 0)))
+    except (TypeError, ValueError):
+        return 0

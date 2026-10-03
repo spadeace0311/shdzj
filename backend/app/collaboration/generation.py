@@ -295,6 +295,12 @@ class CollaborationTaskGenerator:
             revision_id=revision.id,
             observed_at=observed_at,
         )
+        from app.collaboration.artifact_link import ArtifactLinkService
+
+        await ArtifactLinkService().reconcile_pending_run_requests(
+            session,
+            event.id,
+        )
 
         return GenerationResult(
             event_id=event.id,

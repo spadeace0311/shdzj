@@ -806,6 +806,60 @@ async def test_task_route_maps_permission_error_to_403(
     assert response.status_code == 403
 
 
+async def test_task_detail_etag_and_quoted_if_match(
+    session,
+    task_factory,
+    group_member_user,
+):
+    task = await task_factory(workgroup_code="monitoring_forecast")
+    initial_version = task.row_version
+    member = await group_member_user()
+    await _make_member_roster(
+        session,
+        await _task_event(session, task.id),
+        member,
+    )
+    client = await _client(
+        session,
+        AuthUser(member.username, member.role, member.workgroup),
+    )
+    try:
+        detail = await client.get(
+            f"/api/v1/collaboration/tasks/{task.id}"
+        )
+        assert detail.status_code == 200
+        assert detail.headers["etag"] == f'"{initial_version}"'
+
+        malformed = await client.post(
+            f"/api/v1/collaboration/tasks/{task.id}/start",
+            headers={"If-Match": "not-a-version"},
+        )
+        assert malformed.status_code == 422
+
+        stale = await client.post(
+            f"/api/v1/collaboration/tasks/{task.id}/start",
+            headers={
+                "If-Match": f'"{initial_version + 1}"',
+                "Idempotency-Key": "quoted-stale-start",
+            },
+        )
+        assert stale.status_code == 409
+
+        started = await client.post(
+            f"/api/v1/collaboration/tasks/{task.id}/start",
+            headers={
+                "If-Match": f'"{initial_version}"',
+                "Idempotency-Key": "quoted-start",
+            },
+        )
+        assert started.status_code == 200
+        assert started.json()["row_version"] == initial_version + 1
+    finally:
+        await client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+
 async def test_list_and_detail_task_routes(
     session,
     event_factory,
@@ -842,6 +896,7 @@ async def test_list_and_detail_task_routes(
     assert detail.status_code == 200
     assert detail.json()["id"] == str(first.id)
     assert detail.json()["row_version"] == 1
+    assert detail.headers["etag"] == '"1"'
 
 
 async def test_task_reads_are_scoped_to_effective_workgroup(

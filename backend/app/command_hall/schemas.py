@@ -65,3 +65,16 @@ class TaskDetail(BaseModel):
 class ProjectionUpdatedPayload(BaseModel):
     event_id: UUID
     projection_version: int
+
+
+class LifecycleChangedPayload(BaseModel):
+    event_id: UUID
+    projection_version: int
+    previous_lifecycle_state: str | None
+    lifecycle_state: str | None
+
+
+class TaskAlertCreatedPayload(BaseModel):
+    event_id: UUID
+    projection_version: int
+    alert_summary: dict[str, Any]

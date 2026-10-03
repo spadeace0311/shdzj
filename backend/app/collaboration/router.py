@@ -349,6 +349,7 @@ async def create_temporary_collaboration_task(
 )
 async def get_collaboration_task(
     task_id: UUID,
+    response: Response,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
     current_user: AuthUser = Depends(get_current_user),
@@ -371,7 +372,9 @@ async def get_collaboration_task(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
-    return await _task_response(session, service, task, current_user)
+    result = await _task_response(session, service, task, current_user)
+    response.headers["ETag"] = f'"{task.row_version}"'
+    return result
 
 
 @router.post(
@@ -1203,11 +1206,19 @@ def _deliverable_publication_response(
 
 def _parse_if_match(if_match: str) -> int:
     try:
-        return int(if_match.strip())
+        value = if_match.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        if not value or not value.isascii() or not value.isdigit():
+            raise ValueError
+        version = int(value)
+        if version < 1:
+            raise ValueError
+        return version
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=422,
-            detail="If-Match must be an integer",
+            detail="If-Match must be a positive integer or quoted row version",
         ) from exc
 
 

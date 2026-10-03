@@ -24,6 +24,7 @@ class ArtifactLinkResult:
     linked_count: int = 0
     created_deliverable_count: int = 0
     outbox_count: int = 0
+    pending_reconciliation_count: int = 0
 
     @property
     def changed(self) -> bool:
@@ -56,6 +57,9 @@ class ArtifactLinkService:
             return ArtifactLinkResult()
 
         event_ids = {publication.event_id for publication, _ in publication_rows}
+        if len(event_ids) != 1:
+            raise ValueError("production run publications span multiple events")
+        event_id = next(iter(event_ids))
         task_rows = (
             await session.execute(
                 select(WorkgroupTask, CollaborationTaskTemplateVersion)
@@ -68,6 +72,16 @@ class ArtifactLinkService:
                 .order_by(WorkgroupTask.created_at, WorkgroupTask.id)
             )
         ).all()
+        if not task_rows:
+            pending_count = await self._mark_reconciliation_pending(
+                session,
+                run_id=run_id,
+                event_id=event_id,
+            )
+            return ArtifactLinkResult(
+                pending_reconciliation_count=pending_count,
+            )
+
         task_ids = [task.id for task, _ in task_rows]
         existing_deliverables = (
             await session.scalars(
@@ -231,38 +245,173 @@ class ArtifactLinkService:
         if created_versions:
             await session.flush()
 
-        outbox_count = 0
-        if changed_event_ids:
-            now = datetime.now(UTC)
-            for event_id in sorted(changed_event_ids, key=str):
-                session.add(
-                    CollaborationOutbox(
-                        event_id=event_id,
-                        task_id=None,
-                        event_type="artifact_linked",
-                        idempotency_key=_outbox_key(event_id, run_id),
-                        payload={
-                            "event_id": str(event_id),
-                            "production_run_id": str(run_id),
-                            "linked_count": linked_count,
-                            "created_deliverable_count": (
-                                created_deliverable_count
-                            ),
-                        },
-                        status="pending",
-                        attempt_count=0,
-                        available_at=now,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                outbox_count += 1
+        outbox_count = await self._mark_reconciliation_complete(
+            session,
+            run_id=run_id,
+            event_id=event_id,
+            linked_count=linked_count,
+            created_deliverable_count=created_deliverable_count,
+            changed=bool(changed_event_ids),
+        )
 
         return ArtifactLinkResult(
             linked_count=linked_count,
             created_deliverable_count=created_deliverable_count,
             outbox_count=outbox_count,
         )
+
+    async def reconcile_pending_run_requests(
+        self,
+        session: AsyncSession,
+        event_id: object,
+        *,
+        limit: int = 50,
+    ) -> int:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        event_uuid = _coerce_uuid(event_id, "event_id")
+        requests = (
+            await session.scalars(
+                select(CollaborationOutbox)
+                .where(
+                    CollaborationOutbox.event_id == event_uuid,
+                    CollaborationOutbox.event_type == "artifact_reconcile",
+                    CollaborationOutbox.status == "pending",
+                )
+                .order_by(
+                    CollaborationOutbox.created_at,
+                    CollaborationOutbox.id,
+                )
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+
+        reconciled_count = 0
+        for request in requests:
+            production_run_id = _payload_uuid(
+                request.payload,
+                "production_run_id",
+            )
+            await self.sync_run_publications(session, production_run_id)
+            if not _needs_reconciliation(request):
+                reconciled_count += 1
+        return reconciled_count
+
+    async def _mark_reconciliation_pending(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: uuid.UUID,
+        event_id: uuid.UUID,
+    ) -> int:
+        now = datetime.now(UTC)
+        outbox = await session.scalar(
+            select(CollaborationOutbox)
+            .where(
+                CollaborationOutbox.idempotency_key
+                == _run_outbox_key(run_id)
+            )
+            .with_for_update()
+        )
+        payload = {
+            "event_id": str(event_id),
+            "production_run_id": str(run_id),
+            "linked_count": 0,
+            "created_deliverable_count": 0,
+            "needs_reconcile": True,
+        }
+        if outbox is None:
+            session.add(
+                CollaborationOutbox(
+                    event_id=event_id,
+                    task_id=None,
+                    event_type="artifact_reconcile",
+                    idempotency_key=_run_outbox_key(run_id),
+                    payload=payload,
+                    status="pending",
+                    attempt_count=0,
+                    available_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            return 1
+
+        outbox.event_id = event_id
+        outbox.event_type = "artifact_reconcile"
+        outbox.payload = payload
+        outbox.status = "pending"
+        outbox.attempt_count = 0
+        outbox.available_at = now
+        outbox.lease_expires_at = None
+        outbox.dispatched_at = None
+        outbox.last_error = None
+        outbox.updated_at = now
+        return 1
+
+    async def _mark_reconciliation_complete(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: uuid.UUID,
+        event_id: uuid.UUID,
+        linked_count: int,
+        created_deliverable_count: int,
+        changed: bool,
+    ) -> int:
+        outbox = await session.scalar(
+            select(CollaborationOutbox)
+            .where(
+                CollaborationOutbox.idempotency_key
+                == _run_outbox_key(run_id)
+            )
+            .with_for_update()
+        )
+        if outbox is None and not changed:
+            return 0
+
+        now = datetime.now(UTC)
+        payload = {
+            "event_id": str(event_id),
+            "production_run_id": str(run_id),
+            "linked_count": linked_count,
+            "created_deliverable_count": created_deliverable_count,
+            "needs_reconcile": False,
+        }
+        if outbox is None:
+            session.add(
+                CollaborationOutbox(
+                    event_id=event_id,
+                    task_id=None,
+                    event_type="artifact_linked",
+                    idempotency_key=_run_outbox_key(run_id),
+                    payload=payload,
+                    status="pending",
+                    attempt_count=0,
+                    available_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            return 1
+
+        if not changed and not _needs_reconciliation(outbox):
+            return 0
+
+        outbox.event_id = event_id
+        outbox.event_type = "artifact_linked"
+        outbox.payload = payload
+        outbox.status = "pending"
+        outbox.attempt_count = 0
+        outbox.available_at = now
+        outbox.lease_expires_at = None
+        outbox.dispatched_at = None
+        outbox.last_error = None
+        outbox.updated_at = now
+        return 1
 
 
 def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:
@@ -307,10 +456,23 @@ def _next_display_order(
     return max(values, default=-1) + 1
 
 
-def _outbox_key(event_id: uuid.UUID, production_run_id: uuid.UUID) -> str:
-    material = f"artifact-link:{event_id}:{production_run_id}"
+def _run_outbox_key(production_run_id: uuid.UUID) -> str:
+    material = f"artifact-link-run:{production_run_id}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _advisory_lock_key(production_run_id: uuid.UUID) -> str:
     return f"artifact-link:{production_run_id}"
+
+
+def _payload_uuid(payload: object, field_name: str) -> uuid.UUID:
+    if not isinstance(payload, dict):
+        raise ValueError("artifact reconciliation payload must be an object")
+    return _coerce_uuid(payload.get(field_name), field_name)
+
+
+def _needs_reconciliation(outbox: CollaborationOutbox) -> bool:
+    return (
+        isinstance(outbox.payload, dict)
+        and outbox.payload.get("needs_reconcile") is True
+    )

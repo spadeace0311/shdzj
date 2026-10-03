@@ -16,7 +16,8 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0022_cleanup_namespace"
+LATEST_REVISION = "0023_workgroup_backfill"
+PREVIOUS_REVISION = "0022_cleanup_namespace"
 CLEANUP_INTENT_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
@@ -1571,6 +1572,320 @@ async def test_0018_collaboration_command_hall_is_reversible() -> None:
         assert await _collaboration_tables_exist() is True
     finally:
         _set_revision(LATEST_REVISION)
+
+
+async def _insert_legacy_workgroup_users() -> dict[str, uuid.UUID]:
+    user_ids = {
+        "member": uuid.uuid4(),
+        "leader": uuid.uuid4(),
+        "deputy": uuid.uuid4(),
+        "outsider": uuid.uuid4(),
+    }
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM users WHERE username LIKE 'migration-workgroup-%'")
+            )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO users (
+                        id, username, password_hash, role, workgroup, is_active
+                    )
+                    VALUES
+                        (
+                            :member_id,
+                            'migration-workgroup-member',
+                            'not-used',
+                            'group_member',
+                            '监测预报组',
+                            true
+                        ),
+                        (
+                            :leader_id,
+                            'migration-workgroup-leader',
+                            'not-used',
+                            'group_leader',
+                            '监测预报组',
+                            true
+                        ),
+                        (
+                            :deputy_id,
+                            'migration-workgroup-deputy',
+                            'not-used',
+                            'group_deputy',
+                            '监测预报组',
+                            true
+                        ),
+                        (
+                            :outsider_id,
+                            'migration-workgroup-outsider',
+                            'not-used',
+                            'group_member',
+                            NULL,
+                            true
+                        )
+                    """
+                ),
+                {
+                    "member_id": user_ids["member"],
+                    "leader_id": user_ids["leader"],
+                    "deputy_id": user_ids["deputy"],
+                    "outsider_id": user_ids["outsider"],
+                },
+            )
+    finally:
+        await engine.dispose()
+    return user_ids
+
+
+async def _legacy_workgroup_membership_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                            u.username,
+                            m.workgroup_code,
+                            m.duty_role,
+                            m.deputy_order,
+                            m.is_active,
+                            m.effective_to
+                        FROM users u
+                        LEFT JOIN workgroup_memberships m
+                          ON m.user_id = u.id
+                         AND m.is_active
+                         AND m.effective_to IS NULL
+                        WHERE u.username LIKE 'migration-workgroup-%'
+                        ORDER BY u.username
+                        """
+                    )
+                )
+            ).mappings().all()
+            checks = await connection.run_sync(
+                lambda sync: {
+                    item["name"]
+                    for item in inspect(sync).get_check_constraints(
+                        "workgroup_memberships"
+                    )
+                }
+            )
+            attendance_checks = await connection.run_sync(
+                lambda sync: {
+                    item["name"]
+                    for item in inspect(sync).get_check_constraints(
+                        "workgroup_attendance"
+                    )
+                }
+            )
+        return {
+            "rows": {row["username"]: dict(row) for row in rows},
+            "membership_checks": checks,
+            "attendance_checks": attendance_checks,
+        }
+    finally:
+        await engine.dispose()
+
+
+async def _delete_legacy_workgroup_users() -> None:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM users WHERE username LIKE 'migration-workgroup-%'")
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> None:
+    import httpx
+    from geoalchemy2.elements import WKTElement
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlalchemy.pool import NullPool
+
+    from app.auth.router import get_current_user
+    from app.auth.service import AuthUser
+    from app.collaboration.models import WorkgroupTask
+    from app.collaboration.roster import RosterService
+    from app.collaboration.router import get_roster_session
+    from app.events.models import (
+        EarthquakeEvent,
+        EarthquakeRevision,
+        RawMessage,
+    )
+    from app.main import app
+
+    _set_revision(PREVIOUS_REVISION)
+    user_ids = await _insert_legacy_workgroup_users()
+    try:
+        _set_revision(LATEST_REVISION)
+        state = await _legacy_workgroup_membership_state()
+        rows = state["rows"]
+        assert rows["migration-workgroup-member"]["workgroup_code"] == (
+            "monitoring_forecast"
+        )
+        assert rows["migration-workgroup-member"]["duty_role"] == "member"
+        assert rows["migration-workgroup-leader"]["duty_role"] == "leader"
+        assert rows["migration-workgroup-deputy"]["duty_role"] == "deputy"
+        assert rows["migration-workgroup-deputy"]["deputy_order"] is None
+        assert (
+            "ck_workgroup_membership_deputy_order_required"
+            not in state["membership_checks"]
+        )
+        assert (
+            "ck_workgroup_attendance_deputy_order_required"
+            not in state["attendance_checks"]
+        )
+
+        engine = create_async_engine(settings.database_url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    event = EarthquakeEvent(
+                        id=uuid.uuid4(),
+                        source="workgroup-migration-test",
+                        canonical_source_id=f"workgroup-{uuid.uuid4()}",
+                        event_type="formal",
+                        origin_time=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+                        longitude=121.5,
+                        latitude=31.2,
+                        depth_km=10,
+                        magnitude=5.2,
+                        place="workgroup migration test",
+                        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                        lifecycle_state="active",
+                    )
+                    session.add(event)
+                    await session.flush()
+                    raw = RawMessage(
+                        id=uuid.uuid4(),
+                        source="workgroup-migration-test",
+                        source_message_id=uuid.uuid4().hex,
+                        message_kind="formal",
+                        checksum=uuid.uuid4().hex,
+                        payload={},
+                    )
+                    session.add(raw)
+                    await session.flush()
+                    revision = EarthquakeRevision(
+                        id=uuid.uuid4(),
+                        event_id=event.id,
+                        raw_message_id=raw.id,
+                        revision_no=1,
+                        revision_kind="formal",
+                        origin_time=event.origin_time,
+                        longitude=event.longitude,
+                        latitude=event.latitude,
+                        depth_km=event.depth_km,
+                        magnitude=event.magnitude,
+                        place=event.place,
+                        is_current=True,
+                        ingested_at=datetime(2026, 10, 3, 1, 1, tzinfo=UTC),
+                    )
+                    session.add(revision)
+                    await session.flush()
+                    task = WorkgroupTask(
+                        event_id=event.id,
+                        trigger_revision_id=revision.id,
+                        task_code=f"workgroup-migration-{uuid.uuid4().hex}",
+                        source_type="ad_hoc",
+                        workgroup_code="monitoring_forecast",
+                        title="Migration access task",
+                        instruction="",
+                        priority=100,
+                        status="pending",
+                        timeliness_state="on_time",
+                        activated_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+                        due_at=datetime(2026, 10, 3, 2, 0, tzinfo=UTC),
+                        row_version=1,
+                        created_by="system",
+                        created_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+                        updated_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+                    )
+                    session.add(task)
+                    await session.flush()
+                    roster = RosterService()
+                    await roster.snapshot_for_event(session, event.id)
+                    await roster.set_attendance(
+                        session,
+                        event.id,
+                        "monitoring_forecast",
+                        user_ids["deputy"],
+                        "present",
+                        "migration-test",
+                    )
+                    assert (
+                        await roster.resolve_confirming_authority(
+                            session,
+                            event.id,
+                            "monitoring_forecast",
+                        )
+                        is None
+                    )
+
+                    async def override_session():
+                        yield session
+
+                    app.dependency_overrides[get_roster_session] = override_session
+                    transport = httpx.ASGITransport(app=app)
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url="http://test",
+                    ) as client:
+                        for username, role in (
+                            ("migration-workgroup-member", "group_member"),
+                            ("migration-workgroup-leader", "group_leader"),
+                            ("migration-workgroup-deputy", "group_deputy"),
+                        ):
+                            app.dependency_overrides[get_current_user] = (
+                                lambda username=username, role=role: AuthUser(
+                                    username=username,
+                                    role=role,
+                                    workgroup="监测预报组",
+                                )
+                            )
+                            response = await client.get(
+                                f"/api/v1/collaboration/tasks/{task.id}"
+                            )
+                            assert response.status_code == 200
+                            assert response.json()["can_work"] is True
+                        app.dependency_overrides[get_current_user] = lambda: (
+                            AuthUser(
+                                username="migration-workgroup-outsider",
+                                role="group_member",
+                                workgroup=None,
+                            )
+                        )
+                        response = await client.get(
+                            f"/api/v1/collaboration/tasks/{task.id}"
+                        )
+                        assert response.status_code == 403
+                    app.dependency_overrides.pop(get_roster_session, None)
+                    app.dependency_overrides.pop(get_current_user, None)
+        finally:
+            await engine.dispose()
+
+        _set_revision(PREVIOUS_REVISION)
+        downgraded = await _legacy_workgroup_membership_state()
+        assert all(
+            row["workgroup_code"] is None
+            for row in downgraded["rows"].values()
+        )
+        _set_revision(LATEST_REVISION)
+        re_upgraded = await _legacy_workgroup_membership_state()
+        assert (
+            re_upgraded["rows"]["migration-workgroup-deputy"]["deputy_order"]
+            is None
+        )
+    finally:
+        _set_revision(LATEST_REVISION)
+        await _delete_legacy_workgroup_users()
 
 
 async def test_0019_event_purge_receipts_are_reversible() -> None:

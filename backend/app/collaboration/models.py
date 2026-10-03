@@ -70,10 +70,6 @@ class WorkgroupMembership(Base):
     __tablename__ = "workgroup_memberships"
     __table_args__ = (
         CheckConstraint(
-            "duty_role != 'deputy' OR deputy_order IS NOT NULL",
-            name="ck_workgroup_membership_deputy_order_required",
-        ),
-        CheckConstraint(
             "duty_role IN ('leader', 'deputy', 'member', 'viewer')",
             name="ck_workgroup_membership_duty_role",
         ),
@@ -198,11 +194,6 @@ class WorkgroupAttendance(Base):
         CheckConstraint(
             "duty_role_in_snapshot IN ('leader', 'deputy', 'member', 'viewer')",
             name="ck_workgroup_attendance_snapshot_role",
-        ),
-        CheckConstraint(
-            "duty_role_in_snapshot != 'deputy' "
-            "OR deputy_order_in_snapshot IS NOT NULL",
-            name="ck_workgroup_attendance_deputy_order_required",
         ),
     )
 
