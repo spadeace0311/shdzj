@@ -9,6 +9,7 @@ import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ManualEventPage } from "./pages/ManualEventPage";
+import { WorkgroupTasksPage } from "./pages/WorkgroupTasksPage";
 
 interface ConsoleShellProps {
   onLogout: () => void;
@@ -79,6 +80,14 @@ function ConsoleShell({
             >
               成果中心
             </NavLink>
+            <NavLink
+              to="/tasks"
+              className={({ isActive }) =>
+                isActive ? "nav-link nav-link--active" : "nav-link"
+              }
+            >
+              工作组任务
+            </NavLink>
           </nav>
           <div className="sidebar-note">
             <p>当前工作区</p>
@@ -109,6 +118,24 @@ function ConsoleShell({
               path="/artifacts/:eventId"
               element={
                 <ArtifactCenterRoute
+                  userRole={userRole}
+                  workgroup={userWorkgroup}
+                />
+              }
+            />
+            <Route
+              path="/tasks"
+              element={
+                <WorkgroupTasksPage
+                  userRole={userRole}
+                  workgroup={userWorkgroup}
+                />
+              }
+            />
+            <Route
+              path="/tasks/:eventId"
+              element={
+                <WorkgroupTasksPage
                   userRole={userRole}
                   workgroup={userWorkgroup}
                 />
