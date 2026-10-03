@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact, ProductionRun
-from app.event_object_cleanup import ObjectCleanupIntent, ObjectCleanupResult
+from app.event_object_cleanup import (
+    ARTIFACT_RETENTION_CLEANUP_SOURCE,
+    enqueue_object_cleanup_intent,
+)
 from app.event_object_locks import (
     lock_artifact_object,
     lock_event_write,
@@ -26,16 +28,6 @@ class ArtifactRetentionResult:
     failed_deletions: int = 0
     protected_publication_count: int = 0
     protected_publication_reasons: tuple[tuple[str, int], ...] = ()
-    cleanup_intents: tuple[ObjectCleanupIntent, ...] = ()
-
-    def with_cleanup_result(
-        self,
-        cleanup_result: ObjectCleanupResult,
-    ) -> "ArtifactRetentionResult":
-        return replace(
-            self,
-            failed_deletions=len(cleanup_result.failed_paths),
-        )
 
 
 class ArtifactRetentionService:
@@ -122,7 +114,6 @@ class ArtifactRetentionService:
         }
 
         deletable: list[GeneratedArtifact] = []
-        cleanup_owners: dict[str, uuid.UUID] = {}
         for storage_path in sorted(expired_paths):
             path_deletable = [
                 artifact
@@ -134,10 +125,6 @@ class ArtifactRetentionService:
             if not path_deletable:
                 continue
             deletable.extend(path_deletable)
-            cleanup_owners[storage_path] = sorted(
-                {artifact.event_id for artifact in path_deletable},
-                key=str,
-            )[0]
 
         if deletable:
             ids = [artifact.id for artifact in deletable]
@@ -150,10 +137,15 @@ class ArtifactRetentionService:
                 await session.delete(artifact)
             await session.flush()
 
-        cleanup_by_event: dict[uuid.UUID, set[str]] = {}
-        for storage_path, event_id in cleanup_owners.items():
-            if await storage_path_reference_count(session, storage_path) == 0:
-                cleanup_by_event.setdefault(event_id, set()).add(storage_path)
+        for artifact in deletable:
+            if await storage_path_reference_count(session, artifact.storage_path) == 0:
+                await enqueue_object_cleanup_intent(
+                    session,
+                    event_id=artifact.event_id,
+                    source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                    source_key=str(artifact.id),
+                    storage_path=artifact.storage_path,
+                )
 
         return ArtifactRetentionResult(
             test_deleted=sum(1 for artifact in deletable if artifact.production_mode == "test"),
@@ -165,13 +157,6 @@ class ArtifactRetentionService:
             protected_publication_count=len(publication_references),
             protected_publication_reasons=tuple(
                 (reason, count) for reason, count in protection_reasons.items() if count
-            ),
-            cleanup_intents=tuple(
-                ObjectCleanupIntent(event_id, tuple(sorted(paths)))
-                for event_id, paths in sorted(
-                    cleanup_by_event.items(),
-                    key=lambda item: str(item[0]),
-                )
             ),
         )
 

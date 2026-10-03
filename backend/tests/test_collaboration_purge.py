@@ -55,7 +55,11 @@ from app.collaboration.purge import (
     EventPurgeReceipt,
     SuperadminPurgeService,
 )
-from app.collaboration.router import get_artifact_store, get_purge_session
+from app.collaboration.router import (
+    get_artifact_store,
+    get_cleanup_session,
+    get_purge_session,
+)
 from app.collaboration.service import DeliverableService
 from app.config import settings
 from app.data_assets.models import (
@@ -70,6 +74,12 @@ from app.events.models import (
     EarthquakeRevision,
     EventLifecycleOutbox,
     RawMessage,
+)
+from app.event_object_cleanup import (
+    CANDIDATE_DELETE_CLEANUP_SOURCE,
+    CleanupIntentStatus,
+    EventObjectCleanupIntent,
+    process_cleanup_intents,
 )
 from app.main import app
 
@@ -846,6 +856,18 @@ class FailOnceStore(CommitAwareStore):
         super().delete_unreferenced(stored)
 
 
+class FailOnceArtifactStore(ArtifactStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.calls = 0
+
+    def delete_unreferenced(self, stored: StoredArtifactFile) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("simulated candidate cleanup failure")
+        super().delete_unreferenced(stored)
+
+
 async def test_http_purge_deletes_files_only_after_commit(
     purge_fixture,
     session_factory,
@@ -941,6 +963,91 @@ async def test_http_purge_retries_failed_file_cleanup_after_commit(
 
     assert state["committed"] is True
     assert state["deleted"] == [purge_fixture.manual_path]
+
+
+async def test_http_candidate_delete_without_key_recovers_failed_cleanup(
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    fixture = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-http-recovery",
+    )
+    store = FailOnceArtifactStore(tmp_path / "artifacts")
+    service = DeliverableService(artifact_store=store)
+    payload = f"candidate-http-recovery-{uuid.uuid4()}".encode()
+    file_name = f"candidate-http-recovery-{uuid.uuid4()}.txt"
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await service.add_manual_version(
+                session,
+                fixture.deliverable_id,
+                fixture.actor,
+                source=BytesIO(payload),
+                file_name=file_name,
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            path = store.resolve(storage_path)
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_cleanup_session] = override_session
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_current_user] = lambda: fixture.actor
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.delete(
+                f"/api/v1/collaboration/deliverable-versions/{version_id}"
+            )
+            assert response.status_code == 503
+            retry = await client.delete(f"/api/v1/collaboration/deliverable-versions/{version_id}")
+            assert retry.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+    assert path.is_file()
+    async with session_factory() as session:
+        assert await session.get(TaskDeliverableVersion, version_id) is None
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                EventObjectCleanupIntent.source_key == str(version_id),
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.PENDING.value
+    assert intent.attempt_count == 1
+    assert intent.last_error
+
+    recovered = await process_cleanup_intents(
+        session_factory,
+        store,
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(version_id),
+        lease_owner="candidate-http-recovery-worker",
+    )
+    assert recovered.failed_count == 0
+    assert not path.exists()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                EventObjectCleanupIntent.source_key == str(version_id),
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.COMPLETED.value
 
 
 @dataclass(frozen=True, slots=True)

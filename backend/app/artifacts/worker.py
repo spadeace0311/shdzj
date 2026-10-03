@@ -70,7 +70,10 @@ from app.event_object_locks import (
     lock_event_write,
     storage_path_reference_count,
 )
-from app.event_object_cleanup import cleanup_object_intents
+from app.event_object_cleanup import (
+    ARTIFACT_RETENTION_CLEANUP_SOURCE,
+    process_cleanup_intents,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 from sqlalchemy import select
 
@@ -1026,52 +1029,66 @@ async def _run_retention_loop(
     session_factory: object,
     configured: Settings,
 ) -> None:
-    if not configured.artifact_retention_enabled:
-        return
     service = ArtifactRetentionService()
+    artifact_store = ArtifactStore(configured.artifact_storage_root)
+    cleanup_owner = f"artifact-retention:{uuid.uuid4().hex}"
     while True:
-        await asyncio.sleep(configured.artifact_retention_interval_seconds)
-        observed_at = datetime.now(UTC)
         try:
-            async with session_factory() as session:
-                async with session.begin():
-                    result = await service.retain_expired(
-                        session,
-                        observed_at=observed_at,
-                    )
-            if result.cleanup_intents:
-                async with session_factory() as cleanup_session:
-                    async with cleanup_session.begin():
-                        cleanup_result = await cleanup_object_intents(
-                            cleanup_session,
-                            result.cleanup_intents,
-                            ArtifactStore(configured.artifact_storage_root),
-                        )
-                result = result.with_cleanup_result(cleanup_result)
-            payload = {
-                "test": result.test_deleted,
-                "drill": result.drill_deleted,
-                "live": result.live_deleted,
-                "manual": result.manual_deleted,
-                "replay": result.replay_deleted,
-                "failed": result.failed_deletions,
-                "protected_publications": result.protected_publication_count,
-                "protection_reasons": dict(result.protected_publication_reasons),
-            }
-            logger.info(
-                "artifact retention completed counts=%s",
-                json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                extra={
-                    "artifact_retention_counts": payload,
-                },
+            recovered_cleanup = await process_cleanup_intents(
+                session_factory,
+                artifact_store,
+                lease_owner=cleanup_owner,
             )
+            if configured.artifact_retention_enabled:
+                observed_at = datetime.now(UTC)
+                async with session_factory() as session:
+                    async with session.begin():
+                        result = await service.retain_expired(
+                            session,
+                            observed_at=observed_at,
+                        )
+                cleanup_result = await process_cleanup_intents(
+                    session_factory,
+                    artifact_store,
+                    lease_owner=cleanup_owner,
+                    source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                )
+                payload = {
+                    "test": result.test_deleted,
+                    "drill": result.drill_deleted,
+                    "live": result.live_deleted,
+                    "manual": result.manual_deleted,
+                    "replay": result.replay_deleted,
+                    "failed": (
+                        result.failed_deletions
+                        + recovered_cleanup.failed_count
+                        + cleanup_result.failed_count
+                    ),
+                    "protected_publications": result.protected_publication_count,
+                    "protection_reasons": dict(result.protected_publication_reasons),
+                }
+                logger.info(
+                    "artifact retention completed counts=%s",
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    extra={
+                        "artifact_retention_counts": payload,
+                    },
+                )
+            else:
+                logger.info(
+                    "artifact cleanup completed failed=%s",
+                    recovered_cleanup.failed_count,
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("artifact retention failed")
+        await asyncio.sleep(configured.artifact_retention_interval_seconds)
 
 
 async def run_artifact_dispatcher(

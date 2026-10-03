@@ -34,7 +34,11 @@ from app.event_object_locks import (
     lock_event_write,
     storage_path_reference_count,
 )
-from app.event_object_cleanup import ObjectCleanupIntent
+from app.event_object_cleanup import (
+    CANDIDATE_DELETE_CLEANUP_SOURCE,
+    ObjectCleanupIntent,
+    enqueue_object_cleanup_intent,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 
 
@@ -1208,7 +1212,11 @@ class DeliverableService:
                     "deliverable_candidate_deleted",
                     resource_identity={"version_id": version_id},
                 )
-                return await _cleanup_intent_from_event(session, previous)
+                return await _cleanup_intent_from_event(
+                    session,
+                    previous,
+                    fallback_source_key=str(version_id),
+                )
 
         event_id = await _event_id_for_version(session, version_id)
         if event_id is None:
@@ -1224,7 +1232,11 @@ class DeliverableService:
             event_type="deliverable_candidate_deleted",
         )
         if previous is not None:
-            return await _cleanup_intent_from_event(session, previous)
+            return await _cleanup_intent_from_event(
+                session,
+                previous,
+                fallback_source_key=str(version_id),
+            )
         if version.source_kind != DeliverableSourceKind.MANUAL.value:
             raise ValueError("only manual candidate versions can be deleted")
         if await self.repository.publication_for_version(session, version.id) is not None:
@@ -1249,9 +1261,18 @@ class DeliverableService:
                 exclude_deliverable_version_id=version.id,
             )
             if reference_count == 0:
+                await enqueue_object_cleanup_intent(
+                    session,
+                    event_id=event_id,
+                    source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+                    source_key=str(version.id),
+                    storage_path=version.storage_key,
+                )
                 cleanup = ObjectCleanupIntent(
                     event_id,
                     (version.storage_key,),
+                    source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+                    source_key=str(version.id),
                 )
 
         now = datetime.now(UTC)
@@ -1727,6 +1748,8 @@ async def _event_id_for_version(
 async def _cleanup_intent_from_event(
     session: AsyncSession,
     event: CollaborationTaskEvent,
+    *,
+    fallback_source_key: str | None = None,
 ) -> ObjectCleanupIntent | None:
     payload = event.payload if isinstance(event.payload, dict) else {}
     storage_path = payload.get("storage_path")
@@ -1739,9 +1762,23 @@ async def _cleanup_intent_from_event(
         )
     if event_id_value is None:
         return None
+    source_key = payload.get("version_id") or fallback_source_key
+    if not source_key:
+        return None
+    event_id = _coerce_uuid(event_id_value, "event_id")
+    storage_path = str(storage_path)
+    await enqueue_object_cleanup_intent(
+        session,
+        event_id=event_id,
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(source_key),
+        storage_path=storage_path,
+    )
     return ObjectCleanupIntent(
-        _coerce_uuid(event_id_value, "event_id"),
-        (str(storage_path),),
+        event_id,
+        (storage_path,),
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(source_key),
     )
 
 

@@ -16,7 +16,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0020_override_event"
+LATEST_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -59,6 +59,9 @@ COLLABORATION_TABLES = {
     "command_hall_group_projections",
     "command_hall_alert_projections",
     "event_purge_receipts",
+}
+CLEANUP_TABLES = {
+    "event_object_cleanup_intents",
 }
 LOSS_TABLES = {
     "loss_model_definitions",
@@ -467,6 +470,16 @@ async def _collaboration_tables_exist() -> bool:
     finally:
         await engine.dispose()
     return COLLABORATION_TABLES <= names
+
+
+async def _cleanup_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
+    finally:
+        await engine.dispose()
+    return CLEANUP_TABLES <= names
 
 
 async def _event_purge_receipt_schema_state() -> dict[str, object]:
@@ -1620,3 +1633,91 @@ async def test_0020_artifact_override_event_identity_backfill_and_fk() -> None:
     finally:
         _set_revision(LATEST_REVISION)
         await _delete_artifact_override_backfill_rows(event_id)
+
+
+async def _cleanup_intent_schema_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            table_names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+            if "event_object_cleanup_intents" not in table_names:
+                return {"exists": False}
+            columns = await connection.run_sync(
+                lambda sync: {
+                    column["name"]
+                    for column in inspect(sync).get_columns("event_object_cleanup_intents")
+                }
+            )
+            indexes = await connection.run_sync(
+                lambda sync: {
+                    index["name"]: bool(index["unique"])
+                    for index in inspect(sync).get_indexes("event_object_cleanup_intents")
+                }
+            )
+            checks = await connection.run_sync(
+                lambda sync: {
+                    constraint["name"]
+                    for constraint in inspect(sync).get_check_constraints(
+                        "event_object_cleanup_intents"
+                    )
+                }
+            )
+            unique_constraints = await connection.run_sync(
+                lambda sync: {
+                    constraint["name"]
+                    for constraint in inspect(sync).get_unique_constraints(
+                        "event_object_cleanup_intents"
+                    )
+                }
+            )
+    finally:
+        await engine.dispose()
+    return {
+        "exists": True,
+        "columns": columns,
+        "indexes": indexes,
+        "checks": checks,
+        "unique_constraints": unique_constraints,
+    }
+
+
+async def test_0021_cleanup_intents_are_reversible() -> None:
+    previous_revision = "0020_override_event"
+    _set_revision(previous_revision)
+    assert await _cleanup_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        state = await _cleanup_intent_schema_state()
+        assert state["exists"] is True
+        assert state["columns"] == {
+            "id",
+            "event_id",
+            "source_kind",
+            "source_key",
+            "storage_path",
+            "status",
+            "attempt_count",
+            "last_error",
+            "lease_owner",
+            "lease_expires_at",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }
+        assert state["unique_constraints"] == {"uq_event_object_cleanup_source_path"}
+        assert state["indexes"] == {
+            "ix_event_object_cleanup_event_id": False,
+            "ix_event_object_cleanup_claim": False,
+            "uq_event_object_cleanup_source_path": True,
+        }
+        assert "ck_event_object_cleanup_status" in state["checks"]
+
+        _set_revision(previous_revision)
+        assert await _cleanup_tables_exist() is False
+
+        _set_revision(LATEST_REVISION)
+        assert await _cleanup_tables_exist() is True
+    finally:
+        _set_revision(LATEST_REVISION)

@@ -65,7 +65,7 @@ from app.collaboration.service import (
 )
 from app.config import settings
 from app.db import SessionFactory
-from app.event_object_cleanup import cleanup_event_objects
+from app.event_object_cleanup import process_cleanup_intents
 
 router = APIRouter(prefix="/api/v1", tags=["workgroups"])
 logger = logging.getLogger(__name__)
@@ -717,20 +717,20 @@ async def delete_deliverable_candidate(
     if cleanup is None:
         return
     try:
-        async with session.begin():
-            cleanup_result = await cleanup_event_objects(
-                session,
-                cleanup.event_id,
-                cleanup.storage_paths,
-                artifact_store,
-            )
+        cleanup_result = await process_cleanup_intents(
+            SessionFactory,
+            artifact_store,
+            source_kind=cleanup.source_kind or None,
+            source_key=cleanup.source_key or None,
+            lease_owner=f"http-candidate-delete:{version_id}",
+        )
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
-    if not cleanup_result.succeeded:
+    if cleanup_result.failed_count:
         logger.warning(
             "deliverable candidate cleanup incomplete version_id=%s paths=%s",
             version_id,
-            cleanup_result.failed_paths,
+            cleanup.storage_paths,
         )
         raise _storage_unavailable()
 

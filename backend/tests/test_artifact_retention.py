@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
 from app.artifacts import worker as artifact_worker
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact
@@ -18,6 +19,13 @@ from app.collaboration.models import (
     WorkgroupTask,
 )
 from app.config import settings
+from app.event_object_cleanup import (
+    ARTIFACT_RETENTION_CLEANUP_SOURCE,
+    CleanupIntentStatus,
+    EventObjectCleanupIntent,
+    enqueue_object_cleanup_intent,
+    process_cleanup_intents,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -182,6 +190,7 @@ async def test_retention_uses_cross_table_reference_count_for_manual_version(
     seeded_artifact_assessment,
     artifact_retention_service,
     session,
+    session_factory,
 ) -> None:
     expired = await seeded_artifact_assessment.expired_artifact(
         production_mode="test",
@@ -240,7 +249,19 @@ async def test_retention_uses_cross_table_reference_count_for_manual_version(
     )
 
     assert result.test_deleted == 1
-    assert result.cleanup_intents == ()
+    async with session_factory() as count_session:
+        intent_count = int(
+            await count_session.scalar(
+                select(func.count())
+                .select_from(EventObjectCleanupIntent)
+                .where(
+                    EventObjectCleanupIntent.event_id == expired.event_id,
+                    EventObjectCleanupIntent.storage_path == expired.storage_path,
+                )
+            )
+            or 0
+        )
+    assert intent_count == 0
     assert await session.get(GeneratedArtifact, expired.id) is None
     assert await session.get(TaskDeliverableVersion, manual.id) is not None
     assert path.is_file()
@@ -267,7 +288,18 @@ async def test_retention_defers_unlink_until_db_commit_and_rollback_keeps_file(
             observed_at=seeded_artifact_assessment.now,
         )
         assert result.test_deleted == 1
-        assert len(result.cleanup_intents) == 1
+        intent_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(EventObjectCleanupIntent)
+                .where(
+                    EventObjectCleanupIntent.event_id == artifact.event_id,
+                    EventObjectCleanupIntent.storage_path == artifact.storage_path,
+                )
+            )
+            or 0
+        )
+        assert intent_count == 1
         assert path.is_file()
         await transaction.rollback()
 
@@ -275,6 +307,18 @@ async def test_retention_defers_unlink_until_db_commit_and_rollback_keeps_file(
     assert path.read_bytes() == b"retention-rollback-object"
     async with session_factory() as session:
         assert await session.get(GeneratedArtifact, artifact.id) is not None
+        intent_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(EventObjectCleanupIntent)
+                .where(
+                    EventObjectCleanupIntent.event_id == artifact.event_id,
+                    EventObjectCleanupIntent.storage_path == artifact.storage_path,
+                )
+            )
+            or 0
+        )
+    assert intent_count == 0
 
 
 class FlakyCleanupStore(ArtifactStore):
@@ -294,8 +338,6 @@ async def test_retention_cleanup_can_retry_same_intent_after_unlink_failure(
     session_factory,
     tmp_path,
 ) -> None:
-    from app.event_object_cleanup import cleanup_object_intents
-
     artifact = await seeded_artifact_assessment.expired_artifact(
         production_mode="test",
         age_days=401,
@@ -308,30 +350,31 @@ async def test_retention_cleanup_can_retry_same_intent_after_unlink_failure(
 
     async with session_factory() as session:
         async with session.begin():
-            result = await ArtifactRetentionService().retain_expired(
+            await ArtifactRetentionService().retain_expired(
                 session,
                 observed_at=seeded_artifact_assessment.now,
             )
 
-    async with session_factory() as session:
-        async with session.begin():
-            first = await cleanup_object_intents(
-                session,
-                result.cleanup_intents,
-                store,
-            )
-    assert first.failed_paths == (relative_path,)
+    first = await process_cleanup_intents(
+        session_factory,
+        store,
+        source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+        source_key=str(artifact.id),
+        lease_owner="retention-retry-one",
+    )
+    assert first.failed_count == 1
     assert source_path.is_file()
 
-    async with session_factory() as session:
-        async with session.begin():
-            second = await cleanup_object_intents(
-                session,
-                result.cleanup_intents,
-                store,
-            )
-    assert second.failed_paths == ()
+    second = await process_cleanup_intents(
+        session_factory,
+        store,
+        source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+        source_key=str(artifact.id),
+        lease_owner="retention-retry-two",
+    )
+    assert second.failed_count == 0
     assert not source_path.exists()
+    assert relative_path
 
 
 async def test_retention_reports_postcommit_cleanup_intent(
@@ -351,8 +394,159 @@ async def test_retention_reports_postcommit_cleanup_intent(
 
     assert result.test_deleted == 1
     assert result.failed_deletions == 0
-    assert len(result.cleanup_intents) == 1
     assert await session.get(type(artifact), artifact.id) is None
+    intent = await session.scalar(
+        select(EventObjectCleanupIntent).where(
+            EventObjectCleanupIntent.source_kind == ARTIFACT_RETENTION_CLEANUP_SOURCE,
+            EventObjectCleanupIntent.source_key == str(artifact.id),
+            EventObjectCleanupIntent.storage_path == artifact.storage_path,
+        )
+    )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.PENDING.value
+
+
+async def test_retention_loop_retries_failed_unlink_on_next_cycle(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    store = FlakyCleanupStore(tmp_path / "artifacts")
+    source_path = store.resolve(artifact.storage_path)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"retention-loop-retry")
+    sleep_count = 0
+
+    async def sleep(_seconds: float) -> None:
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await artifact_worker._run_retention_loop(
+            session_factory=session_factory,
+            configured=SimpleNamespace(
+                artifact_retention_enabled=True,
+                artifact_retention_interval_seconds=60,
+                artifact_storage_root=str(tmp_path / "artifacts"),
+            ),
+        )
+
+    assert store.calls == 3
+    assert not source_path.exists()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == str(artifact.id)
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.COMPLETED.value
+
+
+async def test_retention_loop_recovers_committed_intent_after_crash(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    store = ArtifactStore(tmp_path / "artifacts")
+    source_path = store.resolve(artifact.storage_path)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"retention-crash-recovery")
+
+    async with session_factory() as session:
+        async with session.begin():
+            await ArtifactRetentionService().retain_expired(
+                session,
+                observed_at=seeded_artifact_assessment.now,
+            )
+
+    async def sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await artifact_worker._run_retention_loop(
+            session_factory=session_factory,
+            configured=SimpleNamespace(
+                artifact_retention_enabled=True,
+                artifact_retention_interval_seconds=60,
+                artifact_storage_root=str(tmp_path / "artifacts"),
+            ),
+        )
+
+    assert not source_path.exists()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == str(artifact.id)
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.COMPLETED.value
+
+
+async def test_cleanup_recovery_runs_when_retention_disabled(
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    event_id = uuid.uuid4()
+    relative_path = "objects/aa/bb/candidate-recovery.txt"
+    store = ArtifactStore(tmp_path / "artifacts")
+    source_path = store.resolve(relative_path)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"candidate-recovery")
+
+    async with session_factory() as session:
+        async with session.begin():
+            await enqueue_object_cleanup_intent(
+                session,
+                event_id=event_id,
+                source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                source_key=uuid.uuid4().hex,
+                storage_path=relative_path,
+            )
+
+    async def sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await artifact_worker._run_retention_loop(
+            session_factory=session_factory,
+            configured=SimpleNamespace(
+                artifact_retention_enabled=False,
+                artifact_retention_interval_seconds=60,
+                artifact_storage_root=str(tmp_path / "artifacts"),
+            ),
+        )
+
+    assert not source_path.exists()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(EventObjectCleanupIntent.event_id == event_id)
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.COMPLETED.value
 
 
 async def test_retention_loop_logs_all_modes_and_protected_counts(
@@ -396,10 +590,18 @@ async def test_retention_loop_logs_all_modes_and_protected_counts(
             return
         raise asyncio.CancelledError
 
+    async def process_cleanup_intents(*_args, **_kwargs):
+        return SimpleNamespace(failed_count=0)
+
     monkeypatch.setattr(
         artifact_worker,
         "ArtifactRetentionService",
         lambda: Service(),
+    )
+    monkeypatch.setattr(
+        artifact_worker,
+        "process_cleanup_intents",
+        process_cleanup_intents,
     )
     monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
 
@@ -410,6 +612,7 @@ async def test_retention_loop_logs_all_modes_and_protected_counts(
                 configured=SimpleNamespace(
                     artifact_retention_enabled=True,
                     artifact_retention_interval_seconds=60,
+                    artifact_storage_root="/tmp/artifact-retention-test",
                 ),
             )
 
