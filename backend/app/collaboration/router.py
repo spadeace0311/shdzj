@@ -1,7 +1,16 @@
 from collections.abc import AsyncIterator
+import json
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    UploadFile,
+)
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +27,12 @@ from app.collaboration.schemas import (
     AttendanceResponse,
     AttendanceUpdateRequest,
     ConfirmingAuthorityResponse,
+    DeliverableOverrideRequest,
+    DeliverablePublicationResponse,
+    DeliverablePublishRequest,
+    DeliverableResponse,
+    DeliverableTextVersionRequest,
+    DeliverableVersionResponse,
     EventWorkgroupResponse,
     EventWorkgroupsResponse,
     MembershipReplaceRequest,
@@ -33,6 +48,7 @@ from app.collaboration.schemas import (
 )
 from app.collaboration.service import (
     CollaborationTaskService,
+    DeliverableService,
     MissingRequiredDeliverableError,
     StaleTaskVersion,
 )
@@ -53,6 +69,13 @@ def get_roster_service() -> RosterService:
 
 def get_task_service() -> CollaborationTaskService:
     return CollaborationTaskService(
+        repository=CollaborationRepository(),
+        roster_service=RosterService(),
+    )
+
+
+def get_deliverable_service() -> DeliverableService:
+    return DeliverableService(
         repository=CollaborationRepository(),
         roster_service=RosterService(),
     )
@@ -435,6 +458,264 @@ async def update_collaboration_task(
     return await _task_response(session, service, task)
 
 
+@router.get(
+    "/collaboration/tasks/{task_id}/deliverables",
+    response_model=list[DeliverableResponse],
+)
+async def list_task_deliverables(
+    task_id: UUID,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    _current_user: AuthUser = Depends(get_current_user),
+) -> list[DeliverableResponse]:
+    try:
+        task = await service.repository.get_task(session, task_id)
+        if task is None:
+            raise LookupError("task_not_found")
+        deliverables = await service.repository.list_task_deliverables(
+            session, task_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        raise _storage_unavailable() from exc
+    return [
+        await _deliverable_response(session, service, deliverable)
+        for deliverable in deliverables
+    ]
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/versions",
+    response_model=DeliverableVersionResponse,
+)
+async def add_text_deliverable_version(
+    deliverable_id: UUID,
+    request: DeliverableTextVersionRequest,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(get_current_user),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverableVersionResponse:
+    try:
+        version = await service.add_text_version(
+            session,
+            deliverable_id,
+            current_user,
+            text_result=request.text_result,
+            basis_text=request.basis_text,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_version_response(version)
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/versions/file",
+    response_model=DeliverableVersionResponse,
+)
+async def add_file_deliverable_version(
+    deliverable_id: UUID,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(get_current_user),
+    mime_type: str | None = Form(default=None),
+    text_result: str | None = Form(default=None),
+    basis_text: str | None = Form(default=None),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverableVersionResponse:
+    parsed_text_result = _parse_optional_json_object(text_result)
+    try:
+        version = await service.add_manual_version(
+            session,
+            deliverable_id,
+            current_user,
+            source=file.file,
+            file_name=file.filename or "",
+            mime_type=mime_type or file.content_type,
+            text_result=parsed_text_result,
+            basis_text=basis_text,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_version_response(version)
+
+
+@router.delete(
+    "/collaboration/deliverable-versions/{version_id}",
+    status_code=204,
+)
+async def delete_deliverable_candidate(
+    version_id: UUID,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(get_current_user),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> None:
+    expected_version = _parse_optional_if_match(if_match)
+    try:
+        await service.delete_candidate(
+            session,
+            version_id,
+            current_user,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/publish",
+    response_model=DeliverablePublicationResponse,
+)
+async def publish_deliverable_version(
+    deliverable_id: UUID,
+    request: DeliverablePublishRequest,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(get_current_user),
+    if_match: str = Header(alias="If-Match"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverablePublicationResponse:
+    expected_version = _parse_if_match(if_match)
+    try:
+        publication = await service.publish(
+            session,
+            deliverable_id,
+            current_user,
+            version_id=request.version_id,
+            publication_note=request.publication_note,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_publication_response(publication)
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/restore",
+    response_model=DeliverablePublicationResponse,
+)
+async def restore_deliverable_version(
+    deliverable_id: UUID,
+    request: DeliverablePublishRequest,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(get_current_user),
+    if_match: str = Header(alias="If-Match"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverablePublicationResponse:
+    expected_version = _parse_if_match(if_match)
+    try:
+        publication = await service.restore(
+            session,
+            deliverable_id,
+            current_user,
+            version_id=request.version_id,
+            publication_note=request.publication_note,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_publication_response(publication)
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/override",
+    response_model=DeliverablePublicationResponse,
+)
+async def override_deliverable_version(
+    deliverable_id: UUID,
+    request: DeliverableOverrideRequest,
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(require_role("superadmin")),
+    if_match: str = Header(alias="If-Match"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverablePublicationResponse:
+    expected_version = _parse_if_match(if_match)
+    try:
+        publication = await service.override(
+            session,
+            deliverable_id,
+            current_user,
+            text_result=request.text_result,
+            basis_text=request.basis_text,
+            publication_note=request.publication_note,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_publication_response(publication)
+
+
+@router.post(
+    "/collaboration/deliverables/{deliverable_id}/override/file",
+    response_model=DeliverablePublicationResponse,
+)
+async def override_deliverable_file(
+    deliverable_id: UUID,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_roster_session),
+    service: DeliverableService = Depends(get_deliverable_service),
+    current_user: AuthUser = Depends(require_role("superadmin")),
+    mime_type: str | None = Form(default=None),
+    text_result: str | None = Form(default=None),
+    basis_text: str | None = Form(default=None),
+    publication_note: str | None = Form(default=None),
+    if_match: str = Header(alias="If-Match"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> DeliverablePublicationResponse:
+    expected_version = _parse_if_match(if_match)
+    parsed_text_result = _parse_optional_json_object(text_result)
+    try:
+        publication = await service.override(
+            session,
+            deliverable_id,
+            current_user,
+            source=file.file,
+            file_name=file.filename or "",
+            mime_type=mime_type or file.content_type,
+            text_result=parsed_text_result,
+            basis_text=basis_text,
+            publication_note=publication_note,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+    except _task_mutation_error_types() as exc:
+        raise _task_mutation_exception(exc) from exc
+    return _deliverable_publication_response(publication)
+
+
 def _membership_response(membership, user) -> MembershipResponse:
     return MembershipResponse(
         membership_id=membership.id,
@@ -563,6 +844,82 @@ async def _task_response(
     )
 
 
+async def _deliverable_response(
+    session: AsyncSession,
+    service: DeliverableService,
+    deliverable,
+) -> DeliverableResponse:
+    versions = await service.repository.list_deliverable_versions(
+        session, deliverable.id
+    )
+    current_publication = (
+        await service.repository.get_current_publication(
+            session, deliverable.id
+        )
+    )
+    current_version_id = (
+        current_publication.version_id
+        if current_publication is not None
+        else await service.current_version_id(session, deliverable.id)
+    )
+    return DeliverableResponse(
+        id=deliverable.id,
+        task_id=deliverable.task_id,
+        deliverable_code=deliverable.deliverable_code,
+        title=deliverable.title,
+        is_required=deliverable.is_required,
+        requirement_kind=deliverable.requirement_kind,
+        artifact_binding=deliverable.artifact_binding,
+        display_order=deliverable.display_order,
+        current_version_id=current_version_id,
+        current_publication=(
+            _deliverable_publication_response(current_publication)
+            if current_publication is not None
+            else None
+        ),
+        versions=[
+            _deliverable_version_response(version) for version in versions
+        ],
+    )
+
+
+def _deliverable_version_response(version) -> DeliverableVersionResponse:
+    return DeliverableVersionResponse(
+        id=version.id,
+        deliverable_id=version.deliverable_id,
+        version_no=version.version_no,
+        source_kind=version.source_kind,
+        artifact_id=version.artifact_id,
+        artifact_publication_id=version.artifact_publication_id,
+        storage_key=version.storage_key,
+        file_name=version.file_name,
+        checksum=version.checksum,
+        mime_type=version.mime_type,
+        size_bytes=version.size_bytes,
+        text_result=version.text_result,
+        created_by=version.created_by,
+        basis_text=version.basis_text,
+        supersedes_version_id=version.supersedes_version_id,
+        created_at=version.created_at,
+    )
+
+
+def _deliverable_publication_response(
+    publication,
+) -> DeliverablePublicationResponse:
+    return DeliverablePublicationResponse(
+        id=publication.id,
+        deliverable_id=publication.deliverable_id,
+        version_id=publication.version_id,
+        published_by=publication.published_by,
+        published_role=publication.published_role,
+        published_at=publication.published_at,
+        superseded_at=publication.superseded_at,
+        publication_note=publication.publication_note,
+        created_at=publication.created_at,
+    )
+
+
 def _parse_if_match(if_match: str) -> int:
     try:
         return int(if_match.strip())
@@ -571,6 +928,30 @@ def _parse_if_match(if_match: str) -> int:
             status_code=422,
             detail="If-Match must be an integer",
         ) from exc
+
+
+def _parse_optional_if_match(if_match: str | None) -> int | None:
+    if if_match is None:
+        return None
+    return _parse_if_match(if_match)
+
+
+def _parse_optional_json_object(value: str | None) -> dict | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="text_result must be a JSON object",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="text_result must be a JSON object",
+        )
+    return parsed
 
 
 def _task_mutation_error_types() -> tuple[type[Exception], ...]:

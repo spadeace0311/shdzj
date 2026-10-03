@@ -189,3 +189,151 @@ class CollaborationRepository:
             ):
                 return False
         return True
+
+    async def get_deliverable(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> TaskDeliverable | None:
+        statement = select(TaskDeliverable).where(
+            TaskDeliverable.id == deliverable_id
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
+
+    async def get_deliverable_version(
+        self,
+        session: AsyncSession,
+        version_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> TaskDeliverableVersion | None:
+        statement = select(TaskDeliverableVersion).where(
+            TaskDeliverableVersion.id == version_id
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
+
+    async def next_deliverable_version_no(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+    ) -> int:
+        value = await session.scalar(
+            select(func.max(TaskDeliverableVersion.version_no)).where(
+                TaskDeliverableVersion.deliverable_id == deliverable_id
+            )
+        )
+        return int(value or 0) + 1
+
+    async def latest_deliverable_version(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> TaskDeliverableVersion | None:
+        statement = (
+            select(TaskDeliverableVersion)
+            .where(TaskDeliverableVersion.deliverable_id == deliverable_id)
+            .order_by(TaskDeliverableVersion.version_no.desc())
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
+
+    async def list_deliverable_versions(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+    ) -> tuple[TaskDeliverableVersion, ...]:
+        rows = await session.scalars(
+            select(TaskDeliverableVersion)
+            .where(TaskDeliverableVersion.deliverable_id == deliverable_id)
+            .order_by(TaskDeliverableVersion.version_no)
+        )
+        return tuple(rows)
+
+    async def list_task_deliverables(
+        self,
+        session: AsyncSession,
+        task_id: uuid.UUID,
+    ) -> tuple[TaskDeliverable, ...]:
+        rows = await session.scalars(
+            select(TaskDeliverable)
+            .where(TaskDeliverable.task_id == task_id)
+            .order_by(TaskDeliverable.display_order, TaskDeliverable.created_at)
+        )
+        return tuple(rows)
+
+    async def get_task_for_deliverable(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> WorkgroupTask | None:
+        statement = (
+            select(WorkgroupTask)
+            .join(TaskDeliverable, TaskDeliverable.task_id == WorkgroupTask.id)
+            .where(TaskDeliverable.id == deliverable_id)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
+
+    async def get_current_publication(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> TaskDeliverablePublication | None:
+        statement = (
+            select(TaskDeliverablePublication)
+            .where(
+                TaskDeliverablePublication.deliverable_id == deliverable_id,
+                TaskDeliverablePublication.superseded_at.is_(None),
+            )
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
+
+    async def get_publication(
+        self,
+        session: AsyncSession,
+        publication_id: uuid.UUID,
+    ) -> TaskDeliverablePublication | None:
+        return await session.get(TaskDeliverablePublication, publication_id)
+
+    async def publication_for_version(
+        self,
+        session: AsyncSession,
+        version_id: uuid.UUID,
+    ) -> TaskDeliverablePublication | None:
+        return await session.scalar(
+            select(TaskDeliverablePublication).where(
+                TaskDeliverablePublication.version_id == version_id
+            ).limit(1)
+        )
+
+    async def current_version_id(
+        self,
+        session: AsyncSession,
+        deliverable_id: uuid.UUID,
+    ) -> uuid.UUID | None:
+        return await session.scalar(
+            select(TaskDeliverablePublication.version_id)
+            .where(
+                TaskDeliverablePublication.deliverable_id == deliverable_id,
+                TaskDeliverablePublication.superseded_at.is_(None),
+            )
+            .limit(1)
+        )
