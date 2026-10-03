@@ -7,14 +7,22 @@ from decimal import Decimal
 
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.collaboration.domain import WorkgroupCode
+from app.collaboration.generation import CollaborationTaskGenerator
 from app.collaboration.models import WorkgroupTask
 from app.collaboration.retention import CollaborationRetentionService
+from app.collaboration.templates import TaskTemplateCatalog, TaskTemplateDefinition
 from app.config import settings
-from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
 
 
 @pytest.fixture
@@ -236,6 +244,75 @@ async def _seed_retention_task(
     return task, event, raw.id
 
 
+async def _seed_retention_generation_event(
+    session,
+    *,
+    origin_time: datetime,
+) -> tuple[EarthquakeEvent, EarthquakeRevision, EventLifecycleOutbox, uuid.UUID]:
+    event = EarthquakeEvent(
+        id=uuid.uuid4(),
+        source="retention-generation-test",
+        canonical_source_id=f"retention-generation-{uuid.uuid4().hex}",
+        event_type="test",
+        origin_time=origin_time,
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.2"),
+        place="retention generation fixture",
+        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+        lifecycle_state="not_applicable",
+    )
+    session.add(event)
+    await session.flush()
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source="retention-generation-test",
+        source_message_id=uuid.uuid4().hex,
+        message_kind="test",
+        checksum=uuid.uuid4().hex,
+        payload={"event_id": str(event.id)},
+    )
+    session.add(raw)
+    await session.flush()
+    revision = EarthquakeRevision(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        raw_message_id=raw.id,
+        revision_no=1,
+        revision_kind="test",
+        origin_time=event.origin_time,
+        longitude=event.longitude,
+        latitude=event.latitude,
+        depth_km=event.depth_km,
+        magnitude=event.magnitude,
+        place=event.place,
+        is_current=True,
+        ingested_at=event.origin_time,
+    )
+    session.add(revision)
+    await session.flush()
+    outbox = EventLifecycleOutbox(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        revision_id=revision.id,
+        trigger_type="collaboration.requested",
+        trigger_reason="live",
+        payload={
+            "event_id": str(event.id),
+            "revision_id": str(revision.id),
+            "revision_no": 1,
+        },
+        status="processing",
+        attempt_count=1,
+        created_at=origin_time,
+        available_at=origin_time,
+    )
+    session.add(outbox)
+    await session.flush()
+    return event, revision, outbox, raw.id
+
+
 OBSERVED_AT = datetime(2026, 10, 3, tzinfo=UTC)
 
 
@@ -423,6 +500,84 @@ async def test_retention_locks_existing_tasks_before_dependency_check(
         stored_task = await verify_session.get(WorkgroupTask, task_id)
         assert stored_task is not None
         assert stored_task.status == "in_progress"
+
+    async with isolated_session_factory() as cleanup_session:
+        async with cleanup_session.begin():
+            await cleanup_session.execute(
+                delete(EarthquakeEvent).where(EarthquakeEvent.id == event_id)
+            )
+            await cleanup_session.execute(
+                delete(RawMessage).where(RawMessage.id == raw_id)
+            )
+
+
+async def test_retention_and_generation_serialize_without_deleting_active_dependency(
+    isolated_session_factory,
+):
+    origin_time = OBSERVED_AT - timedelta(days=401)
+    catalog = TaskTemplateCatalog(
+        version="retention-generation.1",
+        definitions=(
+            TaskTemplateDefinition(
+                template_code="retention.generation.task",
+                workgroup_code=WorkgroupCode.MONITORING_FORECAST,
+                phase_code="within_30m",
+                title="concurrent generation task",
+                source="test",
+                applicability={"spatial_class": "any"},
+            ),
+        ),
+    )
+
+    async with isolated_session_factory() as seed_session:
+        async with seed_session.begin():
+            event, revision, outbox, raw_id = (
+                await _seed_retention_generation_event(
+                    seed_session,
+                    origin_time=origin_time,
+                )
+            )
+            event_id = event.id
+            revision_id = revision.id
+            outbox_id = outbox.id
+
+    generator = CollaborationTaskGenerator(catalog=catalog)
+    retention = CollaborationRetentionService()
+
+    async def generate():
+        async with isolated_session_factory() as session:
+            async with session.begin():
+                await generator.generate_for_revision(
+                    session,
+                    event_id,
+                    revision_id,
+                    outbox_id,
+                )
+
+    async def retain():
+        async with isolated_session_factory() as session:
+            async with session.begin():
+                return await retention.purge_due(
+                    session,
+                    observed_at=OBSERVED_AT,
+                )
+
+    result, _ = await asyncio.gather(retain(), generate())
+
+    assert result.test_deleted == 0
+    async with isolated_session_factory() as verify_session:
+        stored_event = await verify_session.get(EarthquakeEvent, event_id)
+        tasks = (
+            await verify_session.scalars(
+                select(WorkgroupTask).where(
+                    WorkgroupTask.event_id == event_id,
+                    WorkgroupTask.template_version_id.is_not(None),
+                )
+            )
+        ).all()
+        assert stored_event is not None
+        assert len(tasks) == 1
+        assert tasks[0].status == "pending"
 
     async with isolated_session_factory() as cleanup_session:
         async with cleanup_session.begin():

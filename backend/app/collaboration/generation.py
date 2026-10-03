@@ -92,6 +92,13 @@ class CollaborationTaskGenerator:
         revision_uuid = _coerce_uuid(revision_id, "revision_id")
         outbox_uuid = _coerce_uuid(outbox_id, "outbox_id")
 
+        event = await session.get(
+            EarthquakeEvent,
+            event_uuid,
+            with_for_update=True,
+        )
+        if event is None:
+            raise LookupError("collaboration event not found")
         outbox = await session.get(
             EventLifecycleOutbox,
             outbox_uuid,
@@ -105,14 +112,6 @@ class CollaborationTaskGenerator:
             or outbox.revision_id != revision_uuid
         ):
             raise ValueError("collaboration outbox identity mismatch")
-
-        event = await session.get(
-            EarthquakeEvent,
-            event_uuid,
-            with_for_update=True,
-        )
-        if event is None:
-            raise LookupError("collaboration event not found")
         revision = await session.get(
             EarthquakeRevision,
             revision_uuid,
