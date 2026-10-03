@@ -14,7 +14,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0017_production_cancel_outbox"
+LATEST_REVISION = "0018_collaboration_command_hall"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -36,6 +36,26 @@ ARTIFACT_TABLES = {
     "artifact_publications",
     "artifact_override_requests",
     "artifact_production_cancel_requests",
+}
+COLLABORATION_TABLES = {
+    "workgroup_definitions",
+    "workgroup_memberships",
+    "workgroup_roster_snapshots",
+    "workgroup_attendance",
+    "collaboration_settings",
+    "collaboration_task_templates",
+    "collaboration_task_template_versions",
+    "collaboration_tasks",
+    "collaboration_task_contributors",
+    "collaboration_task_deliverables",
+    "collaboration_deliverable_versions",
+    "collaboration_deliverable_publications",
+    "collaboration_task_events",
+    "collaboration_notification_deliveries",
+    "collaboration_projection_outbox",
+    "command_hall_event_projections",
+    "command_hall_group_projections",
+    "command_hall_alert_projections",
 }
 LOSS_TABLES = {
     "loss_model_definitions",
@@ -442,6 +462,18 @@ async def _artifact_tables_exist() -> bool:
     finally:
         await engine.dispose()
     return ARTIFACT_TABLES <= names
+
+
+async def _collaboration_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+    finally:
+        await engine.dispose()
+    return COLLABORATION_TABLES <= names
 
 
 async def _production_snapshot_item_identity_nullability() -> dict[str, bool]:
@@ -1228,3 +1260,14 @@ async def test_0016_artifact_retention_uses_application_only_state() -> None:
 
     service = ArtifactRetentionService()
     assert service.retain_expired is not None
+
+
+async def test_0018_collaboration_command_hall_is_reversible() -> None:
+    previous_revision = "0017_production_cancel_outbox"
+    _set_revision(previous_revision)
+    assert await _collaboration_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        assert await _collaboration_tables_exist() is True
+    finally:
+        _set_revision(LATEST_REVISION)
