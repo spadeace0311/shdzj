@@ -113,12 +113,25 @@ function phaseForTask(task: WorkgroupTask): string {
     : "other";
 }
 
+function emptyTemporaryForm() {
+  return {
+    title: "",
+    workgroupCode: "comprehensive_coordination",
+    instruction: "",
+    priority: "10",
+    dueAt: "",
+    continuesUntilCancelled: false,
+  };
+}
+
 export function WorkgroupTasksPage({
   userRole,
   workgroup,
 }: WorkgroupTasksPageProps) {
   const { eventId } = useParams<{ eventId: string }>();
   const [tasks, setTasks] = useState<WorkgroupTask[]>([]);
+  const [loadedEventId, setLoadedEventId] = useState<string | null>(null);
+  const [stateEventId, setStateEventId] = useState<string | null>(null);
   const [eventKind, setEventKind] = useState<string | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -131,49 +144,60 @@ export function WorkgroupTasksPage({
   const [temporaryBusy, setTemporaryBusy] = useState(false);
   const listRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
+  const temporaryRequestRef = useRef(0);
   const eventIdRef = useRef(eventId);
   eventIdRef.current = eventId;
-  const [temporaryForm, setTemporaryForm] = useState({
-    title: "",
-    workgroupCode: "comprehensive_coordination",
-    instruction: "",
-    priority: "10",
-    dueAt: "",
-    continuesUntilCancelled: false,
-  });
+  const [temporaryForm, setTemporaryForm] = useState(emptyTemporaryForm);
 
   const currentWorkgroupCode = WORKGROUP_CODES[workgroup ?? ""] ?? null;
-  const visibleTasks = tasks;
-  const marker = eventMarker(eventKind);
+  const isEventLoaded = loadedEventId === eventId;
+  const isCurrentEventState = stateEventId === eventId;
+  const visibleTasks = isEventLoaded
+    ? tasks.filter((task) => task.event_id === eventId)
+    : [];
+  const visibleSelectedTask =
+    isEventLoaded && selectedTask?.event_id === eventId
+      ? selectedTask
+      : null;
+  const currentEventKind = isEventLoaded ? eventKind : null;
+  const marker = eventMarker(currentEventKind);
   const canCreateTemporary =
+    isEventLoaded &&
     Boolean(eventId) &&
     (userRole === "superadmin" ||
       (currentWorkgroupCode === "comprehensive_coordination" &&
         ["group_leader", "group_deputy", "group_member"].includes(userRole)));
 
   async function loadTasks() {
+    const requestEventId = eventId;
     const requestId = ++listRequestRef.current;
-    if (!eventId) {
+    if (!requestEventId) {
+      setLoadedEventId(null);
+      setStateEventId(null);
       setStatus("ready");
       return;
     }
+    setStateEventId(requestEventId);
     setStatus("loading");
     setError("");
     try {
       const [taskList, eventDetail] = await Promise.all([
-        listCollaborationTasks(eventId),
-        getEvent(eventId).catch(() => null),
+        listCollaborationTasks(requestEventId),
+        getEvent(requestEventId).catch(() => null),
       ]);
       if (
         requestId !== listRequestRef.current ||
-        eventId !== eventIdRef.current
+        requestEventId !== eventIdRef.current
       ) {
         return;
       }
-      setTasks(taskList);
+      const currentTasks = taskList.filter(
+        (task) => task.event_id === requestEventId,
+      );
+      setTasks(currentTasks);
       setEventKind(eventDetail?.event_kind ?? null);
       setSelectedTaskId((current) =>
-        current && taskList.some((task) => task.id === current)
+        current && currentTasks.some((task) => task.id === current)
           ? current
           : null,
       );
@@ -181,16 +205,23 @@ export function WorkgroupTasksPage({
         if (!current) {
           return null;
         }
-        return taskList.find((task) => task.id === current.id) ?? null;
+        return currentTasks.find((task) => task.id === current.id) ?? null;
       });
+      setLoadedEventId(requestEventId);
       setStatus("ready");
     } catch (caught) {
       if (
         requestId !== listRequestRef.current ||
-        eventId !== eventIdRef.current
+        requestEventId !== eventIdRef.current
       ) {
         return;
       }
+      setTasks([]);
+      setEventKind(null);
+      setSelectedTaskId(null);
+      setSelectedTask(null);
+      setLoadedEventId(null);
+      setStateEventId(requestEventId);
       setStatus("error");
       setError(errorMessage(caught));
     }
@@ -199,61 +230,118 @@ export function WorkgroupTasksPage({
   useEffect(() => {
     listRequestRef.current += 1;
     detailRequestRef.current += 1;
+    temporaryRequestRef.current += 1;
     setTasks([]);
+    setLoadedEventId(null);
+    setStateEventId(eventId ?? null);
     setEventKind(null);
     setSelectedTaskId(null);
     setSelectedTask(null);
+    setStatus(eventId ? "loading" : "ready");
     setError("");
     setSuccess("");
     setActionKeys({});
     setTemporaryKey(null);
+    setTemporaryBusy(false);
+    setTemporaryForm(emptyTemporaryForm());
     void loadTasks();
   }, [eventId]);
 
   async function refreshTasks() {
-    if (!eventId) {
-      return;
-    }
     const requestEventId = eventId;
-    const requestId = ++listRequestRef.current;
-    const taskList = await listCollaborationTasks(requestEventId);
     if (
-      requestId !== listRequestRef.current ||
-      requestEventId !== eventIdRef.current
+      !requestEventId ||
+      requestEventId !== eventIdRef.current ||
+      loadedEventId !== requestEventId
     ) {
       return;
     }
-    setTasks(taskList);
-    setSelectedTaskId((current) =>
-      current && taskList.some((task) => task.id === current)
-        ? current
-        : null,
-    );
-    setSelectedTask((current) => {
-      if (!current) {
-        return null;
+    const requestId = ++listRequestRef.current;
+    try {
+      const taskList = await listCollaborationTasks(requestEventId);
+      if (
+        requestId !== listRequestRef.current ||
+        requestEventId !== eventIdRef.current
+      ) {
+        return;
       }
-      return taskList.find((task) => task.id === current.id) ?? null;
-    });
+      const currentTasks = taskList.filter(
+        (task) => task.event_id === requestEventId,
+      );
+      setTasks(currentTasks);
+      setSelectedTaskId((current) =>
+        current && currentTasks.some((task) => task.id === current)
+          ? current
+          : null,
+      );
+      setSelectedTask((current) => {
+        if (!current) {
+          return null;
+        }
+        return currentTasks.find((task) => task.id === current.id) ?? null;
+      });
+      setLoadedEventId(requestEventId);
+      setStatus("ready");
+      setError("");
+    } catch (caught) {
+      if (
+        requestId !== listRequestRef.current ||
+        requestEventId !== eventIdRef.current
+      ) {
+        return;
+      }
+      setTasks([]);
+      setEventKind(null);
+      setSelectedTaskId(null);
+      setSelectedTask(null);
+      setLoadedEventId(null);
+      setStateEventId(requestEventId);
+      setStatus("error");
+      setError(errorMessage(caught));
+      throw caught;
+    }
   }
 
-  async function openTask(taskId: string) {
+  async function openTask(task: WorkgroupTask) {
+    const requestEventId = eventId;
+    if (
+      !requestEventId ||
+      requestEventId !== eventIdRef.current ||
+      loadedEventId !== requestEventId ||
+      task.event_id !== requestEventId
+    ) {
+      return;
+    }
     const requestId = ++detailRequestRef.current;
-    setSelectedTaskId(taskId);
+    setSelectedTaskId(task.id);
     setSelectedTask(null);
     setActionKeys({});
     setError("");
     setSuccess("");
     try {
-      const detail = await getCollaborationTask(taskId);
-      if (requestId !== detailRequestRef.current) {
+      const detail = await getCollaborationTask(task.id);
+      if (
+        requestId !== detailRequestRef.current ||
+        requestEventId !== eventIdRef.current
+      ) {
+        return;
+      }
+      if (detail.event_id !== requestEventId) {
+        setSelectedTaskId(null);
+        setSelectedTask(null);
+        setError("任务不属于当前事件");
         return;
       }
       setSelectedTask(detail);
     } catch (caught) {
-      if (requestId !== detailRequestRef.current) {
+      if (
+        requestId !== detailRequestRef.current ||
+        requestEventId !== eventIdRef.current
+      ) {
         return;
       }
+      setSelectedTaskId(null);
+      setSelectedTask(null);
       setError(errorMessage(caught));
     }
   }
@@ -283,6 +371,13 @@ export function WorkgroupTasksPage({
     successMessage: string,
   ) {
     const requestEventId = eventIdRef.current;
+    if (
+      !requestEventId ||
+      loadedEventId !== requestEventId ||
+      task.event_id !== requestEventId
+    ) {
+      return;
+    }
     setBusyTaskId(task.id);
     setError("");
     setSuccess("");
@@ -316,7 +411,12 @@ export function WorkgroupTasksPage({
 
   async function handleTemporaryTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!eventId) {
+    const requestEventId = eventId;
+    if (
+      !requestEventId ||
+      requestEventId !== eventIdRef.current ||
+      loadedEventId !== requestEventId
+    ) {
       return;
     }
     if (!temporaryForm.title.trim()) {
@@ -339,13 +439,16 @@ export function WorkgroupTasksPage({
     if (!temporaryKey) {
       setTemporaryKey(idempotencyKey);
     }
-    const requestEventId = eventId;
+    const requestToken = ++temporaryRequestRef.current;
+    const isCurrentRequest = () =>
+      requestToken === temporaryRequestRef.current &&
+      eventIdRef.current === requestEventId;
     setTemporaryBusy(true);
     setError("");
     setSuccess("");
     try {
       await createTemporaryTask(
-        eventId,
+        requestEventId,
         {
           workgroup_code: temporaryForm.workgroupCode,
           title: temporaryForm.title.trim(),
@@ -360,26 +463,22 @@ export function WorkgroupTasksPage({
         },
         idempotencyKey,
       );
-      if (eventIdRef.current !== requestEventId) {
+      if (!isCurrentRequest()) {
         return;
       }
       setTemporaryKey(null);
-      setTemporaryForm({
-        title: "",
-        workgroupCode: "comprehensive_coordination",
-        instruction: "",
-        priority: "10",
-        dueAt: "",
-        continuesUntilCancelled: false,
-      });
+      setTemporaryForm(emptyTemporaryForm());
       await refreshTasks();
+      if (!isCurrentRequest()) {
+        return;
+      }
       setSuccess("临时任务已创建");
     } catch (caught) {
-      if (eventIdRef.current === requestEventId) {
+      if (isCurrentRequest()) {
         setError(errorMessage(caught));
       }
     } finally {
-      if (eventIdRef.current === requestEventId) {
+      if (isCurrentRequest()) {
         setTemporaryBusy(false);
       }
     }
@@ -422,30 +521,30 @@ export function WorkgroupTasksPage({
           className="secondary-button"
           type="button"
           onClick={() => void loadTasks()}
-          disabled={status === "loading"}
+          disabled={status === "loading" || !isEventLoaded}
         >
           刷新
         </button>
       </header>
 
-      {error ? (
+      {isCurrentEventState && error ? (
         <p className="form-error" role="alert">
           {error}
         </p>
       ) : null}
-      {success ? (
+      {isCurrentEventState && success ? (
         <p className="form-success" role="status">
           {success}
         </p>
       ) : null}
 
-      {status === "loading" ? (
+      {!isCurrentEventState || status === "loading" ? (
         <div className="state-panel">
           <span className="state-icon" aria-hidden="true" />
           <p>正在加载工作组任务</p>
         </div>
       ) : null}
-      {status === "error" ? (
+      {isCurrentEventState && status === "error" ? (
         <div className="state-panel state-panel--error" role="alert">
           <p>{error || "无法加载工作组任务"}</p>
           <button
@@ -458,7 +557,7 @@ export function WorkgroupTasksPage({
         </div>
       ) : null}
 
-      {status === "ready" ? (
+      {isEventLoaded && status === "ready" ? (
         <div className="workgroup-tasks-layout">
           <section className="workgroup-task-list" aria-label="工作组任务列表">
             {visibleTasks.length === 0 ? (
@@ -498,7 +597,7 @@ export function WorkgroupTasksPage({
                               className="workgroup-task-row__main"
                               type="button"
                               aria-label={`查看任务详情：${task.title}`}
-                              onClick={() => void openTask(task.id)}
+                              onClick={() => void openTask(task)}
                             >
                               <strong>{task.title}</strong>
                               <span>{task.instruction}</span>
@@ -550,7 +649,7 @@ export function WorkgroupTasksPage({
                                 <button
                                   className="secondary-button"
                                   type="button"
-                                  onClick={() => void openTask(task.id)}
+                                  onClick={() => void openTask(task)}
                                 >
                                   填写结果
                                 </button>
@@ -578,11 +677,12 @@ export function WorkgroupTasksPage({
                                 </button>
                               ) : null}
                             </div>
-                            {eventKind === "test" || eventKind === "drill" ? (
+                            {currentEventKind === "test" ||
+                            currentEventKind === "drill" ? (
                               <span
-                                className={`task-event-marker task-event-marker--${eventKind}`}
+                                className={`task-event-marker task-event-marker--${currentEventKind}`}
                               >
-                                {eventKind === "test" ? "测试" : "演练"}
+                                {currentEventKind === "test" ? "测试" : "演练"}
                               </span>
                             ) : null}
                           </article>
@@ -596,13 +696,14 @@ export function WorkgroupTasksPage({
           </section>
 
           <div className="workgroup-task-detail">
-            {selectedTask ? (
+            {visibleSelectedTask ? (
               <CollaborationTaskPanel
-                key={selectedTask.id}
-                task={selectedTask}
-                canWork={selectedTask.can_work}
-                canConfirm={selectedTask.can_confirm}
-                eventKind={eventKind}
+                key={visibleSelectedTask.id}
+                eventId={eventId}
+                task={visibleSelectedTask}
+                canWork={visibleSelectedTask.can_work}
+                canConfirm={visibleSelectedTask.can_confirm}
+                eventKind={currentEventKind}
                 onRefresh={refreshTasks}
               />
             ) : (
@@ -614,7 +715,7 @@ export function WorkgroupTasksPage({
         </div>
       ) : null}
 
-      {status === "ready" && canCreateTemporary ? (
+      {isEventLoaded && status === "ready" && canCreateTemporary ? (
         <section className="temporary-task-panel" aria-labelledby="temporary-task-title">
           <header className="section-header">
             <div>

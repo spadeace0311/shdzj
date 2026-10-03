@@ -820,6 +820,7 @@ async def test_list_and_detail_task_routes(
         status="in_progress",
     )
     member = await group_member_user()
+    await RosterService().snapshot_for_event(session, event.id)
     client = await _client(
         session,
         AuthUser(member.username, member.role, member.workgroup),
@@ -954,6 +955,127 @@ async def test_task_reads_are_scoped_to_effective_workgroup(
     assert outsider_listed.status_code == 200
     assert outsider_listed.json() == []
     assert outsider_detail.status_code == 403
+
+
+async def test_task_reads_require_matching_event_roster_role(
+    session,
+    event_factory,
+    task_factory,
+    group_member_user,
+    user_factory,
+):
+    event = await event_factory()
+    task = await task_factory(
+        event=event,
+        workgroup_code="monitoring_forecast",
+    )
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="permission.result",
+        title="Permission result",
+        is_required=False,
+        requirement_kind=DeliverableRequirementKind.MANUAL_TEXT,
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+
+    viewer = await user_factory(
+        "snapshot-viewer",
+        "viewer",
+        "monitoring_forecast",
+        duty_role="viewer",
+        group_code="monitoring_forecast",
+    )
+    mismatch = await user_factory(
+        "snapshot-mismatch",
+        "group_member",
+        "monitoring_forecast",
+        duty_role="member",
+        group_code="monitoring_forecast",
+    )
+    outside = await user_factory(
+        "snapshot-outside",
+        "group_member",
+        "monitoring_forecast",
+    )
+    member = await group_member_user()
+    roster = RosterService()
+    await roster.snapshot_for_event(session, event.id)
+
+    mismatch_membership = await session.scalar(
+        select(WorkgroupMembership).where(
+            WorkgroupMembership.user_id == mismatch.id,
+            WorkgroupMembership.workgroup_code == "monitoring_forecast",
+            WorkgroupMembership.is_active.is_(True),
+            WorkgroupMembership.effective_to.is_(None),
+        )
+    )
+    assert mismatch_membership is not None
+    mismatch_membership.duty_role = "leader"
+    session.add(
+        WorkgroupMembership(
+            user_id=outside.id,
+            workgroup_code="monitoring_forecast",
+            duty_role="member",
+            is_active=True,
+            created_by="system",
+        )
+    )
+    await session.flush()
+
+    async def read_paths(user: User):
+        client = await _client(
+            session,
+            AuthUser(user.username, user.role, user.workgroup),
+        )
+        try:
+            listed = await client.get(
+                f"/api/v1/events/{event.id}/collaboration/tasks"
+            )
+            detail = await client.get(
+                f"/api/v1/collaboration/tasks/{task.id}"
+            )
+            deliverables = await client.get(
+                f"/api/v1/collaboration/tasks/{task.id}/deliverables"
+            )
+            return listed, detail, deliverables
+        finally:
+            await client.aclose()
+            app.dependency_overrides.pop(get_roster_session, None)
+            app.dependency_overrides.pop(get_current_user, None)
+
+    viewer_listed, viewer_detail, viewer_deliverables = await read_paths(
+        viewer
+    )
+    assert viewer_listed.status_code == 200
+    assert viewer_listed.json() == []
+    assert viewer_detail.status_code == 403
+    assert viewer_deliverables.status_code == 403
+
+    mismatch_listed, mismatch_detail, mismatch_deliverables = await read_paths(
+        mismatch
+    )
+    assert mismatch_listed.status_code == 200
+    assert mismatch_listed.json() == []
+    assert mismatch_detail.status_code == 403
+    assert mismatch_deliverables.status_code == 403
+
+    outside_listed, outside_detail, outside_deliverables = await read_paths(
+        outside
+    )
+    assert outside_listed.status_code == 200
+    assert outside_listed.json() == []
+    assert outside_detail.status_code == 403
+    assert outside_deliverables.status_code == 403
+
+    member_listed, member_detail, member_deliverables = await read_paths(
+        member
+    )
+    assert member_listed.status_code == 200
+    assert [item["id"] for item in member_listed.json()] == [str(task.id)]
+    assert member_detail.status_code == 200
+    assert member_deliverables.status_code == 200
 
 
 async def test_can_confirm_follows_leader_and_deputy_attendance_order(

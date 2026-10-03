@@ -400,11 +400,7 @@ class CommandHallService:
         )
         if snapshot is None:
             return False
-        return snapshot_role_for_user(snapshot, user.id) in {
-            "leader",
-            "deputy",
-            "member",
-        }
+        return snapshot_role_for_user(snapshot, user.id) == membership.duty_role
 
     async def get_event_projection(
         self,

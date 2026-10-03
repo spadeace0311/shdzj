@@ -77,22 +77,6 @@ class CollaborationRepository:
             )
         )
 
-    async def list_active_memberships_for_user(
-        self,
-        session: AsyncSession,
-        user_id: uuid.UUID,
-    ) -> tuple[WorkgroupMembership, ...]:
-        rows = await session.scalars(
-            select(WorkgroupMembership)
-            .where(
-                WorkgroupMembership.user_id == user_id,
-                WorkgroupMembership.is_active.is_(True),
-                WorkgroupMembership.effective_to.is_(None),
-            )
-            .order_by(WorkgroupMembership.workgroup_code)
-        )
-        return tuple(rows)
-
     async def upsert_contributor(
         self,
         session: AsyncSession,

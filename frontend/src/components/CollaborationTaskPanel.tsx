@@ -63,6 +63,7 @@ interface DeliverableRecord {
 }
 
 export interface CollaborationTaskPanelProps {
+  eventId: string;
   task: WorkgroupTask;
   canWork: boolean;
   canConfirm: boolean;
@@ -129,6 +130,7 @@ function eventMarker(kind: string | null): {
 }
 
 export function CollaborationTaskPanel({
+  eventId,
   task,
   canWork,
   canConfirm,
@@ -167,14 +169,30 @@ export function CollaborationTaskPanel({
     Record<string, string>
   >({});
   const detailRequestRef = useRef(0);
+  const eventIdRef = useRef(eventId);
+  eventIdRef.current = eventId;
+
+  function isCurrentTask(): boolean {
+    return (
+      eventIdRef.current === eventId &&
+      task.event_id === eventIdRef.current
+    );
+  }
 
   async function loadDetail() {
+    if (!isCurrentTask()) {
+      return;
+    }
     const requestId = ++detailRequestRef.current;
     setDetailStatus("loading");
     setError("");
     try {
       const loaded = await getCommandHallTask(task.id);
-      if (requestId !== detailRequestRef.current) {
+      if (
+        requestId !== detailRequestRef.current ||
+        !isCurrentTask() ||
+        loaded.event_id !== eventIdRef.current
+      ) {
         return;
       }
       setDetail(loaded);
@@ -196,8 +214,14 @@ export function CollaborationTaskPanel({
   }, [task.id, task.row_version]);
 
   async function afterMutation(message: string) {
+    if (!isCurrentTask()) {
+      return;
+    }
     setSuccess(message);
     await onRefresh();
+    if (!isCurrentTask()) {
+      return;
+    }
     await loadDetail();
   }
 
@@ -223,18 +247,28 @@ export function CollaborationTaskPanel({
     operation: () => Promise<unknown>,
     successMessage: string,
   ): Promise<boolean> {
+    if (!isCurrentTask()) {
+      return false;
+    }
     setBusy(true);
     setError("");
     setSuccess("");
     try {
       await operation();
+      if (!isCurrentTask()) {
+        return false;
+      }
       await afterMutation(successMessage);
       return true;
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (isCurrentTask()) {
+        setError(errorMessage(caught));
+      }
       return false;
     } finally {
-      setBusy(false);
+      if (isCurrentTask()) {
+        setBusy(false);
+      }
     }
   }
 

@@ -260,19 +260,17 @@ async def list_collaboration_tasks(
         if actor is None:
             return []
         if actor.role != "superadmin":
-            memberships = (
-                await service.repository.list_active_memberships_for_user(
+            readable_tasks = []
+            for task in tasks:
+                readable, _, _ = await _task_access(
                     session,
-                    actor.id,
+                    service,
+                    task,
+                    current_user,
                 )
-            )
-            allowed_groups = {
-                membership.workgroup_code
-                for membership in memberships
-            }
-            tasks = tuple(
-                task for task in tasks if task.workgroup_code in allowed_groups
-            )
+                if readable:
+                    readable_tasks.append(task)
+            tasks = tuple(readable_tasks)
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
@@ -998,7 +996,10 @@ async def _task_access(
         task.workgroup_code,
         actor.id,
     )
-    if membership is None:
+    if (
+        membership is None
+        or membership.duty_role not in {"leader", "deputy", "member"}
+    ):
         return False, False, False
 
     snapshot = (
@@ -1009,10 +1010,9 @@ async def _task_access(
         )
     )
     snapshot_role = snapshot_role_for_user(snapshot, actor.id)
-    can_work = (
-        membership.duty_role in {"leader", "deputy", "member"}
-        and snapshot_role in {"leader", "deputy", "member"}
-    )
+    if snapshot_role != membership.duty_role:
+        return False, False, False
+    can_work = True
     authority = (
         await service.roster_service.resolve_confirming_authority(
             session,

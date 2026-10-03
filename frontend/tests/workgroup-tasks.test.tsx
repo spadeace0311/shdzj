@@ -431,6 +431,92 @@ test("clears the previous event selection when navigating to another event", asy
   ).not.toBeInTheDocument();
 });
 
+test("hides the previous event tasks before the next event finishes loading", async () => {
+  let resolveEventB!: (tasks: WorkgroupTask[]) => void;
+  const delayedEventB = new Promise<WorkgroupTask[]>((resolve) => {
+    resolveEventB = resolve;
+  });
+  const taskB: WorkgroupTask = {
+    ...pendingTask,
+    id: "task-b",
+    event_id: "event-2",
+    title: "事件 B 任务",
+  };
+  listMock.mockImplementation((id) =>
+    id === "event-1" ? Promise.resolve([pendingTask]) : delayedEventB,
+  );
+  getEventMock.mockImplementation(async (id) =>
+    id === "event-2"
+      ? { ...event, id: "event-2", place: "上海松江区" }
+      : event,
+  );
+
+  renderPage("group_member", "监测预报组");
+
+  const startButton = await screen.findByRole("button", {
+    name: "开始处理",
+  });
+  fireEvent.click(screen.getByRole("button", { name: "切换到事件 B" }));
+  fireEvent.click(startButton);
+
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+  expect(startButton).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "填写结果" })).not.toBeInTheDocument();
+  expect(startMock).not.toHaveBeenCalled();
+
+  await act(async () => {
+    resolveEventB([taskB]);
+  });
+
+  expect(await screen.findByText(taskB.title)).toBeInTheDocument();
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+  expect(startMock).not.toHaveBeenCalled();
+});
+
+test("clears task state when opening a task fails", async () => {
+  listMock.mockResolvedValue([pendingTask]);
+  getTaskMock.mockRejectedValue(new ApiError("task_not_found", 404));
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `查看任务详情：${pendingTask.title}`,
+    }),
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("task_not_found");
+  expect(
+    screen.queryByRole("button", { name: "开始处理" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: pendingTask.title }),
+  ).not.toBeInTheDocument();
+});
+
+test("clears task state when the post-mutation refresh fails", async () => {
+  listMock
+    .mockResolvedValueOnce([pendingTask])
+    .mockRejectedValueOnce(new ApiError("storage_unavailable", 503));
+  startMock.mockResolvedValue({
+    ...pendingTask,
+    status: "in_progress",
+    row_version: 5,
+  });
+
+  renderPage("group_member", "监测预报组");
+
+  fireEvent.click(await screen.findByRole("button", { name: "开始处理" }));
+
+  expect(
+    (await screen.findAllByText("storage_unavailable")).length,
+  ).toBeGreaterThan(0);
+  expect(screen.queryByText(pendingTask.title)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "开始处理" }),
+  ).not.toBeInTheDocument();
+});
+
 test("ignores a delayed list response from the previous event", async () => {
   let resolveEventA!: (tasks: WorkgroupTask[]) => void;
   const delayedEventA = new Promise<WorkgroupTask[]>((resolve) => {
@@ -641,6 +727,54 @@ test("creates a temporary task with the fixed workgroup list and refreshes", asy
   });
   await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
   expect(screen.getAllByRole("option")).toHaveLength(7);
+});
+
+test("does not leave the next event temporary-task button disabled after switching", async () => {
+  let resolveTemporary!: (task: WorkgroupTask) => void;
+  const delayedTemporary = new Promise<WorkgroupTask>((resolve) => {
+    resolveTemporary = resolve;
+  });
+  listMock.mockResolvedValue([]);
+  getEventMock.mockImplementation(async (id) =>
+    id === "event-2"
+      ? { ...event, id: "event-2", place: "上海松江区" }
+      : event,
+  );
+  createTemporaryMock.mockReturnValue(delayedTemporary);
+
+  renderPage("superadmin", null);
+
+  fireEvent.change(await screen.findByLabelText("临时任务标题"), {
+    target: { value: "事件 A 临时任务" },
+  });
+  fireEvent.change(screen.getByLabelText("任务说明"), {
+    target: { value: "事件 A 说明" },
+  });
+  fireEvent.change(screen.getByLabelText("截止时间"), {
+    target: { value: "2026-10-03T10:00" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "创建临时任务" }));
+
+  expect(
+    screen.getByRole("button", { name: "创建临时任务" }),
+  ).toBeDisabled();
+
+  fireEvent.click(screen.getByRole("button", { name: "切换到事件 B" }));
+
+  const nextEventButton = await screen.findByRole("button", {
+    name: "创建临时任务",
+  });
+  expect(nextEventButton).toBeEnabled();
+
+  await act(async () => {
+    resolveTemporary({
+      ...pendingTask,
+      id: "task-a",
+      source_type: "ad_hoc",
+    });
+  });
+
+  expect(screen.getByRole("button", { name: "创建临时任务" })).toBeEnabled();
 });
 
 test("uploads a candidate file and confirms publication of that version", async () => {
