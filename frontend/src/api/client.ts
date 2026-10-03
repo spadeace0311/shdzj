@@ -156,17 +156,50 @@ function collaborationHeaders(
   return authenticatedHeaders(message);
 }
 
-function idempotentMutationHeaders(): Record<string, string> {
+export function newIdempotencyKey(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  const bytes = new Uint8Array(16);
+  if (typeof globalThis.crypto?.getRandomValues === "function") {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  );
+  return [
+    hex.slice(0, 4).join(""),
+    hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""),
+    hex.slice(8, 10).join(""),
+    hex.slice(10, 16).join(""),
+  ].join("-");
+}
+
+function idempotentMutationHeaders(
+  idempotencyKey = newIdempotencyKey(),
+): Record<string, string> {
   return {
     ...collaborationHeaders(),
     "Content-Type": "application/json",
-    "Idempotency-Key": globalThis.crypto.randomUUID(),
+    "Idempotency-Key": idempotencyKey,
   };
 }
 
-function mutationHeaders(version: number): Record<string, string> {
+function mutationHeaders(
+  version: number,
+  idempotencyKey?: string,
+): Record<string, string> {
   return {
-    ...idempotentMutationHeaders(),
+    ...idempotentMutationHeaders(idempotencyKey),
     "If-Match": String(version),
   };
 }
@@ -361,12 +394,13 @@ export async function getCollaborationTask(
 export async function startCollaborationTask(
   taskId: string,
   version: number,
+  idempotencyKey?: string,
 ): Promise<WorkgroupTask> {
   return requestJson<WorkgroupTask>(
     `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/start`,
     {
       method: "POST",
-      headers: mutationHeaders(version),
+      headers: mutationHeaders(version, idempotencyKey),
     },
   );
 }
@@ -375,12 +409,13 @@ export async function submitCollaborationTask(
   taskId: string,
   version: number,
   input: TaskSubmitInput,
+  idempotencyKey?: string,
 ): Promise<WorkgroupTask> {
   return requestJson<WorkgroupTask>(
     `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/submit`,
     {
       method: "POST",
-      headers: mutationHeaders(version),
+      headers: mutationHeaders(version, idempotencyKey),
       body: JSON.stringify(input),
     },
   );
@@ -390,12 +425,13 @@ export async function returnCollaborationTask(
   taskId: string,
   version: number,
   reason: string,
+  idempotencyKey?: string,
 ): Promise<WorkgroupTask> {
   return requestJson<WorkgroupTask>(
     `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/return`,
     {
       method: "POST",
-      headers: mutationHeaders(version),
+      headers: mutationHeaders(version, idempotencyKey),
       body: JSON.stringify({ reason }),
     },
   );
@@ -404,12 +440,13 @@ export async function returnCollaborationTask(
 export async function completeCollaborationTask(
   taskId: string,
   version: number,
+  idempotencyKey?: string,
 ): Promise<WorkgroupTask> {
   return requestJson<WorkgroupTask>(
     `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/complete`,
     {
       method: "POST",
-      headers: mutationHeaders(version),
+      headers: mutationHeaders(version, idempotencyKey),
     },
   );
 }
@@ -417,12 +454,13 @@ export async function completeCollaborationTask(
 export async function createTemporaryTask(
   eventId: string,
   input: TemporaryTaskCreateInput,
+  idempotencyKey?: string,
 ): Promise<WorkgroupTask> {
   return requestJson<WorkgroupTask>(
     `/api/v1/events/${encodeURIComponent(eventId)}/collaboration/tasks`,
     {
       method: "POST",
-      headers: idempotentMutationHeaders(),
+      headers: idempotentMutationHeaders(idempotencyKey),
       body: JSON.stringify(input),
     },
   );

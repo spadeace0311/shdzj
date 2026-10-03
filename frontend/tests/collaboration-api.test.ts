@@ -11,6 +11,7 @@ import {
   getCommandHallOverview,
   getCommandHallTask,
   listCollaborationTasks,
+  newIdempotencyKey,
   returnCollaborationTask,
   setAccessToken,
   startCollaborationTask,
@@ -55,6 +56,12 @@ function mutationRequest(index = 0): [string, RequestInit] {
   return fetchMock.mock.calls[index] as [string, RequestInit];
 }
 
+function isUuidV4(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+    value,
+  );
+}
+
 beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   clearAccessToken();
@@ -92,6 +99,21 @@ test("getCollaborationTask reads task detail with bearer auth", async () => {
   );
 });
 
+test("newIdempotencyKey falls back when randomUUID is unavailable", () => {
+  const getRandomValues = globalThis.crypto.getRandomValues.bind(
+    globalThis.crypto,
+  );
+  vi.stubGlobal("crypto", { getRandomValues } as Crypto);
+
+  expect(isUuidV4(newIdempotencyKey())).toBe(true);
+});
+
+test("newIdempotencyKey falls back to Math.random without Web Crypto", () => {
+  vi.stubGlobal("crypto", undefined);
+
+  expect(isUuidV4(newIdempotencyKey())).toBe(true);
+});
+
 test("startCollaborationTask sends If-Match and an idempotency key", async () => {
   fetchMock.mockResolvedValue(jsonResponse({ ...task, status: "in_progress" }));
 
@@ -103,6 +125,24 @@ test("startCollaborationTask sends If-Match and an idempotency key", async () =>
   expect(init.method).toBe("POST");
   expect(headers.get("If-Match")).toBe("4");
   expect(headers.get("Idempotency-Key")).toBeTruthy();
+});
+
+test("startCollaborationTask reuses a caller-provided idempotency key", async () => {
+  fetchMock.mockImplementation(async () =>
+    jsonResponse({ ...task, status: "in_progress" }),
+  );
+
+  await startCollaborationTask("task-1", 4, "retry-safe-key");
+  await startCollaborationTask("task-1", 4, "retry-safe-key");
+
+  const firstHeaders = Object.fromEntries(
+    new Headers(mutationRequest(0)[1].headers).entries(),
+  );
+  const secondHeaders = Object.fromEntries(
+    new Headers(mutationRequest(1)[1].headers).entries(),
+  );
+  expect(firstHeaders).toEqual(secondHeaders);
+  expect(firstHeaders["idempotency-key"]).toBe("retry-safe-key");
 });
 
 test("submitCollaborationTask sends the result text and optimistic version", async () => {
@@ -187,6 +227,30 @@ test("createTemporaryTask posts the backend fields with an idempotency key", asy
   });
 });
 
+test("all collaboration task writes accept explicit idempotency keys", async () => {
+  fetchMock.mockImplementation(async () => jsonResponse(task));
+
+  await submitCollaborationTask("task-1", 4, {}, "submit-key");
+  await returnCollaborationTask("task-1", 4, "补充说明", "return-key");
+  await completeCollaborationTask("task-1", 4, "complete-key");
+  await createTemporaryTask(
+    "event-1",
+    {
+      workgroup_code: "comprehensive_coordination",
+      title: "临时协调任务",
+      instruction: "联系相关单位确认信息",
+      priority: 20,
+    },
+    "temporary-key",
+  );
+
+  expect(
+    fetchMock.mock.calls.map(([, init]) =>
+      new Headers((init as RequestInit).headers).get("Idempotency-Key"),
+    ),
+  ).toEqual(["submit-key", "return-key", "complete-key", "temporary-key"]);
+});
+
 test("command hall read helpers use authenticated backend routes", async () => {
   fetchMock
     .mockResolvedValueOnce(jsonResponse({ event_id: "event-1" }))
@@ -255,6 +319,50 @@ test("streamCommandHall parses split named SSE events with bearer auth", async (
     {
       type: "projection.updated",
       data: { event_id: "event-1", projection_version: 2 },
+    },
+    {
+      type: "task.alert.created",
+      data: { task_id: "task-1" },
+    },
+  ]);
+});
+
+test("streamCommandHall handles split boundaries, multiline data, and a final frame without a delimiter", async () => {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode('event: projection.updated\ndata: {"event_id":"event-1",\n'),
+      );
+      controller.enqueue(
+        encoder.encode('data: "projection_version":3}\r\n\r'),
+      );
+      controller.enqueue(
+        encoder.encode(
+          '\nevent: task.alert.created\ndata: {"task_id":"task-1"}',
+        ),
+      );
+      controller.close();
+    },
+  });
+  fetchMock.mockResolvedValue(
+    new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }),
+  );
+  const events: CommandHallStreamEvent[] = [];
+
+  await streamCommandHall(
+    "event-1",
+    (event) => events.push(event),
+    new AbortController().signal,
+  );
+
+  expect(events).toEqual([
+    {
+      type: "projection.updated",
+      data: { event_id: "event-1", projection_version: 3 },
     },
     {
       type: "task.alert.created",
