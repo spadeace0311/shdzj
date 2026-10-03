@@ -574,6 +574,12 @@ class ArtifactActivities:
                     observed,
                 )
                 tasks = await repository.list_tasks(session, run.id)
+                from app.collaboration.artifact_link import ArtifactLinkService
+
+                await ArtifactLinkService().sync_run_publications(
+                    session,
+                    run.id,
+                )
                 return {
                     "status": finalized.status,
                     "completed_count": sum(
