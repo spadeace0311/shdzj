@@ -23,9 +23,7 @@ from app.db import Base
 
 class ArtifactTemplate(Base):
     __tablename__ = "artifact_templates"
-    __table_args__ = (
-        UniqueConstraint("template_key", name="uq_artifact_template_key"),
-    )
+    __table_args__ = (UniqueConstraint("template_key", name="uq_artifact_template_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -161,8 +159,7 @@ class ProductionRun(Base):
             name="uq_artifact_run_generation",
         ),
         CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'partial', "
-            "'failed', 'canceled')",
+            "status IN ('pending', 'running', 'completed', 'partial', " "'failed', 'canceled')",
             name="ck_artifact_run_status",
         ),
         CheckConstraint(
@@ -223,9 +220,7 @@ class ProductionRun(Base):
     deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     deadline_kind: Mapped[str] = mapped_column(String(32))
     deadline_exceeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_artifact_committed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    last_artifact_committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_reason: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -340,12 +335,8 @@ class ArtifactProductionCancelRequest(Base):
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
     )
-    lease_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
-    dispatched_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -740,6 +731,9 @@ class ArtifactOverrideRequest(Base):
     response_body: Mapped[dict | None] = mapped_column(JSONB)
     production_run_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("artifact_production_runs.id", ondelete="SET NULL"),
+    )
+    event_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("earthquake_events.id", ondelete="CASCADE"),
     )
     artifact_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("generated_artifacts.id", ondelete="SET NULL"),

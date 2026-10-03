@@ -70,6 +70,7 @@ from app.event_object_locks import (
     lock_event_write,
     storage_path_reference_count,
 )
+from app.event_object_cleanup import cleanup_object_intents
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 from sqlalchemy import select
 
@@ -1038,6 +1039,15 @@ async def _run_retention_loop(
                         session,
                         observed_at=observed_at,
                     )
+            if result.cleanup_intents:
+                async with session_factory() as cleanup_session:
+                    async with cleanup_session.begin():
+                        cleanup_result = await cleanup_object_intents(
+                            cleanup_session,
+                            result.cleanup_intents,
+                            ArtifactStore(configured.artifact_storage_root),
+                        )
+                result = result.with_cleanup_result(cleanup_result)
             payload = {
                 "test": result.test_deleted,
                 "drill": result.drill_deleted,

@@ -29,10 +29,11 @@ from app.collaboration.models import (
     WorkgroupTask,
 )
 from app.collaboration.roster import MemberInput, RosterService
-from app.collaboration.router import get_roster_session
+from app.collaboration.router import get_cleanup_session, get_roster_session
 from app.collaboration.service import DeliverableService
 from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.event_object_cleanup import cleanup_event_objects
 from app.main import app
 
 
@@ -665,9 +666,10 @@ async def test_add_manual_version_stores_file_and_records_metadata(
     assert version.source_kind == DeliverableSourceKind.MANUAL
     assert version.storage_key is not None
     assert version.size_bytes == len(b"manual-bytes")
-    assert version.checksum == store.store_immutable_stream(
-        BytesIO(b"manual-bytes"), file_name="result.txt"
-    ).checksum
+    assert (
+        version.checksum
+        == store.store_immutable_stream(BytesIO(b"manual-bytes"), file_name="result.txt").checksum
+    )
     assert store.resolve(version.storage_key).is_file()
 
 
@@ -807,8 +809,7 @@ async def test_delete_candidate_rejects_automatic_version(
             select(TaskDeliverableVersion)
             .where(
                 TaskDeliverableVersion.deliverable_id == deliverable.id,
-                TaskDeliverableVersion.source_kind
-                == DeliverableSourceKind.AUTOMATIC,
+                TaskDeliverableVersion.source_kind == DeliverableSourceKind.AUTOMATIC,
             )
             .limit(1)
         )
@@ -1008,11 +1009,20 @@ async def test_delete_candidate_cleans_unreferenced_manual_object(
     path = store.resolve(version.storage_key)
     assert path.is_file()
 
-    await service.delete_candidate(
+    cleanup = await service.delete_candidate(
         session,
         version.id,
         actor=group_member_user,
     )
+    assert cleanup is not None
+    assert path.is_file()
+    result = await cleanup_event_objects(
+        session,
+        cleanup.event_id,
+        cleanup.storage_paths,
+        store,
+    )
+    assert result.succeeded
     assert not path.exists()
 
 
@@ -1043,18 +1053,27 @@ async def test_delete_candidate_keeps_shared_storage_object(
     assert first.storage_key == second.storage_key
     path = store.resolve(first.storage_key)
 
-    await service.delete_candidate(
+    cleanup = await service.delete_candidate(
         session,
         first.id,
         actor=group_member_user,
     )
+    assert cleanup is None
     assert path.is_file()
 
-    await service.delete_candidate(
+    cleanup = await service.delete_candidate(
         session,
         second.id,
         actor=group_member_user,
     )
+    assert cleanup is not None
+    result = await cleanup_event_objects(
+        session,
+        cleanup.event_id,
+        cleanup.storage_paths,
+        store,
+    )
+    assert result.succeeded
     assert not path.exists()
 
 
@@ -1070,9 +1089,7 @@ async def test_deliverable_list_and_publish_routes(
         AuthUser(superadmin_user.username, superadmin_user.role, None),
     )
     try:
-        listed = await client.get(
-            f"/api/v1/collaboration/tasks/{deliverable.task_id}/deliverables"
-        )
+        listed = await client.get(f"/api/v1/collaboration/tasks/{deliverable.task_id}/deliverables")
         assert listed.status_code == 200
         assert listed.json()[0]["versions"][0]["version_no"] == 1
 
@@ -1170,6 +1187,7 @@ async def _client(session, current_user: AuthUser):
         yield session
 
     app.dependency_overrides[get_roster_session] = override_session
+    app.dependency_overrides[get_cleanup_session] = override_session
     app.dependency_overrides[get_current_user] = lambda: current_user
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")

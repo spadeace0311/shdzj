@@ -291,10 +291,33 @@ async def purge_fixture(seeded_artifact_assessment, session_factory):
                 response_status=200,
                 production_run_id=artifact.production_run_id,
                 artifact_id=artifact.id,
+                event_id=first_event.id,
                 created_at=now,
                 completed_at=now,
             )
             session.add(override)
+            session.add(
+                ArtifactOverrideRequest(
+                    actor_id="purge-test",
+                    endpoint=(
+                        f"/api/v1/events/{first_event.id}/artifacts/map.epicenter/"
+                        "override?output_profile=a3v-professional"
+                    ),
+                    idempotency_key=f"purge-failed-override-{uuid.uuid4()}",
+                    request_fingerprint="f" * 64,
+                    status="failed",
+                    response_status=422,
+                    response_body={
+                        "error_category": "format_mismatch",
+                        "summary": "failed before run/artifact binding",
+                    },
+                    production_run_id=None,
+                    artifact_id=None,
+                    event_id=first_event.id,
+                    created_at=now,
+                    completed_at=now,
+                )
+            )
 
             asset = DataAsset(
                 asset_key=f"purge-global-{uuid.uuid4().hex}",
@@ -622,7 +645,7 @@ async def test_superadmin_purge_removes_full_event_closure_and_preserves_shared_
     assert result.deleted_collaboration_task_count == 1
     assert result.deleted_artifact_count == 1
     assert result.deleted_publication_count == 1
-    assert result.deleted_override_count == 1
+    assert result.deleted_override_count == 2
     assert result.deleted_task_event_count == 1
     assert result.already_purged is False
     assert purge_fixture.shared_artifact_path == purge_fixture.artifact_path
@@ -651,6 +674,18 @@ async def test_superadmin_purge_removes_full_event_closure_and_preserves_shared_
     )
     assert (await session.get(CollaborationTaskEvent, purge_fixture.task_event_id)) is None
     assert await session.get(ArtifactOverrideRequest, purge_fixture.override_id) is None
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(ArtifactOverrideRequest)
+            .where(
+                ArtifactOverrideRequest.endpoint.like(
+                    f"%/events/{purge_fixture.event_id}/artifacts/%"
+                )
+            )
+        )
+        == 0
+    )
     assert await session.get(ProductionRun, purge_fixture.production_run_id) is None
 
     child_counts = (
@@ -1408,3 +1443,136 @@ async def test_purge_first_makes_inflight_manual_write_fail_without_orphan(
             await asyncio.wait_for(writer, timeout=5)
 
     assert not store.resolve(relative_path).exists()
+
+
+async def test_candidate_delete_returns_postcommit_cleanup_intent_and_rollback_keeps_file(
+    session_factory,
+    tmp_path,
+) -> None:
+    fixture = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-rollback",
+    )
+    store = ArtifactStore(tmp_path / "artifacts")
+    service = DeliverableService(artifact_store=store)
+    payload = f"rollback-candidate-{uuid.uuid4()}".encode()
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await service.add_manual_version(
+                session,
+                fixture.deliverable_id,
+                fixture.actor,
+                source=BytesIO(payload),
+                file_name="rollback-candidate.txt",
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            path = store.resolve(storage_path)
+            assert path.is_file()
+
+    async with session_factory() as session:
+        transaction = await session.begin()
+        cleanup = await service.delete_candidate(
+            session,
+            version_id,
+            fixture.actor,
+        )
+        assert cleanup is not None
+        assert cleanup.event_id == fixture.event_id
+        assert cleanup.storage_paths == (storage_path,)
+        assert path.is_file()
+        await transaction.rollback()
+
+    assert path.is_file()
+    async with session_factory() as session:
+        assert await session.get(TaskDeliverableVersion, version_id) is not None
+
+
+async def test_candidate_delete_waits_for_cross_event_same_path_writer(
+    session_factory,
+    tmp_path,
+) -> None:
+    first = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-cross-event-a",
+    )
+    second = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-cross-event-b",
+    )
+    store = ArtifactStore(tmp_path / "artifacts")
+    writer_service = DeliverableService(artifact_store=store)
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await writer_service.add_manual_version(
+                session,
+                first.deliverable_id,
+                first.actor,
+                source=BytesIO(b"cross-event-candidate"),
+                file_name="cross-event-candidate.txt",
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            path = store.resolve(storage_path)
+            assert path.is_file()
+
+    stored = asyncio.Event()
+    release = asyncio.Event()
+    pausing_writer = PausingDeliverableService(
+        stored=stored,
+        release=release,
+        artifact_store=store,
+    )
+
+    async def write_second_event() -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                await pausing_writer.add_manual_version(
+                    session,
+                    second.deliverable_id,
+                    second.actor,
+                    source=BytesIO(b"cross-event-candidate"),
+                    file_name="cross-event-candidate.txt",
+                    mime_type="text/plain",
+                )
+
+    writer = asyncio.create_task(write_second_event())
+    await asyncio.wait_for(stored.wait(), timeout=2)
+    delete_result: list[object] = []
+
+    async def delete_first_event_candidate() -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                cleanup = await writer_service.delete_candidate(
+                    session,
+                    version_id,
+                    first.actor,
+                )
+                delete_result.append(cleanup)
+
+    deleter = asyncio.create_task(delete_first_event_candidate())
+    await _wait_for_advisory_waiter(session_factory)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(deleter, writer), timeout=5)
+
+    assert delete_result == [None]
+    assert path.is_file()
+    async with session_factory() as session:
+        second_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(TaskDeliverableVersion)
+                .where(
+                    TaskDeliverableVersion.deliverable_id == second.deliverable_id,
+                    TaskDeliverableVersion.storage_key == storage_path,
+                )
+            )
+            or 0
+        )
+    assert second_count == 1

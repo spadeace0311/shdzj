@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact, ProductionRun
-from app.artifacts.storage import ArtifactStore, StoredArtifactFile
-from app.config import settings
+from app.event_object_cleanup import ObjectCleanupIntent, ObjectCleanupResult
+from app.event_object_locks import (
+    lock_artifact_object,
+    lock_event_write,
+    storage_path_reference_count,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,19 +26,20 @@ class ArtifactRetentionResult:
     failed_deletions: int = 0
     protected_publication_count: int = 0
     protected_publication_reasons: tuple[tuple[str, int], ...] = ()
+    cleanup_intents: tuple[ObjectCleanupIntent, ...] = ()
+
+    def with_cleanup_result(
+        self,
+        cleanup_result: ObjectCleanupResult,
+    ) -> "ArtifactRetentionResult":
+        return replace(
+            self,
+            failed_deletions=len(cleanup_result.failed_paths),
+        )
 
 
 class ArtifactRetentionService:
     """Delete expired test/drill artifacts without touching live or manual output."""
-
-    def __init__(self, store: ArtifactStore | None = None) -> None:
-        self._store = store
-
-    @property
-    def _artifact_store(self) -> ArtifactStore:
-        if self._store is None:
-            self._store = ArtifactStore(settings.artifact_storage_root)
-        return self._store
 
     async def retain_expired(
         self,
@@ -64,26 +70,34 @@ class ArtifactRetentionService:
             expired.extend(rows)
 
         expired_by_id = {artifact.id: artifact for artifact in expired}
+        if not expired_by_id:
+            return ArtifactRetentionResult()
+
         expired_paths = {artifact.storage_path for artifact in expired}
+        for event_id in sorted(
+            {artifact.event_id for artifact in expired},
+            key=str,
+        ):
+            await lock_event_write(session, event_id)
         for storage_path in sorted(expired_paths):
-            await session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(:lock_key, 0))"
-                ),
-                {
-                    "lock_key": (
-                        f"artifact-retention-path:{storage_path}"
-                    )
-                },
+            await lock_artifact_object(session, storage_path)
+
+        current_expired = (
+            await session.scalars(
+                select(GeneratedArtifact)
+                .where(GeneratedArtifact.id.in_(list(expired_by_id)))
+                .order_by(GeneratedArtifact.id)
+                .with_for_update()
             )
+        ).all()
+        current_expired_by_id = {artifact.id: artifact for artifact in current_expired}
+        if not current_expired_by_id:
+            return ArtifactRetentionResult()
 
         path_artifacts = (
             await session.scalars(
                 select(GeneratedArtifact)
-                .where(
-                    GeneratedArtifact.storage_path.in_(expired_paths)
-                )
+                .where(GeneratedArtifact.storage_path.in_(expired_paths))
                 .order_by(GeneratedArtifact.id)
                 .with_for_update()
             )
@@ -94,55 +108,36 @@ class ArtifactRetentionService:
                 select(
                     ArtifactPublication.artifact_id,
                     ArtifactPublication.superseded_at,
-                ).where(
-                    ArtifactPublication.artifact_id.in_(
-                        path_artifact_ids
-                    )
-                )
+                ).where(ArtifactPublication.artifact_id.in_(path_artifact_ids))
             )
         ).all()
-        protected_ids = {
-            artifact_id
-            for artifact_id, _superseded_at in publication_references
-        }
+        protected_ids = {artifact_id for artifact_id, _superseded_at in publication_references}
         protection_reasons = {
             "current_publication": sum(
-                superseded_at is None
-                for _artifact_id, superseded_at in publication_references
+                superseded_at is None for _artifact_id, superseded_at in publication_references
             ),
             "superseded_publication": sum(
-                superseded_at is not None
-                for _artifact_id, superseded_at in publication_references
+                superseded_at is not None for _artifact_id, superseded_at in publication_references
             ),
         }
 
         deletable: list[GeneratedArtifact] = []
-        failed_deletions = 0
+        cleanup_owners: dict[str, uuid.UUID] = {}
         for storage_path in sorted(expired_paths):
-            references = [
+            path_deletable = [
                 artifact
                 for artifact in path_artifacts
                 if artifact.storage_path == storage_path
-            ]
-            path_deletable = [
-                artifact
-                for artifact in references
-                if artifact.id in expired_by_id
+                and artifact.id in current_expired_by_id
                 and artifact.id not in protected_ids
             ]
             if not path_deletable:
                 continue
-            has_survivor = any(
-                artifact.id not in {item.id for item in path_deletable}
-                for artifact in references
-            )
-            if has_survivor:
-                deletable.extend(path_deletable)
-                continue
-            if await self._delete_object(path_deletable[0]):
-                deletable.extend(path_deletable)
-            else:
-                failed_deletions += 1
+            deletable.extend(path_deletable)
+            cleanup_owners[storage_path] = sorted(
+                {artifact.event_id for artifact in path_deletable},
+                key=str,
+            )[0]
 
         if deletable:
             ids = [artifact.id for artifact in deletable]
@@ -155,46 +150,32 @@ class ArtifactRetentionService:
                 await session.delete(artifact)
             await session.flush()
 
-        test_deleted = sum(
-            1
-            for artifact in deletable
-            if artifact.production_mode == "test"
-        )
-        drill_deleted = sum(
-            1
-            for artifact in deletable
-            if artifact.production_mode == "drill"
-        )
+        cleanup_by_event: dict[uuid.UUID, set[str]] = {}
+        for storage_path, event_id in cleanup_owners.items():
+            if await storage_path_reference_count(session, storage_path) == 0:
+                cleanup_by_event.setdefault(event_id, set()).add(storage_path)
+
         return ArtifactRetentionResult(
-            test_deleted=test_deleted,
-            drill_deleted=drill_deleted,
+            test_deleted=sum(1 for artifact in deletable if artifact.production_mode == "test"),
+            drill_deleted=sum(1 for artifact in deletable if artifact.production_mode == "drill"),
             live_deleted=0,
             manual_deleted=0,
             replay_deleted=0,
-            failed_deletions=failed_deletions,
+            failed_deletions=0,
             protected_publication_count=len(publication_references),
             protected_publication_reasons=tuple(
-                (reason, count)
-                for reason, count in protection_reasons.items()
-                if count
+                (reason, count) for reason, count in protection_reasons.items() if count
+            ),
+            cleanup_intents=tuple(
+                ObjectCleanupIntent(event_id, tuple(sorted(paths)))
+                for event_id, paths in sorted(
+                    cleanup_by_event.items(),
+                    key=lambda item: str(item[0]),
+                )
             ),
         )
 
-    async def _delete_object(self, artifact: GeneratedArtifact) -> bool:
-        try:
-            path = self._artifact_store.resolve(artifact.storage_path)
-            self._artifact_store.delete_unreferenced(
-                StoredArtifactFile(
-                    file_name=artifact.file_name,
-                    relative_path=artifact.storage_path,
-                    managed_path=path,
-                    size_bytes=artifact.size_bytes,
-                    checksum=artifact.checksum,
-                )
-            )
-        except (OSError, ValueError):
-            return False
-        return True
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("observed_at must include timezone information")

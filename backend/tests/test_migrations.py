@@ -16,7 +16,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0019_event_purge_receipts"
+LATEST_REVISION = "0020_override_event"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -565,6 +565,215 @@ async def _exercise_event_purge_receipt_identity() -> None:
                     WHERE event_id = :event_id
                     """
                 ),
+                {"event_id": event_id},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _artifact_override_event_schema_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync: {
+                    column["name"]: column
+                    for column in inspect(sync).get_columns("artifact_override_requests")
+                }
+            )
+            foreign_keys = await connection.run_sync(
+                lambda sync: inspect(sync).get_foreign_keys("artifact_override_requests")
+            )
+            indexes = await connection.run_sync(
+                lambda sync: {
+                    index["name"]
+                    for index in inspect(sync).get_indexes("artifact_override_requests")
+                }
+            )
+    finally:
+        await engine.dispose()
+    return {
+        "columns": columns,
+        "foreign_keys": foreign_keys,
+        "indexes": indexes,
+    }
+
+
+async def _insert_artifact_override_backfill_rows() -> tuple[uuid.UUID, uuid.UUID]:
+    event_id = uuid.uuid4()
+    unmatched_id = uuid.uuid4()
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO earthquake_events (
+                        id,
+                        source,
+                        canonical_source_id,
+                        event_type,
+                        origin_time,
+                        longitude,
+                        latitude,
+                        depth_km,
+                        magnitude,
+                        place,
+                        geom,
+                        lifecycle_state
+                    )
+                    VALUES (
+                        :event_id,
+                        'migration-0020',
+                        :canonical_source_id,
+                        'test',
+                        now(),
+                        121.5,
+                        31.2,
+                        10,
+                        4.5,
+                        'migration 0020 event',
+                        ST_SetSRID(ST_MakePoint(121.5, 31.2), 4326),
+                        'active'
+                    )
+                    """
+                ),
+                {
+                    "event_id": event_id,
+                    "canonical_source_id": f"migration-0020-{event_id}",
+                },
+            )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO artifact_override_requests (
+                        id,
+                        actor_id,
+                        endpoint,
+                        idempotency_key,
+                        request_fingerprint,
+                        status
+                    )
+                    VALUES (
+                        :valid_id,
+                        'migration-0020',
+                        :valid_endpoint,
+                        'valid-key',
+                        :fingerprint,
+                        'failed'
+                    ),
+                    (
+                        :empty_id,
+                        'migration-0020',
+                        '',
+                        'empty-key',
+                        :fingerprint,
+                        'failed'
+                    ),
+                    (
+                        :unmatched_id,
+                        'migration-0020',
+                        :unmatched_endpoint,
+                        'unmatched-key',
+                        :fingerprint,
+                        'failed'
+                    )
+                    """
+                ),
+                {
+                    "valid_id": uuid.uuid4(),
+                    "valid_endpoint": (
+                        f"/api/v1/events/{event_id}/artifacts/map.epicenter/"
+                        "override?output_profile=a3v-professional"
+                    ),
+                    "empty_id": uuid.uuid4(),
+                    "unmatched_id": uuid.uuid4(),
+                    "unmatched_endpoint": (
+                        f"/api/v1/events/{unmatched_id}/artifacts/map.epicenter/"
+                        "override?output_profile=a3v-professional"
+                    ),
+                    "fingerprint": "a" * 64,
+                },
+            )
+    finally:
+        await engine.dispose()
+    return event_id, unmatched_id
+
+
+async def _assert_artifact_override_event_backfill(event_id: uuid.UUID) -> None:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            """
+                        SELECT idempotency_key, event_id
+                        FROM artifact_override_requests
+                        WHERE actor_id = 'migration-0020'
+                        ORDER BY idempotency_key
+                        """
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        assert {row["idempotency_key"]: row["event_id"] for row in rows} == {
+            "empty-key": None,
+            "unmatched-key": None,
+            "valid-key": event_id,
+        }
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO artifact_override_requests (
+                            id,
+                            actor_id,
+                            endpoint,
+                            idempotency_key,
+                            request_fingerprint,
+                            status,
+                            event_id
+                        )
+                        VALUES (
+                            :id,
+                            'migration-0020-invalid',
+                            '/api/v1/events/not-a-uuid/artifacts/x/override',
+                            'invalid-fk',
+                            :fingerprint,
+                            'failed',
+                            :missing_event_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "fingerprint": "b" * 64,
+                        "missing_event_id": uuid.uuid4(),
+                    },
+                )
+    finally:
+        await engine.dispose()
+
+
+async def _delete_artifact_override_backfill_rows(event_id: uuid.UUID) -> None:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM artifact_override_requests
+                    WHERE actor_id LIKE 'migration-0020%'
+                    """
+                )
+            )
+            await connection.execute(
+                text("DELETE FROM earthquake_events WHERE id = :event_id"),
                 {"event_id": event_id},
             )
     finally:
@@ -1380,3 +1589,34 @@ async def test_0019_event_purge_receipts_are_reversible() -> None:
         assert (await _event_purge_receipt_schema_state())["exists"] is True
     finally:
         _set_revision(LATEST_REVISION)
+
+
+async def test_0020_artifact_override_event_identity_backfill_and_fk() -> None:
+    previous_revision = "0019_event_purge_receipts"
+    _set_revision(previous_revision)
+    event_id, _unmatched_id = await _insert_artifact_override_backfill_rows()
+    try:
+        previous_state = await _artifact_override_event_schema_state()
+        assert "event_id" not in previous_state["columns"]
+
+        _set_revision(LATEST_REVISION)
+        await _assert_artifact_override_event_backfill(event_id)
+        state = await _artifact_override_event_schema_state()
+        assert state["columns"]["event_id"]["nullable"] is True
+        assert any(
+            foreign_key["constrained_columns"] == ["event_id"]
+            and foreign_key["referred_table"] == "earthquake_events"
+            for foreign_key in state["foreign_keys"]
+        )
+        assert "ix_artifact_override_requests_event_id" in state["indexes"]
+
+        _set_revision(previous_revision)
+        downgraded = await _artifact_override_event_schema_state()
+        assert "event_id" not in downgraded["columns"]
+
+        _set_revision(LATEST_REVISION)
+        re_upgraded = await _artifact_override_event_schema_state()
+        assert "event_id" in re_upgraded["columns"]
+    finally:
+        _set_revision(LATEST_REVISION)
+        await _delete_artifact_override_backfill_rows(event_id)

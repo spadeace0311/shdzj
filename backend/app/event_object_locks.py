@@ -63,6 +63,8 @@ async def lock_purge_event_objects(
 async def storage_path_reference_count(
     session: AsyncSession,
     relative_path: str,
+    *,
+    exclude_deliverable_version_id: uuid.UUID | None = None,
 ) -> int:
     artifact_count = int(
         await session.scalar(
@@ -72,14 +74,16 @@ async def storage_path_reference_count(
         )
         or 0
     )
-    deliverable_count = int(
-        await session.scalar(
-            select(func.count())
-            .select_from(TaskDeliverableVersion)
-            .where(TaskDeliverableVersion.storage_key == relative_path)
-        )
-        or 0
+    deliverable_statement = (
+        select(func.count())
+        .select_from(TaskDeliverableVersion)
+        .where(TaskDeliverableVersion.storage_key == relative_path)
     )
+    if exclude_deliverable_version_id is not None:
+        deliverable_statement = deliverable_statement.where(
+            TaskDeliverableVersion.id != exclude_deliverable_version_id
+        )
+    deliverable_count = int(await session.scalar(deliverable_statement) or 0)
     return artifact_count + deliverable_count
 
 

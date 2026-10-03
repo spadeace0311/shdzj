@@ -65,6 +65,7 @@ from app.collaboration.service import (
 )
 from app.config import settings
 from app.db import SessionFactory
+from app.event_object_cleanup import cleanup_event_objects
 
 router = APIRouter(prefix="/api/v1", tags=["workgroups"])
 logger = logging.getLogger(__name__)
@@ -102,6 +103,11 @@ def get_deliverable_service() -> DeliverableService:
 
 
 async def get_purge_session() -> AsyncIterator[AsyncSession]:
+    async with SessionFactory() as session:
+        yield session
+
+
+async def get_cleanup_session() -> AsyncIterator[AsyncSession]:
     async with SessionFactory() as session:
         yield session
 
@@ -685,8 +691,9 @@ async def add_file_deliverable_version(
 )
 async def delete_deliverable_candidate(
     version_id: UUID,
-    session: AsyncSession = Depends(get_roster_session),
+    session: AsyncSession = Depends(get_cleanup_session),
     service: DeliverableService = Depends(get_deliverable_service),
+    artifact_store: ArtifactStore = Depends(get_artifact_store),
     current_user: AuthUser = Depends(get_current_user),
     if_match: str | None = Header(default=None, alias="If-Match"),
     idempotency_key: str | None = Header(
@@ -696,15 +703,36 @@ async def delete_deliverable_candidate(
 ) -> None:
     expected_version = _parse_optional_if_match(if_match)
     try:
-        await service.delete_candidate(
-            session,
-            version_id,
-            current_user,
-            expected_version=expected_version,
-            idempotency_key=idempotency_key,
-        )
+        async with session.begin():
+            cleanup = await service.delete_candidate(
+                session,
+                version_id,
+                current_user,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
+
+    if cleanup is None:
+        return
+    try:
+        async with session.begin():
+            cleanup_result = await cleanup_event_objects(
+                session,
+                cleanup.event_id,
+                cleanup.storage_paths,
+                artifact_store,
+            )
+    except SQLAlchemyError as exc:
+        raise _storage_unavailable() from exc
+    if not cleanup_result.succeeded:
+        logger.warning(
+            "deliverable candidate cleanup incomplete version_id=%s paths=%s",
+            version_id,
+            cleanup_result.failed_paths,
+        )
+        raise _storage_unavailable()
 
 
 @router.post(

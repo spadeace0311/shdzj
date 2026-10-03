@@ -691,6 +691,7 @@ class ArtifactOverrideService:
             "endpoint": endpoint,
             "idempotency_key": idempotency_key,
             "request_fingerprint": request_fingerprint,
+            "event_id": event_id,
             "status": "processing",
             "claimed_at": now,
             "lease_expires_at": now + timedelta(seconds=self._lease_seconds),
@@ -717,6 +718,14 @@ class ArtifactOverrideService:
                         ArtifactOverrideRequest.idempotency_key == idempotency_key,
                     )
                 )
+                if row is not None:
+                    if row.event_id is not None and row.event_id != event_id:
+                        raise IdempotencyConflictError(
+                            "override idempotency record belongs to another event"
+                        )
+                    if row.event_id is None:
+                        row.event_id = event_id
+                        await session.flush()
         if row is None:
             raise RuntimeError("override idempotency claim was not persisted")
         if insert_result.rowcount == 1:

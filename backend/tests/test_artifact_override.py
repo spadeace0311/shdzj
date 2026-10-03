@@ -576,6 +576,7 @@ async def test_expired_processing_request_is_recovered(
     assert response.production_run_id is not None
     assert request is not None
     assert request.status == "succeeded"
+    assert request.event_id == seeded_event.id
     assert request.lease_generation == 2
 
 
@@ -608,8 +609,7 @@ async def test_validation_failure_marks_request_failed_and_cleans_staging(
             select(ArtifactOverrideRequest).where(
                 ArtifactOverrideRequest.actor_id == "admin-id",
                 ArtifactOverrideRequest.endpoint == endpoint,
-                ArtifactOverrideRequest.idempotency_key
-                == "00000000-0000-0000-0000-000000000005"
+                ArtifactOverrideRequest.idempotency_key == "00000000-0000-0000-0000-000000000005",
             )
         )
         run_count = await session.scalar(
@@ -620,6 +620,7 @@ async def test_validation_failure_marks_request_failed_and_cleans_staging(
 
     assert request is not None
     assert request.status == "failed"
+    assert request.event_id == seeded_event.id
     assert request.response_body is not None
     assert request.response_body["error_category"] == "format_mismatch"
     assert run_count == 0

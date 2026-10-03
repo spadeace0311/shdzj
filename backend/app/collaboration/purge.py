@@ -3,7 +3,6 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
 
 from sqlalchemy import (
     DateTime,
@@ -26,7 +25,7 @@ from app.artifacts.models import (
     ProductionRun,
     ProductionTask,
 )
-from app.artifacts.storage import ArtifactStore, StoredArtifactFile
+from app.artifacts.storage import ArtifactStore
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.collaboration.models import (
     CollaborationOutbox,
@@ -53,8 +52,8 @@ from app.events.models import (
 from app.event_object_locks import (
     lock_artifact_object,
     lock_event_write,
-    unreferenced_storage_paths,
 )
+from app.event_object_cleanup import cleanup_event_objects
 
 
 class EventNotFoundError(LookupError):
@@ -183,14 +182,8 @@ class SuperadminPurgeService:
                 )
             ).all()
         )
-        production_run_ids = list(
-            (
-                await session.scalars(
-                    select(ProductionRun.id)
-                    .where(ProductionRun.event_id == event_id)
-                    .with_for_update()
-                )
-            ).all()
+        await session.execute(
+            select(ProductionRun.id).where(ProductionRun.event_id == event_id).with_for_update()
         )
         artifact_ids = list(
             (
@@ -222,10 +215,7 @@ class SuperadminPurgeService:
             (
                 await session.scalars(
                     select(ArtifactOverrideRequest.id)
-                    .where(
-                        (ArtifactOverrideRequest.production_run_id.in_(production_run_ids))
-                        | (ArtifactOverrideRequest.artifact_id.in_(artifact_ids))
-                    )
+                    .where(ArtifactOverrideRequest.event_id == event_id)
                     .with_for_update()
                 )
             ).all()
@@ -376,30 +366,14 @@ async def cleanup_purged_event(
     storage_paths: tuple[str, ...],
     artifact_store: ArtifactStore,
 ) -> bool:
-    candidate_paths = {str(path) for path in storage_paths if path}
-    await lock_event_write(session, event_id, exclusive=True)
-    for storage_path in sorted(candidate_paths):
-        await lock_artifact_object(session, storage_path)
-
-    deleted_all = True
-    for storage_path in await unreferenced_storage_paths(
+    result = await cleanup_event_objects(
         session,
-        candidate_paths,
-    ):
-        try:
-            managed_path = artifact_store.resolve(storage_path)
-            artifact_store.delete_unreferenced(
-                StoredArtifactFile(
-                    file_name=Path(storage_path).name,
-                    relative_path=storage_path,
-                    managed_path=managed_path,
-                    size_bytes=0,
-                    checksum="",
-                )
-            )
-        except (OSError, ValueError):
-            deleted_all = False
-    return deleted_all
+        event_id,
+        storage_paths,
+        artifact_store,
+        exclusive_event_lock=True,
+    )
+    return result.succeeded
 
 
 def _idempotency_key(

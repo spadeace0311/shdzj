@@ -32,7 +32,9 @@ from app.config import settings
 from app.event_object_locks import (
     lock_artifact_object,
     lock_event_write,
+    storage_path_reference_count,
 )
+from app.event_object_cleanup import ObjectCleanupIntent
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 
 
@@ -1193,7 +1195,7 @@ class DeliverableService:
         *,
         idempotency_key: str | None = None,
         expected_version: int | None = None,
-    ) -> None:
+    ) -> ObjectCleanupIntent | None:
         if idempotency_key is not None:
             previous = await self.repository.get_event_by_idempotency_key_any(
                 session, idempotency_key
@@ -1206,7 +1208,12 @@ class DeliverableService:
                     "deliverable_candidate_deleted",
                     resource_identity={"version_id": version_id},
                 )
-                return
+                return await _cleanup_intent_from_event(session, previous)
+
+        event_id = await _event_id_for_version(session, version_id)
+        if event_id is None:
+            raise LookupError("deliverable_version_not_found")
+        await lock_event_write(session, event_id)
 
         deliverable, task, version, actor_identity, previous = await self._lock_version(
             session,
@@ -1217,7 +1224,7 @@ class DeliverableService:
             event_type="deliverable_candidate_deleted",
         )
         if previous is not None:
-            return
+            return await _cleanup_intent_from_event(session, previous)
         if version.source_kind != DeliverableSourceKind.MANUAL.value:
             raise ValueError("only manual candidate versions can be deleted")
         if await self.repository.publication_for_version(session, version.id) is not None:
@@ -1233,20 +1240,18 @@ class DeliverableService:
         if not can_delete:
             raise PermissionError("Insufficient permissions")
 
-        stored_for_cleanup: StoredArtifactFile | None = None
+        cleanup: ObjectCleanupIntent | None = None
         if version.storage_key is not None:
-            reference_count = await self.repository.storage_key_reference_count(
+            await lock_artifact_object(session, version.storage_key)
+            reference_count = await storage_path_reference_count(
                 session,
                 version.storage_key,
-                exclude_version_id=version.id,
+                exclude_deliverable_version_id=version.id,
             )
             if reference_count == 0:
-                stored_for_cleanup = StoredArtifactFile(
-                    file_name=version.file_name or "",
-                    relative_path=version.storage_key,
-                    managed_path=self.artifact_store.resolve(version.storage_key),
-                    size_bytes=version.size_bytes or 0,
-                    checksum=version.checksum or "",
+                cleanup = ObjectCleanupIntent(
+                    event_id,
+                    (version.storage_key,),
                 )
 
         now = datetime.now(UTC)
@@ -1267,13 +1272,14 @@ class DeliverableService:
                 "deliverable_code": deliverable.deliverable_code,
                 "version_id": str(version.id),
                 "version_no": version.version_no,
+                "event_id": str(event_id),
+                "storage_path": version.storage_key,
             },
             idempotency_key=idempotency_key,
             occurred_at=now,
         )
         await session.flush()
-        if stored_for_cleanup is not None:
-            self.artifact_store.delete_unreferenced(stored_for_cleanup)
+        return cleanup
 
     async def current_version_id(
         self,
@@ -1701,6 +1707,42 @@ class DeliverableService:
         if membership is None or membership.duty_role != authority.role.value:
             raise PermissionError("Insufficient permissions")
         return authority.role.value
+
+
+async def _event_id_for_version(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+) -> uuid.UUID | None:
+    return await session.scalar(
+        select(WorkgroupTask.event_id)
+        .join(TaskDeliverable, TaskDeliverable.task_id == WorkgroupTask.id)
+        .join(
+            TaskDeliverableVersion,
+            TaskDeliverableVersion.deliverable_id == TaskDeliverable.id,
+        )
+        .where(TaskDeliverableVersion.id == version_id)
+    )
+
+
+async def _cleanup_intent_from_event(
+    session: AsyncSession,
+    event: CollaborationTaskEvent,
+) -> ObjectCleanupIntent | None:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    storage_path = payload.get("storage_path")
+    if not storage_path:
+        return None
+    event_id_value = payload.get("event_id")
+    if event_id_value is None:
+        event_id_value = await session.scalar(
+            select(WorkgroupTask.event_id).where(WorkgroupTask.id == event.task_id)
+        )
+    if event_id_value is None:
+        return None
+    return ObjectCleanupIntent(
+        _coerce_uuid(event_id_value, "event_id"),
+        (str(storage_path),),
+    )
 
 
 async def _validate_version_for_publication(
