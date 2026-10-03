@@ -43,6 +43,22 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.CheckConstraint(
+            "code IN ("
+            "'news_information', "
+            "'monitoring_forecast', "
+            "'comprehensive_coordination', "
+            "'damage_assessment', "
+            "'emergency_technology', "
+            "'logistics', "
+            "'center_station'"
+            ")",
+            name="ck_workgroup_definition_code",
+        ),
+        sa.CheckConstraint(
+            "display_order BETWEEN 1 AND 7",
+            name="ck_workgroup_definition_display_order",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("code", name="uq_workgroup_definition_code"),
         sa.UniqueConstraint(
@@ -575,11 +591,20 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "event_id",
-            "task_code",
-            name="uq_collaboration_task_event_code",
-        ),
+    )
+    op.create_index(
+        "uq_collaboration_task_preplan_identity",
+        "collaboration_tasks",
+        ["event_id", "template_version_id", "task_code"],
+        unique=True,
+        postgresql_where=sa.text("template_version_id IS NOT NULL"),
+    )
+    op.create_index(
+        "uq_collaboration_task_ad_hoc_identity",
+        "collaboration_tasks",
+        ["event_id", "task_code"],
+        unique=True,
+        postgresql_where=sa.text("template_version_id IS NULL"),
     )
     op.create_index(
         "ix_collaboration_tasks_event_id",
@@ -987,14 +1012,20 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "event_id",
-            "task_id",
-            "recipient_user_id",
-            "channel",
-            "dedupe_key",
-            name="uq_collaboration_notification_delivery",
-        ),
+    )
+    op.create_index(
+        "uq_collaboration_notification_task_delivery",
+        "collaboration_notification_deliveries",
+        ["event_id", "task_id", "recipient_user_id", "channel", "dedupe_key"],
+        unique=True,
+        postgresql_where=sa.text("task_id IS NOT NULL"),
+    )
+    op.create_index(
+        "uq_collaboration_notification_event_delivery",
+        "collaboration_notification_deliveries",
+        ["event_id", "recipient_user_id", "channel", "dedupe_key"],
+        unique=True,
+        postgresql_where=sa.text("task_id IS NULL"),
     )
     op.create_index(
         "ix_collaboration_notification_deliveries_event_id",

@@ -14,7 +14,7 @@ from app.data_assets.models import DataAssetSnapshot
 
 
 BACKEND_DIR = Path(__file__).parents[1]
-LATEST_REVISION = "0017_production_cancel_outbox"
+LATEST_REVISION = "0018_collaboration_command_hall"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 DATA_ASSET_TABLES = {
     "data_assets",

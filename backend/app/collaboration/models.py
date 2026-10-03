@@ -20,12 +20,28 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.collaboration.domain import WorkgroupCode
 from app.db import Base
+
+
+WORKGROUP_CODES_SQL = ", ".join(
+    f"'{workgroup_code.value}'" for workgroup_code in WorkgroupCode
+)
 
 
 class WorkgroupDefinition(Base):
     __tablename__ = "workgroup_definitions"
-    __table_args__ = (UniqueConstraint("code", name="uq_workgroup_definition_code"),)
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_workgroup_definition_code"),
+        CheckConstraint(
+            f"code IN ({WORKGROUP_CODES_SQL})",
+            name="ck_workgroup_definition_code",
+        ),
+        CheckConstraint(
+            "display_order BETWEEN 1 AND 7",
+            name="ck_workgroup_definition_display_order",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -387,10 +403,20 @@ class CollaborationTaskTemplateVersion(Base):
 class WorkgroupTask(Base):
     __tablename__ = "collaboration_tasks"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_collaboration_task_preplan_identity",
+            "event_id",
+            "template_version_id",
+            "task_code",
+            unique=True,
+            postgresql_where=text("template_version_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_collaboration_task_ad_hoc_identity",
             "event_id",
             "task_code",
-            name="uq_collaboration_task_event_code",
+            unique=True,
+            postgresql_where=text("template_version_id IS NULL"),
         ),
         CheckConstraint(
             "source_type IN ('preplan', 'correction', 'ad_hoc', 'system_review')",
@@ -730,13 +756,24 @@ class NotificationDelivery(Base):
             "'fallback_sent')",
             name="ck_collaboration_notification_status",
         ),
-        UniqueConstraint(
+        Index(
+            "uq_collaboration_notification_task_delivery",
             "event_id",
             "task_id",
             "recipient_user_id",
             "channel",
             "dedupe_key",
-            name="uq_collaboration_notification_delivery",
+            unique=True,
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_collaboration_notification_event_delivery",
+            "event_id",
+            "recipient_user_id",
+            "channel",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text("task_id IS NULL"),
         ),
         Index("ix_collaboration_notifications_pending", "status", "available_at"),
     )
