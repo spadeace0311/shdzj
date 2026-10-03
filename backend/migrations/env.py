@@ -10,6 +10,7 @@ from app.auth import models as auth_models  # noqa: F401
 from app.artifacts import models as artifact_models  # noqa: F401
 from app.assessment import models as assessment_models  # noqa: F401
 from app.collaboration import models as collaboration_models  # noqa: F401
+from app.collaboration import purge as collaboration_purge  # noqa: F401
 from app.collector import models as collector_models  # noqa: F401
 from app.config import settings
 from app.data_assets import models as data_asset_models  # noqa: F401

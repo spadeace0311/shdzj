@@ -1,5 +1,7 @@
 from collections.abc import AsyncIterator
 import json
+import logging
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import (
@@ -9,14 +11,20 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Response,
     UploadFile,
 )
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.auth.router import get_current_user, require_role
 from app.auth.service import AuthUser
 from app.collaboration.domain import DutyRole
+from app.collaboration.purge import (
+    EventNotFoundError,
+    SuperadminPurgeService,
+)
 from app.collaboration.repository import CollaborationRepository
 from app.collaboration.roster import (
     EventRosterGroup,
@@ -55,9 +63,11 @@ from app.collaboration.service import (
     StaleTaskVersion,
     TemporaryTaskService,
 )
+from app.config import settings
 from app.db import SessionFactory
 
 router = APIRouter(prefix="/api/v1", tags=["workgroups"])
+logger = logging.getLogger(__name__)
 
 
 async def get_roster_session() -> AsyncIterator[AsyncSession]:
@@ -89,6 +99,19 @@ def get_deliverable_service() -> DeliverableService:
         repository=CollaborationRepository(),
         roster_service=RosterService(),
     )
+
+
+async def get_purge_session() -> AsyncIterator[AsyncSession]:
+    async with SessionFactory() as session:
+        yield session
+
+
+def get_purge_service() -> SuperadminPurgeService:
+    return SuperadminPurgeService()
+
+
+def get_artifact_store() -> ArtifactStore:
+    return ArtifactStore(settings.artifact_storage_root)
 
 
 @router.get("/workgroups", response_model=list[WorkgroupResponse])
@@ -837,6 +860,68 @@ async def override_deliverable_file(
     except _task_mutation_error_types() as exc:
         raise _task_mutation_exception(exc) from exc
     return _deliverable_publication_response(publication)
+
+
+@router.delete(
+    "/admin/events/{event_id}/purge",
+    status_code=204,
+)
+async def purge_event(
+    event_id: UUID,
+    session: AsyncSession = Depends(get_purge_session),
+    service: SuperadminPurgeService = Depends(get_purge_service),
+    artifact_store: ArtifactStore = Depends(get_artifact_store),
+    current_user: AuthUser = Depends(require_role("superadmin")),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
+) -> Response:
+    try:
+        async with session.begin():
+            result = await service.purge_event(
+                session,
+                event_id,
+                actor=current_user,
+                idempotency_key=idempotency_key,
+            )
+    except EventNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="event_not_found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        raise _storage_unavailable() from exc
+
+    if not _delete_storage_paths(result.storage_paths, artifact_store):
+        raise _storage_unavailable()
+    return Response(status_code=204)
+
+
+def _delete_storage_paths(
+    storage_paths: tuple[str, ...],
+    artifact_store: ArtifactStore,
+) -> bool:
+    deleted_all = True
+    for relative_path in storage_paths:
+        try:
+            managed_path = artifact_store.resolve(relative_path)
+            artifact_store.delete_unreferenced(
+                StoredArtifactFile(
+                    file_name=Path(relative_path).name,
+                    relative_path=relative_path,
+                    managed_path=managed_path,
+                    size_bytes=0,
+                    checksum="",
+                )
+            )
+        except (OSError, ValueError):
+            deleted_all = False
+            logger.warning(
+                "event purge object cleanup failed path=%s",
+                relative_path,
+                exc_info=True,
+            )
+    return deleted_all
 
 
 def _membership_response(membership, user) -> MembershipResponse:

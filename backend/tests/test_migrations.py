@@ -14,7 +14,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0018_collaboration_command_hall"
+LATEST_REVISION = "0019_event_purge_receipts"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -56,6 +56,7 @@ COLLABORATION_TABLES = {
     "command_hall_event_projections",
     "command_hall_group_projections",
     "command_hall_alert_projections",
+    "event_purge_receipts",
 }
 LOSS_TABLES = {
     "loss_model_definitions",
