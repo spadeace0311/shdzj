@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ class DispatchResult:
     retried: int = 0
     failed: int = 0
     fallback_sent: int = 0
+    affected_event_ids: frozenset[uuid.UUID] = frozenset()
 
 
 class NotificationService:
@@ -80,7 +82,9 @@ class NotificationService:
         active_formal = await self._has_active_live_formal(session)
 
         result = DispatchResult()
+        affected_event_ids: set[uuid.UUID] = set()
         for delivery in rows:
+            affected_event_ids.add(delivery.event_id)
             event = await session.get(EarthquakeEvent, delivery.event_id)
             if event is not None and self._suppress_external(
                 delivery.channel,
@@ -103,7 +107,14 @@ class NotificationService:
                 result,
             )
         await session.flush()
-        return result
+        return DispatchResult(
+            processed=result.processed,
+            sent=result.sent,
+            retried=result.retried,
+            failed=result.failed,
+            fallback_sent=result.fallback_sent,
+            affected_event_ids=frozenset(affected_event_ids),
+        )
 
     @staticmethod
     async def _has_active_live_formal(

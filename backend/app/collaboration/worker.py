@@ -272,9 +272,22 @@ async def run_worker_cycle(
                 await notification_service.dispatch_pending(session, limit)
             )
 
+    affected_event_ids = set(
+        getattr(scheduler_result, "affected_event_ids", frozenset())
+    )
+    affected_event_ids.update(
+        getattr(notification_result, "affected_event_ids", frozenset())
+    )
+    if affected_event_ids:
+        projector = CommandHallProjector()
+        async with session_factory() as session:
+            async with session.begin():
+                for event_id in sorted(affected_event_ids, key=str):
+                    await projector.refresh_event(session, event_id)
+
     result = WorkerCycleResult(
         collaboration_dispatched=collaboration_count,
-        projection_dispatched=projection_count,
+        projection_dispatched=projection_count + len(affected_event_ids),
         tasks_scanned=scheduler_result.tasks_scanned,
         timeliness_updated=scheduler_result.timeliness_updated,
         assigned_created=scheduler_result.assigned_created,

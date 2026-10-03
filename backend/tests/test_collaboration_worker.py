@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.auth.models import User
+from app.command_hall.service import CommandHallService
 from app.collaboration.domain import DutyRole
 from app.collaboration.models import (
     CollaborationOutbox,
@@ -945,6 +946,172 @@ class _FakeNotificationService:
         del session, limit
         self.calls += 1
         return DispatchResult(processed=4, sent=2)
+
+
+async def _seed_overdue_projection_task(
+    session_factory,
+    observed_at: datetime,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    event_id = uuid.uuid4()
+    raw_id = uuid.uuid4()
+    leader_id = uuid.uuid4()
+    async with session_factory() as session:
+        async with session.begin():
+            event = EarthquakeEvent(
+                id=event_id,
+                source="worker-overdue-projection-test",
+                canonical_source_id=f"worker-overdue-projection-{event_id}",
+                event_type="formal",
+                origin_time=observed_at,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="worker overdue projection fixture",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="formal_triggered",
+            )
+            session.add(event)
+            await session.flush()
+            raw = RawMessage(
+                id=raw_id,
+                source="worker-overdue-projection-test",
+                source_message_id=raw_id.hex,
+                message_kind="formal",
+                checksum=raw_id.hex,
+                payload={"event_id": str(event_id)},
+            )
+            session.add(raw)
+            await session.flush()
+            revision = EarthquakeRevision(
+                id=uuid.uuid4(),
+                event_id=event.id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="formal",
+                origin_time=event.origin_time,
+                longitude=event.longitude,
+                latitude=event.latitude,
+                depth_km=event.depth_km,
+                magnitude=event.magnitude,
+                place=event.place,
+                inside_shanghai=True,
+                distance_to_boundary_km=Decimal("0"),
+                is_current=True,
+                ingested_at=observed_at,
+            )
+            session.add(revision)
+            await session.flush()
+            leader = User(
+                id=leader_id,
+                username=f"worker-overdue-projection-{leader_id.hex[:8]}",
+                password_hash="not-used",
+                role="group_leader",
+                workgroup="monitoring_forecast",
+                is_active=True,
+            )
+            session.add(leader)
+            session.add(
+                WorkgroupMembership(
+                    user_id=leader.id,
+                    workgroup_code="monitoring_forecast",
+                    duty_role="leader",
+                    is_active=True,
+                    created_by="system",
+                )
+            )
+            await session.flush()
+            roster = RosterService()
+            await roster.replace_group_members(
+                session,
+                "monitoring_forecast",
+                [MemberInput(leader.id, DutyRole.LEADER)],
+                actor="system",
+            )
+            await roster.snapshot_for_event(session, event.id)
+            await roster.set_attendance(
+                session,
+                event.id,
+                "monitoring_forecast",
+                leader.id,
+                "present",
+                "system",
+            )
+            session.add(
+                WorkgroupTask(
+                    event_id=event.id,
+                    trigger_revision_id=revision.id,
+                    task_code=f"overdue-projection-{uuid.uuid4().hex}",
+                    source_type="ad_hoc",
+                    workgroup_code="monitoring_forecast",
+                    title="Worker overdue projection task",
+                    instruction="Exercise post-scheduler projection refresh.",
+                    priority=100,
+                    status="pending",
+                    timeliness_state="on_time",
+                    phase_code="within_30m",
+                    activated_at=observed_at - timedelta(minutes=2),
+                    due_at=observed_at - timedelta(minutes=1),
+                    row_version=1,
+                    created_by="system",
+                    created_at=observed_at,
+                    updated_at=observed_at,
+                )
+            )
+            await session.flush()
+    return event_id, raw_id, leader_id
+
+
+async def test_worker_refreshes_projection_after_scheduler_marks_task_overdue(
+    isolated_session_factory,
+):
+    observed_at = datetime(2026, 10, 3, 1, 0, tzinfo=UTC)
+    event_id, raw_id, leader_id = await _seed_overdue_projection_task(
+        isolated_session_factory,
+        observed_at,
+    )
+
+    try:
+        result = await run_worker_cycle(
+            session_factory=isolated_session_factory,
+            observed_at=observed_at,
+            collaboration_dispatcher=_FakeDispatcher(
+                "collaboration",
+                count=0,
+            ),
+            projection_dispatcher=_FakeDispatcher(
+                "projection",
+                count=0,
+            ),
+            notification_service=_FakeNotificationService(),
+        )
+
+        assert result.projection_dispatched >= 1
+        async with isolated_session_factory() as check_session:
+            overview = await CommandHallService().overview(
+                check_session,
+                event_id,
+            )
+        assert overview.task_counts.overdue == 1
+    finally:
+        async with isolated_session_factory() as cleanup_session:
+            async with cleanup_session.begin():
+                await cleanup_session.execute(
+                    delete(WorkgroupMembership).where(
+                        WorkgroupMembership.user_id == leader_id
+                    )
+                )
+                await cleanup_session.execute(
+                    delete(User).where(User.id == leader_id)
+                )
+                await cleanup_session.execute(
+                    delete(EarthquakeEvent).where(
+                        EarthquakeEvent.id == event_id
+                    )
+                )
+                await cleanup_session.execute(
+                    delete(RawMessage).where(RawMessage.id == raw_id)
+                )
 
 
 async def test_worker_cycle_calls_services_in_order_and_logs_counts(

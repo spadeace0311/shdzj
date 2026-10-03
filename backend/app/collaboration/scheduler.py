@@ -32,6 +32,7 @@ class SchedulerResult:
     due_soon_created: int = 0
     overdue_marked: int = 0
     overdue_reminder_count: int = 0
+    affected_event_ids: frozenset[uuid.UUID] = frozenset()
 
 
 class DeadlineScheduler:
@@ -58,6 +59,7 @@ class DeadlineScheduler:
             "due_soon": 0,
             "overdue": 0,
         }
+        affected_event_ids: set[uuid.UUID] = set()
         for task in tasks:
             event = await session.get(EarthquakeEvent, task.event_id)
             if event is None:
@@ -76,6 +78,7 @@ class DeadlineScheduler:
             )
             if timeliness_changed:
                 result = _increment(result, "timeliness_updated")
+                affected_event_ids.add(task.event_id)
             if newly_overdue:
                 result = _increment(result, "overdue_marked")
 
@@ -91,6 +94,8 @@ class DeadlineScheduler:
             )
             for field, value in created_counts.items():
                 counts[field] += value
+            if timeliness_changed or any(created_counts.values()):
+                affected_event_ids.add(task.event_id)
 
         return SchedulerResult(
             tasks_scanned=result.tasks_scanned,
@@ -99,6 +104,7 @@ class DeadlineScheduler:
             due_soon_created=counts["due_soon"],
             overdue_marked=result.overdue_marked,
             overdue_reminder_count=counts["overdue"],
+            affected_event_ids=frozenset(affected_event_ids),
         )
 
     async def _list_nonterminal_tasks(

@@ -16,6 +16,7 @@ from app.auth.service import AuthUser
 from app.command_hall.projector import CommandHallProjector
 from app.command_hall.router import (
     get_command_hall_service,
+    get_command_hall_session_factory,
     get_command_hall_session,
 )
 from app.command_hall.service import CommandHallService
@@ -50,6 +51,20 @@ class _UnknownEventCommandHallService:
     async def get_event_projection(self, session, event_id):
         del session, event_id
         return None
+
+
+class _NoopSession:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        del exc_type, exc, tb
+        return False
+
+
+class _NoopSessionFactory:
+    def __call__(self):
+        return _NoopSession()
 
 
 @pytest.fixture
@@ -179,6 +194,12 @@ def client():
         yield None
 
     app.dependency_overrides[get_command_hall_session] = override_session
+    def override_session_factory():
+        return _NoopSessionFactory()
+
+    app.dependency_overrides[get_command_hall_session_factory] = (
+        override_session_factory
+    )
     app.dependency_overrides[get_command_hall_service] = (
         lambda: _UnknownEventCommandHallService()
     )
@@ -192,6 +213,7 @@ def client():
         test_client.close()
         app.dependency_overrides.pop(get_current_user, None)
         app.dependency_overrides.pop(get_command_hall_session, None)
+        app.dependency_overrides.pop(get_command_hall_session_factory, None)
         app.dependency_overrides.pop(get_command_hall_service, None)
 
 

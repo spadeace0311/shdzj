@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
@@ -28,6 +28,10 @@ async def get_command_hall_session() -> AsyncIterator[AsyncSession]:
 
 def get_command_hall_service() -> CommandHallService:
     return CommandHallService()
+
+
+def get_command_hall_session_factory() -> async_sessionmaker[AsyncSession]:
+    return SessionFactory
 
 
 @router.get("/active-event", response_model=ActiveEventResponse)
@@ -101,19 +105,22 @@ async def task_detail(
 async def event_stream(
     event_id: UUID,
     request: Request,
-    session: AsyncSession = Depends(get_command_hall_session),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(
+        get_command_hall_session_factory
+    ),
     service: CommandHallService = Depends(get_command_hall_service),
     _current_user: AuthUser = Depends(get_current_user),
 ) -> StreamingResponse:
-    try:
-        projection = await service.get_event_projection(session, event_id)
-    except SQLAlchemyError as exc:
-        raise _storage_unavailable() from exc
+    async def read_projection():
+        try:
+            async with session_factory() as session:
+                return await service.get_event_projection(session, event_id)
+        except SQLAlchemyError as exc:
+            raise _storage_unavailable() from exc
+
+    projection = await read_projection()
     if projection is None:
         raise _not_found(LookupError("command_hall_event_not_found"))
-
-    async def read_projection():
-        return await service.get_event_projection(session, event_id)
 
     async def is_disconnected() -> bool:
         return await request.is_disconnected()
@@ -146,4 +153,3 @@ def _storage_unavailable() -> HTTPException:
         status_code=503,
         detail="command hall storage is unavailable",
     )
-
