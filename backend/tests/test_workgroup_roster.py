@@ -86,7 +86,7 @@ def event_factory(session):
     return factory
 
 
-async def test_deputy_authority_uses_first_present_deputy_by_order(
+async def test_deputy_authority_skips_absent_deputy_by_order(
     session,
     event_factory,
     user_factory,
@@ -126,6 +126,52 @@ async def test_deputy_authority_uses_first_present_deputy_by_order(
         user_id=deputy_2.id,
         role=DutyRole.DEPUTY,
         deputy_order=2,
+    )
+
+
+async def test_deputy_authority_uses_lowest_order_when_multiple_deputies_present(
+    session,
+    event_factory,
+    user_factory,
+):
+    event = await event_factory()
+    leader = await user_factory("leader", "group_leader", "monitoring_forecast")
+    deputy_1 = await user_factory(
+        "deputy-1", "group_deputy", "monitoring_forecast"
+    )
+    deputy_2 = await user_factory(
+        "deputy-2", "group_deputy", "monitoring_forecast"
+    )
+    service = RosterService()
+    await service.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [
+            MemberInput(leader.id, DutyRole.LEADER, None),
+            MemberInput(deputy_1.id, DutyRole.DEPUTY, 1),
+            MemberInput(deputy_2.id, DutyRole.DEPUTY, 2),
+        ],
+        actor="superadmin",
+    )
+    await service.snapshot_for_event(session, event.id)
+    for deputy in (deputy_1, deputy_2):
+        await service.set_attendance(
+            session,
+            event.id,
+            "monitoring_forecast",
+            deputy.id,
+            "present",
+            "superadmin",
+        )
+
+    authority = await service.resolve_confirming_authority(
+        session, event.id, "monitoring_forecast"
+    )
+
+    assert authority == ConfirmingAuthority(
+        user_id=deputy_1.id,
+        role=DutyRole.DEPUTY,
+        deputy_order=1,
     )
 
 
@@ -504,3 +550,72 @@ async def test_membership_routes_require_superadmin(
         (str(leader.id), "leader", None),
         (str(deputy.id), "deputy", 1),
     }
+
+
+async def test_event_roster_read_does_not_create_snapshot(
+    session,
+    event_factory,
+    user_factory,
+):
+    event = await event_factory()
+    first_leader = await user_factory(
+        "first-leader", "group_leader", "monitoring_forecast"
+    )
+    intended_leader = await user_factory(
+        "intended-leader", "group_leader", "monitoring_forecast"
+    )
+    service = RosterService()
+    await service.replace_group_members(
+        session,
+        "monitoring_forecast",
+        [MemberInput(first_leader.id, DutyRole.LEADER, None)],
+        actor="superadmin",
+    )
+
+    async def override_session():
+        yield session
+
+    app.dependency_overrides[get_roster_session] = override_session
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        username="viewer",
+        role="viewer",
+        workgroup=None,
+    )
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            first_read = await client.get(
+                f"/api/v1/events/{event.id}/workgroups"
+            )
+
+        await service.replace_group_members(
+            session,
+            "monitoring_forecast",
+            [MemberInput(intended_leader.id, DutyRole.LEADER, None)],
+            actor="superadmin",
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            second_read = await client.get(
+                f"/api/v1/events/{event.id}/workgroups"
+            )
+    finally:
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert first_read.status_code == 200
+    assert first_read.json()["groups"] == []
+    assert second_read.status_code == 200
+    assert second_read.json()["groups"] == []
+    assert not await service.repository.list_roster_snapshots(session, event.id)
+
+    snapshots = await service.snapshot_for_event(session, event.id)
+
+    monitoring = next(
+        item for item in snapshots if item.workgroup_code == "monitoring_forecast"
+    )
+    assert monitoring.leader_user_id == intended_leader.id

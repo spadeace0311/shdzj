@@ -561,7 +561,10 @@ class RosterService:
         session: AsyncSession,
         event_id: uuid.UUID,
     ) -> tuple[EventRosterGroup, ...]:
-        snapshots = await self.snapshot_for_event(session, event_id)
+        event = await self.repository.get_event(session, event_id)
+        if event is None:
+            raise LookupError("event_not_found")
+        snapshots = await self.repository.list_roster_snapshots(session, event_id)
         definitions = {
             definition.code: definition
             for definition in await self.repository.list_workgroups(session)
