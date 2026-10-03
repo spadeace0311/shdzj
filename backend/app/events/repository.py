@@ -406,6 +406,52 @@ class EventRepository:
             created_at=created_at,
         )
 
+    async def enqueue_collaboration_upgrade(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: object,
+        revision_id: object,
+        revision_no: int,
+        template_version: str,
+        trigger_reason: str,
+        created_at: datetime,
+    ) -> bool:
+        if not isinstance(template_version, str) or not template_version.strip():
+            raise ValueError("template_version must be a non-empty string")
+        event_uuid = _coerce_uuid(event_id)
+        revision_uuid = _coerce_uuid(revision_id)
+        event = await session.get(
+            EarthquakeEvent,
+            event_uuid,
+            with_for_update=True,
+        )
+        if event is None:
+            raise LookupError(f"event not found: {event_uuid}")
+        revision = await session.get(
+            EarthquakeRevision,
+            revision_uuid,
+            with_for_update=True,
+        )
+        if revision is None or revision.event_id != event_uuid:
+            raise LookupError(f"revision not found: {revision_uuid}")
+
+        return await self._enqueue_lifecycle_trigger(
+            session,
+            event_id=event_uuid,
+            revision_id=revision_uuid,
+            revision_no=revision_no,
+            trigger_reason=trigger_reason,
+            trigger_type="collaboration.upgrade_requested",
+            payload={
+                "event_id": str(event_uuid),
+                "revision_id": str(revision_uuid),
+                "revision_no": revision_no,
+                "template_version": template_version,
+            },
+            created_at=created_at,
+        )
+
     async def _enqueue_lifecycle_trigger(
         self,
         session: AsyncSession,

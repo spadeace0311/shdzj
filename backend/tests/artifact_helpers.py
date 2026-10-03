@@ -1109,6 +1109,27 @@ class ArtifactAcceptanceEnvironment:
         )
         return await self._execute_run(run)
 
+    async def run_selected_outputs(
+        self,
+        *,
+        required_outputs: tuple[tuple[str, str], ...],
+        production_mode: str,
+        magnitude: float | None = None,
+    ) -> ArtifactAcceptanceResult:
+        if not required_outputs:
+            raise ValueError("required_outputs must not be empty")
+        await self.seed()
+        now = datetime.now(UTC)
+        if magnitude is not None:
+            await self._set_event_magnitude(magnitude)
+        run = await self._create_standalone_run(
+            production_mode=production_mode,
+            deadline_basis_at=now,
+            deadline_at=now + timedelta(seconds=300),
+            required_outputs=required_outputs,
+        )
+        return await self._execute_run(run)
+
     async def run_replay_event(
         self,
         *,
@@ -1204,15 +1225,33 @@ class ArtifactAcceptanceEnvironment:
         production_mode: str,
         deadline_basis_at: datetime,
         deadline_at: datetime,
+        required_outputs: tuple[tuple[str, str], ...] | None = None,
     ) -> ProductionRun:
         repository = ArtifactProductionRepository()
-        command = self._seeded.full_run_command(
-            production_mode=production_mode,
-            launch_mode="standalone",
-            deadline_basis_at=deadline_basis_at,
-            deadline_at=deadline_at,
-            deadline_kind="rebuild_deadline",
+        selected_outputs = (
+            required_outputs
+            if required_outputs is not None
+            else self._seeded.catalog.full_required_outputs()
         )
+        if len(selected_outputs) == 1:
+            artifact_key, output_profile = selected_outputs[0]
+            command = self._seeded.rebuild_command(
+                artifact_key,
+                output_profile=output_profile,
+                production_mode=production_mode,
+                deadline_basis_at=deadline_basis_at,
+                deadline_at=deadline_at,
+                deadline_kind="rebuild_deadline",
+            )
+        else:
+            command = self._seeded.full_run_command(
+                production_mode=production_mode,
+                launch_mode="standalone",
+                deadline_basis_at=deadline_basis_at,
+                deadline_at=deadline_at,
+                deadline_kind="rebuild_deadline",
+                required_outputs=selected_outputs,
+            )
         async with self._session_factory() as session:
             async with session.begin():
                 return await repository.create_run(session, command)

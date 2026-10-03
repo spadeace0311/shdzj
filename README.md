@@ -161,40 +161,78 @@ E2E 使用真实登录和真实后端数据库，准备测试事件、39 项专�
 
 - `E2E_SUPERADMIN_USERNAME`（可选）：超级管理员用户名，默认 `superadmin`。若 `.env` 修改了 `SUPERADMIN_USERNAME`，必须同步设置该变量。
 - `E2E_SUPERADMIN_PASSWORD`（必填）：超级管理员密码。测试代码不包含密码。
+- `E2E_VIEWER_USERNAME`（可选）：非超级管理员验收账号，默认 `e2e-viewer`。夹具使用与超级管理员相同的测试密码创建该账号，用于真实 403 权限链路。
 - `E2E_BASE_URL`（可选）：前端地址，默认 `http://localhost:5173`。
 - `E2E_API_BASE_URL`（可选）：只影响 Playwright `APIRequestContext` 发出的 API 请求。留空时这些请求使用 Vite 的 `/api` 相对路径；设为绝对地址时，只有测试中的 API 请求直连该地址，页面 UI 的 `/api` 请求仍走 Vite 代理。
 
-通过 Compose 运行：
+干净环境的准备顺序如下。先构建后端、迁移数据库、启动 API、`collaboration-worker`、成果 Worker 和 Temporal Worker：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm `
-  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
-  -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
-  frontend npm run test:e2e
+docker compose --env-file .env -f infra/compose.yaml build
+docker compose --env-file .env -f infra/compose.yaml up -d postgres temporal-postgres temporal
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d `
+  api collaboration-worker artifact-worker artifact-dispatcher `
+  temporal-worker assessment-dispatcher
 ```
 
-协同与指挥大厅专项验收：
+设置只存在于当前终端的测试变量，然后准备夹具。不要执行会回显变量值的命令：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm `
-  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
-  -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
-  frontend npm run test:e2e -- e2e/command-hall.spec.ts e2e/workgroup-tasks.spec.ts
+$env:E2E_SUPERADMIN_USERNAME = "<你的超级管理员用户名>"
+$env:E2E_SUPERADMIN_PASSWORD = "<你的超级管理员密码>"
+$env:E2E_VIEWER_USERNAME = "e2e-viewer"
+docker compose --env-file .env -f infra/compose.yaml run --rm -T `
+  -e E2E_SUPERADMIN_USERNAME `
+  -e E2E_SUPERADMIN_PASSWORD `
+  -e E2E_VIEWER_USERNAME `
+  -e PYTHONPATH=/app `
+  api python -m tests.e2e_fixture
 ```
 
-该专项测试包含 `7680 x 2430` 主屏和 `1920 x 1080` 管理终端，检查七组卡片重叠、页面溢出、测试标识、自动/人工版本共存、SSE、5 秒轮询降级、权限错误和关键服务错误。
-
-需要让 Playwright 的 API 测试请求直连时，在 Compose 容器内应使用服务名 `http://api:8000`，不是容器内的 `localhost`：
+确认 PostgreSQL、API 和 Worker 已就绪：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm `
-  -e E2E_SUPERADMIN_USERNAME="<你的超级管理员用户名>" `
-  -e E2E_SUPERADMIN_PASSWORD="<你的超级管理员密码>" `
-  -e E2E_API_BASE_URL="http://api:8000" `
-  frontend npm run test:e2e
+docker compose --env-file .env -f infra/compose.yaml ps
+docker compose --env-file .env -f infra/compose.yaml exec collaboration-worker `
+  python -m app.process_health collaboration
+Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Compress
 ```
 
-页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发。Compose 模式未设置 `VITE_API_PROXY_TARGET` 时默认使用 `http://api:8000`；宿主机直接运行前端时应设置为 `http://127.0.0.1:8000`（或实际可达地址）。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的 API 测试请求，不会把页面 UI 的 API 基地址改成其他值。Playwright `APIRequestContext` 在浏览器上下文之外发送 HTTP 请求，因此不受浏览器 CORS 限制；页面 UI 的 `/api` 请求则依赖 Vite 代理，通常无需跨域配置。
+另开终端启动宿主机 Vite，并安装 Playwright Chromium：
+
+```powershell
+cd frontend
+npm ci
+npx playwright install chromium
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm run dev
+```
+
+保留 Vite 终端运行，在另一个终端执行全量或协同专项验收：
+
+```powershell
+cd frontend
+$env:E2E_BASE_URL = "http://127.0.0.1:5173"
+$env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
+npm run test:e2e
+
+# 协同与指挥大厅专项
+npm run test:e2e -- e2e/command-hall.spec.ts e2e/workgroup-tasks.spec.ts
+```
+
+该专项测试包含 `7680 x 2430` 主屏和 `1920 x 1080` 管理终端，检查元素和文本的视口边界、`scrollWidth`/`scrollHeight`、卡片及抽屉遮挡、测试标识、自动/人工版本共存、SSE、5 秒轮询后的真实 GET、真实后端 403 和关键服务错误。若本机 `8000` 或 `5173` 已被其他任务占用，可在当前终端覆盖 `API_PORT`、`VITE_API_PROXY_TARGET`、`E2E_BASE_URL` 和 `E2E_API_BASE_URL`，不要停止或复用其他任务的数据。
+
+清理：
+
+```powershell
+# 先停止 Vite 和 Playwright。
+docker compose --env-file .env -f infra/compose.yaml down --remove-orphans
+# 仅对一次性验收数据库执行：
+# docker compose --env-file .env -f infra/compose.yaml down -v --remove-orphans
+```
+
+页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发。宿主机直接运行前端时，`VITE_API_PROXY_TARGET` 应指向实际 API 地址。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的控制请求，不会把页面 UI 的 API 基地址改成其他值。不要输出 `.env`、密码、Token、API Key 或连接串。
 
 ## 运行与交接手册
 

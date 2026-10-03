@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.artifacts.catalog import load_catalog
+from app.artifacts.domain import ArtifactKind
 from app.collaboration.domain import WorkgroupCode
 from app.collaboration.templates import (
     ArtifactBinding,
@@ -27,15 +28,15 @@ def test_catalog_covers_all_groups_and_preplan_phases() -> None:
         "logistics",
         "center_station",
     }
-    assert catalog.version == "shanghai-2026.2"
+    assert catalog.version == "shanghai-2026.1"
     assert len(catalog.definitions) == 61
     assert catalog.get("technology.rapid_brief").artifact_bindings == (
         ArtifactBinding("doc.rapid_brief", "a3v-professional"),
     )
     assert catalog.get("technology.rapid_special").due_offset_seconds == 3600
     assert catalog.get("technology.intensity_map").continues_until_response_end
-    assert catalog.get("technology.intensity_map") is catalog.get(
-        "technology.professional_outputs"
+    assert catalog.get("technology.professional_outputs").artifact_bindings == (
+        ArtifactBinding("map.shelter_emergency", "a3v-professional"),
     )
     assert catalog.get("technology.rapid_brief").required_deliverables == ()
 
@@ -46,6 +47,111 @@ def test_catalog_artifact_bindings_exist_in_artifact_catalog() -> None:
     for definition in task_catalog.definitions:
         for binding in definition.artifact_bindings:
             artifact_catalog.get(binding.artifact_key, binding.output_profile)
+
+
+def test_catalog_binds_each_professional_artifact_to_intended_task() -> None:
+    task_catalog = load_task_template_catalog(CATALOG_PATH)
+    artifact_catalog = load_catalog(Path("/config/artifacts/catalog.yaml"))
+    bindings = {
+        (
+            definition.template_code,
+            binding.artifact_key,
+            binding.output_profile,
+        )
+        for definition in task_catalog.definitions
+        for binding in definition.artifact_bindings
+    }
+    artifact_keys = {
+        definition.artifact_key for definition in artifact_catalog.definitions
+    }
+    map_keys = {
+        definition.artifact_key
+        for definition in artifact_catalog.definitions
+        if definition.kind is ArtifactKind.MAP
+    }
+    expected_bindings = {
+        (
+            "monitoring.epicenter_maps",
+            "map.historical_earthquakes",
+            "a3v-professional",
+        ),
+        (
+            "monitoring.epicenter_maps",
+            "map.intensity",
+            "a3v-professional",
+        ),
+        (
+            "monitoring.epicenter_maps",
+            "map.epicenter",
+            "a3v-professional",
+        ),
+        (
+            "monitoring.epicenter_maps",
+            "map.city_distances",
+            "a3v-professional",
+        ),
+        (
+            "monitoring.station_and_mechanism",
+            "map.seismic_stations",
+            "a3v-professional",
+        ),
+        (
+            "damage.background_materials",
+            "doc.background",
+            "a3v-professional",
+        ),
+        (
+            "damage.background_materials",
+            "map.active_faults",
+            "a3v-professional",
+        ),
+        (
+            "damage.loss_assessment",
+            "map.building_grid",
+            "a3v-professional",
+        ),
+        (
+            "damage.intensity_map",
+            "map.intensity",
+            "a3v-professional",
+        ),
+        (
+            "coordination.response_suggestion",
+            "doc.decision_report",
+            "a3v-professional",
+        ),
+        (
+            "coordination.response_suggestion",
+            "deck.decision_report",
+            "a3v-professional",
+        ),
+        (
+            "technology.rapid_brief",
+            "doc.rapid_brief",
+            "a3v-professional",
+        ),
+        (
+            "technology.rapid_special",
+            "doc.rapid_report",
+            "a3v-professional",
+        ),
+        (
+            "technology.professional_outputs",
+            "map.shelter_emergency",
+            "a3v-professional",
+        ),
+    }
+    bound_keys = {artifact_key for _, artifact_key, _ in bindings}
+    rapid_brief_owners = {
+        task_code
+        for task_code, artifact_key, _ in bindings
+        if artifact_key == "doc.rapid_brief"
+    }
+
+    assert len(map_keys) == 27
+    assert bound_keys == artifact_keys
+    assert expected_bindings <= bindings
+    assert rapid_brief_owners == {"technology.rapid_brief"}
 
 
 def test_catalog_applicability_splits_in_scope_and_out_of_scope_events() -> None:

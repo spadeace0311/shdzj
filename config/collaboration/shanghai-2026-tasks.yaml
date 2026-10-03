@@ -1,4 +1,4 @@
-version: shanghai-2026.2
+version: shanghai-2026.1
 tasks:
   - code: news.takeover_duty
     group: news_information
@@ -121,6 +121,8 @@ tasks:
     artifacts:
       - [map.historical_earthquakes, a3v-professional]
       - [map.intensity, a3v-professional]
+      - [map.epicenter, a3v-professional]
+      - [map.city_distances, a3v-professional]
   - code: monitoring.sequence_tracking
     group: monitoring_forecast
     phase: 30m_to_60m
@@ -180,6 +182,9 @@ tasks:
     title: 提出应急服务响应启动建议
     source: 预案5.2（3）
     due_offset_seconds: 1800
+    artifacts:
+      - [doc.decision_report, a3v-professional]
+      - [deck.decision_report, a3v-professional]
   - code: coordination.collect_situation
     group: comprehensive_coordination
     phase: within_30m
@@ -250,6 +255,27 @@ tasks:
     source: 预案5.2（4）
     start_offset_seconds: 1800
     due_offset_seconds: 3600
+    artifacts:
+      - [doc.background, a3v-professional]
+      - [doc.housing, a3v-professional]
+      - [doc.economy, a3v-professional]
+      - [doc.population, a3v-professional]
+      - [doc.key_targets, a3v-professional]
+      - [doc.spatial_distances, a3v-professional]
+      - [doc.area_overview, a3v-professional]
+      - [doc.historical_catalog, a3v-professional]
+      - [map.gdp, a3v-professional]
+      - [map.pga_zoning, a3v-professional]
+      - [map.transport, a3v-professional]
+      - [map.population, a3v-professional]
+      - [map.reservoirs, a3v-professional]
+      - [map.hazard_sources, a3v-professional]
+      - [map.schools, a3v-professional]
+      - [map.hospitals, a3v-professional]
+      - [map.metro, a3v-professional]
+      - [map.active_faults, a3v-professional]
+      - [map.cultural_relics, a3v-professional]
+      - [map.key_targets, a3v-professional]
   - code: damage.structural_array
     group: damage_assessment
     phase: 30m_to_60m
@@ -271,6 +297,16 @@ tasks:
     source: 预案5.2（4）
     start_offset_seconds: 3600
     continuous: true
+    artifacts:
+      - [map.economic_loss, a3v-professional]
+      - [map.rescue_demand, a3v-professional]
+      - [map.deaths, a3v-professional]
+      - [map.injuries, a3v-professional]
+      - [map.buried, a3v-professional]
+      - [map.material_demand, a3v-professional]
+      - [map.building_damage, a3v-professional]
+      - [map.building_grid, a3v-professional]
+      - [map.rescue_teams, a3v-professional]
   - code: damage.intensity_map
     group: damage_assessment
     phase: 1h_to_end
@@ -278,6 +314,8 @@ tasks:
     source: 预案6.2（4）
     start_offset_seconds: 3600
     continuous: true
+    artifacts:
+      - [map.intensity, a3v-professional]
   - code: technology.open_command_hall
     group: emergency_technology
     phase: within_30m
@@ -317,44 +355,6 @@ tasks:
     continuous: true
     artifacts:
       - [map.shelter_emergency, a3v-professional]
-      - [map.intensity, a3v-professional]
-      - [map.economic_loss, a3v-professional]
-      - [map.rescue_demand, a3v-professional]
-      - [map.deaths, a3v-professional]
-      - [map.injuries, a3v-professional]
-      - [map.buried, a3v-professional]
-      - [map.material_demand, a3v-professional]
-      - [map.gdp, a3v-professional]
-      - [map.pga_zoning, a3v-professional]
-      - [map.transport, a3v-professional]
-      - [map.historical_earthquakes, a3v-professional]
-      - [map.population, a3v-professional]
-      - [map.reservoirs, a3v-professional]
-      - [map.hazard_sources, a3v-professional]
-      - [map.schools, a3v-professional]
-      - [map.hospitals, a3v-professional]
-      - [map.metro, a3v-professional]
-      - [map.seismic_stations, a3v-professional]
-      - [map.active_faults, a3v-professional]
-      - [map.building_damage, a3v-professional]
-      - [map.building_grid, a3v-professional]
-      - [map.rescue_teams, a3v-professional]
-      - [map.cultural_relics, a3v-professional]
-      - [map.key_targets, a3v-professional]
-      - [map.epicenter, a3v-professional]
-      - [map.city_distances, a3v-professional]
-      - [doc.background, a3v-professional]
-      - [doc.housing, a3v-professional]
-      - [doc.economy, a3v-professional]
-      - [doc.population, a3v-professional]
-      - [doc.key_targets, a3v-professional]
-      - [doc.spatial_distances, a3v-professional]
-      - [doc.area_overview, a3v-professional]
-      - [doc.historical_catalog, a3v-professional]
-      - [doc.rapid_brief, a3v-professional]
-      - [doc.rapid_report, a3v-professional]
-      - [doc.decision_report, a3v-professional]
-      - [deck.decision_report, a3v-professional]
   - code: technology.system_operations
     group: emergency_technology
     phase: 1h_to_end

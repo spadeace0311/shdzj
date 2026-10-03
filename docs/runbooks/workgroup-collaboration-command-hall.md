@@ -9,7 +9,7 @@
 `collaboration-worker` 是常驻进程，负责：
 
 - 消费 `event_lifecycle_outbox` 中的 `collaboration.requested`。
-- 按 `shanghai-2026.2` 预案模板生成七个工作组的固定任务。
+- 按 `shanghai-2026.1` 预案模板生成七个工作组的固定任务。
 - 将成果关联、任务状态、到岗和告警变化写入 `collaboration_projection_outbox`。
 - 刷新单事件和分组指挥大厅投影。
 - 执行临期、超时、提醒和通知降级。
@@ -270,7 +270,7 @@ WHERE e.id = '<事件 UUID>';
 
 测试事件必须显示“测试”，演练事件必须显示“演练”。任务列表、任务详情、成果面板和指挥大厅标题均读取同一事件类型。不得通过编辑任务标题、成果文件名或投影 JSON 去除标识。
 
-测试和演练成果仍进入正常版本链，保留 400 天或按既有保留策略处理；正式事件数据不得被测试成果覆盖。
+测试成果仍进入正常版本链并保留 400 天；演练成果仍进入正常版本链并保留 2 年。正式事件数据不得被测试或演练成果覆盖。
 
 ## 9. 自动版与人工修订版
 
@@ -311,9 +311,53 @@ ORDER BY v.version_no, p.published_at;
 后端夹具准备好测试事件、39 项成果、60 条任务和双版本后，运行：
 
 ```powershell
-$env:E2E_SUPERADMIN_PASSWORD = "<验收账号密码>"
+$env:E2E_SUPERADMIN_USERNAME = "<超级管理员用户名>"
+$env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
+$env:E2E_VIEWER_USERNAME = "e2e-viewer"
+$env:E2E_BASE_URL = "http://127.0.0.1:5173"
+$env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
 cd frontend
 npm run test:e2e -- e2e/command-hall.spec.ts e2e/workgroup-tasks.spec.ts
+```
+
+干净环境必须先执行以下前置步骤，不能只启动 Playwright：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml build
+docker compose --env-file .env -f infra/compose.yaml up -d postgres temporal-postgres temporal
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d `
+  api collaboration-worker artifact-worker artifact-dispatcher temporal-worker assessment-dispatcher
+
+$env:E2E_SUPERADMIN_USERNAME = "<超级管理员用户名>"
+$env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
+$env:E2E_VIEWER_USERNAME = "e2e-viewer"
+docker compose --env-file .env -f infra/compose.yaml run --rm -T `
+  -e E2E_SUPERADMIN_USERNAME `
+  -e E2E_SUPERADMIN_PASSWORD `
+  -e E2E_VIEWER_USERNAME `
+  -e PYTHONPATH=/app `
+  api python -m tests.e2e_fixture
+
+docker compose --env-file .env -f infra/compose.yaml ps
+docker compose --env-file .env -f infra/compose.yaml exec collaboration-worker `
+  python -m app.process_health collaboration
+Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Compress
+
+cd frontend
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8000"
+npm run dev
+```
+
+另开一个终端运行 Playwright 命令。夹具会用与超级管理员相同的测试密码创建 `e2e-viewer`，该账号不是超级管理员，只能作为真实 403 权限链路验收主体；如果修改 `E2E_VIEWER_USERNAME`，两边必须一致。不要把密码、Token、API Key 或连接串写入输出、截图或提交。
+
+清理：
+
+```powershell
+# 先停止 Playwright 和 Vite；共享数据库不想保留时再删除卷。
+docker compose --env-file .env -f infra/compose.yaml down --remove-orphans
+# 仅对一次性验收库执行：
+# docker compose --env-file .env -f infra/compose.yaml down -v --remove-orphans
 ```
 
 必须覆盖：

@@ -27,6 +27,7 @@ from app.events.models import (
     EventLifecycleOutbox,
     RawMessage,
 )
+from app.events.repository import EventRepository
 from app.events.response_rules import ResponseInput
 from app.events.service import EventService
 from app.regions.domain import RegionContext
@@ -223,7 +224,7 @@ async def test_formal_revision_generates_seven_group_tasks_once(
                     CollaborationTaskTemplateVersion.id,
                 ).where(
                     CollaborationTaskTemplateVersion.version
-                    == "shanghai-2026.2"
+                    == "shanghai-2026.1"
                 )
             )
         ).all()
@@ -592,7 +593,7 @@ tasks:
     ]
 
 
-async def test_correction_reconciles_current_template_version(
+async def test_correction_reconciles_frozen_template_version(
     session,
     session_factory,
     tmp_path,
@@ -670,10 +671,22 @@ tasks:
         received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
         report_number=2,
     )
-    assert await CollaborationOutboxDispatcher(
+    correction_dispatched = await CollaborationOutboxDispatcher(
         session_factory=session_factory,
         catalog_path=str(catalog_path),
-    ).dispatch_once() == 1
+    ).dispatch_once()
+    correction_outbox = await session.scalar(
+        select(EventLifecycleOutbox).where(
+            EventLifecycleOutbox.event_id == event.id,
+            EventLifecycleOutbox.revision_id == correction_revision.id,
+            EventLifecycleOutbox.trigger_type == "collaboration.requested",
+        )
+    )
+    assert correction_dispatched == 1, (
+        correction_outbox.last_error
+        if correction_outbox is not None
+        else "correction outbox missing"
+    )
 
     versions = (
         await session.scalars(
@@ -698,7 +711,10 @@ tasks:
     }
 
     v1_base = tasks_by_key[
-        (version_ids[("generation-reconcile.1", "generation.base")], "generation.base")
+        (
+            version_ids[("generation-reconcile.1", "generation.base")],
+            "generation.base",
+        )
     ]
     v1_legacy = tasks_by_key[
         (
@@ -706,21 +722,128 @@ tasks:
             "generation.legacy",
         )
     ]
-    v2_base = tasks_by_key[
-        (version_ids[("generation-reconcile.2", "generation.base")], "generation.base")
-    ]
-    v2_new = tasks_by_key[
-        (version_ids[("generation-reconcile.2", "generation.new")], "generation.new")
-    ]
 
-    assert len(tasks) == 4
-    assert v1_base.status == "not_required"
+    assert len(tasks) == 2
+    assert v1_base.status == "pending"
     assert v1_legacy.status == "completed"
-    assert v2_base.status == "pending"
-    assert v2_base.trigger_revision_id == correction_revision.id
-    assert v2_new.status == "pending"
-    assert v2_new.trigger_revision_id == correction_revision.id
-    assert v1_base.id != v2_base.id
+    assert not any(
+        task.task_code == "generation.new" for task in tasks
+    )
+    assert {
+        task.template_version_id for task in tasks
+    } == {version_ids[("generation-reconcile.1", "generation.base")],
+          version_ids[("generation-reconcile.1", "generation.legacy")]}
+    assert correction_revision.id != _formal_revision.id
+
+
+async def test_explicit_template_upgrade_switches_only_after_upgrade_request(
+    session,
+    session_factory,
+    tmp_path,
+):
+    catalog_path = tmp_path / "explicit-upgrade.yaml"
+    catalog_path.write_text(
+        """
+version: generation-upgrade.1
+tasks:
+  - code: generation.base
+    group: comprehensive_coordination
+    phase: within_30m
+    title: base v1
+    source: test
+  - code: generation.legacy
+    group: comprehensive_coordination
+    phase: within_30m
+    title: legacy v1
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    suffix = uuid.uuid4().hex
+    event, formal_revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="4.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="3",
+        suffix=suffix,
+        report_number=1,
+    )
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    catalog_path.write_text(
+        """
+version: generation-upgrade.2
+tasks:
+  - code: generation.base
+    group: comprehensive_coordination
+    phase: within_30m
+    title: base v2
+    source: test
+  - code: generation.new
+    group: comprehensive_coordination
+    phase: within_30m
+    title: new v2
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            await EventRepository(
+                session_factory
+            ).enqueue_collaboration_upgrade(
+                write_session,
+                event_id=event.id,
+                revision_id=formal_revision.id,
+                revision_no=formal_revision.revision_no,
+                template_version="generation-upgrade.2",
+                trigger_reason="recovery",
+                created_at=BASE_RECEIVED_AT + timedelta(minutes=10),
+            )
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    versions = (
+        await session.scalars(
+            select(CollaborationTaskTemplateVersion).where(
+                CollaborationTaskTemplateVersion.version.in_(
+                    ("generation-upgrade.1", "generation-upgrade.2")
+                )
+            )
+        )
+    ).all()
+    version_ids = {
+        (version.version, version.template_code): version.id
+        for version in versions
+    }
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    tasks_by_key = {
+        (task.template_version_id, task.task_code): task for task in tasks
+    }
+
+    assert set(tasks_by_key) == {
+        (version_ids[("generation-upgrade.1", "generation.base")], "generation.base"),
+        (version_ids[("generation-upgrade.1", "generation.legacy")], "generation.legacy"),
+        (version_ids[("generation-upgrade.2", "generation.base")], "generation.base"),
+        (version_ids[("generation-upgrade.2", "generation.new")], "generation.new"),
+    }
+    assert tasks_by_key[
+        (version_ids[("generation-upgrade.1", "generation.base")], "generation.base")
+    ].status == "pending"
+    assert tasks_by_key[
+        (version_ids[("generation-upgrade.2", "generation.new")], "generation.new")
+    ].status == "pending"
 
 
 async def test_stale_outbox_cannot_overwrite_newer_revision_tasks(

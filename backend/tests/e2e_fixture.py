@@ -327,6 +327,7 @@ async def _ensure_dual_versions() -> None:
                 )
                 .where(
                     WorkgroupTask.event_id == E2E_EVENT_ID,
+                    WorkgroupTask.task_code == "technology.rapid_brief",
                     TaskDeliverable.deliverable_code == "doc.rapid_brief",
                     TaskDeliverableVersion.source_kind == "automatic",
                 )
@@ -409,6 +410,7 @@ async def _configure_e2e_login() -> None:
     if not password:
         return
     username = os.environ.get("E2E_SUPERADMIN_USERNAME", "superadmin")
+    viewer_username = os.environ.get("E2E_VIEWER_USERNAME", "e2e-viewer")
     async with SessionFactory() as session:
         async with session.begin():
             user = await session.scalar(
@@ -421,11 +423,28 @@ async def _configure_e2e_login() -> None:
                     password_hash=hash_password(password),
                     role="superadmin",
                 )
-                return
-            user.password_hash = hash_password(password)
-            user.role = "superadmin"
-            user.workgroup = None
-            user.is_active = True
+            else:
+                user.password_hash = hash_password(password)
+                user.role = "superadmin"
+                user.workgroup = None
+                user.is_active = True
+
+            viewer = await session.scalar(
+                select(User).where(User.username == viewer_username)
+            )
+            if viewer is None:
+                await UserRepository(SessionFactory).create(
+                    session,
+                    username=viewer_username,
+                    password_hash=hash_password(password),
+                    role="viewer",
+                    workgroup="news_information",
+                )
+            else:
+                viewer.password_hash = hash_password(password)
+                viewer.role = "viewer"
+                viewer.workgroup = "news_information"
+                viewer.is_active = True
 
 
 async def main() -> None:

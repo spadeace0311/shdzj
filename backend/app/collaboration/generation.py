@@ -8,18 +8,22 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.collaboration.domain import WorkgroupCode
 from app.collaboration.models import (
+    CollaborationOutbox,
     CollaborationTaskEvent,
     CollaborationTaskTemplate,
     CollaborationTaskTemplateVersion,
     WorkgroupTask,
 )
 from app.collaboration.templates import (
+    ArtifactBinding,
     TaskTemplateCatalog,
     TaskTemplateDefinition,
     load_task_template_catalog,
@@ -33,6 +37,11 @@ from app.events.models import (
 )
 
 _COLLABORATION_TRIGGER_TYPE = "collaboration.requested"
+_COLLABORATION_UPGRADE_TRIGGER_TYPE = "collaboration.upgrade_requested"
+_COLLABORATION_TRIGGER_TYPES = {
+    _COLLABORATION_TRIGGER_TYPE,
+    _COLLABORATION_UPGRADE_TRIGGER_TYPE,
+}
 _SYSTEM_ACTOR = "system"
 
 
@@ -107,7 +116,7 @@ class CollaborationTaskGenerator:
         if outbox is None:
             raise LookupError("collaboration outbox not found")
         if (
-            outbox.trigger_type != _COLLABORATION_TRIGGER_TYPE
+            outbox.trigger_type not in _COLLABORATION_TRIGGER_TYPES
             or outbox.event_id != event_uuid
             or outbox.revision_id != revision_uuid
         ):
@@ -127,7 +136,32 @@ class CollaborationTaskGenerator:
 
         observed_at = _normalize_utc(outbox.created_at, "outbox.created_at")
         threshold = _payload_threshold(outbox.payload)
-        definitions = self.catalog.get_applicable(
+        explicit_version = _explicit_template_version(outbox)
+        if (
+            outbox.trigger_type == _COLLABORATION_UPGRADE_TRIGGER_TYPE
+            and explicit_version is None
+        ):
+            raise ValueError(
+                "explicit template upgrade requires payload.template_version"
+            )
+        if (
+            explicit_version is not None
+            and explicit_version != self.catalog.version
+        ):
+            raise ValueError(
+                "explicit template upgrade must match the active catalog version"
+            )
+
+        frozen_version = explicit_version or await self._frozen_template_version(
+            session,
+            event.id,
+        )
+        catalog = (
+            self.catalog
+            if frozen_version == self.catalog.version
+            else await self._persisted_catalog(session, frozen_version)
+        )
+        definitions = catalog.get_applicable(
             event,
             revision,
             intensity_threshold=threshold,
@@ -136,6 +170,7 @@ class CollaborationTaskGenerator:
         catalog_versions = await self._ensure_catalog_versions(
             session,
             observed_at=observed_at,
+            catalog=catalog,
         )
         existing_tasks = (
             await session.scalars(
@@ -147,6 +182,12 @@ class CollaborationTaskGenerator:
                 .with_for_update()
             )
         ).all()
+        frozen_version_ids = set(catalog_versions.values())
+        existing_tasks = [
+            task
+            for task in existing_tasks
+            if task.template_version_id in frozen_version_ids
+        ]
         tasks_by_key = {
             (task.template_version_id, task.task_code): task
             for task in existing_tasks
@@ -237,6 +278,13 @@ class CollaborationTaskGenerator:
             )
             not_required += 1
 
+        await _enqueue_projection(
+            session,
+            event_id=event.id,
+            revision_id=revision.id,
+            observed_at=observed_at,
+        )
+
         return GenerationResult(
             event_id=event.id,
             revision_id=revision.id,
@@ -252,16 +300,18 @@ class CollaborationTaskGenerator:
         session: AsyncSession,
         *,
         observed_at: datetime,
+        catalog: TaskTemplateCatalog | None = None,
     ) -> dict[str, uuid.UUID]:
+        catalog = catalog or self.catalog
         await session.execute(
             text(
                 "SELECT pg_advisory_xact_lock("
                 "hashtextextended(:lock_key, 0))"
             ),
-            {"lock_key": f"collaboration-template:{self.catalog.version}"},
+            {"lock_key": f"collaboration-template:{catalog.version}"},
         )
         versions: dict[str, uuid.UUID] = {}
-        for definition in self.catalog.definitions:
+        for definition in catalog.definitions:
             template = await session.scalar(
                 select(CollaborationTaskTemplate)
                 .where(
@@ -287,14 +337,14 @@ class CollaborationTaskGenerator:
                     CollaborationTaskTemplateVersion.template_code
                     == definition.template_code,
                     CollaborationTaskTemplateVersion.version
-                    == self.catalog.version,
+                    == catalog.version,
                 )
                 .with_for_update()
             )
             if version is None:
                 version = CollaborationTaskTemplateVersion(
                     template_id=template.id,
-                    version=self.catalog.version,
+                    version=catalog.version,
                     template_code=definition.template_code,
                     phase_code=definition.phase_code,
                     start_offset_seconds=definition.start_offset_seconds,
@@ -326,6 +376,70 @@ class CollaborationTaskGenerator:
                 await session.flush()
             versions[definition.template_code] = version.id
         return versions
+
+    async def _frozen_template_version(
+        self,
+        session: AsyncSession,
+        event_id: uuid.UUID,
+    ) -> str:
+        row = (
+            await session.execute(
+                select(
+                    CollaborationTaskTemplateVersion.version,
+                    func.max(WorkgroupTask.created_at),
+                )
+                .join(
+                    WorkgroupTask,
+                    WorkgroupTask.template_version_id
+                    == CollaborationTaskTemplateVersion.id,
+                )
+                .where(
+                    WorkgroupTask.event_id == event_id,
+                    WorkgroupTask.template_version_id.is_not(None),
+                )
+                .group_by(CollaborationTaskTemplateVersion.version)
+                .order_by(
+                    func.max(WorkgroupTask.created_at).desc(),
+                    CollaborationTaskTemplateVersion.version.desc(),
+                )
+                .limit(1)
+            )
+        ).first()
+        return str(row[0]) if row is not None else self.catalog.version
+
+    async def _persisted_catalog(
+        self,
+        session: AsyncSession,
+        version_name: str,
+    ) -> TaskTemplateCatalog:
+        rows = (
+            await session.execute(
+                select(
+                    CollaborationTaskTemplateVersion,
+                    CollaborationTaskTemplate,
+                )
+                .join(
+                    CollaborationTaskTemplate,
+                    CollaborationTaskTemplate.id
+                    == CollaborationTaskTemplateVersion.template_id,
+                )
+                .where(
+                    CollaborationTaskTemplateVersion.version == version_name,
+                )
+                .order_by(CollaborationTaskTemplateVersion.template_code)
+            )
+        ).all()
+        if not rows:
+            raise ValueError(
+                f"frozen task template version is unavailable: {version_name}"
+            )
+        return TaskTemplateCatalog(
+            version=version_name,
+            definitions=tuple(
+                _definition_from_version(version, template)
+                for version, template in rows
+            ),
+        )
 
     @staticmethod
     def _new_task(
@@ -441,7 +555,7 @@ class CollaborationOutboxDispatcher:
                         select(EventLifecycleOutbox)
                         .where(
                             EventLifecycleOutbox.trigger_type
-                            == _COLLABORATION_TRIGGER_TYPE,
+                            .in_(tuple(_COLLABORATION_TRIGGER_TYPES)),
                             EventLifecycleOutbox.status.in_(
                                 ("pending", "processing")
                             ),
@@ -577,6 +691,85 @@ def _payload_threshold(payload: Mapping[str, Any]) -> Decimal | None:
     if not threshold.is_finite() or threshold < 0:
         raise ValueError("intensity_threshold payload must be non-negative")
     return threshold
+
+
+def _explicit_template_version(
+    outbox: EventLifecycleOutbox,
+) -> str | None:
+    value = outbox.payload.get("template_version")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("template_version payload must be a non-empty string")
+    return value.strip()
+
+
+def _definition_from_version(
+    version: CollaborationTaskTemplateVersion,
+    template: CollaborationTaskTemplate,
+) -> TaskTemplateDefinition:
+    return TaskTemplateDefinition(
+        template_code=version.template_code,
+        workgroup_code=WorkgroupCode(template.workgroup_code),
+        phase_code=version.phase_code,
+        title=template.title or version.template_code,
+        source=(version.response_basis or "frozen template"),
+        start_offset_seconds=version.start_offset_seconds,
+        due_offset_seconds=version.due_offset_seconds,
+        continues_until_response_end=version.continues_until_response_end,
+        required_deliverables=tuple(
+            str(item) for item in (version.required_deliverables or ())
+        ),
+        artifact_bindings=tuple(
+            ArtifactBinding(
+                artifact_key=str(item["artifact_key"]),
+                output_profile=str(item["output_profile"]),
+            )
+            for item in (version.artifact_bindings or ())
+            if isinstance(item, Mapping)
+            and item.get("artifact_key")
+            and item.get("output_profile")
+        ),
+        applicability=MappingProxyType(dict(version.applicability or {})),
+        priority=version.priority,
+        instruction=version.instruction,
+        response_basis=version.response_basis,
+    )
+
+
+async def _enqueue_projection(
+    session: AsyncSession,
+    *,
+    event_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    observed_at: datetime,
+) -> None:
+    key = f"collaboration-generated:{event_id}:{revision_id}"
+    existing = await session.scalar(
+        select(CollaborationOutbox.id).where(
+            CollaborationOutbox.idempotency_key == key
+        )
+    )
+    if existing is not None:
+        return
+    session.add(
+        CollaborationOutbox(
+            event_id=event_id,
+            task_id=None,
+            event_type="task.generated",
+            idempotency_key=key,
+            payload={
+                "event_id": str(event_id),
+                "revision_id": str(revision_id),
+            },
+            status="pending",
+            attempt_count=0,
+            available_at=observed_at,
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+    )
+    await session.flush()
 
 
 def _json_compatible(value: Any) -> Any:
