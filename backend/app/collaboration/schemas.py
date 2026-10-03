@@ -80,3 +80,53 @@ class EventWorkgroupResponse(BaseModel):
 class EventWorkgroupsResponse(BaseModel):
     event_id: UUID
     groups: list[EventWorkgroupResponse] = Field(default_factory=list)
+
+
+class TaskContributorResponse(BaseModel):
+    user_id: UUID
+    username: str
+    contribution_count: int
+    first_contributed_at: datetime
+    last_contributed_at: datetime
+
+
+class WorkgroupTaskResponse(BaseModel):
+    id: UUID
+    event_id: UUID
+    workgroup_code: str
+    task_code: str
+    title: str
+    status: str
+    timeliness_state: str
+    due_at: datetime | None
+    row_version: int
+    instruction: str
+    priority: int
+    phase_code: str | None
+    source_type: str
+    source_ref: str | None
+    activated_at: datetime | None
+    completed_at: datetime | None
+    closed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    contributors: list[TaskContributorResponse] = Field(default_factory=list)
+
+
+class TaskSubmitRequest(BaseModel):
+    result_text: str | None = None
+
+
+class TaskReturnRequest(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+class TaskCancelRequest(BaseModel):
+    reason: str | None = None
+
+
+class TaskUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1)
+    instruction: str | None = None
+    priority: int | None = Field(default=None, ge=0)
+    due_at: datetime | None = None
