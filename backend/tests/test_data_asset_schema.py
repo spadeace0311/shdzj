@@ -14,7 +14,17 @@ from app.data_assets.models import DataAssetSnapshot
 
 
 BACKEND_DIR = Path(__file__).parents[1]
-LATEST_REVISION = "0018_collaboration_command_hall"
+
+
+def _latest_revision() -> str:
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    revision = ScriptDirectory.from_config(config).get_current_head()
+    assert revision is not None
+    return revision
+
+
+LATEST_REVISION = _latest_revision()
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 DATA_ASSET_TABLES = {
     "data_assets",
