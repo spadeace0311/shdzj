@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact
@@ -37,6 +37,10 @@ class ArtifactLinkService:
         production_run_id: object,
     ) -> ArtifactLinkResult:
         run_id = _coerce_uuid(production_run_id, "production_run_id")
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": _advisory_lock_key(run_id)},
+        )
         publication_rows = (
             await session.execute(
                 select(ArtifactPublication, GeneratedArtifact)
@@ -187,6 +191,11 @@ class ArtifactLinkService:
                 identity = (deliverable.id, publication.id)
                 if identity in existing_version_keys:
                     continue
+                await session.get(
+                    TaskDeliverable,
+                    deliverable.id,
+                    with_for_update=True,
+                )
                 previous = await session.scalar(
                     select(TaskDeliverableVersion)
                     .where(
@@ -301,3 +310,7 @@ def _next_display_order(
 def _outbox_key(event_id: uuid.UUID, production_run_id: uuid.UUID) -> str:
     material = f"artifact-link:{event_id}:{production_run_id}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _advisory_lock_key(production_run_id: uuid.UUID) -> str:
+    return f"artifact-link:{production_run_id}"

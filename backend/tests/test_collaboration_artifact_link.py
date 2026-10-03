@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -604,6 +605,59 @@ async def test_repeated_sync_does_not_create_duplicate_version_or_outbox(
         )
     )
     assert version_count == 1
+    assert outbox_count == 1
+
+
+async def test_concurrent_syncs_are_idempotent(
+    seeded_artifact_assessment,
+    task_factory,
+    session_factory,
+) -> None:
+    task_fixture = await task_factory(
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        create_deliverables=True,
+    )
+    artifact = await seeded_artifact_assessment.published_artifact(
+        "map.epicenter",
+        version=1,
+    )
+
+    async def sync_once():
+        async with session_factory() as session:
+            async with session.begin():
+                return await ArtifactLinkService().sync_run_publications(
+                    session,
+                    artifact.production_run_id,
+                )
+
+    first, second = await asyncio.gather(sync_once(), sync_once())
+
+    assert {first.linked_count, second.linked_count} == {0, 1}
+    async with session_factory() as session:
+        version_count = await session.scalar(
+            select(func.count())
+            .select_from(TaskDeliverableVersion)
+            .where(
+                TaskDeliverableVersion.deliverable_id
+                == task_fixture.deliverable_id
+            )
+        )
+        deliverable_count = await session.scalar(
+            select(func.count())
+            .select_from(TaskDeliverable)
+            .where(TaskDeliverable.task_id == task_fixture.task_id)
+        )
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(CollaborationOutbox)
+            .where(
+                CollaborationOutbox.event_id
+                == seeded_artifact_assessment.event_id
+            )
+        )
+    assert version_count == 1
+    assert deliverable_count == 1
     assert outbox_count == 1
 
 
