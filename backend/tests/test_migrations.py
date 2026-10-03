@@ -16,7 +16,8 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0021_cleanup_intents"
+LATEST_REVISION = "0022_cleanup_namespace"
+CLEANUP_INTENT_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
 LOSS_PREVIOUS_REVISION = "0013_data_asset_final_fixes"
@@ -1587,6 +1588,7 @@ async def test_0019_event_purge_receipts_are_reversible() -> None:
             "actor",
             "deletion_counts",
             "storage_paths",
+            "storage_namespace",
             "purged_at",
         }
         assert upgraded["indexes"] == {
@@ -1688,7 +1690,7 @@ async def test_0021_cleanup_intents_are_reversible() -> None:
     _set_revision(previous_revision)
     assert await _cleanup_tables_exist() is False
     try:
-        _set_revision(LATEST_REVISION)
+        _set_revision(CLEANUP_INTENT_REVISION)
         state = await _cleanup_intent_schema_state()
         assert state["exists"] is True
         assert state["columns"] == {
@@ -1717,7 +1719,123 @@ async def test_0021_cleanup_intents_are_reversible() -> None:
         _set_revision(previous_revision)
         assert await _cleanup_tables_exist() is False
 
-        _set_revision(LATEST_REVISION)
+        _set_revision(CLEANUP_INTENT_REVISION)
         assert await _cleanup_tables_exist() is True
     finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> None:
+    legacy_id = uuid.uuid4()
+    _set_revision(CLEANUP_INTENT_REVISION)
+    try:
+        legacy_receipt_state = await _event_purge_receipt_schema_state()
+        assert "storage_namespace" not in legacy_receipt_state["columns"]
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO event_object_cleanup_intents (
+                            id,
+                            event_id,
+                            source_kind,
+                            source_key,
+                            storage_path,
+                            status,
+                            attempt_count
+                        ) VALUES (
+                            :id,
+                            :event_id,
+                            'retention',
+                            :source_key,
+                            'objects/aa/bb/legacy.txt',
+                            'pending',
+                            0
+                        )
+                        """
+                    ),
+                    {
+                        "id": legacy_id,
+                        "event_id": uuid.uuid4(),
+                        "source_key": uuid.uuid4().hex,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+        _set_revision(LATEST_REVISION)
+        state = await _cleanup_intent_schema_state()
+        assert state["exists"] is True
+        assert state["columns"] == {
+            "id",
+            "event_id",
+            "source_kind",
+            "source_key",
+            "storage_path",
+            "storage_namespace",
+            "max_attempts",
+            "status",
+            "attempt_count",
+            "last_error",
+            "lease_owner",
+            "lease_expires_at",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }
+        assert state["unique_constraints"] == {"uq_event_object_cleanup_namespace_source_path"}
+        assert state["indexes"] == {
+            "ix_event_object_cleanup_event_id": False,
+            "ix_event_object_cleanup_claim": False,
+            "uq_event_object_cleanup_namespace_source_path": True,
+        }
+        assert "ck_event_object_cleanup_status" in state["checks"]
+
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT storage_namespace, max_attempts, status, last_error
+                            FROM event_object_cleanup_intents
+                            WHERE id = :id
+                            """
+                        ),
+                        {"id": legacy_id},
+                    )
+                ).one()
+        finally:
+            await engine.dispose()
+        assert row.storage_namespace is None
+        assert row.max_attempts == 5
+        assert row.status == "unprocessable"
+        assert "manual remediation required" in row.last_error
+
+        _set_revision(CLEANUP_INTENT_REVISION)
+        state = await _cleanup_intent_schema_state()
+        assert "storage_namespace" not in state["columns"]
+        assert "max_attempts" not in state["columns"]
+        downgraded_receipt_state = await _event_purge_receipt_schema_state()
+        assert "storage_namespace" not in downgraded_receipt_state["columns"]
+
+        _set_revision(LATEST_REVISION)
+        state = await _cleanup_intent_schema_state()
+        assert "storage_namespace" in state["columns"]
+        assert "max_attempts" in state["columns"]
+        upgraded_receipt_state = await _event_purge_receipt_schema_state()
+        assert "storage_namespace" in upgraded_receipt_state["columns"]
+    finally:
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("DELETE FROM event_object_cleanup_intents WHERE id = :id"),
+                    {"id": legacy_id},
+                )
+        finally:
+            await engine.dispose()
         _set_revision(LATEST_REVISION)

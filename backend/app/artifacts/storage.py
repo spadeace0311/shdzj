@@ -12,6 +12,11 @@ from typing import BinaryIO
 from app.config import settings
 
 
+_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/][^\s\"']+|\\\\[^\s\"']+|/[^\s\"']+)"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class StoredArtifactFile:
     file_name: str
@@ -28,9 +33,15 @@ class ArtifactStore:
         self,
         root: str | Path,
         *,
+        namespace: str | None = None,
         max_override_bytes: int | None = None,
     ) -> None:
         self._root = Path(root).resolve()
+        self._storage_namespace = (
+            _safe_storage_namespace(namespace)
+            if namespace is not None
+            else _root_storage_namespace(self._root)
+        )
         self._staging = self._root / "staging"
         self._objects = self._root / "objects"
         self._max_override_bytes = (
@@ -40,6 +51,10 @@ class ArtifactStore:
         )
         if self._max_override_bytes < 1:
             raise ValueError("max_override_bytes must be positive")
+
+    @property
+    def storage_namespace(self) -> str:
+        return self._storage_namespace
 
     def stage(self, source: BinaryIO, *, file_name: str) -> Path:
         safe_name = _safe_file_name(file_name)
@@ -86,10 +101,7 @@ class ArtifactStore:
 
         checksum = _sha256_path(source)
         safe_name = _safe_file_name(file_name)
-        relative_path = (
-            f"objects/{checksum[:2]}/{checksum[2:4]}/"
-            f"{checksum}-{safe_name}"
-        )
+        relative_path = f"objects/{checksum[:2]}/{checksum[2:4]}/" f"{checksum}-{safe_name}"
         object_path = self._root / relative_path
         object_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -145,14 +157,9 @@ class ArtifactStore:
         try:
             int(checksum, 16)
         except ValueError as error:
-            raise ValueError(
-                "checksum must contain 64 hexadecimal characters"
-            ) from error
+            raise ValueError("checksum must contain 64 hexadecimal characters") from error
         safe_name = _safe_file_name(file_name)
-        return (
-            f"objects/{checksum[:2]}/{checksum[2:4]}/"
-            f"{checksum}-{safe_name}"
-        )
+        return f"objects/{checksum[:2]}/{checksum[2:4]}/" f"{checksum}-{safe_name}"
 
     def resolve(self, relative_path: str) -> Path:
         normalized = _safe_relative_path(relative_path)
@@ -173,6 +180,19 @@ class ArtifactStore:
             raise ValueError("artifact path escapes storage root") from error
         if path.exists():
             path.unlink()
+
+    def redact_error(self, error: BaseException, *, relative_path: str | None = None) -> str:
+        message = str(error)
+        replacements: list[tuple[str, str]] = [(str(self._root), "<artifact-root>")]
+        if relative_path:
+            replacements.append((str(self.resolve(relative_path)), "<artifact-object>"))
+        for value, replacement in sorted(
+            replacements,
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            message = message.replace(value, replacement)
+        return _ABSOLUTE_PATH_PATTERN.sub("<path>", message)[:2000]
 
 
 def _safe_file_name(file_name: str) -> str:
@@ -199,6 +219,22 @@ def _safe_relative_path(relative_path: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("relative_path must not contain path traversal")
     return normalized
+
+
+def _root_storage_namespace(root: Path) -> str:
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:40]
+    return f"local-root-v1:{digest}"
+
+
+def _safe_storage_namespace(namespace: str) -> str:
+    if not isinstance(namespace, str) or not namespace.strip():
+        raise ValueError("storage namespace must not be empty")
+    value = namespace.strip()
+    if len(value) > 128:
+        raise ValueError("storage namespace is too long")
+    if any(character.isspace() for character in value):
+        raise ValueError("storage namespace must not contain whitespace")
+    return value
 
 
 def _sha256_path(path: Path) -> str:

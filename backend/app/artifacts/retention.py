@@ -37,6 +37,8 @@ class ArtifactRetentionService:
         self,
         session: AsyncSession,
         observed_at: datetime,
+        *,
+        storage_namespace: str,
     ) -> ArtifactRetentionResult:
         observed_at = _as_utc(observed_at)
         thresholds = (
@@ -145,6 +147,7 @@ class ArtifactRetentionService:
                     source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                     source_key=str(artifact.id),
                     storage_path=artifact.storage_path,
+                    storage_namespace=storage_namespace,
                 )
 
         return ArtifactRetentionResult(

@@ -82,6 +82,7 @@ class EventPurgeReceipt(Base):
     actor: Mapped[str] = mapped_column(String(64))
     deletion_counts: Mapped[dict] = mapped_column(JSONB)
     storage_paths: Mapped[list] = mapped_column(JSONB)
+    storage_namespace: Mapped[str | None] = mapped_column(String(128))
     purged_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
@@ -101,6 +102,7 @@ class PurgeResult:
     deleted_override_count: int
     deleted_task_event_count: int
     storage_paths: tuple[str, ...] = ()
+    storage_namespace: str | None = None
     already_purged: bool = False
 
 
@@ -112,6 +114,7 @@ class SuperadminPurgeService:
         actor: object,
         *,
         idempotency_key: str | None = None,
+        storage_namespace: str | None = None,
     ) -> PurgeResult:
         if getattr(actor, "role", None) != "superadmin":
             raise PermissionError("Insufficient permissions")
@@ -346,6 +349,7 @@ class SuperadminPurgeService:
             deleted_override_count=len(override_ids),
             deleted_task_event_count=task_event_count,
             storage_paths=storage_paths,
+            storage_namespace=storage_namespace,
         )
         session.add(
             EventPurgeReceipt(
@@ -354,6 +358,7 @@ class SuperadminPurgeService:
                 actor=str(getattr(actor, "username", "unknown")),
                 deletion_counts=_result_counts(result),
                 storage_paths=list(storage_paths),
+                storage_namespace=storage_namespace,
             )
         )
         await session.flush()
@@ -365,7 +370,16 @@ async def cleanup_purged_event(
     event_id: uuid.UUID,
     storage_paths: tuple[str, ...],
     artifact_store: ArtifactStore,
+    *,
+    expected_storage_namespace: str | None = None,
 ) -> bool:
+    current_namespace = getattr(artifact_store, "storage_namespace", None)
+    if (
+        expected_storage_namespace is not None
+        and current_namespace is not None
+        and expected_storage_namespace != current_namespace
+    ):
+        return False
     result = await cleanup_event_objects(
         session,
         event_id,
@@ -394,7 +408,13 @@ def _result_counts(result: PurgeResult) -> dict[str, int]:
     return {
         key: value
         for key, value in asdict(result).items()
-        if key not in {"deleted_event_id", "storage_paths", "already_purged"}
+        if key
+        not in {
+            "deleted_event_id",
+            "storage_paths",
+            "storage_namespace",
+            "already_purged",
+        }
     }
 
 
@@ -419,5 +439,6 @@ def _result_from_receipt(
             if storage_paths is not None
             else tuple(str(path) for path in (receipt.storage_paths or ()))
         ),
+        storage_namespace=receipt.storage_namespace,
         already_purged=True,
     )

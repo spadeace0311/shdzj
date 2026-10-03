@@ -36,6 +36,7 @@ from app.event_object_locks import (
 )
 from app.event_object_cleanup import (
     CANDIDATE_DELETE_CLEANUP_SOURCE,
+    EventObjectCleanupIntent,
     ObjectCleanupIntent,
     enqueue_object_cleanup_intent,
 )
@@ -50,6 +51,10 @@ class StaleTaskVersion(Exception):
 
 
 class MissingRequiredDeliverableError(Exception):
+    pass
+
+
+class CleanupNamespaceUnavailableError(RuntimeError):
     pass
 
 
@@ -1004,7 +1009,10 @@ class DeliverableService:
     ) -> None:
         self.repository = repository or CollaborationRepository()
         self.roster_service = roster_service or RosterService()
-        self.artifact_store = artifact_store or ArtifactStore(settings.artifact_storage_root)
+        self.artifact_store = artifact_store or ArtifactStore(
+            settings.artifact_storage_root,
+            namespace=settings.artifact_storage_namespace,
+        )
 
     async def add_text_version(
         self,
@@ -1267,6 +1275,7 @@ class DeliverableService:
                     source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
                     source_key=str(version.id),
                     storage_path=version.storage_key,
+                    storage_namespace=self.artifact_store.storage_namespace,
                 )
                 cleanup = ObjectCleanupIntent(
                     event_id,
@@ -1295,6 +1304,7 @@ class DeliverableService:
                 "version_no": version.version_no,
                 "event_id": str(event_id),
                 "storage_path": version.storage_key,
+                "storage_namespace": self.artifact_store.storage_namespace,
             },
             idempotency_key=idempotency_key,
             occurred_at=now,
@@ -1767,12 +1777,35 @@ async def _cleanup_intent_from_event(
         return None
     event_id = _coerce_uuid(event_id_value, "event_id")
     storage_path = str(storage_path)
+    frozen_namespaces = {
+        str(namespace)
+        for namespace in (
+            await session.scalars(
+                select(EventObjectCleanupIntent.storage_namespace)
+                .where(
+                    EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                    EventObjectCleanupIntent.source_key == str(source_key),
+                    EventObjectCleanupIntent.storage_path == storage_path,
+                    EventObjectCleanupIntent.storage_namespace.is_not(None),
+                )
+                .distinct()
+            )
+        ).all()
+    }
+    if len(frozen_namespaces) > 1:
+        raise CleanupNamespaceUnavailableError("cleanup storage namespace is ambiguous")
+    storage_namespace = (
+        next(iter(frozen_namespaces)) if frozen_namespaces else payload.get("storage_namespace")
+    )
+    if not isinstance(storage_namespace, str) or not storage_namespace.strip():
+        raise CleanupNamespaceUnavailableError("cleanup storage namespace is unavailable")
     await enqueue_object_cleanup_intent(
         session,
         event_id=event_id,
         source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
         source_key=str(source_key),
         storage_path=storage_path,
+        storage_namespace=storage_namespace.strip(),
     )
     return ObjectCleanupIntent(
         event_id,

@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     data_asset_mdb_driver: str = "Microsoft Access Driver (*.mdb, *.accdb)"
     data_asset_worker_poll_seconds: float = 1.0
     artifact_storage_root: str = "/var/lib/artifacts"
+    artifact_storage_namespace: str | None = None
     artifact_template_root: str = "/config/artifacts/templates"
     artifact_catalog_path: str = "/config/artifacts/catalog.yaml"
     artifact_font_path: str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -71,9 +72,7 @@ class Settings(BaseSettings):
     artifact_browser_pool_size: int = 2
     artifact_retention_enabled: bool = True
     artifact_retention_interval_seconds: int = 86_400
-    collaboration_task_template_path: str = (
-        "/config/collaboration/shanghai-2026-tasks.yaml"
-    )
+    collaboration_task_template_path: str = "/config/collaboration/shanghai-2026-tasks.yaml"
     collaboration_worker_enabled: bool = False
     collaboration_worker_poll_seconds: float = 1.0
     collaboration_worker_batch_size: int = 50
@@ -99,9 +98,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_collector_configuration(self) -> "Settings":
         if self.cenc_collector_enabled and not self.resolved_fan_app_id:
-            raise ValueError(
-                "FAN_APP_ID or CENC_APP_ID is required when the collector is enabled"
-            )
+            raise ValueError("FAN_APP_ID or CENC_APP_ID is required when the collector is enabled")
         if self.cenc_collector_enabled and not self.fan_api_key.get_secret_value():
             raise ValueError("FAN_API_KEY is required when the collector is enabled")
         if self.fan_query_interval_seconds < 1 or self.wolfx_poll_interval_seconds < 1:
@@ -166,6 +163,15 @@ class Settings(BaseSettings):
         for path in artifact_paths:
             if not path.strip():
                 raise ValueError("artifact configuration paths must not be empty")
+        if self.artifact_storage_namespace is not None:
+            namespace = self.artifact_storage_namespace.strip()
+            if not namespace:
+                raise ValueError("ARTIFACT_STORAGE_NAMESPACE must not be empty")
+            if len(namespace) > 128:
+                raise ValueError("ARTIFACT_STORAGE_NAMESPACE is too long")
+            if any(character.isspace() for character in namespace):
+                raise ValueError("ARTIFACT_STORAGE_NAMESPACE must not contain whitespace")
+            self.artifact_storage_namespace = namespace
         if self.artifact_max_override_bytes < 1:
             raise ValueError("ARTIFACT_MAX_OVERRIDE_BYTES must be positive")
         if not 1 <= self.artifact_render_concurrency <= 6:
@@ -181,43 +187,28 @@ class Settings(BaseSettings):
         if not self.artifact_basemap_zoom_levels:
             raise ValueError("ARTIFACT_BASEMAP_ZOOM_LEVELS must not be empty")
         if any(
-            isinstance(zoom, bool)
-            or not isinstance(zoom, int)
-            or not 0 <= zoom <= 22
+            isinstance(zoom, bool) or not isinstance(zoom, int) or not 0 <= zoom <= 22
             for zoom in self.artifact_basemap_zoom_levels
         ):
-            raise ValueError(
-                "ARTIFACT_BASEMAP_ZOOM_LEVELS must contain integers between 0 and 22"
-            )
+            raise ValueError("ARTIFACT_BASEMAP_ZOOM_LEVELS must contain integers between 0 and 22")
         if not 0 < self.artifact_optional_dependency_reserve_seconds < 300:
             raise ValueError(
-                "ARTIFACT_OPTIONAL_DEPENDENCY_RESERVE_SECONDS must be positive "
-                "and less than 300"
+                "ARTIFACT_OPTIONAL_DEPENDENCY_RESERVE_SECONDS must be positive " "and less than 300"
             )
         if self.artifact_retention_interval_seconds < 60:
-            raise ValueError(
-                "ARTIFACT_RETENTION_INTERVAL_SECONDS must be at least 60"
-            )
+            raise ValueError("ARTIFACT_RETENTION_INTERVAL_SECONDS must be at least 60")
         return self
 
     @model_validator(mode="after")
     def validate_collaboration_configuration(self) -> "Settings":
         if self.collaboration_worker_poll_seconds <= 0:
-            raise ValueError(
-                "COLLABORATION_WORKER_POLL_SECONDS must be positive"
-            )
+            raise ValueError("COLLABORATION_WORKER_POLL_SECONDS must be positive")
         if not 1 <= self.collaboration_worker_batch_size <= 1_000:
-            raise ValueError(
-                "COLLABORATION_WORKER_BATCH_SIZE must be between 1 and 1000"
-            )
+            raise ValueError("COLLABORATION_WORKER_BATCH_SIZE must be between 1 and 1000")
         if not 1 <= self.collaboration_outbox_max_attempts <= 100:
-            raise ValueError(
-                "COLLABORATION_OUTBOX_MAX_ATTEMPTS must be between 1 and 100"
-            )
+            raise ValueError("COLLABORATION_OUTBOX_MAX_ATTEMPTS must be between 1 and 100")
         if self.collaboration_outbox_lease_seconds <= 0:
-            raise ValueError(
-                "COLLABORATION_OUTBOX_LEASE_SECONDS must be positive"
-            )
+            raise ValueError("COLLABORATION_OUTBOX_LEASE_SECONDS must be positive")
         return self
 
 

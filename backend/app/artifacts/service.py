@@ -447,6 +447,7 @@ class ArtifactOverrideService:
         self._repository = repository or ArtifactProductionRepository(self._catalog)
         self._store = store or ArtifactStore(
             storage_root or settings.artifact_storage_root,
+            namespace=settings.artifact_storage_namespace,
             max_override_bytes=(
                 settings.artifact_max_override_bytes
                 if max_override_bytes is None

@@ -132,6 +132,28 @@ WHERE storage_path LIKE 'objects/%';
 
 再对每个候选对象执行 `ArtifactStore.delete_unreferenced`。不要在数据库记录删除前删除磁盘对象。
 
+## 7.1 迁移对象存储根目录
+
+每个清理 intent 和 purge receipt 都冻结了创建时的 `storage_namespace`。
+`storage_namespace` 默认由解析后的 `ARTIFACT_STORAGE_ROOT` 生成，也可以用
+`ARTIFACT_STORAGE_NAMESPACE` 显式指定。namespace 不匹配时 worker 只会
+告警并保留 intent，不会使用当前 root 解析旧相对路径。
+
+迁移存储根目录时必须按以下顺序执行：
+
+1. 暂停会创建清理 intent 的写入路径。
+2. 等待 `event_object_cleanup_intents` 中旧 namespace 的 `pending`、
+   `processing`、`dead_letter` 和 `unprocessable` 行全部处理完毕或转入人工处置。
+3. 在旧 root 上运行一次清理 worker，确认没有剩余 intent。
+4. 切换 `ARTIFACT_STORAGE_ROOT`；如有必要，同步设置新的
+   `ARTIFACT_STORAGE_NAMESPACE`。
+5. 启动新 root 的 worker，并检查是否出现
+   `cleanup intents require a different storage namespace` 告警。
+
+如果必须保留旧 namespace 的待处理 intent，需要为 worker 配置能解析该
+namespace 的旧 store，而不是直接把旧 intent 交给新 root。不要手工把
+namespace 改写成当前 root，也不要直接删除仍未完成的 intent。
+
 ## 8. 轮换测试和演练成果
 
 系统按生产模式保留：

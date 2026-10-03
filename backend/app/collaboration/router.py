@@ -57,6 +57,7 @@ from app.collaboration.schemas import (
     WorkgroupTaskResponse,
 )
 from app.collaboration.service import (
+    CleanupNamespaceUnavailableError,
     CollaborationTaskService,
     DeliverableService,
     MissingRequiredDeliverableError,
@@ -117,7 +118,10 @@ def get_purge_service() -> SuperadminPurgeService:
 
 
 def get_artifact_store() -> ArtifactStore:
-    return ArtifactStore(settings.artifact_storage_root)
+    return ArtifactStore(
+        settings.artifact_storage_root,
+        namespace=settings.artifact_storage_namespace,
+    )
 
 
 @router.get("/workgroups", response_model=list[WorkgroupResponse])
@@ -726,11 +730,15 @@ async def delete_deliverable_candidate(
         )
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
-    if cleanup_result.failed_count:
+    if not cleanup_result.succeeded:
         logger.warning(
-            "deliverable candidate cleanup incomplete version_id=%s paths=%s",
+            "deliverable candidate cleanup incomplete version_id=%s paths=%s "
+            "failed=%s dead_letter=%s namespace_mismatch=%s",
             version_id,
             cleanup.storage_paths,
+            cleanup_result.failed_count,
+            cleanup_result.dead_letter_count,
+            cleanup_result.namespace_mismatch_count,
         )
         raise _storage_unavailable()
 
@@ -888,6 +896,7 @@ async def purge_event(
         alias="Idempotency-Key",
     ),
 ) -> Response:
+    storage_namespace = getattr(artifact_store, "storage_namespace", None)
     try:
         async with session.begin():
             result = await service.purge_event(
@@ -895,6 +904,7 @@ async def purge_event(
                 event_id,
                 actor=current_user,
                 idempotency_key=idempotency_key,
+                storage_namespace=storage_namespace,
             )
     except EventNotFoundError as exc:
         raise HTTPException(status_code=404, detail="event_not_found") from exc
@@ -903,6 +913,20 @@ async def purge_event(
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
+    if (
+        result.storage_namespace is not None
+        and storage_namespace is not None
+        and result.storage_namespace != storage_namespace
+    ):
+        logger.error(
+            "event purge cleanup requires a different storage namespace "
+            "event_id=%s expected=%s current=%s",
+            event_id,
+            result.storage_namespace,
+            storage_namespace,
+        )
+        raise _storage_unavailable()
+
     try:
         async with session.begin():
             cleanup_succeeded = await cleanup_purged_event(
@@ -910,6 +934,7 @@ async def purge_event(
                 event_id,
                 result.storage_paths,
                 artifact_store,
+                expected_storage_namespace=result.storage_namespace,
             )
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
@@ -1206,6 +1231,7 @@ def _task_mutation_error_types() -> tuple[type[Exception], ...]:
         LookupError,
         StaleTaskVersion,
         MissingRequiredDeliverableError,
+        CleanupNamespaceUnavailableError,
         TypeError,
         ValueError,
         SQLAlchemyError,
@@ -1223,6 +1249,8 @@ def _task_mutation_exception(exc: Exception) -> HTTPException:
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, (TypeError, ValueError)):
         return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, CleanupNamespaceUnavailableError):
+        return _storage_unavailable()
     return _storage_unavailable()
 
 

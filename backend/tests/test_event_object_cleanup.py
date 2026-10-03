@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.event_object_cleanup import (
@@ -19,9 +19,12 @@ from app.event_object_cleanup import (
 
 @pytest.fixture(autouse=True)
 async def _dispose_engine_between_cleanup_tests():
-    from app.db import engine
+    from app.db import SessionFactory, engine
 
     await engine.dispose()
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(EventObjectCleanupIntent))
     yield
     await engine.dispose()
 
@@ -58,6 +61,7 @@ async def test_cleanup_intent_processor_reclaims_expired_processing_lease(
                     source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                     source_key=source_key,
                     storage_path=relative_path,
+                    storage_namespace=store.storage_namespace,
                     status=CleanupIntentStatus.PROCESSING.value,
                     attempt_count=1,
                     lease_owner="crashed-worker",
@@ -112,6 +116,7 @@ async def test_cleanup_intent_processor_records_partial_failure(
                 source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                 source_key=uuid.uuid4().hex,
                 storage_path=failing_path,
+                storage_namespace=store.storage_namespace,
             )
             await enqueue_object_cleanup_intent(
                 session,
@@ -119,6 +124,7 @@ async def test_cleanup_intent_processor_records_partial_failure(
                 source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                 source_key=uuid.uuid4().hex,
                 storage_path=succeeding_path,
+                storage_namespace=store.storage_namespace,
             )
 
     result = await process_cleanup_intents(
@@ -168,6 +174,7 @@ async def test_cleanup_intent_processor_skips_cross_table_reference(
                 source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                 source_key=source_key,
                 storage_path=artifact.storage_path,
+                storage_namespace=store.storage_namespace,
             )
 
     result = await process_cleanup_intents(
@@ -188,3 +195,161 @@ async def test_cleanup_intent_processor_skips_cross_table_reference(
     assert intent is not None
     assert intent.status == CleanupIntentStatus.SKIPPED.value
     assert intent.completed_at is not None
+
+
+async def test_cleanup_intent_namespace_prevents_wrong_root_delete(
+    session_factory,
+    tmp_path,
+) -> None:
+    event_id = uuid.uuid4()
+    source_key = uuid.uuid4().hex
+    relative_path = "objects/aa/bb/shared-relative-path.txt"
+    store_a = ArtifactStore(tmp_path / "root-a")
+    store_b = ArtifactStore(tmp_path / "root-b")
+    path_a = store_a.resolve(relative_path)
+    path_b = store_b.resolve(relative_path)
+    for path, payload in ((path_a, b"root-a"), (path_b, b"root-b")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    async with session_factory() as session:
+        async with session.begin():
+            await enqueue_object_cleanup_intent(
+                session,
+                event_id=event_id,
+                source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                source_key=source_key,
+                storage_path=relative_path,
+                storage_namespace=store_a.storage_namespace,
+            )
+
+    wrong_root = await process_cleanup_intents(
+        session_factory,
+        store_b,
+        lease_owner="wrong-root-worker",
+        source_key=source_key,
+    )
+
+    assert wrong_root.namespace_mismatch_count == 1
+    assert wrong_root.completed_count == 0
+    assert path_a.read_bytes() == b"root-a"
+    assert path_b.read_bytes() == b"root-b"
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == source_key
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.PENDING.value
+    assert intent.attempt_count == 0
+
+    correct_root = await process_cleanup_intents(
+        session_factory,
+        store_a,
+        lease_owner="correct-root-worker",
+        source_key=source_key,
+    )
+
+    assert correct_root.completed_count == 1
+    assert not path_a.exists()
+    assert path_b.read_bytes() == b"root-b"
+
+
+async def test_cleanup_intent_moves_to_dead_letter_after_max_attempts(
+    session_factory,
+    tmp_path,
+) -> None:
+    event_id = uuid.uuid4()
+    source_key = uuid.uuid4().hex
+    relative_path = "objects/aa/bb/dead-letter.txt"
+    store = SelectiveFailureStore(
+        tmp_path / "artifacts",
+        failing_path=relative_path,
+    )
+    path = store.resolve(relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"dead-letter")
+
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                EventObjectCleanupIntent(
+                    event_id=event_id,
+                    source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                    source_key=source_key,
+                    storage_path=relative_path,
+                    storage_namespace=store.storage_namespace,
+                    status=CleanupIntentStatus.PENDING.value,
+                    attempt_count=4,
+                    max_attempts=5,
+                )
+            )
+
+    result = await process_cleanup_intents(
+        session_factory,
+        store,
+        lease_owner="dead-letter-worker",
+    )
+
+    assert result.dead_letter_count == 1
+    assert result.failed_count == 0
+    assert path.is_file()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == source_key
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.DEAD_LETTER.value
+    assert intent.attempt_count == 5
+    assert intent.lease_owner is None
+    assert intent.lease_expires_at is None
+
+
+async def test_cleanup_intent_error_redacts_absolute_storage_paths(
+    session_factory,
+    tmp_path,
+) -> None:
+    event_id = uuid.uuid4()
+    source_key = uuid.uuid4().hex
+    relative_path = "objects/aa/bb/redaction.txt"
+    store = ArtifactStore(tmp_path / "artifacts")
+    path = store.resolve(relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"redaction")
+
+    class AbsolutePathFailureStore(ArtifactStore):
+        def delete_unreferenced(self, stored: StoredArtifactFile) -> None:
+            raise OSError(f"cannot unlink {stored.managed_path}")
+
+    failing_store = AbsolutePathFailureStore(tmp_path / "artifacts")
+    async with session_factory() as session:
+        async with session.begin():
+            await enqueue_object_cleanup_intent(
+                session,
+                event_id=event_id,
+                source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                source_key=source_key,
+                storage_path=relative_path,
+                storage_namespace=failing_store.storage_namespace,
+            )
+
+    result = await process_cleanup_intents(
+        session_factory,
+        failing_store,
+        lease_owner="redaction-worker",
+    )
+
+    assert result.failed_count == 1
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == source_key
+            )
+        )
+    assert intent is not None
+    assert intent.last_error is not None
+    assert str(tmp_path) not in intent.last_error
+    assert "<artifact-object>" in intent.last_error

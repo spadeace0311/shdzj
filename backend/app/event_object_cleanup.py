@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    func,
     or_,
     select,
     text,
@@ -36,6 +38,9 @@ from app.event_object_locks import (
 
 CANDIDATE_DELETE_CLEANUP_SOURCE = "candidate_delete"
 ARTIFACT_RETENTION_CLEANUP_SOURCE = "retention"
+DEFAULT_CLEANUP_MAX_ATTEMPTS = 5
+
+logger = logging.getLogger(__name__)
 
 
 class CleanupIntentStatus(StrEnum):
@@ -43,6 +48,8 @@ class CleanupIntentStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     SKIPPED = "skipped"
+    DEAD_LETTER = "dead_letter"
+    UNPROCESSABLE = "unprocessable"
 
 
 class EventObjectCleanupIntent(Base):
@@ -55,17 +62,22 @@ class EventObjectCleanupIntent(Base):
     __tablename__ = "event_object_cleanup_intents"
     __table_args__ = (
         UniqueConstraint(
+            "storage_namespace",
             "source_kind",
             "source_key",
             "storage_path",
-            name="uq_event_object_cleanup_source_path",
+            name="uq_event_object_cleanup_namespace_source_path",
         ),
         CheckConstraint(
-            "status IN ('pending', 'processing', 'completed', 'skipped')",
+            "status IN ("
+            "'pending', 'processing', 'completed', 'skipped', "
+            "'dead_letter', 'unprocessable'"
+            ")",
             name="ck_event_object_cleanup_status",
         ),
         Index(
             "ix_event_object_cleanup_claim",
+            "storage_namespace",
             "status",
             "lease_expires_at",
         ),
@@ -84,6 +96,13 @@ class EventObjectCleanupIntent(Base):
     source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     source_key: Mapped[str] = mapped_column(String(160), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    storage_namespace: Mapped[str | None] = mapped_column(String(128))
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_CLEANUP_MAX_ATTEMPTS,
+        server_default=text(str(DEFAULT_CLEANUP_MAX_ATTEMPTS)),
+    )
     status: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
@@ -144,10 +163,16 @@ class CleanupProcessingResult:
     completed_count: int = 0
     skipped_count: int = 0
     failed_count: int = 0
+    dead_letter_count: int = 0
+    namespace_mismatch_count: int = 0
 
     @property
     def succeeded(self) -> bool:
-        return self.failed_count == 0
+        return (
+            self.failed_count == 0
+            and self.dead_letter_count == 0
+            and self.namespace_mismatch_count == 0
+        )
 
 
 async def enqueue_object_cleanup_intent(
@@ -157,6 +182,7 @@ async def enqueue_object_cleanup_intent(
     source_kind: str,
     source_key: str,
     storage_path: str,
+    storage_namespace: str,
 ) -> EventObjectCleanupIntent:
     if not source_kind:
         raise ValueError("source_kind must not be empty")
@@ -164,6 +190,10 @@ async def enqueue_object_cleanup_intent(
         raise ValueError("source_key must not be empty")
     if not storage_path:
         raise ValueError("storage_path must not be empty")
+    if not storage_namespace:
+        raise ValueError("storage_namespace must not be empty")
+    if len(storage_namespace) > 128:
+        raise ValueError("storage_namespace is too long")
 
     statement = (
         insert(EventObjectCleanupIntent)
@@ -172,10 +202,12 @@ async def enqueue_object_cleanup_intent(
             source_kind=source_kind,
             source_key=source_key,
             storage_path=storage_path,
+            storage_namespace=storage_namespace,
             status=CleanupIntentStatus.PENDING.value,
+            max_attempts=DEFAULT_CLEANUP_MAX_ATTEMPTS,
         )
         .on_conflict_do_nothing(
-            constraint="uq_event_object_cleanup_source_path",
+            constraint="uq_event_object_cleanup_namespace_source_path",
         )
         .returning(EventObjectCleanupIntent.id)
     )
@@ -186,6 +218,7 @@ async def enqueue_object_cleanup_intent(
                 EventObjectCleanupIntent.source_kind == source_kind,
                 EventObjectCleanupIntent.source_key == source_key,
                 EventObjectCleanupIntent.storage_path == storage_path,
+                EventObjectCleanupIntent.storage_namespace == storage_namespace,
             )
         )
     if intent_id is None:
@@ -222,6 +255,12 @@ async def process_cleanup_intents(
     owner = lease_owner or f"cleanup-{uuid.uuid4().hex}"
     lease_until = now + timedelta(seconds=lease_seconds)
 
+    source_filters = []
+    if source_kind is not None:
+        source_filters.append(EventObjectCleanupIntent.source_kind == source_kind)
+    if source_key is not None:
+        source_filters.append(EventObjectCleanupIntent.source_key == source_key)
+
     claim_filters = [
         or_(
             EventObjectCleanupIntent.status == CleanupIntentStatus.PENDING.value,
@@ -230,15 +269,53 @@ async def process_cleanup_intents(
                 EventObjectCleanupIntent.lease_expires_at.is_not(None),
                 EventObjectCleanupIntent.lease_expires_at <= now,
             ),
-        )
+        ),
+        EventObjectCleanupIntent.storage_namespace == artifact_store.storage_namespace,
+        *source_filters,
     ]
-    if source_kind is not None:
-        claim_filters.append(EventObjectCleanupIntent.source_kind == source_kind)
-    if source_key is not None:
-        claim_filters.append(EventObjectCleanupIntent.source_key == source_key)
+    mismatch_filters = [
+        or_(
+            EventObjectCleanupIntent.status == CleanupIntentStatus.PENDING.value,
+            and_(
+                EventObjectCleanupIntent.status == CleanupIntentStatus.PROCESSING.value,
+                EventObjectCleanupIntent.lease_expires_at.is_not(None),
+                EventObjectCleanupIntent.lease_expires_at <= now,
+            ),
+            EventObjectCleanupIntent.status == CleanupIntentStatus.UNPROCESSABLE.value,
+        ),
+        EventObjectCleanupIntent.storage_namespace.is_distinct_from(
+            artifact_store.storage_namespace
+        ),
+        *source_filters,
+    ]
+    namespace_mismatch_count = 0
 
     async with session_factory() as session:  # type: ignore[operator]
         async with session.begin():
+            namespace_mismatch_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(EventObjectCleanupIntent)
+                    .where(*mismatch_filters)
+                )
+                or 0
+            )
+            if namespace_mismatch_count:
+                mismatch_ids = (
+                    await session.scalars(
+                        select(EventObjectCleanupIntent.id)
+                        .where(*mismatch_filters)
+                        .order_by(EventObjectCleanupIntent.created_at)
+                        .limit(5)
+                    )
+                ).all()
+                logger.error(
+                    "cleanup intents require a different storage namespace "
+                    "count=%s expected=%s examples=%s",
+                    namespace_mismatch_count,
+                    artifact_store.storage_namespace,
+                    [str(intent_id) for intent_id in mismatch_ids],
+                )
             intents = (
                 await session.scalars(
                     select(EventObjectCleanupIntent)
@@ -251,8 +328,7 @@ async def process_cleanup_intents(
                     .with_for_update(skip_locked=True)
                 )
             ).all()
-            if not intents:
-                return CleanupProcessingResult()
+            claimed_ids: list[uuid.UUID] = []
             for intent in intents:
                 intent.status = CleanupIntentStatus.PROCESSING.value
                 intent.attempt_count += 1
@@ -260,11 +336,12 @@ async def process_cleanup_intents(
                 intent.lease_owner = owner
                 intent.lease_expires_at = lease_until
                 intent.updated_at = now
-            claimed_ids = [intent.id for intent in intents]
+                claimed_ids.append(intent.id)
 
     completed_count = 0
     skipped_count = 0
     failed_count = 0
+    dead_letter_count = 0
     for intent_id in claimed_ids:
         async with session_factory() as session:  # type: ignore[operator]
             async with session.begin():
@@ -280,9 +357,25 @@ async def process_cleanup_intents(
                 ):
                     continue
 
+                if intent.storage_namespace != artifact_store.storage_namespace:
+                    intent.status = CleanupIntentStatus.PENDING.value
+                    intent.lease_owner = None
+                    intent.lease_expires_at = None
+                    intent.updated_at = datetime.now(UTC)
+                    namespace_mismatch_count += 1
+                    continue
+
                 await lock_event_write(session, intent.event_id)
                 await lock_artifact_object(session, intent.storage_path)
                 now = datetime.now(UTC)
+                if intent.attempt_count > intent.max_attempts:
+                    intent.status = CleanupIntentStatus.DEAD_LETTER.value
+                    intent.last_error = "cleanup attempt limit exceeded"
+                    intent.lease_owner = None
+                    intent.lease_expires_at = None
+                    intent.updated_at = now
+                    dead_letter_count += 1
+                    continue
                 if (
                     await storage_path_reference_count(
                         session,
@@ -306,12 +399,19 @@ async def process_cleanup_intents(
                 except FileNotFoundError:
                     pass
                 except Exception as error:
-                    intent.status = CleanupIntentStatus.PENDING.value
-                    intent.last_error = str(error)[:2000]
+                    if intent.attempt_count >= intent.max_attempts:
+                        intent.status = CleanupIntentStatus.DEAD_LETTER.value
+                        dead_letter_count += 1
+                    else:
+                        intent.status = CleanupIntentStatus.PENDING.value
+                        failed_count += 1
+                    intent.last_error = artifact_store.redact_error(
+                        error,
+                        relative_path=intent.storage_path,
+                    )
                     intent.lease_owner = None
                     intent.lease_expires_at = None
                     intent.updated_at = now
-                    failed_count += 1
                     continue
 
                 intent.status = CleanupIntentStatus.COMPLETED.value
@@ -327,6 +427,8 @@ async def process_cleanup_intents(
         completed_count=completed_count,
         skipped_count=skipped_count,
         failed_count=failed_count,
+        dead_letter_count=dead_letter_count,
+        namespace_mismatch_count=namespace_mismatch_count,
     )
 
 

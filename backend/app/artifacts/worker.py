@@ -128,7 +128,10 @@ class ArtifactActivities:
     @property
     def _artifact_store(self) -> ArtifactStore:
         if self._store is None:
-            self._store = ArtifactStore(settings.artifact_storage_root)
+            self._store = ArtifactStore(
+                settings.artifact_storage_root,
+                namespace=settings.artifact_storage_namespace,
+            )
         return self._store
 
     @property
@@ -1030,7 +1033,10 @@ async def _run_retention_loop(
     configured: Settings,
 ) -> None:
     service = ArtifactRetentionService()
-    artifact_store = ArtifactStore(configured.artifact_storage_root)
+    artifact_store = ArtifactStore(
+        configured.artifact_storage_root,
+        namespace=getattr(configured, "artifact_storage_namespace", None),
+    )
     cleanup_owner = f"artifact-retention:{uuid.uuid4().hex}"
     while True:
         try:
@@ -1046,6 +1052,7 @@ async def _run_retention_loop(
                         result = await service.retain_expired(
                             session,
                             observed_at=observed_at,
+                            storage_namespace=artifact_store.storage_namespace,
                         )
                 cleanup_result = await process_cleanup_intents(
                     session_factory,
@@ -1079,10 +1086,13 @@ async def _run_retention_loop(
                         "artifact_retention_counts": payload,
                     },
                 )
-            else:
-                logger.info(
-                    "artifact cleanup completed failed=%s",
+            elif not recovered_cleanup.succeeded:
+                logger.warning(
+                    "artifact cleanup incomplete while retention is disabled "
+                    "failed=%s dead_letter=%s namespace_mismatch=%s",
                     recovered_cleanup.failed_count,
+                    recovered_cleanup.dead_letter_count,
+                    recovered_cleanup.namespace_mismatch_count,
                 )
         except asyncio.CancelledError:
             raise

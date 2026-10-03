@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.artifacts import worker as artifact_worker
 from app.artifacts.models import ArtifactPublication, GeneratedArtifact
@@ -30,9 +30,12 @@ from app.event_object_cleanup import (
 
 @pytest.fixture(autouse=True)
 async def _dispose_engine_between_retention_tests():
-    from app.db import engine
+    from app.db import SessionFactory, engine
 
     await engine.dispose()
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(EventObjectCleanupIntent))
     yield
     await engine.dispose()
 
@@ -58,6 +61,7 @@ async def test_retention_removes_expired_test_and_drill_but_not_live(
     removed = await artifact_retention_service.retain_expired(
         session,
         observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
     )
 
     assert removed.test_deleted == 1
@@ -126,6 +130,7 @@ async def test_retention_protects_current_and_superseded_publications(
     result = await artifact_retention_service.retain_expired(
         session,
         observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
     )
 
     assert result.test_deleted == 0
@@ -177,6 +182,7 @@ async def test_retention_preserves_shared_object_referenced_by_live_artifact(
     result = await artifact_retention_service.retain_expired(
         session,
         observed_at=seeded_artifact_assessment.now,
+        storage_namespace=store.storage_namespace,
     )
 
     assert result.test_deleted == 1
@@ -246,6 +252,7 @@ async def test_retention_uses_cross_table_reference_count_for_manual_version(
     result = await artifact_retention_service.retain_expired(
         session,
         observed_at=seeded_artifact_assessment.now,
+        storage_namespace=store.storage_namespace,
     )
 
     assert result.test_deleted == 1
@@ -286,6 +293,7 @@ async def test_retention_defers_unlink_until_db_commit_and_rollback_keeps_file(
         result = await ArtifactRetentionService().retain_expired(
             session,
             observed_at=seeded_artifact_assessment.now,
+            storage_namespace=store.storage_namespace,
         )
         assert result.test_deleted == 1
         intent_count = int(
@@ -353,6 +361,7 @@ async def test_retention_cleanup_can_retry_same_intent_after_unlink_failure(
             await ArtifactRetentionService().retain_expired(
                 session,
                 observed_at=seeded_artifact_assessment.now,
+                storage_namespace=store.storage_namespace,
             )
 
     first = await process_cleanup_intents(
@@ -390,6 +399,7 @@ async def test_retention_reports_postcommit_cleanup_intent(
     result = await artifact_retention_service.retain_expired(
         session,
         observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
     )
 
     assert result.test_deleted == 1
@@ -428,7 +438,11 @@ async def test_retention_loop_retries_failed_unlink_on_next_cycle(
         if sleep_count >= 2:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(
+        artifact_worker,
+        "ArtifactStore",
+        lambda _root, namespace=None: store,
+    )
     monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -441,7 +455,7 @@ async def test_retention_loop_retries_failed_unlink_on_next_cycle(
             ),
         )
 
-    assert store.calls == 3
+    assert store.calls == 2
     assert not source_path.exists()
     async with session_factory() as session:
         intent = await session.scalar(
@@ -473,12 +487,17 @@ async def test_retention_loop_recovers_committed_intent_after_crash(
             await ArtifactRetentionService().retain_expired(
                 session,
                 observed_at=seeded_artifact_assessment.now,
+                storage_namespace=store.storage_namespace,
             )
 
     async def sleep(_seconds: float) -> None:
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(
+        artifact_worker,
+        "ArtifactStore",
+        lambda _root, namespace=None: store,
+    )
     monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -522,12 +541,17 @@ async def test_cleanup_recovery_runs_when_retention_disabled(
                 source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
                 source_key=uuid.uuid4().hex,
                 storage_path=relative_path,
+                storage_namespace=store.storage_namespace,
             )
 
     async def sleep(_seconds: float) -> None:
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(artifact_worker, "ArtifactStore", lambda _root: store)
+    monkeypatch.setattr(
+        artifact_worker,
+        "ArtifactStore",
+        lambda _root, namespace=None: store,
+    )
     monkeypatch.setattr(artifact_worker.asyncio, "sleep", sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -569,8 +593,8 @@ async def test_retention_loop_logs_all_modes_and_protected_counts(
     sleep_count = 0
 
     class Service:
-        async def retain_expired(self, session, *, observed_at):
-            del session, observed_at
+        async def retain_expired(self, session, *, observed_at, storage_namespace):
+            del session, observed_at, storage_namespace
             return result
 
     class Session:

@@ -58,6 +58,7 @@ from app.collaboration.purge import (
 from app.collaboration.router import (
     get_artifact_store,
     get_cleanup_session,
+    get_deliverable_service,
     get_purge_session,
 )
 from app.collaboration.service import DeliverableService
@@ -965,6 +966,67 @@ async def test_http_purge_retries_failed_file_cleanup_after_commit(
     assert state["deleted"] == [purge_fixture.manual_path]
 
 
+async def test_http_purge_rejects_cleanup_against_different_storage_namespace(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    store_a = FailOnceArtifactStore(tmp_path / "root-a")
+    store_b = ArtifactStore(tmp_path / "root-b")
+    path_a = store_a.resolve(purge_fixture.manual_path)
+    path_b = store_b.resolve(purge_fixture.manual_path)
+    for path, payload in ((path_a, b"root-a"), (path_b, b"root-b")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_purge_session] = override_session
+    app.dependency_overrides[get_current_user] = lambda: superadmin_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        app.dependency_overrides[get_artifact_store] = lambda: store_a
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            first = await client.delete(
+                f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                headers={"Idempotency-Key": "http-purge-namespace"},
+            )
+            assert first.status_code == 503
+
+        app.dependency_overrides[get_artifact_store] = lambda: store_b
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            mismatch = await client.delete(
+                f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                headers={"Idempotency-Key": "http-purge-namespace"},
+            )
+            assert mismatch.status_code == 503
+
+        app.dependency_overrides[get_artifact_store] = lambda: ArtifactStore(tmp_path / "root-a")
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            recovered = await client.delete(
+                f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                headers={"Idempotency-Key": "http-purge-namespace"},
+            )
+            assert recovered.status_code == 204
+    finally:
+        app.dependency_overrides.clear()
+
+    assert not path_a.exists()
+    assert path_b.read_bytes() == b"root-b"
+
+
 async def test_http_candidate_delete_without_key_recovers_failed_cleanup(
     session_factory,
     superadmin_user,
@@ -1000,6 +1062,7 @@ async def test_http_candidate_delete_without_key_recovers_failed_cleanup(
 
     app.dependency_overrides[get_cleanup_session] = override_session
     app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_deliverable_service] = lambda: service
     app.dependency_overrides[get_current_user] = lambda: fixture.actor
     transport = httpx.ASGITransport(app=app)
     try:
@@ -1048,6 +1111,178 @@ async def test_http_candidate_delete_without_key_recovers_failed_cleanup(
         )
     assert intent is not None
     assert intent.status == CleanupIntentStatus.COMPLETED.value
+
+
+async def test_http_candidate_delete_rejects_wrong_storage_namespace(
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    fixture = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-http-namespace",
+    )
+    store_a = ArtifactStore(tmp_path / "root-a")
+    store_b = ArtifactStore(tmp_path / "root-b")
+    service = DeliverableService(artifact_store=store_a)
+    payload = f"candidate-http-namespace-{uuid.uuid4()}".encode()
+    file_name = f"candidate-http-namespace-{uuid.uuid4()}.txt"
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await service.add_manual_version(
+                session,
+                fixture.deliverable_id,
+                fixture.actor,
+                source=BytesIO(payload),
+                file_name=file_name,
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            path_a = store_a.resolve(storage_path)
+            path_b = store_b.resolve(storage_path)
+            path_b.parent.mkdir(parents=True, exist_ok=True)
+            path_b.write_bytes(b"root-b")
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_cleanup_session] = override_session
+    app.dependency_overrides[get_artifact_store] = lambda: store_b
+    app.dependency_overrides[get_deliverable_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: fixture.actor
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.delete(
+                f"/api/v1/collaboration/deliverable-versions/{version_id}"
+            )
+            assert response.status_code == 503
+            retry = await client.delete(f"/api/v1/collaboration/deliverable-versions/{version_id}")
+            assert retry.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+    assert path_a.is_file()
+    assert path_b.read_bytes() == b"root-b"
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                EventObjectCleanupIntent.source_key == str(version_id),
+            )
+        )
+    assert intent is not None
+    assert intent.storage_namespace == store_a.storage_namespace
+    assert intent.status == CleanupIntentStatus.PENDING.value
+    assert intent.attempt_count == 0
+
+    recovered = await process_cleanup_intents(
+        session_factory,
+        store_a,
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(version_id),
+        lease_owner="candidate-namespace-worker",
+    )
+    assert recovered.completed_count == 1
+    assert not path_a.exists()
+    assert path_b.read_bytes() == b"root-b"
+
+
+async def test_candidate_delete_replay_reuses_frozen_storage_namespace(
+    session_factory,
+    tmp_path,
+) -> None:
+    fixture = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-replay-namespace",
+    )
+    store_a = ArtifactStore(tmp_path / "root-a")
+    store_b = ArtifactStore(tmp_path / "root-b")
+    service_a = DeliverableService(artifact_store=store_a)
+    service_b = DeliverableService(artifact_store=store_b)
+    idempotency_key = f"candidate-replay-{uuid.uuid4()}"
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await service_a.add_manual_version(
+                session,
+                fixture.deliverable_id,
+                fixture.actor,
+                source=BytesIO(f"candidate-replay-{uuid.uuid4()}".encode()),
+                file_name="candidate-replay.txt",
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            cleanup = await service_a.delete_candidate(
+                session,
+                version_id,
+                fixture.actor,
+                idempotency_key=idempotency_key,
+            )
+            assert cleanup is not None
+
+    path_a = store_a.resolve(storage_path)
+    path_b = store_b.resolve(storage_path)
+    path_b.parent.mkdir(parents=True, exist_ok=True)
+    path_b.write_bytes(b"root-b")
+    assert path_a.is_file()
+
+    async with session_factory() as session:
+        async with session.begin():
+            replay = await service_b.delete_candidate(
+                session,
+                version_id,
+                fixture.actor,
+                idempotency_key=idempotency_key,
+            )
+            assert replay is not None
+            assert replay.storage_paths == (storage_path,)
+
+    async with session_factory() as session:
+        intents = (
+            await session.scalars(
+                select(EventObjectCleanupIntent).where(
+                    EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                    EventObjectCleanupIntent.source_key == str(version_id),
+                    EventObjectCleanupIntent.storage_path == storage_path,
+                )
+            )
+        ).all()
+    assert len(intents) == 1
+    assert intents[0].storage_namespace == store_a.storage_namespace
+    assert intents[0].status == CleanupIntentStatus.PENDING.value
+
+    wrong_root = await process_cleanup_intents(
+        session_factory,
+        store_b,
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(version_id),
+        lease_owner="candidate-replay-wrong-root",
+    )
+    assert wrong_root.namespace_mismatch_count == 1
+    assert wrong_root.completed_count == 0
+    assert path_a.is_file()
+    assert path_b.read_bytes() == b"root-b"
+
+    correct_root = await process_cleanup_intents(
+        session_factory,
+        store_a,
+        source_kind=CANDIDATE_DELETE_CLEANUP_SOURCE,
+        source_key=str(version_id),
+        lease_owner="candidate-replay-correct-root",
+    )
+    assert correct_root.completed_count == 1
+    assert not path_a.exists()
+    assert path_b.read_bytes() == b"root-b"
 
 
 @dataclass(frozen=True, slots=True)
