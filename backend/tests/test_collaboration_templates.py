@@ -1,4 +1,7 @@
+import json
+from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +15,7 @@ from app.collaboration.templates import (
     TaskTemplateDefinition,
     load_task_template_catalog,
 )
+from tests.collaboration_expectations import EXPECTED_ARTIFACT_OWNERS
 
 CATALOG_PATH = Path("/config/collaboration/shanghai-2026-tasks.yaml")
 
@@ -49,6 +53,35 @@ def test_catalog_artifact_bindings_exist_in_artifact_catalog() -> None:
             artifact_catalog.get(binding.artifact_key, binding.output_profile)
 
 
+def test_catalog_snapshot_round_trips_for_outbox_jsonb() -> None:
+    catalog = TaskTemplateCatalog(
+        version="snapshot.1",
+        definitions=(
+            TaskTemplateDefinition(
+                template_code="snapshot.task",
+                workgroup_code=WorkgroupCode.EMERGENCY_TECHNOLOGY,
+                phase_code="within_30m",
+                title="snapshot task",
+                source="test",
+                required_deliverables=("manual.result",),
+                artifact_bindings=(
+                    ArtifactBinding("doc.rapid_brief", "a3v-professional"),
+                ),
+                applicability=MappingProxyType(
+                    {"minimum_max_intensity": Decimal("2.0")}
+                ),
+                due_offset_seconds=300,
+                response_basis="test",
+            ),
+        ),
+    )
+
+    snapshot = catalog.to_snapshot()
+    json.dumps(snapshot)
+
+    assert TaskTemplateCatalog.from_snapshot(snapshot) == catalog
+
+
 def test_catalog_binds_each_professional_artifact_to_intended_task() -> None:
     task_catalog = load_task_template_catalog(CATALOG_PATH)
     artifact_catalog = load_catalog(Path("/config/artifacts/catalog.yaml"))
@@ -70,76 +103,9 @@ def test_catalog_binds_each_professional_artifact_to_intended_task() -> None:
         if definition.kind is ArtifactKind.MAP
     }
     expected_bindings = {
-        (
-            "monitoring.epicenter_maps",
-            "map.historical_earthquakes",
-            "a3v-professional",
-        ),
-        (
-            "monitoring.epicenter_maps",
-            "map.intensity",
-            "a3v-professional",
-        ),
-        (
-            "monitoring.epicenter_maps",
-            "map.epicenter",
-            "a3v-professional",
-        ),
-        (
-            "monitoring.epicenter_maps",
-            "map.city_distances",
-            "a3v-professional",
-        ),
-        (
-            "monitoring.station_and_mechanism",
-            "map.seismic_stations",
-            "a3v-professional",
-        ),
-        (
-            "damage.background_materials",
-            "doc.background",
-            "a3v-professional",
-        ),
-        (
-            "damage.background_materials",
-            "map.active_faults",
-            "a3v-professional",
-        ),
-        (
-            "damage.loss_assessment",
-            "map.building_grid",
-            "a3v-professional",
-        ),
-        (
-            "damage.intensity_map",
-            "map.intensity",
-            "a3v-professional",
-        ),
-        (
-            "coordination.response_suggestion",
-            "doc.decision_report",
-            "a3v-professional",
-        ),
-        (
-            "coordination.response_suggestion",
-            "deck.decision_report",
-            "a3v-professional",
-        ),
-        (
-            "technology.rapid_brief",
-            "doc.rapid_brief",
-            "a3v-professional",
-        ),
-        (
-            "technology.rapid_special",
-            "doc.rapid_report",
-            "a3v-professional",
-        ),
-        (
-            "technology.professional_outputs",
-            "map.shelter_emergency",
-            "a3v-professional",
-        ),
+        (task_code, artifact_key, "a3v-professional")
+        for task_code, artifact_keys in EXPECTED_ARTIFACT_OWNERS.items()
+        for artifact_key in artifact_keys
     }
     bound_keys = {artifact_key for _, artifact_key, _ in bindings}
     rapid_brief_owners = {
@@ -150,7 +116,7 @@ def test_catalog_binds_each_professional_artifact_to_intended_task() -> None:
 
     assert len(map_keys) == 27
     assert bound_keys == artifact_keys
-    assert expected_bindings <= bindings
+    assert bindings == expected_bindings
     assert rapid_brief_owners == {"technology.rapid_brief"}
 
 

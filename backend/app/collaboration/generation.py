@@ -136,31 +136,42 @@ class CollaborationTaskGenerator:
 
         observed_at = _normalize_utc(outbox.created_at, "outbox.created_at")
         threshold = _payload_threshold(outbox.payload)
-        explicit_version = _explicit_template_version(outbox)
-        if (
-            outbox.trigger_type == _COLLABORATION_UPGRADE_TRIGGER_TYPE
-            and explicit_version is None
-        ):
-            raise ValueError(
-                "explicit template upgrade requires payload.template_version"
-            )
-        if (
-            explicit_version is not None
-            and explicit_version != self.catalog.version
-        ):
-            raise ValueError(
-                "explicit template upgrade must match the active catalog version"
+        explicit_version: str | None = None
+        frozen_snapshot: TaskTemplateCatalog | None = None
+        payload_frozen_version: str | None = None
+        if outbox.trigger_type == _COLLABORATION_UPGRADE_TRIGGER_TYPE:
+            explicit_version = _explicit_template_version(outbox)
+            if explicit_version is None:
+                raise ValueError(
+                    "explicit template upgrade requires "
+                    "payload.template_version"
+                )
+            if explicit_version != self.catalog.version:
+                raise ValueError(
+                    "explicit template upgrade must match the active "
+                    "catalog version"
+                )
+        else:
+            frozen_snapshot, payload_frozen_version = (
+                _frozen_template_snapshot(outbox)
             )
 
-        frozen_version = explicit_version or await self._frozen_template_version(
-            session,
-            event.id,
+        frozen_version = (
+            explicit_version
+            or payload_frozen_version
+            or await self._frozen_template_version(session, event.id)
         )
-        catalog = (
-            self.catalog
-            if frozen_version == self.catalog.version
-            else await self._persisted_catalog(session, frozen_version)
-        )
+        if explicit_version is not None:
+            catalog = self.catalog
+        elif frozen_snapshot is not None:
+            catalog = frozen_snapshot
+        elif frozen_version == self.catalog.version:
+            catalog = self.catalog
+        else:
+            catalog = await self._persisted_catalog(
+                session,
+                frozen_version,
+            )
         definitions = catalog.get_applicable(
             event,
             revision,
@@ -702,6 +713,30 @@ def _explicit_template_version(
     if not isinstance(value, str) or not value.strip():
         raise ValueError("template_version payload must be a non-empty string")
     return value.strip()
+
+
+def _frozen_template_snapshot(
+    outbox: EventLifecycleOutbox,
+) -> tuple[TaskTemplateCatalog | None, str | None]:
+    raw_snapshot = outbox.payload.get("template_catalog")
+    raw_version = outbox.payload.get("template_version")
+    payload_version = (
+        _explicit_template_version(outbox)
+        if raw_version is not None
+        else None
+    )
+    if raw_snapshot is None:
+        return None, payload_version
+
+    snapshot = TaskTemplateCatalog.from_snapshot(raw_snapshot)
+    if (
+        payload_version is not None
+        and payload_version != snapshot.version
+    ):
+        raise ValueError(
+            "frozen template version and snapshot version do not match"
+        )
+    return snapshot, snapshot.version
 
 
 def _definition_from_version(

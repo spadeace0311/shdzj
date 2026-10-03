@@ -11,7 +11,16 @@ from geoalchemy2.elements import WKTElement
 from sqlalchemy import case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.collaboration.models import CollaborationSettings
+from app.collaboration.models import (
+    CollaborationSettings,
+    CollaborationTaskTemplateVersion,
+    WorkgroupTask,
+)
+from app.collaboration.templates import (
+    TaskTemplateCatalog,
+    load_task_template_catalog,
+)
+from app.config import settings
 from app.events.domain import EventKind, NormalizedEvent, canonical_source_id
 from app.events.models import (
     EarthquakeEvent,
@@ -93,8 +102,30 @@ class EventRepository:
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        *,
+        task_template_catalog: TaskTemplateCatalog | None = None,
+        task_template_catalog_path: str | None = None,
     ) -> None:
+        if (
+            task_template_catalog is not None
+            and task_template_catalog_path is not None
+        ):
+            raise ValueError(
+                "provide task_template_catalog or "
+                "task_template_catalog_path, not both"
+            )
         self._session_factory = session_factory
+        self._task_template_catalog = task_template_catalog
+        self._task_template_catalog_path = task_template_catalog_path
+
+    @property
+    def task_template_catalog(self) -> TaskTemplateCatalog:
+        if self._task_template_catalog is None:
+            self._task_template_catalog = load_task_template_catalog(
+                self._task_template_catalog_path
+                or settings.collaboration_task_template_path
+            )
+        return self._task_template_catalog
 
     @classmethod
     def validate_payload(cls, payload: object) -> None:
@@ -387,6 +418,10 @@ class EventRepository:
         )
         if policy is None:
             raise LookupError("collaboration settings not found")
+        template_payload = await self._freeze_task_template_payload(
+            session,
+            event_uuid,
+        )
 
         return await self._enqueue_lifecycle_trigger(
             session,
@@ -402,9 +437,39 @@ class EventRepository:
                 "intensity_threshold": str(policy.intensity_threshold),
                 "policy_version": policy.row_version,
                 "region_boundary_version": revision.region_boundary_version,
+                **template_payload,
             },
             created_at=created_at,
         )
+
+    async def _freeze_task_template_payload(
+        self,
+        session: AsyncSession,
+        event_id: uuid.UUID,
+    ) -> dict[str, object]:
+        existing_version = await session.scalar(
+            select(CollaborationTaskTemplateVersion.version)
+            .join(
+                WorkgroupTask,
+                WorkgroupTask.template_version_id
+                == CollaborationTaskTemplateVersion.id,
+            )
+            .where(
+                WorkgroupTask.event_id == event_id,
+                WorkgroupTask.template_version_id.is_not(None),
+            )
+            .group_by(CollaborationTaskTemplateVersion.version)
+            .order_by(
+                func.max(WorkgroupTask.created_at).desc(),
+                CollaborationTaskTemplateVersion.version.desc(),
+            )
+            .limit(1)
+        )
+        if existing_version is not None:
+            return {"template_version": str(existing_version)}
+        return {
+            "template_catalog": self.task_template_catalog.to_snapshot(),
+        }
 
     async def enqueue_collaboration_upgrade(
         self,

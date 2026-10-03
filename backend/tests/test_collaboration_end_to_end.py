@@ -30,7 +30,6 @@ from app.collaboration.service import (
     CollaborationTaskService,
     DeliverableService,
 )
-from app.collaboration.templates import load_task_template_catalog
 from app.collaboration.worker import run_worker_cycle
 from app.config import settings
 from app.db import SessionFactory, engine
@@ -50,6 +49,7 @@ from tests.artifact_helpers import (
     ArtifactAssessmentFixture,
     SeededArtifactAssessment,
 )
+from tests.collaboration_expectations import EXPECTED_TASK_OUTPUT_PAIRS
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,14 +82,7 @@ def _all_outputs() -> tuple[tuple[str, str], ...]:
 
 
 def _expected_task_output_pairs() -> set[tuple[str, str]]:
-    catalog = load_task_template_catalog(
-        settings.collaboration_task_template_path
-    )
-    return {
-        (definition.template_code, binding.artifact_key)
-        for definition in catalog.definitions
-        for binding in definition.artifact_bindings
-    }
+    return set(EXPECTED_TASK_OUTPUT_PAIRS)
 
 
 async def _ingest(

@@ -126,6 +126,67 @@ class TaskTemplateCatalog:
         except KeyError as error:
             raise KeyError(f"unknown task template: {template_code}") from error
 
+    def to_snapshot(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "definitions": [
+                {
+                    "template_code": definition.template_code,
+                    "workgroup_code": definition.workgroup_code.value,
+                    "phase_code": definition.phase_code,
+                    "title": definition.title,
+                    "source": definition.source,
+                    "start_offset_seconds": definition.start_offset_seconds,
+                    "due_offset_seconds": definition.due_offset_seconds,
+                    "continues_until_response_end": (
+                        definition.continues_until_response_end
+                    ),
+                    "required_deliverables": list(
+                        definition.required_deliverables
+                    ),
+                    "artifact_bindings": [
+                        {
+                            "artifact_key": binding.artifact_key,
+                            "output_profile": binding.output_profile,
+                        }
+                        for binding in definition.artifact_bindings
+                    ],
+                    "applicability": _snapshot_json_compatible(
+                        dict(definition.applicability)
+                    ),
+                    "priority": definition.priority,
+                    "instruction": definition.instruction or None,
+                    "response_basis": definition.response_basis,
+                }
+                for definition in self.definitions
+            ],
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: object) -> TaskTemplateCatalog:
+        raw = _mapping(snapshot, "template catalog snapshot")
+        version = _required_text(
+            raw.get("version"),
+            "template catalog snapshot.version",
+        )
+        raw_definitions = _sequence(
+            raw.get("definitions"),
+            "template catalog snapshot.definitions",
+        )
+        return cls(
+            version=version,
+            definitions=tuple(
+                _definition_from_snapshot(
+                    _mapping(
+                        raw_definition,
+                        f"template catalog snapshot.definitions[{index}]",
+                    ),
+                    index,
+                )
+                for index, raw_definition in enumerate(raw_definitions)
+            ),
+        )
+
     def get_applicable(
         self,
         event: object,
@@ -322,6 +383,137 @@ def _applicability(value: Any, label: str) -> Mapping[str, object]:
         else:
             normalized[key] = _decimal(raw_value, f"{label}.{key}")
     return MappingProxyType(normalized)
+
+
+def _snapshot_json_compatible(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _snapshot_json_compatible(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_json_compatible(item) for item in value]
+    return value
+
+
+def _definition_from_snapshot(
+    raw_definition: Mapping[str, Any],
+    index: int,
+) -> TaskTemplateDefinition:
+    label = f"template catalog snapshot.definitions[{index}]"
+    template_code = _required_text(
+        raw_definition.get("template_code"),
+        f"{label}.template_code",
+    )
+    raw_group = _required_text(
+        raw_definition.get("workgroup_code"),
+        f"{label}.workgroup_code",
+    )
+    try:
+        workgroup_code = WorkgroupCode(raw_group)
+    except ValueError as error:
+        raise ValueError(
+            f"{label} has unknown workgroup: {raw_group}"
+        ) from error
+    phase_code = _required_text(
+        raw_definition.get("phase_code"),
+        f"{label}.phase_code",
+    )
+    if phase_code not in PHASE_CODES:
+        raise ValueError(f"{label} has unknown phase: {phase_code}")
+    start_offset_seconds = _integer(
+        raw_definition.get("start_offset_seconds", 0),
+        f"{label}.start_offset_seconds",
+        minimum=0,
+    )
+    raw_due = raw_definition.get("due_offset_seconds")
+    due_offset_seconds = (
+        None
+        if raw_due is None
+        else _integer(
+            raw_due,
+            f"{label}.due_offset_seconds",
+            minimum=0,
+        )
+    )
+    if (
+        due_offset_seconds is not None
+        and due_offset_seconds < start_offset_seconds
+    ):
+        raise ValueError(
+            f"{label}.due_offset_seconds must be greater than or equal to "
+            "start_offset_seconds"
+        )
+    artifact_bindings: list[ArtifactBinding] = []
+    raw_bindings = _sequence(
+        raw_definition.get("artifact_bindings", []),
+        f"{label}.artifact_bindings",
+    )
+    for binding_index, raw_binding in enumerate(raw_bindings):
+        binding = _mapping(
+            raw_binding,
+            f"{label}.artifact_bindings[{binding_index}]",
+        )
+        artifact_bindings.append(
+            ArtifactBinding(
+                artifact_key=_required_text(
+                    binding.get("artifact_key"),
+                    (
+                        f"{label}.artifact_bindings"
+                        f"[{binding_index}].artifact_key"
+                    ),
+                ),
+                output_profile=_required_text(
+                    binding.get("output_profile"),
+                    (
+                        f"{label}.artifact_bindings"
+                        f"[{binding_index}].output_profile"
+                    ),
+                ),
+            )
+        )
+    if len(artifact_bindings) != len(set(artifact_bindings)):
+        raise ValueError(f"{label}.artifact_bindings cannot contain duplicates")
+
+    return TaskTemplateDefinition(
+        template_code=template_code,
+        workgroup_code=workgroup_code,
+        phase_code=phase_code,
+        title=_required_text(raw_definition.get("title"), f"{label}.title"),
+        source=_required_text(raw_definition.get("source"), f"{label}.source"),
+        start_offset_seconds=start_offset_seconds,
+        due_offset_seconds=due_offset_seconds,
+        continues_until_response_end=_boolean(
+            raw_definition.get("continues_until_response_end", False),
+            f"{label}.continues_until_response_end",
+        ),
+        required_deliverables=_string_tuple(
+            raw_definition.get("required_deliverables", []),
+            f"{label}.required_deliverables",
+        ),
+        artifact_bindings=tuple(artifact_bindings),
+        applicability=_applicability(
+            raw_definition.get("applicability"),
+            f"{label}.applicability",
+        ),
+        priority=_integer(
+            raw_definition.get("priority", 100),
+            f"{label}.priority",
+        ),
+        instruction=(
+            _optional_text(
+                raw_definition.get("instruction"),
+                f"{label}.instruction",
+            )
+            or ""
+        ),
+        response_basis=_optional_text(
+            raw_definition.get("response_basis"),
+            f"{label}.response_basis",
+        ),
+    )
 
 
 def _decimal(value: Any, label: str) -> Decimal:

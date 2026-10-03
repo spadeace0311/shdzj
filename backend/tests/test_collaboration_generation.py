@@ -93,6 +93,7 @@ async def _ingest(
     suffix: str,
     received_at: datetime = BASE_RECEIVED_AT,
     report_number: int | None = None,
+    task_template_catalog_path: str | None = None,
 ) -> tuple[EarthquakeEvent, EarthquakeRevision]:
     source_event_id = f"COLLAB-GENERATION-{suffix}"
     event = NormalizedEvent(
@@ -108,7 +109,17 @@ async def _ingest(
         report_time=received_at,
         report_number=report_number,
     )
-    outcome = await EventService(session_factory).ingest_collected(
+    outcome = await EventService(
+        session_factory,
+        repository=(
+            EventRepository(
+                session_factory,
+                task_template_catalog_path=task_template_catalog_path,
+            )
+            if task_template_catalog_path is not None
+            else None
+        ),
+    ).ingest_collected(
         raw_payload={
             "EventID": source_event_id,
             "type": kind.value,
@@ -357,6 +368,7 @@ tasks:
         max_intensity="3",
         suffix=uuid.uuid4().hex,
         report_number=1,
+        task_template_catalog_path=str(catalog_path),
     )
 
     async with session_factory() as write_session:
@@ -448,6 +460,86 @@ async def test_official_catalog_uses_frozen_threshold_after_settings_change(
     assert outbox.payload["policy_version"] == 2
 
 
+async def test_pending_event_uses_template_version_frozen_at_ingest(
+    session,
+    session_factory,
+    tmp_path,
+):
+    catalog_path = tmp_path / "frozen-at-ingest.yaml"
+    catalog_path.write_text(
+        """
+version: generation-frozen.1
+tasks:
+  - code: generation.frozen_v1
+    group: emergency_technology
+    phase: within_30m
+    title: frozen v1
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    event, revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="5.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="6",
+        suffix=uuid.uuid4().hex,
+        report_number=1,
+        task_template_catalog_path=str(catalog_path),
+    )
+
+    async with session_factory() as write_session:
+        outbox = await write_session.scalar(
+            select(EventLifecycleOutbox).where(
+                EventLifecycleOutbox.event_id == event.id,
+                EventLifecycleOutbox.revision_id == revision.id,
+                EventLifecycleOutbox.trigger_type == "collaboration.requested",
+            )
+        )
+    assert outbox is not None
+    assert outbox.status == "pending"
+    assert (
+        outbox.payload.get("template_catalog", {}).get("version")
+        == "generation-frozen.1"
+    )
+
+    catalog_path.write_text(
+        """
+version: generation-frozen.2
+tasks:
+  - code: generation.frozen_v2
+    group: emergency_technology
+    phase: within_30m
+    title: frozen v2
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    assert [task.task_code for task in tasks] == ["generation.frozen_v1"]
+    v1 = await session.scalar(
+        select(CollaborationTaskTemplateVersion).where(
+            CollaborationTaskTemplateVersion.version == "generation-frozen.1",
+            CollaborationTaskTemplateVersion.template_code
+            == "generation.frozen_v1",
+        )
+    )
+    assert v1 is not None
+    assert tasks[0].template_version_id == v1.id
+
+
 async def test_correction_upgrade_adds_tasks_and_downgrade_cancels_only_pending(
     session,
     session_factory,
@@ -502,6 +594,7 @@ tasks:
         max_intensity="3",
         suffix=suffix,
         report_number=1,
+        task_template_catalog_path=str(catalog_path),
     )
     dispatcher = CollaborationOutboxDispatcher(
         session_factory=session_factory,
@@ -519,6 +612,7 @@ tasks:
         suffix=suffix,
         received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
         report_number=2,
+        task_template_catalog_path=str(catalog_path),
     )
     assert await dispatcher.dispatch_once() == 1
 
@@ -547,6 +641,7 @@ tasks:
         suffix=suffix,
         received_at=BASE_RECEIVED_AT + timedelta(minutes=20),
         report_number=3,
+        task_template_catalog_path=str(catalog_path),
     )
     assert await dispatcher.dispatch_once() == 1
 
@@ -626,6 +721,7 @@ tasks:
         max_intensity="3",
         suffix=suffix,
         report_number=1,
+        task_template_catalog_path=str(catalog_path),
     )
     assert await CollaborationOutboxDispatcher(
         session_factory=session_factory,
@@ -670,6 +766,7 @@ tasks:
         suffix=suffix,
         received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
         report_number=2,
+        task_template_catalog_path=str(catalog_path),
     )
     correction_dispatched = await CollaborationOutboxDispatcher(
         session_factory=session_factory,
@@ -769,6 +866,7 @@ tasks:
         max_intensity="3",
         suffix=suffix,
         report_number=1,
+        task_template_catalog_path=str(catalog_path),
     )
     assert await CollaborationOutboxDispatcher(
         session_factory=session_factory,
@@ -884,6 +982,7 @@ tasks:
         max_intensity="3",
         suffix=suffix,
         report_number=1,
+        task_template_catalog_path=str(catalog_path),
     )
     _event, correction_revision = await _ingest(
         session_factory,
@@ -895,6 +994,7 @@ tasks:
         suffix=suffix,
         received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
         report_number=2,
+        task_template_catalog_path=str(catalog_path),
     )
 
     async with session_factory() as write_session:
