@@ -58,15 +58,35 @@ def test_catalog_applicability_splits_in_scope_and_out_of_scope_events() -> None
         inside_shanghai=False,
         distance_to_boundary_km=50,
     )
+    low_intensity_revision = SimpleNamespace(
+        revision_kind="formal",
+        inside_shanghai=True,
+        distance_to_boundary_km=None,
+        response_suggestion={"max_intensity": "1.0"},
+    )
 
     in_scope = catalog.get_applicable(event, in_scope_revision)
+    in_scope_with_threshold = catalog.get_applicable(
+        event,
+        in_scope_revision,
+        intensity_threshold="2.0",
+    )
     out_of_scope = catalog.get_applicable(event, out_of_scope_revision)
+    low_intensity = catalog.get_applicable(
+        event,
+        low_intensity_revision,
+        intensity_threshold="2.0",
+    )
 
     assert len(in_scope) == 60
+    assert len(in_scope_with_threshold) == 60
     assert "news.external_event_record_notify" not in {
         definition.template_code for definition in in_scope
     }
     assert [definition.template_code for definition in out_of_scope] == [
+        "news.external_event_record_notify"
+    ]
+    assert [definition.template_code for definition in low_intensity] == [
         "news.external_event_record_notify"
     ]
 

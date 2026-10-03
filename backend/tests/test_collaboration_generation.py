@@ -385,6 +385,68 @@ tasks:
     ]
 
 
+async def test_official_catalog_uses_frozen_threshold_after_settings_change(
+    session,
+    session_factory,
+):
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            policy = await write_session.get(
+                CollaborationSettings,
+                uuid.UUID("00000000-0000-0000-0000-000000000018"),
+                with_for_update=True,
+            )
+            assert policy is not None
+            policy.intensity_threshold = Decimal("5.0")
+            policy.row_version = 2
+
+    event, _revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="4.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="3",
+        suffix=uuid.uuid4().hex,
+        report_number=1,
+    )
+
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            policy = await write_session.get(
+                CollaborationSettings,
+                uuid.UUID("00000000-0000-0000-0000-000000000018"),
+                with_for_update=True,
+            )
+            assert policy is not None
+            policy.intensity_threshold = Decimal("1.0")
+            policy.row_version = 3
+
+    await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=CATALOG_PATH,
+    ).dispatch_once()
+
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    assert [task.task_code for task in tasks] == [
+        "news.external_event_record_notify"
+    ]
+
+    outbox = await session.scalar(
+        select(EventLifecycleOutbox).where(
+            EventLifecycleOutbox.event_id == event.id,
+            EventLifecycleOutbox.trigger_type == "collaboration.requested",
+        )
+    )
+    assert outbox is not None
+    assert outbox.payload["intensity_threshold"] == "5.0"
+    assert outbox.payload["policy_version"] == 2
+
+
 async def test_correction_upgrade_adds_tasks_and_downgrade_cancels_only_pending(
     session,
     session_factory,
@@ -528,6 +590,137 @@ tasks:
         (None, "pending"),
         ("pending", "not_required"),
     ]
+
+
+async def test_correction_reconciles_current_template_version(
+    session,
+    session_factory,
+    tmp_path,
+):
+    catalog_path = tmp_path / "versioned-reconcile.yaml"
+    catalog_path.write_text(
+        """
+version: generation-reconcile.1
+tasks:
+  - code: generation.base
+    group: comprehensive_coordination
+    phase: within_30m
+    title: base v1
+    source: test
+  - code: generation.legacy
+    group: comprehensive_coordination
+    phase: within_30m
+    title: legacy
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    suffix = uuid.uuid4().hex
+    event, _formal_revision = await _ingest(
+        session_factory,
+        kind=EventKind.FORMAL,
+        magnitude="4.2",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="3",
+        suffix=suffix,
+        report_number=1,
+    )
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    async with session_factory() as write_session:
+        async with write_session.begin():
+            v1_legacy = await write_session.scalar(
+                select(WorkgroupTask).where(
+                    WorkgroupTask.event_id == event.id,
+                    WorkgroupTask.task_code == "generation.legacy",
+                )
+            )
+            assert v1_legacy is not None
+            v1_legacy.status = "completed"
+
+    catalog_path.write_text(
+        """
+version: generation-reconcile.2
+tasks:
+  - code: generation.base
+    group: comprehensive_coordination
+    phase: within_30m
+    title: base v2
+    source: test
+  - code: generation.new
+    group: comprehensive_coordination
+    phase: within_30m
+    title: new
+    source: test
+""".strip(),
+        encoding="utf-8",
+    )
+    _event, correction_revision = await _ingest(
+        session_factory,
+        kind=EventKind.CORRECTION,
+        magnitude="4.3",
+        inside_shanghai=True,
+        distance_to_boundary_km="0",
+        max_intensity="4",
+        suffix=suffix,
+        received_at=BASE_RECEIVED_AT + timedelta(minutes=10),
+        report_number=2,
+    )
+    assert await CollaborationOutboxDispatcher(
+        session_factory=session_factory,
+        catalog_path=str(catalog_path),
+    ).dispatch_once() == 1
+
+    versions = (
+        await session.scalars(
+            select(CollaborationTaskTemplateVersion).where(
+                CollaborationTaskTemplateVersion.version.in_(
+                    ("generation-reconcile.1", "generation-reconcile.2")
+                )
+            )
+        )
+    ).all()
+    version_ids = {
+        (version.version, version.template_code): version.id
+        for version in versions
+    }
+    tasks = (
+        await session.scalars(
+            select(WorkgroupTask).where(WorkgroupTask.event_id == event.id)
+        )
+    ).all()
+    tasks_by_key = {
+        (task.template_version_id, task.task_code): task for task in tasks
+    }
+
+    v1_base = tasks_by_key[
+        (version_ids[("generation-reconcile.1", "generation.base")], "generation.base")
+    ]
+    v1_legacy = tasks_by_key[
+        (
+            version_ids[("generation-reconcile.1", "generation.legacy")],
+            "generation.legacy",
+        )
+    ]
+    v2_base = tasks_by_key[
+        (version_ids[("generation-reconcile.2", "generation.base")], "generation.base")
+    ]
+    v2_new = tasks_by_key[
+        (version_ids[("generation-reconcile.2", "generation.new")], "generation.new")
+    ]
+
+    assert len(tasks) == 4
+    assert v1_base.status == "not_required"
+    assert v1_legacy.status == "completed"
+    assert v2_base.status == "pending"
+    assert v2_base.trigger_revision_id == correction_revision.id
+    assert v2_new.status == "pending"
+    assert v2_new.trigger_revision_id == correction_revision.id
+    assert v1_base.id != v2_base.id
 
 
 async def test_stale_outbox_cannot_overwrite_newer_revision_tasks(

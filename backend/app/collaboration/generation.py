@@ -148,9 +148,13 @@ class CollaborationTaskGenerator:
                 .with_for_update()
             )
         ).all()
-        tasks_by_code = {task.task_code: task for task in existing_tasks}
-        applicable_codes = {
-            definition.template_code for definition in definitions
+        tasks_by_key = {
+            (task.template_version_id, task.task_code): task
+            for task in existing_tasks
+        }
+        applicable_keys = {
+            (catalog_versions[definition.template_code], definition.template_code)
+            for definition in definitions
         }
         timing_basis = _task_timing_basis(event, revision, observed_at)
         source_type = (
@@ -166,14 +170,15 @@ class CollaborationTaskGenerator:
         task_events = 0
 
         for definition in definitions:
-            task = tasks_by_code.get(definition.template_code)
+            template_version_id = catalog_versions[definition.template_code]
+            task = tasks_by_key.get(
+                (template_version_id, definition.template_code)
+            )
             if task is None:
                 task = self._new_task(
                     event=event,
                     revision=revision,
-                    template_version_id=catalog_versions[
-                        definition.template_code
-                    ],
+                    template_version_id=template_version_id,
                     definition=definition,
                     source_type=source_type,
                     timing_basis=timing_basis,
@@ -214,7 +219,8 @@ class CollaborationTaskGenerator:
                 existing += 1
 
         for task in existing_tasks:
-            if task.task_code in applicable_codes or task.status != "pending":
+            task_key = (task.template_version_id, task.task_code)
+            if task.status != "pending" or task_key in applicable_keys:
                 continue
             previous_status = task.status
             task.status = "not_required"

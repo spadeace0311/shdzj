@@ -516,12 +516,6 @@ def _definition_applicable(
         _first_attr(revision, event, "distance_to_boundary_km")
     )
     spatial_class = applicability.get("spatial_class")
-    if spatial_class is not None and not _matches_spatial_class(
-        str(spatial_class),
-        inside_shanghai=inside_shanghai,
-        distance=distance,
-    ):
-        return False
 
     magnitude = _coerce_optional_decimal(
         _first_attr(revision, event, "magnitude")
@@ -541,29 +535,55 @@ def _definition_applicable(
     ):
         return False
 
-    has_configured_threshold = (
-        "minimum_max_intensity" in applicability
-        or "intensity_threshold" in applicability
+    normal_scope = _normal_task_scope(
+        applicability,
+        event,
+        revision,
+        inside_shanghai=inside_shanghai,
+        distance=distance,
+        intensity_threshold=intensity_threshold,
     )
-    minimum_intensity = applicability.get("minimum_max_intensity")
-    if minimum_intensity is None:
-        minimum_intensity = applicability.get("intensity_threshold")
-    if has_configured_threshold and intensity_threshold is not None:
-        minimum_intensity = intensity_threshold
-    if minimum_intensity is not None:
-        max_intensity = _response_max_intensity(revision, event)
-        if (
-            max_intensity is None
-            or max_intensity < _decimal(minimum_intensity, "intensity threshold")
-        ):
-            return False
+    if str(spatial_class) == "outside_assessment_scope":
+        return not normal_scope
+    if spatial_class is not None and not _matches_spatial_class(
+        str(spatial_class),
+        inside_shanghai=inside_shanghai,
+        distance=distance,
+    ):
+        return False
+    return normal_scope
 
-    if not applicability:
-        return _is_assessment_scope(
-            inside_shanghai=inside_shanghai,
-            distance=distance,
-        )
-    return True
+
+def _normal_task_scope(
+    applicability: Mapping[str, object],
+    event: object,
+    revision: object,
+    *,
+    inside_shanghai: object,
+    distance: Decimal | None,
+    intensity_threshold: Decimal | str | None,
+) -> bool:
+    if not _is_assessment_scope(
+        inside_shanghai=inside_shanghai,
+        distance=distance,
+    ):
+        return False
+
+    effective_threshold = intensity_threshold
+    if effective_threshold is None:
+        effective_threshold = applicability.get("minimum_max_intensity")
+    if effective_threshold is None:
+        effective_threshold = applicability.get("intensity_threshold")
+    if effective_threshold is None:
+        return True
+
+    max_intensity = _response_max_intensity(revision, event)
+    if max_intensity is None:
+        return True
+    return max_intensity >= _decimal(
+        effective_threshold,
+        "intensity threshold",
+    )
 
 
 def _applicability_values(
