@@ -85,6 +85,9 @@ from app.event_object_cleanup import (
 from app.main import app
 
 
+PURGE_STORAGE_NAMESPACE = "test-purge-storage-namespace"
+
+
 @pytest.fixture(autouse=True)
 async def _dispose_engine():
     await engine.dispose()
@@ -590,6 +593,7 @@ async def _cleanup_purge_fixture(session_factory, fixture: PurgeFixture) -> None
                         event_id,
                         actor=actor,
                         idempotency_key=key,
+                        storage_namespace=PURGE_STORAGE_NAMESPACE,
                     )
                 except EventNotFoundError:
                     pass
@@ -630,6 +634,7 @@ async def test_non_superadmin_cannot_purge_event(
                 session,
                 purge_fixture.event_id,
                 actor=group_leader_user,
+                storage_namespace=PURGE_STORAGE_NAMESPACE,
             )
 
     async with session_factory() as session:
@@ -646,6 +651,7 @@ async def test_superadmin_purge_removes_full_event_closure_and_preserves_shared_
         purge_fixture.event_id,
         actor=superadmin_user,
         idempotency_key="purge-full-closure",
+        storage_namespace=PURGE_STORAGE_NAMESPACE,
     )
     await session.commit()
 
@@ -777,6 +783,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
         purge_fixture.event_id,
         actor=superadmin_user,
         idempotency_key="same-purge-key",
+        storage_namespace=PURGE_STORAGE_NAMESPACE,
     )
     await session.commit()
     second_version = await session.get(
@@ -803,6 +810,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
         purge_fixture.event_id,
         actor=superadmin_user,
         idempotency_key="same-purge-key",
+        storage_namespace=PURGE_STORAGE_NAMESPACE,
     )
     await session.commit()
 
@@ -818,6 +826,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
             purge_fixture.event_id,
             actor=superadmin_user,
             idempotency_key="different-purge-key",
+            storage_namespace=PURGE_STORAGE_NAMESPACE,
         )
     await session.rollback()
     with pytest.raises(EventNotFoundError):
@@ -826,11 +835,14 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
             uuid.uuid4(),
             actor=superadmin_user,
             idempotency_key="never-existed",
+            storage_namespace=PURGE_STORAGE_NAMESPACE,
         )
     await session.rollback()
 
 
 class CommitAwareStore:
+    storage_namespace = PURGE_STORAGE_NAMESPACE
+
     def __init__(self, state: dict[str, object]) -> None:
         self._state = state
 
@@ -867,6 +879,17 @@ class FailOnceArtifactStore(ArtifactStore):
         if self.calls == 1:
             raise OSError("simulated candidate cleanup failure")
         super().delete_unreferenced(stored)
+
+
+class AlwaysFailArtifactStore(ArtifactStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.calls = 0
+
+    def delete_unreferenced(self, stored: StoredArtifactFile) -> None:
+        del stored
+        self.calls += 1
+        raise OSError("simulated persistent cleanup failure")
 
 
 async def test_http_purge_deletes_files_only_after_commit(
@@ -1025,6 +1048,85 @@ async def test_http_purge_rejects_cleanup_against_different_storage_namespace(
 
     assert not path_a.exists()
     assert path_b.read_bytes() == b"root-b"
+
+
+async def test_http_purge_legacy_null_receipt_fails_closed_without_unlink(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    store = ArtifactStore(tmp_path / "current-root")
+    path = store.resolve(purge_fixture.manual_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"legacy-receipt")
+
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                EventPurgeReceipt(
+                    event_id=purge_fixture.event_id,
+                    idempotency_key="legacy-null-receipt",
+                    actor=superadmin_user.username,
+                    deletion_counts={},
+                    storage_paths=[purge_fixture.manual_path],
+                    storage_namespace=None,
+                )
+            )
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_purge_session] = override_session
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_current_user] = lambda: superadmin_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.delete(
+                f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                headers={"Idempotency-Key": "legacy-null-receipt"},
+            )
+            assert response.status_code == 503
+    finally:
+        app.dependency_overrides.clear()
+
+    assert path.read_bytes() == b"legacy-receipt"
+
+
+async def test_superadmin_purge_service_requires_explicit_storage_namespace(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            with pytest.raises(TypeError):
+                await SuperadminPurgeService().purge_event(
+                    session,
+                    purge_fixture.event_id,
+                    actor=superadmin_user,
+                )
+
+
+async def test_superadmin_purge_service_rejects_blank_storage_namespace(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            with pytest.raises(ValueError, match="storage namespace"):
+                await SuperadminPurgeService().purge_event(
+                    session,
+                    purge_fixture.event_id,
+                    actor=superadmin_user,
+                    storage_namespace="   ",
+                )
 
 
 async def test_http_candidate_delete_without_key_recovers_failed_cleanup(
@@ -1285,6 +1387,74 @@ async def test_candidate_delete_replay_reuses_frozen_storage_namespace(
     assert path_b.read_bytes() == b"root-b"
 
 
+async def test_http_candidate_delete_same_key_returns_503_after_dead_letter(
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    fixture = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="candidate-http-dead-letter",
+    )
+    store = AlwaysFailArtifactStore(tmp_path / "artifacts")
+    service = DeliverableService(artifact_store=store)
+    payload = f"candidate-http-dead-letter-{uuid.uuid4()}".encode()
+    idempotency_key = f"candidate-http-dead-letter-{uuid.uuid4()}"
+
+    async with session_factory() as session:
+        async with session.begin():
+            version = await service.add_manual_version(
+                session,
+                fixture.deliverable_id,
+                fixture.actor,
+                source=BytesIO(payload),
+                file_name="candidate-http-dead-letter.txt",
+                mime_type="text/plain",
+            )
+            version_id = version.id
+            storage_path = version.storage_key
+            assert storage_path is not None
+            path = store.resolve(storage_path)
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_cleanup_session] = override_session
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_deliverable_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: fixture.actor
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            responses = [
+                await client.delete(
+                    f"/api/v1/collaboration/deliverable-versions/{version_id}",
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                for _ in range(6)
+            ]
+    finally:
+        app.dependency_overrides.clear()
+
+    assert [response.status_code for response in responses] == [503] * 6
+    assert store.calls == 5
+    assert path.is_file()
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_kind == CANDIDATE_DELETE_CLEANUP_SOURCE,
+                EventObjectCleanupIntent.source_key == str(version_id),
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.DEAD_LETTER.value
+    assert intent.attempt_count == 5
+
+
 @dataclass(frozen=True, slots=True)
 class ConcurrentDeliverableFixture:
     event_id: uuid.UUID
@@ -1418,6 +1588,7 @@ async def _purge_test_event(
                 event_id,
                 actor=actor,
                 idempotency_key=key,
+                storage_namespace=PURGE_STORAGE_NAMESPACE,
             )
 
 

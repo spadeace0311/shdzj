@@ -22,6 +22,7 @@ from app.auth.service import AuthUser
 from app.collaboration.domain import DutyRole
 from app.collaboration.purge import (
     EventNotFoundError,
+    PurgeNamespaceUnavailableError,
     SuperadminPurgeService,
     cleanup_purged_event,
 )
@@ -897,6 +898,13 @@ async def purge_event(
     ),
 ) -> Response:
     storage_namespace = getattr(artifact_store, "storage_namespace", None)
+    if not isinstance(storage_namespace, str) or not storage_namespace.strip():
+        logger.error(
+            "event purge storage namespace is unavailable event_id=%s",
+            event_id,
+        )
+        raise _storage_unavailable()
+    storage_namespace = storage_namespace.strip()
     try:
         async with session.begin():
             result = await service.purge_event(
@@ -906,6 +914,12 @@ async def purge_event(
                 idempotency_key=idempotency_key,
                 storage_namespace=storage_namespace,
             )
+    except PurgeNamespaceUnavailableError as exc:
+        logger.error(
+            "event purge replay requires manual namespace remediation event_id=%s",
+            event_id,
+        )
+        raise _storage_unavailable() from exc
     except EventNotFoundError as exc:
         raise HTTPException(status_code=404, detail="event_not_found") from exc
     except ValueError as exc:
@@ -913,11 +927,7 @@ async def purge_event(
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
-    if (
-        result.storage_namespace is not None
-        and storage_namespace is not None
-        and result.storage_namespace != storage_namespace
-    ):
+    if result.storage_namespace != storage_namespace:
         logger.error(
             "event purge cleanup requires a different storage namespace "
             "event_id=%s expected=%s current=%s",

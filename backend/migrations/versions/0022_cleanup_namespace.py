@@ -17,6 +17,14 @@ def upgrade() -> None:
         "event_purge_receipts",
         sa.Column("storage_namespace", sa.String(length=128), nullable=True),
     )
+    op.execute(
+        """
+        UPDATE event_purge_receipts
+        SET storage_namespace = 'legacy-namespace-unavailable'
+        WHERE storage_namespace IS NULL
+           OR btrim(storage_namespace) = ''
+        """
+    )
     op.add_column(
         "event_object_cleanup_intents",
         sa.Column("storage_namespace", sa.String(length=128), nullable=True),
@@ -43,7 +51,10 @@ def upgrade() -> None:
             lease_owner = NULL,
             lease_expires_at = NULL,
             updated_at = now()
-        WHERE storage_namespace IS NULL
+        WHERE (
+            storage_namespace IS NULL
+            OR btrim(storage_namespace) = ''
+        )
           AND status IN ('pending', 'processing')
         """
     )
@@ -86,8 +97,11 @@ def downgrade() -> None:
     op.execute(
         """
         UPDATE event_object_cleanup_intents
-        SET status = 'pending',
-            last_error = 'storage namespace metadata discarded by downgrade',
+        SET status = 'skipped',
+            last_error = COALESCE(
+                NULLIF(btrim(last_error), ''),
+                'storage namespace metadata unavailable; manual remediation required'
+            ),
             lease_owner = NULL,
             lease_expires_at = NULL,
             updated_at = now()

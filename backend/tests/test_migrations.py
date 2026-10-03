@@ -1726,7 +1726,13 @@ async def test_0021_cleanup_intents_are_reversible() -> None:
 
 
 async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> None:
-    legacy_id = uuid.uuid4()
+    legacy_pending_id = uuid.uuid4()
+    legacy_processing_id = uuid.uuid4()
+    legacy_completed_id = uuid.uuid4()
+    legacy_dead_letter_id = uuid.uuid4()
+    legacy_unprocessable_id = uuid.uuid4()
+    legacy_receipt_id = uuid.uuid4()
+    legacy_receipt_event_id = uuid.uuid4()
     _set_revision(CLEANUP_INTENT_REVISION)
     try:
         legacy_receipt_state = await _event_purge_receipt_schema_state()
@@ -1734,32 +1740,64 @@ async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> No
         engine = create_async_engine(settings.database_url)
         try:
             async with engine.begin() as connection:
+                for intent_id, status in (
+                    (legacy_pending_id, "pending"),
+                    (legacy_processing_id, "processing"),
+                    (legacy_completed_id, "completed"),
+                ):
+                    await connection.execute(
+                        text(
+                            """
+                            INSERT INTO event_object_cleanup_intents (
+                                id,
+                                event_id,
+                                source_kind,
+                                source_key,
+                                storage_path,
+                                status,
+                                attempt_count
+                            ) VALUES (
+                                :id,
+                                :event_id,
+                                'retention',
+                                :source_key,
+                                :storage_path,
+                                :status,
+                                0
+                            )
+                            """
+                        ),
+                        {
+                            "id": intent_id,
+                            "event_id": uuid.uuid4(),
+                            "source_key": uuid.uuid4().hex,
+                            "storage_path": f"objects/aa/bb/legacy-{status}.txt",
+                            "status": status,
+                        },
+                    )
                 await connection.execute(
                     text(
                         """
-                        INSERT INTO event_object_cleanup_intents (
+                        INSERT INTO event_purge_receipts (
                             id,
                             event_id,
-                            source_kind,
-                            source_key,
-                            storage_path,
-                            status,
-                            attempt_count
+                            idempotency_key,
+                            actor,
+                            deletion_counts,
+                            storage_paths
                         ) VALUES (
                             :id,
                             :event_id,
-                            'retention',
-                            :source_key,
-                            'objects/aa/bb/legacy.txt',
-                            'pending',
-                            0
+                            'legacy-receipt',
+                            'legacy-superadmin',
+                            '{}'::jsonb,
+                            '[]'::jsonb
                         )
                         """
                     ),
                     {
-                        "id": legacy_id,
-                        "event_id": uuid.uuid4(),
-                        "source_key": uuid.uuid4().hex,
+                        "id": legacy_receipt_id,
+                        "event_id": legacy_receipt_event_id,
                     },
                 )
         finally:
@@ -1796,24 +1834,102 @@ async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> No
         engine = create_async_engine(settings.database_url)
         try:
             async with engine.connect() as connection:
-                row = (
+                intent_rows = (
                     await connection.execute(
                         text(
                             """
-                            SELECT storage_namespace, max_attempts, status, last_error
+                            SELECT id, storage_namespace, max_attempts, status, last_error
                             FROM event_object_cleanup_intents
+                            WHERE id = ANY(:ids)
+                            """
+                        ),
+                        {
+                            "ids": [
+                                legacy_pending_id,
+                                legacy_processing_id,
+                                legacy_completed_id,
+                            ]
+                        },
+                    )
+                ).all()
+                receipt_row = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT storage_namespace
+                            FROM event_purge_receipts
                             WHERE id = :id
                             """
                         ),
-                        {"id": legacy_id},
+                        {"id": legacy_receipt_id},
                     )
                 ).one()
         finally:
             await engine.dispose()
-        assert row.storage_namespace is None
-        assert row.max_attempts == 5
-        assert row.status == "unprocessable"
-        assert "manual remediation required" in row.last_error
+        intents_by_id = {row.id: row for row in intent_rows}
+        for legacy_id in (legacy_pending_id, legacy_processing_id):
+            row = intents_by_id[legacy_id]
+            assert row.storage_namespace is None
+            assert row.max_attempts == 5
+            assert row.status == "unprocessable"
+            assert "manual remediation required" in row.last_error
+        completed = intents_by_id[legacy_completed_id]
+        assert completed.storage_namespace is None
+        assert completed.status == "completed"
+        assert receipt_row.storage_namespace == "legacy-namespace-unavailable"
+
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO event_object_cleanup_intents (
+                            id,
+                            event_id,
+                            source_kind,
+                            source_key,
+                            storage_path,
+                            storage_namespace,
+                            status,
+                            attempt_count,
+                            last_error
+                        ) VALUES
+                            (
+                                :dead_letter_id,
+                                :dead_letter_event_id,
+                                'retention',
+                                :dead_letter_source_key,
+                                'objects/aa/bb/dead-letter.txt',
+                                'current-root',
+                                'dead_letter',
+                                5,
+                                'manual dead-letter review required'
+                            ),
+                            (
+                                :unprocessable_id,
+                                :unprocessable_event_id,
+                                'retention',
+                                :unprocessable_source_key,
+                                'objects/aa/bb/unprocessable.txt',
+                                'current-root',
+                                'unprocessable',
+                                2,
+                                'manual namespace review required'
+                            )
+                        """
+                    ),
+                    {
+                        "dead_letter_id": legacy_dead_letter_id,
+                        "dead_letter_event_id": uuid.uuid4(),
+                        "dead_letter_source_key": uuid.uuid4().hex,
+                        "unprocessable_id": legacy_unprocessable_id,
+                        "unprocessable_event_id": uuid.uuid4(),
+                        "unprocessable_source_key": uuid.uuid4().hex,
+                    },
+                )
+        finally:
+            await engine.dispose()
 
         _set_revision(CLEANUP_INTENT_REVISION)
         state = await _cleanup_intent_schema_state()
@@ -1821,6 +1937,67 @@ async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> No
         assert "max_attempts" not in state["columns"]
         downgraded_receipt_state = await _event_purge_receipt_schema_state()
         assert "storage_namespace" not in downgraded_receipt_state["columns"]
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.connect() as connection:
+                downgraded_rows = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT id, status, last_error
+                            FROM event_object_cleanup_intents
+                            WHERE id = ANY(:ids)
+                            """
+                        ),
+                        {
+                            "ids": [
+                                legacy_pending_id,
+                                legacy_processing_id,
+                                legacy_completed_id,
+                                legacy_dead_letter_id,
+                                legacy_unprocessable_id,
+                            ]
+                        },
+                    )
+                ).all()
+                claimable_count = int(
+                    await connection.scalar(
+                        text(
+                            """
+                            SELECT count(*)
+                            FROM event_object_cleanup_intents
+                            WHERE id = ANY(:ids)
+                              AND status IN ('pending', 'processing')
+                            """
+                        ),
+                        {
+                            "ids": [
+                                legacy_pending_id,
+                                legacy_processing_id,
+                                legacy_completed_id,
+                                legacy_dead_letter_id,
+                                legacy_unprocessable_id,
+                            ]
+                        },
+                    )
+                )
+        finally:
+            await engine.dispose()
+        downgraded_by_id = {row.id: row for row in downgraded_rows}
+        assert downgraded_by_id[legacy_pending_id].status == "skipped"
+        assert downgraded_by_id[legacy_processing_id].status == "skipped"
+        assert downgraded_by_id[legacy_completed_id].status == "completed"
+        assert downgraded_by_id[legacy_dead_letter_id].status == "skipped"
+        assert (
+            downgraded_by_id[legacy_dead_letter_id].last_error
+            == "manual dead-letter review required"
+        )
+        assert downgraded_by_id[legacy_unprocessable_id].status == "skipped"
+        assert (
+            downgraded_by_id[legacy_unprocessable_id].last_error
+            == "manual namespace review required"
+        )
+        assert claimable_count == 0
 
         _set_revision(LATEST_REVISION)
         state = await _cleanup_intent_schema_state()
@@ -1833,8 +2010,20 @@ async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> No
         try:
             async with engine.begin() as connection:
                 await connection.execute(
-                    text("DELETE FROM event_object_cleanup_intents WHERE id = :id"),
-                    {"id": legacy_id},
+                    text("DELETE FROM event_object_cleanup_intents WHERE id = ANY(:ids)"),
+                    {
+                        "ids": [
+                            legacy_pending_id,
+                            legacy_processing_id,
+                            legacy_completed_id,
+                            legacy_dead_letter_id,
+                            legacy_unprocessable_id,
+                        ]
+                    },
+                )
+                await connection.execute(
+                    text("DELETE FROM event_purge_receipts WHERE id = :id"),
+                    {"id": legacy_receipt_id},
                 )
         finally:
             await engine.dispose()

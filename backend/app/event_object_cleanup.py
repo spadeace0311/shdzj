@@ -20,6 +20,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    update,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.dialects.postgresql import insert
@@ -39,6 +40,8 @@ from app.event_object_locks import (
 CANDIDATE_DELETE_CLEANUP_SOURCE = "candidate_delete"
 ARTIFACT_RETENTION_CLEANUP_SOURCE = "retention"
 DEFAULT_CLEANUP_MAX_ATTEMPTS = 5
+LEGACY_STORAGE_NAMESPACE = "legacy-namespace-unavailable"
+CLEANUP_NAMESPACE_UNAVAILABLE_ERROR = "storage namespace unavailable; manual remediation required"
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,7 @@ class CleanupProcessingResult:
     failed_count: int = 0
     dead_letter_count: int = 0
     namespace_mismatch_count: int = 0
+    unprocessable_count: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -172,6 +176,7 @@ class CleanupProcessingResult:
             self.failed_count == 0
             and self.dead_letter_count == 0
             and self.namespace_mismatch_count == 0
+            and self.unprocessable_count == 0
         )
 
 
@@ -190,10 +195,7 @@ async def enqueue_object_cleanup_intent(
         raise ValueError("source_key must not be empty")
     if not storage_path:
         raise ValueError("storage_path must not be empty")
-    if not storage_namespace:
-        raise ValueError("storage_namespace must not be empty")
-    if len(storage_namespace) > 128:
-        raise ValueError("storage_namespace is too long")
+    storage_namespace = _normalize_storage_namespace(storage_namespace)
 
     statement = (
         insert(EventObjectCleanupIntent)
@@ -261,50 +263,103 @@ async def process_cleanup_intents(
     if source_key is not None:
         source_filters.append(EventObjectCleanupIntent.source_key == source_key)
 
-    claim_filters = [
-        or_(
-            EventObjectCleanupIntent.status == CleanupIntentStatus.PENDING.value,
-            and_(
-                EventObjectCleanupIntent.status == CleanupIntentStatus.PROCESSING.value,
-                EventObjectCleanupIntent.lease_expires_at.is_not(None),
-                EventObjectCleanupIntent.lease_expires_at <= now,
-            ),
+    expected_namespace = _normalize_storage_namespace(
+        artifact_store.storage_namespace,
+    )
+    claimable_status = or_(
+        EventObjectCleanupIntent.status == CleanupIntentStatus.PENDING.value,
+        and_(
+            EventObjectCleanupIntent.status == CleanupIntentStatus.PROCESSING.value,
+            EventObjectCleanupIntent.lease_expires_at.is_not(None),
+            EventObjectCleanupIntent.lease_expires_at <= now,
         ),
-        EventObjectCleanupIntent.storage_namespace == artifact_store.storage_namespace,
+    )
+    invalid_namespace = or_(
+        EventObjectCleanupIntent.storage_namespace.is_(None),
+        func.btrim(EventObjectCleanupIntent.storage_namespace) == "",
+    )
+    claim_filters = [
+        claimable_status,
+        EventObjectCleanupIntent.storage_namespace == expected_namespace,
         *source_filters,
     ]
     mismatch_filters = [
         or_(
-            EventObjectCleanupIntent.status == CleanupIntentStatus.PENDING.value,
-            and_(
-                EventObjectCleanupIntent.status == CleanupIntentStatus.PROCESSING.value,
-                EventObjectCleanupIntent.lease_expires_at.is_not(None),
-                EventObjectCleanupIntent.lease_expires_at <= now,
-            ),
+            claimable_status,
             EventObjectCleanupIntent.status == CleanupIntentStatus.UNPROCESSABLE.value,
+            EventObjectCleanupIntent.status == CleanupIntentStatus.DEAD_LETTER.value,
         ),
-        EventObjectCleanupIntent.storage_namespace.is_distinct_from(
-            artifact_store.storage_namespace
+        or_(
+            invalid_namespace,
+            EventObjectCleanupIntent.storage_namespace != expected_namespace,
         ),
         *source_filters,
     ]
-    namespace_mismatch_count = 0
 
     async with session_factory() as session:  # type: ignore[operator]
         async with session.begin():
-            namespace_mismatch_count = int(
-                await session.scalar(
-                    select(func.count())
-                    .select_from(EventObjectCleanupIntent)
-                    .where(*mismatch_filters)
-                )
-                or 0
+            namespace_mismatch_ids = set(
+                (
+                    await session.scalars(
+                        select(EventObjectCleanupIntent.id).where(*mismatch_filters)
+                    )
+                ).all()
             )
-            if namespace_mismatch_count:
+            unprocessable_ids = set(
+                (
+                    await session.scalars(
+                        select(EventObjectCleanupIntent.id).where(
+                            EventObjectCleanupIntent.status
+                            == CleanupIntentStatus.UNPROCESSABLE.value,
+                            *source_filters,
+                        )
+                    )
+                ).all()
+            )
+            dead_letter_ids = set(
+                (
+                    await session.scalars(
+                        select(EventObjectCleanupIntent.id).where(
+                            EventObjectCleanupIntent.status
+                            == CleanupIntentStatus.DEAD_LETTER.value,
+                            *source_filters,
+                        )
+                    )
+                ).all()
+            )
+            invalid_ids = set(
+                (
+                    await session.scalars(
+                        select(EventObjectCleanupIntent.id)
+                        .where(
+                            claimable_status,
+                            invalid_namespace,
+                            *source_filters,
+                        )
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            if invalid_ids:
+                await session.execute(
+                    update(EventObjectCleanupIntent)
+                    .where(EventObjectCleanupIntent.id.in_(invalid_ids))
+                    .values(
+                        status=CleanupIntentStatus.UNPROCESSABLE.value,
+                        last_error=CLEANUP_NAMESPACE_UNAVAILABLE_ERROR,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        completed_at=None,
+                        updated_at=now,
+                    )
+                )
+                unprocessable_ids.update(invalid_ids)
+                namespace_mismatch_ids.update(invalid_ids)
+            if namespace_mismatch_ids:
                 mismatch_ids = (
                     await session.scalars(
                         select(EventObjectCleanupIntent.id)
-                        .where(*mismatch_filters)
+                        .where(EventObjectCleanupIntent.id.in_(namespace_mismatch_ids))
                         .order_by(EventObjectCleanupIntent.created_at)
                         .limit(5)
                     )
@@ -312,8 +367,8 @@ async def process_cleanup_intents(
                 logger.error(
                     "cleanup intents require a different storage namespace "
                     "count=%s expected=%s examples=%s",
-                    namespace_mismatch_count,
-                    artifact_store.storage_namespace,
+                    len(namespace_mismatch_ids),
+                    expected_namespace,
                     [str(intent_id) for intent_id in mismatch_ids],
                 )
             intents = (
@@ -341,7 +396,6 @@ async def process_cleanup_intents(
     completed_count = 0
     skipped_count = 0
     failed_count = 0
-    dead_letter_count = 0
     for intent_id in claimed_ids:
         async with session_factory() as session:  # type: ignore[operator]
             async with session.begin():
@@ -357,12 +411,25 @@ async def process_cleanup_intents(
                 ):
                     continue
 
-                if intent.storage_namespace != artifact_store.storage_namespace:
+                intent_namespace = _optional_storage_namespace(
+                    intent.storage_namespace,
+                )
+                if intent_namespace is None:
+                    intent.status = CleanupIntentStatus.UNPROCESSABLE.value
+                    intent.last_error = CLEANUP_NAMESPACE_UNAVAILABLE_ERROR
+                    intent.lease_owner = None
+                    intent.lease_expires_at = None
+                    intent.completed_at = None
+                    intent.updated_at = datetime.now(UTC)
+                    namespace_mismatch_ids.add(intent.id)
+                    unprocessable_ids.add(intent.id)
+                    continue
+                if intent_namespace != expected_namespace:
                     intent.status = CleanupIntentStatus.PENDING.value
                     intent.lease_owner = None
                     intent.lease_expires_at = None
                     intent.updated_at = datetime.now(UTC)
-                    namespace_mismatch_count += 1
+                    namespace_mismatch_ids.add(intent.id)
                     continue
 
                 await lock_event_write(session, intent.event_id)
@@ -374,7 +441,7 @@ async def process_cleanup_intents(
                     intent.lease_owner = None
                     intent.lease_expires_at = None
                     intent.updated_at = now
-                    dead_letter_count += 1
+                    dead_letter_ids.add(intent.id)
                     continue
                 if (
                     await storage_path_reference_count(
@@ -401,7 +468,7 @@ async def process_cleanup_intents(
                 except Exception as error:
                     if intent.attempt_count >= intent.max_attempts:
                         intent.status = CleanupIntentStatus.DEAD_LETTER.value
-                        dead_letter_count += 1
+                        dead_letter_ids.add(intent.id)
                     else:
                         intent.status = CleanupIntentStatus.PENDING.value
                         failed_count += 1
@@ -427,8 +494,9 @@ async def process_cleanup_intents(
         completed_count=completed_count,
         skipped_count=skipped_count,
         failed_count=failed_count,
-        dead_letter_count=dead_letter_count,
-        namespace_mismatch_count=namespace_mismatch_count,
+        dead_letter_count=len(dead_letter_ids),
+        namespace_mismatch_count=len(namespace_mismatch_ids),
+        unprocessable_count=len(unprocessable_ids),
     )
 
 
@@ -520,3 +588,21 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must include timezone information")
     return value.astimezone(UTC)
+
+
+def _normalize_storage_namespace(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("storage_namespace must not be empty")
+    normalized = value.strip()
+    if len(normalized) > 128:
+        raise ValueError("storage_namespace is too long")
+    if any(character.isspace() for character in normalized):
+        raise ValueError("storage_namespace must not contain whitespace")
+    return normalized
+
+
+def _optional_storage_namespace(value: object) -> str | None:
+    try:
+        return _normalize_storage_namespace(value)
+    except ValueError:
+        return None

@@ -1071,6 +1071,9 @@ async def _run_retention_loop(
                         + recovered_cleanup.failed_count
                         + cleanup_result.failed_count
                     ),
+                    "dead_letter": recovered_cleanup.dead_letter_count,
+                    "namespace_mismatch": recovered_cleanup.namespace_mismatch_count,
+                    "unprocessable": recovered_cleanup.unprocessable_count,
                     "protected_publications": result.protected_publication_count,
                     "protection_reasons": dict(result.protected_publication_reasons),
                 }

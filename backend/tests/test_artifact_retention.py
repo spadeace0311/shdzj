@@ -615,7 +615,12 @@ async def test_retention_loop_logs_all_modes_and_protected_counts(
         raise asyncio.CancelledError
 
     async def process_cleanup_intents(*_args, **_kwargs):
-        return SimpleNamespace(failed_count=0)
+        return SimpleNamespace(
+            failed_count=0,
+            dead_letter_count=2,
+            namespace_mismatch_count=3,
+            unprocessable_count=4,
+        )
 
     monkeypatch.setattr(
         artifact_worker,
@@ -647,6 +652,9 @@ async def test_retention_loop_logs_all_modes_and_protected_counts(
     assert '"manual":4' in message
     assert '"replay":5' in message
     assert '"failed":6' in message
+    assert '"dead_letter":2' in message
+    assert '"namespace_mismatch":3' in message
+    assert '"unprocessable":4' in message
     assert '"protected_publications":7' in message
     assert '"current_publication":2' in message
     assert '"superseded_publication":5' in message

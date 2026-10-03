@@ -139,6 +139,14 @@ WHERE storage_path LIKE 'objects/%';
 `ARTIFACT_STORAGE_NAMESPACE` 显式指定。namespace 不匹配时 worker 只会
 告警并保留 intent，不会使用当前 root 解析旧相对路径。
 
+升级到 `0022_cleanup_namespace` 时，历史 purge receipt 会映射为
+`legacy-namespace-unavailable`，旧 0021 中仍需执行的 `NULL` 或纯空白清理
+intent 会转为 `unprocessable`。这些记录都视为命名空间未知，必须人工处置。任何
+`NULL`、空串或纯空白 namespace 都不得按当前 root 清理，也不得标记为
+`completed` 或 `skipped`。如果必须降级到 `0021_cleanup_intents`，系统会把
+`dead_letter` 和 `unprocessable` 映射为旧 worker 不会 claim 的 `skipped`
+终态，并保留人工处置错误信息。
+
 迁移存储根目录时必须按以下顺序执行：
 
 1. 暂停会创建清理 intent 的写入路径。
@@ -153,6 +161,10 @@ WHERE storage_path LIKE 'objects/%';
 如果必须保留旧 namespace 的待处理 intent，需要为 worker 配置能解析该
 namespace 的旧 store，而不是直接把旧 intent 交给新 root。不要手工把
 namespace 改写成当前 root，也不要直接删除仍未完成的 intent。
+
+retention worker 的完成日志必须同时记录 `dead_letter`、
+`namespace_mismatch` 和 `unprocessable` 计数；这些计数非零表示还需人工
+处置或存在错误 root，不能按成功完成处理。
 
 ## 8. 轮换测试和演练成果
 

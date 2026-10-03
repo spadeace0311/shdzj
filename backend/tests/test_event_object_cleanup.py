@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 from sqlalchemy import delete, select
@@ -231,6 +232,7 @@ async def test_cleanup_intent_namespace_prevents_wrong_root_delete(
     )
 
     assert wrong_root.namespace_mismatch_count == 1
+    assert wrong_root.succeeded is False
     assert wrong_root.completed_count == 0
     assert path_a.read_bytes() == b"root-a"
     assert path_b.read_bytes() == b"root-b"
@@ -254,6 +256,78 @@ async def test_cleanup_intent_namespace_prevents_wrong_root_delete(
     assert correct_root.completed_count == 1
     assert not path_a.exists()
     assert path_b.read_bytes() == b"root-b"
+
+
+@pytest.mark.parametrize("namespace", ["", "   ", None])
+async def test_enqueue_object_cleanup_intent_rejects_blank_storage_namespace(
+    session_factory,
+    namespace: object,
+) -> None:
+    async with session_factory() as session:
+        with pytest.raises(ValueError, match="storage_namespace must not be empty"):
+            await enqueue_object_cleanup_intent(
+                session,
+                event_id=uuid.uuid4(),
+                source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                source_key=uuid.uuid4().hex,
+                storage_path="objects/aa/bb/blank-namespace.txt",
+                storage_namespace=cast(str, namespace),
+            )
+
+
+@pytest.mark.parametrize("namespace", ["", "   ", None])
+async def test_cleanup_intent_processor_marks_blank_namespace_unprocessable(
+    session_factory,
+    tmp_path,
+    namespace: object,
+) -> None:
+    event_id = uuid.uuid4()
+    source_key = uuid.uuid4().hex
+    relative_path = "objects/aa/bb/blank-namespace.txt"
+    store = ArtifactStore(tmp_path / "artifacts")
+    path = store.resolve(relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"must-remain")
+
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                EventObjectCleanupIntent(
+                    event_id=event_id,
+                    source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                    source_key=source_key,
+                    storage_path=relative_path,
+                    storage_namespace=cast(str | None, namespace),
+                    status=CleanupIntentStatus.PENDING.value,
+                    attempt_count=0,
+                )
+            )
+
+    result = await process_cleanup_intents(
+        session_factory,
+        store,
+        lease_owner="blank-namespace-worker",
+        source_key=source_key,
+    )
+
+    assert result.succeeded is False
+    assert result.namespace_mismatch_count == 1
+    assert result.unprocessable_count == 1
+    assert result.completed_count == 0
+    assert result.skipped_count == 0
+    assert path.read_bytes() == b"must-remain"
+    async with session_factory() as session:
+        intent = await session.scalar(
+            select(EventObjectCleanupIntent).where(
+                EventObjectCleanupIntent.source_key == source_key
+            )
+        )
+    assert intent is not None
+    assert intent.status == CleanupIntentStatus.UNPROCESSABLE.value
+    assert intent.completed_at is None
+    assert intent.lease_owner is None
+    assert intent.lease_expires_at is None
+    assert intent.last_error == ("storage namespace unavailable; manual remediation required")
 
 
 async def test_cleanup_intent_moves_to_dead_letter_after_max_attempts(
@@ -306,6 +380,47 @@ async def test_cleanup_intent_moves_to_dead_letter_after_max_attempts(
     assert intent.attempt_count == 5
     assert intent.lease_owner is None
     assert intent.lease_expires_at is None
+
+
+async def test_cleanup_intent_processor_reports_preexisting_dead_letter_for_same_source(
+    session_factory,
+    tmp_path,
+) -> None:
+    event_id = uuid.uuid4()
+    source_key = uuid.uuid4().hex
+    relative_path = "objects/aa/bb/already-dead-letter.txt"
+    store = ArtifactStore(tmp_path / "artifacts")
+    path = store.resolve(relative_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"dead-letter")
+
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                EventObjectCleanupIntent(
+                    event_id=event_id,
+                    source_kind=ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                    source_key=source_key,
+                    storage_path=relative_path,
+                    storage_namespace=store.storage_namespace,
+                    status=CleanupIntentStatus.DEAD_LETTER.value,
+                    attempt_count=5,
+                    max_attempts=5,
+                    last_error="cleanup attempt limit exceeded",
+                )
+            )
+
+    result = await process_cleanup_intents(
+        session_factory,
+        store,
+        lease_owner="dead-letter-replay-worker",
+        source_key=source_key,
+    )
+
+    assert result.succeeded is False
+    assert result.dead_letter_count == 1
+    assert result.completed_count == 0
+    assert path.read_bytes() == b"dead-letter"
 
 
 async def test_cleanup_intent_error_redacts_absolute_storage_paths(

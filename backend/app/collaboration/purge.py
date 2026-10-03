@@ -53,11 +53,18 @@ from app.event_object_locks import (
     lock_artifact_object,
     lock_event_write,
 )
-from app.event_object_cleanup import cleanup_event_objects
+from app.event_object_cleanup import (
+    LEGACY_STORAGE_NAMESPACE,
+    cleanup_event_objects,
+)
 
 
 class EventNotFoundError(LookupError):
     """Raised when an event has never existed or lacks the matching receipt."""
+
+
+class PurgeNamespaceUnavailableError(RuntimeError):
+    """Raised when a purge replay lacks a safe frozen storage namespace."""
 
 
 class EventPurgeReceipt(Base):
@@ -101,8 +108,8 @@ class PurgeResult:
     deleted_publication_count: int
     deleted_override_count: int
     deleted_task_event_count: int
+    storage_namespace: str
     storage_paths: tuple[str, ...] = ()
-    storage_namespace: str | None = None
     already_purged: bool = False
 
 
@@ -113,12 +120,13 @@ class SuperadminPurgeService:
         event_id: uuid.UUID,
         actor: object,
         *,
+        storage_namespace: str,
         idempotency_key: str | None = None,
-        storage_namespace: str | None = None,
     ) -> PurgeResult:
         if getattr(actor, "role", None) != "superadmin":
             raise PermissionError("Insufficient permissions")
 
+        namespace = _normalize_storage_namespace(storage_namespace)
         key = _idempotency_key(event_id, idempotency_key)
         await lock_event_write(session, event_id, exclusive=True)
         event = await session.scalar(
@@ -133,6 +141,11 @@ class SuperadminPurgeService:
             .with_for_update()
         )
         if existing_receipt is not None:
+            frozen_namespace = _require_receipt_namespace(existing_receipt)
+            if frozen_namespace != namespace:
+                raise PurgeNamespaceUnavailableError(
+                    "event purge receipt storage namespace does not match current root"
+                )
             return _result_from_receipt(existing_receipt)
         if event is None:
             raise EventNotFoundError("event_not_found")
@@ -349,7 +362,7 @@ class SuperadminPurgeService:
             deleted_override_count=len(override_ids),
             deleted_task_event_count=task_event_count,
             storage_paths=storage_paths,
-            storage_namespace=storage_namespace,
+            storage_namespace=namespace,
         )
         session.add(
             EventPurgeReceipt(
@@ -358,7 +371,7 @@ class SuperadminPurgeService:
                 actor=str(getattr(actor, "username", "unknown")),
                 deletion_counts=_result_counts(result),
                 storage_paths=list(storage_paths),
-                storage_namespace=storage_namespace,
+                storage_namespace=namespace,
             )
         )
         await session.flush()
@@ -371,13 +384,21 @@ async def cleanup_purged_event(
     storage_paths: tuple[str, ...],
     artifact_store: ArtifactStore,
     *,
-    expected_storage_namespace: str | None = None,
+    expected_storage_namespace: str,
 ) -> bool:
-    current_namespace = getattr(artifact_store, "storage_namespace", None)
+    try:
+        expected_namespace = _normalize_storage_namespace(
+            expected_storage_namespace,
+        )
+        current_namespace = _normalize_storage_namespace(
+            getattr(artifact_store, "storage_namespace", None),
+        )
+    except ValueError:
+        return False
     if (
-        expected_storage_namespace is not None
-        and current_namespace is not None
-        and expected_storage_namespace != current_namespace
+        expected_namespace == LEGACY_STORAGE_NAMESPACE
+        or current_namespace == LEGACY_STORAGE_NAMESPACE
+        or expected_namespace != current_namespace
     ):
         return False
     result = await cleanup_event_objects(
@@ -442,3 +463,33 @@ def _result_from_receipt(
         storage_namespace=receipt.storage_namespace,
         already_purged=True,
     )
+
+
+def _require_receipt_namespace(receipt: EventPurgeReceipt) -> str:
+    raw_namespace = receipt.storage_namespace
+    if not isinstance(raw_namespace, str) or not raw_namespace.strip():
+        raise PurgeNamespaceUnavailableError(
+            "event purge receipt storage namespace is unavailable; manual remediation required"
+        )
+    try:
+        namespace = _normalize_storage_namespace(raw_namespace)
+    except ValueError as error:
+        raise PurgeNamespaceUnavailableError(
+            "event purge receipt storage namespace is unavailable; manual remediation required"
+        ) from error
+    if namespace == LEGACY_STORAGE_NAMESPACE:
+        raise PurgeNamespaceUnavailableError(
+            "event purge receipt storage namespace is unavailable; manual remediation required"
+        )
+    return namespace
+
+
+def _normalize_storage_namespace(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("storage namespace must not be empty")
+    namespace = value.strip()
+    if len(namespace) > 128:
+        raise ValueError("storage namespace is too long")
+    if any(character.isspace() for character in namespace):
+        raise ValueError("storage namespace must not contain whitespace")
+    return namespace
