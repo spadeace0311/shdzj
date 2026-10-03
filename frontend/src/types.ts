@@ -108,6 +108,161 @@ export interface EventIngestResponse {
   t1_at?: string | null;
 }
 
+export type WorkgroupTaskStatus =
+  | "pending"
+  | "in_progress"
+  | "pending_review"
+  | "completed"
+  | "not_required"
+  | "failed";
+
+export type WorkgroupTaskTimelinessState =
+  | "on_time"
+  | "at_risk"
+  | "overdue";
+
+export interface WorkgroupTaskContributor {
+  user_id: string;
+  username: string;
+  contribution_count: number;
+  first_contributed_at: string;
+  last_contributed_at: string;
+}
+
+export interface WorkgroupTask {
+  id: string;
+  event_id: string;
+  workgroup_code: string;
+  task_code: string;
+  title: string;
+  status: WorkgroupTaskStatus;
+  timeliness_state: WorkgroupTaskTimelinessState;
+  due_at: string | null;
+  row_version: number;
+  instruction: string;
+  priority: number;
+  phase_code: string | null;
+  source_type: string;
+  source_ref: string | null;
+  activated_at: string | null;
+  completed_at: string | null;
+  closed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  contributors: WorkgroupTaskContributor[];
+}
+
+export interface TaskSubmitInput {
+  result_text?: string | null;
+}
+
+export interface TemporaryTaskCreateInput {
+  workgroup_code: string;
+  title: string;
+  instruction: string;
+  priority: number;
+  due_at?: string | null;
+  continues_until_cancelled?: boolean;
+  source_ref?: string | null;
+}
+
+export interface CommandHallActiveEvent {
+  event_id: string | null;
+}
+
+export interface CommandHallTaskCounts {
+  total: number;
+  pending: number;
+  in_progress: number;
+  pending_review: number;
+  completed: number;
+  not_required: number;
+  failed: number;
+  overdue: number;
+  at_risk: number;
+  dual_version_count: number;
+}
+
+export interface CommandHallAlert {
+  id: string;
+  event_id: string;
+  workgroup_code: string | null;
+  task_id: string | null;
+  alert_key: string;
+  alert_type: string;
+  severity: "info" | "warning" | "critical";
+  status: string;
+  title: string;
+  detail: Record<string, unknown>;
+  first_seen_at: string;
+  resolved_at: string | null;
+  updated_at: string;
+}
+
+export interface CommandHallGroup {
+  [key: string]: unknown;
+  event_id: string;
+  workgroup_code: string;
+  name: string;
+  display_order: number;
+  roster_version: number | null;
+  roster_fingerprint: string | null;
+  leader: Record<string, unknown> | null;
+  deputies: Record<string, unknown>[];
+  members: Record<string, unknown>[];
+  attendance: Record<string, unknown>[];
+  confirming_authority: Record<string, unknown> | null;
+  tasks: Record<string, unknown>[];
+  task_count: number;
+  task_counts: CommandHallTaskCounts;
+  latest_deliverable: Record<string, unknown> | null;
+  alert_summary: Record<string, number>;
+  projection_version: number;
+  updated_at: string;
+}
+
+export interface CommandHallOverview {
+  event_id: string;
+  event: Record<string, unknown>;
+  group_count: number;
+  groups: CommandHallGroup[];
+  alerts: CommandHallAlert[];
+  task_counts: CommandHallTaskCounts;
+  artifact_summary: Record<string, unknown>;
+  alert_summary: Record<string, number>;
+  dual_version_count: number;
+  projection_version: number;
+  updated_at: string;
+}
+
+export interface CommandHallGroupDetail {
+  event_id: string;
+  workgroup_code: string;
+  group: Record<string, unknown>;
+  tasks: Record<string, unknown>[];
+  alerts: CommandHallAlert[];
+  alert_summary: Record<string, number>;
+  task_counts: CommandHallTaskCounts;
+  projection_version: number;
+  updated_at: string;
+}
+
+export interface CommandHallTaskDetail {
+  id: string;
+  event_id: string;
+  task: Record<string, unknown>;
+  contributors: Record<string, unknown>[];
+  deliverables: Record<string, unknown>[];
+  task_events: Record<string, unknown>[];
+  notifications: Record<string, unknown>[];
+  projection_version: number | null;
+}
+
+export interface CommandHallStreamEvent {
+  type: string;
+  data: Record<string, unknown>;
+}
+
 export interface TokenResponse {
   access_token: string;
   token_type?: string;

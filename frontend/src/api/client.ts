@@ -4,6 +4,11 @@ import type {
   ArtifactSummary,
   AssessmentRunStatus,
   CollectorStatus,
+  CommandHallActiveEvent,
+  CommandHallGroupDetail,
+  CommandHallOverview,
+  CommandHallStreamEvent,
+  CommandHallTaskDetail,
   CurrentUser,
   DataAssetImportAccepted,
   DataAssetImportInput,
@@ -21,8 +26,11 @@ import type {
   ManualEventInput,
   ProductionFilters,
   ProductionRun,
+  TaskSubmitInput,
+  TemporaryTaskCreateInput,
   TokenResponse,
   ValidationReport,
+  WorkgroupTask,
 } from "../types";
 import { matchesArtifactFilters } from "../types";
 
@@ -140,6 +148,27 @@ async function requestJson<T>(
     return undefined as T;
   }
   return (await response.json()) as T;
+}
+
+function collaborationHeaders(
+  message = "请先登录后处理工作组任务",
+): Record<string, string> {
+  return authenticatedHeaders(message);
+}
+
+function idempotentMutationHeaders(): Record<string, string> {
+  return {
+    ...collaborationHeaders(),
+    "Content-Type": "application/json",
+    "Idempotency-Key": globalThis.crypto.randomUUID(),
+  };
+}
+
+function mutationHeaders(version: number): Record<string, string> {
+  return {
+    ...idempotentMutationHeaders(),
+    "If-Match": String(version),
+  };
 }
 
 export function manualEventErrorMessage(error: unknown): string {
@@ -305,6 +334,282 @@ export async function createManualEvent(
     },
     body: JSON.stringify(input),
   });
+}
+
+export async function listCollaborationTasks(
+  eventId: string,
+): Promise<WorkgroupTask[]> {
+  return requestJson<WorkgroupTask[]>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/collaboration/tasks`,
+    {
+      headers: collaborationHeaders("请先登录后查看工作组任务"),
+    },
+  );
+}
+
+export async function getCollaborationTask(
+  taskId: string,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}`,
+    {
+      headers: collaborationHeaders("请先登录后查看工作组任务"),
+    },
+  );
+}
+
+export async function startCollaborationTask(
+  taskId: string,
+  version: number,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/start`,
+    {
+      method: "POST",
+      headers: mutationHeaders(version),
+    },
+  );
+}
+
+export async function submitCollaborationTask(
+  taskId: string,
+  version: number,
+  input: TaskSubmitInput,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/submit`,
+    {
+      method: "POST",
+      headers: mutationHeaders(version),
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function returnCollaborationTask(
+  taskId: string,
+  version: number,
+  reason: string,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/return`,
+    {
+      method: "POST",
+      headers: mutationHeaders(version),
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+export async function completeCollaborationTask(
+  taskId: string,
+  version: number,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/collaboration/tasks/${encodeURIComponent(taskId)}/complete`,
+    {
+      method: "POST",
+      headers: mutationHeaders(version),
+    },
+  );
+}
+
+export async function createTemporaryTask(
+  eventId: string,
+  input: TemporaryTaskCreateInput,
+): Promise<WorkgroupTask> {
+  return requestJson<WorkgroupTask>(
+    `/api/v1/events/${encodeURIComponent(eventId)}/collaboration/tasks`,
+    {
+      method: "POST",
+      headers: idempotentMutationHeaders(),
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function getCommandHallActiveEvent(): Promise<CommandHallActiveEvent> {
+  return requestJson<CommandHallActiveEvent>(
+    "/api/v1/command-hall/active-event",
+    {
+      headers: collaborationHeaders("请先登录后查看指挥大厅"),
+    },
+  );
+}
+
+export async function getCommandHallOverview(
+  eventId: string,
+): Promise<CommandHallOverview> {
+  return requestJson<CommandHallOverview>(
+    `/api/v1/command-hall/events/${encodeURIComponent(eventId)}/overview`,
+    {
+      headers: collaborationHeaders("请先登录后查看指挥大厅"),
+    },
+  );
+}
+
+export async function getCommandHallGroup(
+  eventId: string,
+  groupCode: string,
+): Promise<CommandHallGroupDetail> {
+  return requestJson<CommandHallGroupDetail>(
+    `/api/v1/command-hall/events/${encodeURIComponent(eventId)}/groups/${encodeURIComponent(groupCode)}`,
+    {
+      headers: collaborationHeaders("请先登录后查看指挥大厅"),
+    },
+  );
+}
+
+export async function getCommandHallTask(
+  taskId: string,
+): Promise<CommandHallTaskDetail> {
+  return requestJson<CommandHallTaskDetail>(
+    `/api/v1/command-hall/tasks/${encodeURIComponent(taskId)}`,
+    {
+      headers: collaborationHeaders("请先登录后查看指挥大厅"),
+    },
+  );
+}
+
+function nextSseBoundary(
+  value: string,
+): { index: number; length: number } | null {
+  const match = /\r?\n\r?\n/.exec(value);
+  if (match?.index === undefined) {
+    return null;
+  }
+  return { index: match.index, length: match[0].length };
+}
+
+function parseCommandHallSseFrame(
+  frame: string,
+): CommandHallStreamEvent | null {
+  let type = "";
+  const dataLines: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) {
+      value = value.slice(1);
+    }
+    if (field === "event") {
+      type = value;
+    } else if (field === "data") {
+      dataLines.push(value);
+    }
+  }
+  if (!type || dataLines.length === 0) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(dataLines.join("\n")) as unknown;
+  } catch {
+    throw new ApiError("事件流数据格式错误", 0);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ApiError("事件流数据格式错误", 0);
+  }
+  return { type, data: parsed as Record<string, unknown> };
+}
+
+export async function streamCommandHall(
+  eventId: string,
+  onEvent: (event: CommandHallStreamEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const headers = {
+    ...collaborationHeaders("请先登录后查看指挥大厅"),
+    Accept: "text/event-stream",
+  };
+  let response: Response;
+  try {
+    response = await fetch(
+      `/api/v1/command-hall/events/${encodeURIComponent(eventId)}/stream`,
+      {
+        headers,
+        signal,
+      },
+    );
+  } catch (error) {
+    if (signal.aborted || isAbortError(error)) {
+      return;
+    }
+    throw new ApiError("事件流连接失败，请稍后重试", 0);
+  }
+
+  if (!response.ok) {
+    throw new ApiError(await parseError(response), response.status);
+  }
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
+    throw new ApiError("事件流响应格式错误", 0);
+  }
+  if (response.body === null) {
+    throw new ApiError("事件流响应为空", 0);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const cancelReader = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", cancelReader, { once: true });
+  if (signal.aborted) {
+    cancelReader();
+  }
+
+  const emitFrames = (flush = false) => {
+    while (true) {
+      const boundary = nextSseBoundary(buffer);
+      if (boundary === null) {
+        break;
+      }
+      const frame = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      const event = parseCommandHallSseFrame(frame);
+      if (event !== null) {
+        onEvent(event);
+      }
+    }
+    if (flush && buffer.trim()) {
+      const event = parseCommandHallSseFrame(buffer);
+      buffer = "";
+      if (event !== null) {
+        onEvent(event);
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        emitFrames(true);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      emitFrames();
+    }
+  } catch (error) {
+    if (signal.aborted || isAbortError(error)) {
+      return;
+    }
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError("事件流连接中断，请稍后重试", 0);
+  } finally {
+    signal.removeEventListener("abort", cancelReader);
+    reader.releaseLock();
+  }
 }
 
 export async function listDataAssets(): Promise<DataAssetSummary[]> {
