@@ -644,39 +644,27 @@ class TemporaryTaskService(CollaborationTaskService):
             due_at,
             continues_until_cancelled,
         )
-        previous = await self.repository.get_event_by_idempotency_key_any(
+        resource_identity = {
+            "event_id": event_uuid,
+            "workgroup_code": workgroup_code,
+            "title": title,
+            "instruction": instruction,
+            "priority": priority,
+            "due_at": (
+                due_at.isoformat()
+                if due_at is not None
+                else None
+            ),
+            "continues_until_cancelled": continues_until_cancelled,
+        }
+        existing = await self._existing_creation(
             session,
             effective_key,
+            actor_identity,
+            resource_identity,
         )
-        if previous is not None:
-            task = await self.repository.get_task(
-                session,
-                previous.task_id,
-                for_update=True,
-            )
-            if task is None or task.source_type != TaskSourceType.AD_HOC.value:
-                raise ValueError(
-                    "idempotency key was used for a different operation"
-                )
-            _validate_idempotent_replay(
-                previous,
-                actor_identity,
-                "task_created",
-                resource_identity={
-                    "event_id": event_uuid,
-                    "workgroup_code": workgroup_code,
-                    "title": title,
-                    "instruction": instruction,
-                    "priority": priority,
-                    "due_at": (
-                        due_at.isoformat()
-                        if due_at is not None
-                        else None
-                    ),
-                    "continues_until_cancelled": continues_until_cancelled,
-                },
-            )
-            return task
+        if existing is not None:
+            return existing
 
         event = await session.get(
             EarthquakeEvent,
@@ -685,6 +673,14 @@ class TemporaryTaskService(CollaborationTaskService):
         )
         if event is None:
             raise LookupError("event_not_found")
+        existing = await self._existing_creation(
+            session,
+            effective_key,
+            actor_identity,
+            resource_identity,
+        )
+        if existing is not None:
+            return existing
         definition = await session.scalar(
             select(WorkgroupDefinition).where(
                 WorkgroupDefinition.code == workgroup_code,
@@ -781,6 +777,13 @@ class TemporaryTaskService(CollaborationTaskService):
             actor_identity,
         ):
             raise PermissionError("Insufficient permissions")
+
+        if task.status in {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.NOT_REQUIRED.value,
+            TaskStatus.FAILED.value,
+        }:
+            raise ValueError("terminal temporary task cannot be updated")
 
         if task.status != TaskStatus.PENDING.value:
             if title is not None or priority is not None:
@@ -888,6 +891,36 @@ class TemporaryTaskService(CollaborationTaskService):
             occurred_at=now,
         )
         await session.flush()
+        return task
+
+    async def _existing_creation(
+        self,
+        session: AsyncSession,
+        idempotency_key: str,
+        actor_identity: _Actor,
+        resource_identity: dict[str, object],
+    ) -> WorkgroupTask | None:
+        previous = await self.repository.get_event_by_idempotency_key_any(
+            session,
+            idempotency_key,
+        )
+        if previous is None:
+            return None
+        task = await self.repository.get_task(
+            session,
+            previous.task_id,
+            for_update=True,
+        )
+        if task is None or task.source_type != TaskSourceType.AD_HOC.value:
+            raise ValueError(
+                "idempotency key was used for a different operation"
+            )
+        _validate_idempotent_replay(
+            previous,
+            actor_identity,
+            "task_created",
+            resource_identity=resource_identity,
+        )
         return task
 
     async def _can_create_temporary_task(

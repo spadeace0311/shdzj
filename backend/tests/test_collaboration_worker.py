@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -392,6 +392,153 @@ async def test_temporary_task_creation_is_idempotent(
     assert len(outbox) == 1
 
 
+async def _seed_concurrent_temporary_create(
+    session_factory,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    event_id = uuid.uuid4()
+    raw_id = uuid.uuid4()
+    creator_id = uuid.uuid4()
+    async with session_factory() as session:
+        async with session.begin():
+            event = EarthquakeEvent(
+                id=event_id,
+                source="worker-concurrent-test",
+                canonical_source_id=f"worker-concurrent-{event_id}",
+                event_type="formal",
+                origin_time=datetime(2026, 10, 3, 0, 0, tzinfo=UTC),
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="worker concurrent fixture",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="formal_triggered",
+            )
+            session.add(event)
+            await session.flush()
+            raw = RawMessage(
+                id=raw_id,
+                source="worker-concurrent-test",
+                source_message_id=raw_id.hex,
+                message_kind="formal",
+                checksum=raw_id.hex,
+                payload={"event_id": str(event_id)},
+            )
+            session.add(raw)
+            await session.flush()
+            revision = EarthquakeRevision(
+                id=uuid.uuid4(),
+                event_id=event.id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="formal",
+                origin_time=event.origin_time,
+                longitude=event.longitude,
+                latitude=event.latitude,
+                depth_km=event.depth_km,
+                magnitude=event.magnitude,
+                place=event.place,
+                inside_shanghai=True,
+                distance_to_boundary_km=Decimal("0"),
+                is_current=True,
+                ingested_at=event.origin_time,
+            )
+            session.add(revision)
+            creator = User(
+                id=creator_id,
+                username=f"worker-concurrent-{creator_id.hex[:8]}",
+                password_hash="not-used",
+                role="group_member",
+                workgroup=None,
+                is_active=True,
+            )
+            session.add(creator)
+            session.add(
+                WorkgroupMembership(
+                    user_id=creator.id,
+                    workgroup_code="comprehensive_coordination",
+                    duty_role="member",
+                    is_active=True,
+                    created_by="system",
+                )
+            )
+    return event_id, creator_id, raw_id
+
+
+async def test_temporary_task_creation_is_concurrently_idempotent(
+    isolated_session_factory,
+):
+    event_id, creator_id, raw_id = await _seed_concurrent_temporary_create(
+        isolated_session_factory
+    )
+    due_at = datetime(2026, 10, 3, 3, 0, tzinfo=UTC)
+
+    async def create() -> WorkgroupTask:
+        async with isolated_session_factory() as session:
+            async with session.begin():
+                creator = await session.get(User, creator_id)
+                return await TemporaryTaskService().create(
+                    session,
+                    event_id=event_id,
+                    workgroup_code="center_station",
+                    title="补充检查观测点",
+                    instruction="检查受影响观测点并上传结果",
+                    priority=80,
+                    due_at=due_at,
+                    actor=creator,
+                    idempotency_key="concurrent-temporary-create",
+                )
+
+    try:
+        first, second = await asyncio.gather(create(), create())
+
+        assert first.id == second.id
+        async with isolated_session_factory() as session:
+            tasks = (
+                await session.scalars(
+                    select(WorkgroupTask).where(
+                        WorkgroupTask.event_id == event_id
+                    )
+                )
+            ).all()
+            events = (
+                await session.scalars(
+                    select(CollaborationTaskEvent).where(
+                        CollaborationTaskEvent.task_id == first.id
+                    )
+                )
+            ).all()
+            outbox = (
+                await session.scalars(
+                    select(CollaborationOutbox).where(
+                        CollaborationOutbox.task_id == first.id
+                    )
+                )
+            ).all()
+        assert len(tasks) == 1
+        assert len(events) == 1
+        assert len(outbox) == 1
+    finally:
+        async with isolated_session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(WorkgroupMembership).where(
+                        WorkgroupMembership.user_id == creator_id
+                    )
+                )
+                await session.execute(
+                    delete(User).where(User.id == creator_id)
+                )
+                await session.execute(
+                    delete(EarthquakeEvent).where(
+                        EarthquakeEvent.id == event_id
+                    )
+                )
+                await session.execute(
+                    delete(RawMessage).where(RawMessage.id == raw_id)
+                )
+
+
 async def test_temporary_task_uses_shared_lifecycle_and_version(
     session,
     event_factory,
@@ -401,10 +548,11 @@ async def test_temporary_task_uses_shared_lifecycle_and_version(
 ):
     event = await event_factory()
     await revision_factory(event)
+    creator = await coordination_user()
     task = await _create_temporary_task(
         session,
         event,
-        await coordination_user(),
+        creator,
     )
     member = await center_station_member()
 
@@ -423,6 +571,15 @@ async def test_temporary_task_uses_shared_lifecycle_and_version(
             task.id,
             member,
             started.row_version + 1,
+        )
+
+    with pytest.raises(ValueError):
+        await TemporaryTaskService().cancel(
+            session,
+            task.id,
+            creator,
+            started.row_version,
+            reason="started task cannot be cancelled",
         )
 
 
@@ -472,6 +629,50 @@ async def test_creator_can_update_and_cancel_before_start(
         "task_updated",
         "task_cancelled",
     ]
+
+
+async def test_temporary_task_update_rejects_terminal_statuses(
+    session,
+    event_factory,
+    revision_factory,
+    coordination_user,
+):
+    event = await event_factory()
+    await revision_factory(event)
+    creator = await coordination_user()
+    service = TemporaryTaskService()
+
+    cancelled = await _create_temporary_task(session, event, creator)
+    cancelled = await service.cancel(
+        session,
+        cancelled.id,
+        creator,
+        cancelled.row_version,
+        reason="terminal coverage",
+    )
+    with pytest.raises(ValueError):
+        await service.update(
+            session,
+            cancelled.id,
+            creator,
+            cancelled.row_version,
+            instruction="must not mutate cancelled task",
+        )
+
+    completed = await _create_temporary_task(session, event, creator)
+    await session.execute(
+        update(WorkgroupTask)
+        .where(WorkgroupTask.id == completed.id)
+        .values(status="completed", updated_at=datetime.now(UTC))
+    )
+    with pytest.raises(ValueError):
+        await service.update(
+            session,
+            completed.id,
+            creator,
+            completed.row_version,
+            due_at=datetime(2026, 10, 3, 5, 0, tzinfo=UTC),
+        )
 
 
 async def test_temporary_task_assignment_uses_notification_delivery_contract(

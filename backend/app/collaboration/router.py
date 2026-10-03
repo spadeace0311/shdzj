@@ -461,7 +461,7 @@ async def cancel_collaboration_task(
         task = await service.repository.get_task(session, task_id)
         if task is None:
             raise LookupError("task_not_found")
-        if task.source_type == "ad_hoc" and task.status == "pending":
+        if task.source_type == "ad_hoc":
             task = await temporary_service.cancel(
                 session,
                 task_id,
