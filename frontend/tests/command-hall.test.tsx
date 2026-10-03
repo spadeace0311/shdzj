@@ -637,6 +637,68 @@ test("SSE refresh updates an open group and task drawer without reopening it", a
   expect(taskMock).toHaveBeenCalledTimes(2);
 });
 
+test("SSE refresh failures keep the last valid group and task details visible", async () => {
+  let onStreamEvent:
+    | ((event: CommandHallStreamEvent) => void)
+    | undefined;
+  streamMock.mockImplementation((_eventId, callback) => {
+    onStreamEvent = callback;
+    return new Promise<void>(() => undefined);
+  });
+  overviewMock
+    .mockResolvedValueOnce(overview)
+    .mockResolvedValueOnce({
+      ...overview,
+      projection_version: 2,
+      updated_at: "2026-10-03T01:32:00Z",
+    });
+  groupMock
+    .mockResolvedValueOnce(groupDetail)
+    .mockRejectedValueOnce(new ApiError("group unavailable", 503));
+  taskMock
+    .mockResolvedValueOnce(taskDetail)
+    .mockRejectedValueOnce(new ApiError("task unavailable", 503));
+
+  renderHall("/command-hall/event-1");
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: /监测预报组/ }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "查看任务详情：趋势会商",
+    }),
+  );
+  expect(
+    await screen.findByText("组织震后趋势会商并形成会商意见"),
+  ).toBeInTheDocument();
+
+  await waitFor(() => expect(onStreamEvent).toBeDefined());
+  await act(async () => {
+    onStreamEvent?.({
+      type: "projection.updated",
+      data: { event_id: "event-1", projection_version: 2 },
+    });
+  });
+
+  const warnings = await screen.findAllByText(
+    "详情同步失败，当前为最后有效版本",
+  );
+  expect(warnings).toHaveLength(2);
+  expect(screen.getByTestId("command-hall-group-sync-warning")).toHaveTextContent(
+    /最后有效更新：.*09:31:00/,
+  );
+  expect(screen.getByTestId("command-hall-task-sync-warning")).toHaveTextContent(
+    /最后有效更新：.*09:10:00/,
+  );
+  expect(
+    screen.getByRole("heading", { name: "趋势会商" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getAllByText("组织震后趋势会商并形成会商意见"),
+  ).toHaveLength(2);
+});
+
 test("five-second polling refresh also updates an open group and task drawer", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   streamMock.mockRejectedValue(new ApiError("事件流不可用", 0));
@@ -690,6 +752,59 @@ test("five-second polling refresh also updates an open group and task drawer", a
   expect(await screen.findByText("轮询后的最新任务说明")).toBeInTheDocument();
   expect(groupMock).toHaveBeenCalledTimes(2);
   expect(taskMock).toHaveBeenCalledTimes(2);
+});
+
+test("five-second polling refresh failures retain stale group and task details", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  streamMock.mockRejectedValue(new ApiError("事件流不可用", 0));
+  overviewMock
+    .mockResolvedValueOnce(overview)
+    .mockResolvedValueOnce({
+      ...overview,
+      projection_version: 2,
+      updated_at: "2026-10-03T01:32:00Z",
+    });
+  groupMock
+    .mockResolvedValueOnce(groupDetail)
+    .mockRejectedValueOnce(new ApiError("group unavailable", 503));
+  taskMock
+    .mockResolvedValueOnce(taskDetail)
+    .mockRejectedValueOnce(new ApiError("task unavailable", 503));
+
+  renderHall("/command-hall/event-1");
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: /监测预报组/ }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "查看任务详情：趋势会商",
+    }),
+  );
+  expect(
+    await screen.findByText("组织震后趋势会商并形成会商意见"),
+  ).toBeInTheDocument();
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(5_000);
+  });
+
+  const warnings = await screen.findAllByText(
+    "详情同步失败，当前为最后有效版本",
+  );
+  expect(warnings).toHaveLength(2);
+  expect(screen.getByTestId("command-hall-group-sync-warning")).toHaveTextContent(
+    /最后有效更新：.*09:31:00/,
+  );
+  expect(screen.getByTestId("command-hall-task-sync-warning")).toHaveTextContent(
+    /最后有效更新：.*09:10:00/,
+  );
+  expect(
+    screen.getByRole("heading", { name: "趋势会商" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getAllByText("组织震后趋势会商并形成会商意见"),
+  ).toHaveLength(2);
 });
 
 test("SSE failure falls back to five-second overview polling", async () => {

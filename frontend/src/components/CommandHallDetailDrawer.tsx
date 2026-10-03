@@ -126,6 +126,28 @@ function markerClass(kind: string | null): string {
   return "event-marker event-marker--unknown";
 }
 
+function DetailSyncWarning({
+  scope,
+  updatedAt,
+  error,
+}: {
+  scope: "group" | "task";
+  updatedAt: string;
+  error: string;
+}) {
+  return (
+    <div
+      className="command-hall-drawer__sync-warning"
+      role="alert"
+      data-testid={`command-hall-${scope}-sync-warning`}
+    >
+      <strong>详情同步失败，当前为最后有效版本</strong>
+      <span>最后有效更新：{formatDateTime(updatedAt)}</span>
+      {error ? <small>{error}</small> : null}
+    </div>
+  );
+}
+
 function taskTitle(task: Record<string, unknown>): string {
   return textValue(task.title ?? task.task_code, "未命名任务");
 }
@@ -177,6 +199,11 @@ function publishedFileName(
     return "文字成果";
   }
   return "已发布成果";
+}
+
+function taskDetailUpdatedAt(detail: CommandHallTaskDetail): string {
+  const task = asRecord(detail.task);
+  return textValue(task?.updated_at, "");
 }
 
 function TaskDetailView({ detail }: { detail: CommandHallTaskDetail }) {
@@ -295,6 +322,7 @@ export function CommandHallDetailDrawer({
     "loading" | "ready" | "error"
   >("loading");
   const [detailError, setDetailError] = useState("");
+  const [detailRefreshError, setDetailRefreshError] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [taskDetail, setTaskDetail] = useState<CommandHallTaskDetail | null>(
     null,
@@ -303,6 +331,7 @@ export function CommandHallDetailDrawer({
     "idle" | "loading" | "ready" | "error"
   >("idle");
   const [taskError, setTaskError] = useState("");
+  const [taskRefreshError, setTaskRefreshError] = useState("");
   const groupRequestRef = useRef(0);
   const taskRequestRef = useRef(0);
   const detailRef = useRef<CommandHallGroupDetail | null>(null);
@@ -314,18 +343,20 @@ export function CommandHallDetailDrawer({
     setDetail(null);
     setDetailStatus("loading");
     setDetailError("");
+    setDetailRefreshError("");
     setSelectedTaskId(null);
     setTaskDetail(null);
     setTaskStatus("idle");
     setTaskError("");
+    setTaskRefreshError("");
   }, [eventId, groupCode]);
 
   useEffect(() => {
     const requestId = ++groupRequestRef.current;
     if (detailRef.current === null) {
       setDetailStatus("loading");
+      setDetailError("");
     }
-    setDetailError("");
 
     void getCommandHallGroup(eventId, groupCode)
       .then((loaded) => {
@@ -335,14 +366,18 @@ export function CommandHallDetailDrawer({
         detailRef.current = loaded;
         setDetail(loaded);
         setDetailStatus("ready");
+        setDetailRefreshError("");
       })
       .catch((error: unknown) => {
         if (requestId !== groupRequestRef.current) {
           return;
         }
-        setDetailError(errorMessage(error));
+        const message = errorMessage(error);
         if (detailRef.current === null) {
+          setDetailError(message);
           setDetailStatus("error");
+        } else {
+          setDetailRefreshError(message);
         }
       });
 
@@ -358,12 +393,19 @@ export function CommandHallDetailDrawer({
       setTaskDetail(null);
       setTaskStatus("idle");
       setTaskError("");
+      setTaskRefreshError("");
       return;
     }
 
     const requestId = ++taskRequestRef.current;
-    setTaskStatus("loading");
-    setTaskError("");
+    const hasCurrentTask = taskDetailRef.current?.id === selectedTaskId;
+    if (!hasCurrentTask) {
+      taskDetailRef.current = null;
+      setTaskDetail(null);
+      setTaskStatus("loading");
+      setTaskError("");
+      setTaskRefreshError("");
+    }
     void getCommandHallTask(selectedTaskId)
       .then((loaded) => {
         if (requestId !== taskRequestRef.current) {
@@ -377,14 +419,18 @@ export function CommandHallDetailDrawer({
         taskDetailRef.current = loaded;
         setTaskDetail(loaded);
         setTaskStatus("ready");
+        setTaskRefreshError("");
       })
       .catch((error: unknown) => {
         if (requestId !== taskRequestRef.current) {
           return;
         }
-        setTaskError(errorMessage(error));
+        const message = errorMessage(error);
         if (taskDetailRef.current === null) {
+          setTaskError(message);
           setTaskStatus("error");
+        } else {
+          setTaskRefreshError(message);
         }
       });
 
@@ -473,8 +519,11 @@ export function CommandHallDetailDrawer({
                     if (requestId !== groupRequestRef.current) {
                       return;
                     }
+                    detailRef.current = loaded;
                     setDetail(loaded);
                     setDetailStatus("ready");
+                    setDetailError("");
+                    setDetailRefreshError("");
                   })
                   .catch((error: unknown) => {
                     if (requestId !== groupRequestRef.current) {
@@ -492,6 +541,14 @@ export function CommandHallDetailDrawer({
 
         {detailStatus === "ready" ? (
           <div className="command-hall-drawer__content">
+            {detailRefreshError ? (
+              <DetailSyncWarning
+                scope="group"
+                updatedAt={detail?.updated_at ?? ""}
+                error={detailRefreshError}
+              />
+            ) : null}
+
             <section
               className="command-hall-drawer__roster"
               aria-labelledby="command-hall-roster-title"
@@ -598,7 +655,16 @@ export function CommandHallDetailDrawer({
             ) : null}
 
             {taskStatus === "ready" && taskDetail ? (
-              <TaskDetailView detail={taskDetail} />
+              <>
+                {taskRefreshError ? (
+                  <DetailSyncWarning
+                    scope="task"
+                    updatedAt={taskDetailUpdatedAt(taskDetail)}
+                    error={taskRefreshError}
+                  />
+                ) : null}
+                <TaskDetailView detail={taskDetail} />
+              </>
             ) : null}
           </div>
         ) : null}

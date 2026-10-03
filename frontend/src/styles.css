@@ -3284,6 +3284,27 @@ a:hover {
   padding: 16px 18px 30px;
 }
 
+.command-hall-drawer__sync-warning {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #d7a956;
+  border-left: 4px solid #9a6209;
+  border-radius: 5px;
+  background: #fff7e8;
+  color: #65420f;
+  padding: 10px 12px;
+}
+
+.command-hall-drawer__sync-warning strong {
+  font-size: 13px;
+}
+
+.command-hall-drawer__sync-warning span,
+.command-hall-drawer__sync-warning small {
+  color: #785116;
+  font-size: 12px;
+}
+
 .command-hall-drawer__roster,
 .command-hall-drawer__tasks,
 .command-hall-drawer__task-detail {

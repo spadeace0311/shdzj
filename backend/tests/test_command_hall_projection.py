@@ -675,7 +675,7 @@ async def test_worker_default_dispatches_projection_outbox(
                 )
 
 
-async def test_active_event_orders_formal_drill_test_then_other(
+async def test_active_event_orders_formal_drill_test_and_excludes_other_types(
     session, event_factory, revision_factory
 ):
     projector = CommandHallProjector()
@@ -683,7 +683,7 @@ async def test_active_event_orders_formal_drill_test_then_other(
 
     other = await event_factory(
         event_type="auto",
-        lifecycle_state="not_applicable",
+        lifecycle_state="auto_pending",
         origin_time=datetime(2026, 10, 3, 4, 0, tzinfo=UTC),
     )
     test = await event_factory(
@@ -717,7 +717,52 @@ async def test_active_event_orders_formal_drill_test_then_other(
 
     test.lifecycle_state = "not_applicable"
     await projector.refresh_event(session, test.id)
-    assert await service.active_event(session) == other.id
+    assert await service.active_event(session) is None
+
+
+async def test_active_event_prioritizes_manual_over_live_drill_and_test(
+    session, event_factory, revision_factory
+):
+    projector = CommandHallProjector()
+    service = CommandHallService()
+
+    test = await event_factory(
+        event_type="test",
+        lifecycle_state="active",
+        origin_time=datetime(2026, 10, 3, 4, 0, tzinfo=UTC),
+    )
+    drill = await event_factory(
+        event_type="drill",
+        lifecycle_state="active",
+        origin_time=datetime(2026, 10, 3, 3, 0, tzinfo=UTC),
+    )
+    manual = await event_factory(
+        event_type="manual",
+        lifecycle_state="not_applicable",
+        origin_time=datetime(2026, 10, 3, 2, 0, tzinfo=UTC),
+    )
+    for event in (test, drill, manual):
+        await revision_factory(event)
+        await projector.refresh_event(session, event.id)
+
+    assert await service.active_event(session) == manual.id
+
+
+async def test_active_event_excludes_auto_pending_when_no_allowed_event(
+    session, event_factory, revision_factory
+):
+    projector = CommandHallProjector()
+    service = CommandHallService()
+
+    auto = await event_factory(
+        event_type="auto",
+        lifecycle_state="auto_pending",
+        origin_time=datetime(2026, 10, 3, 4, 0, tzinfo=UTC),
+    )
+    await revision_factory(auto)
+    await projector.refresh_event(session, auto.id)
+
+    assert await service.active_event(session) is None
 
 
 async def test_overview_group_and_task_read_contracts(

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import User
@@ -51,10 +51,18 @@ class CommandHallService:
             CommandHallEventProjection.event_snapshot,
             "lifecycle_state",
         )
+        allowed_event = and_(
+            event_type.in_(("formal", "manual", "drill", "test")),
+            or_(
+                event_type == "manual",
+                lifecycle_state != "not_applicable",
+            ),
+        )
         rank = case(
+            (event_type == "manual", 1),
             (
                 and_(
-                    event_type.in_(("formal", "manual")),
+                    event_type == "formal",
                     lifecycle_state != "not_applicable",
                 ),
                 1,
@@ -77,6 +85,7 @@ class CommandHallService:
         )
         return await session.scalar(
             select(CommandHallEventProjection.event_id)
+            .where(allowed_event)
             .order_by(
                 rank,
                 func.jsonb_extract_path_text(
