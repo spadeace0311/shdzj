@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.collaboration.domain import TimelinessState
@@ -226,8 +227,10 @@ class DeadlineScheduler:
             key = (recipient_user_id, channel, dedupe_key)
             if key in existing:
                 continue
-            session.add(
-                NotificationDelivery(
+            result = await session.execute(
+                pg_insert(NotificationDelivery)
+                .values(
+                    id=uuid.uuid4(),
                     event_id=task.event_id,
                     task_id=task.id,
                     recipient_user_id=recipient_user_id,
@@ -240,9 +243,11 @@ class DeadlineScheduler:
                     created_at=observed_at,
                     updated_at=observed_at,
                 )
+                .on_conflict_do_nothing()
             )
-            existing.add(key)
-            created += 1
+            if result.rowcount == 1:
+                existing.add(key)
+                created += 1
         await session.flush()
         return 1 if created else 0
 

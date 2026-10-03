@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.auth.models import User
 from app.collaboration.domain import DutyRole
-from app.collaboration.models import NotificationDelivery, WorkgroupTask
+from app.collaboration.models import (
+    NotificationDelivery,
+    WorkgroupMembership,
+    WorkgroupTask,
+)
 from app.collaboration.notifications import (
     AdapterResult,
     DeadlineScheduler,
@@ -36,6 +41,14 @@ async def session():
                 await transaction.rollback()
     finally:
         await engine.dispose()
+
+
+@pytest.fixture
+async def isolated_session_factory():
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield session_factory
+    await engine.dispose()
 
 
 @pytest.fixture
@@ -178,6 +191,104 @@ def task_factory(session, event_factory, revision_factory, leader_factory):
         return task, leader
 
     return factory
+
+
+async def _seed_notification_task(
+    session,
+    *,
+    workgroup_code: str = "monitoring_forecast",
+) -> tuple[WorkgroupTask, User, EarthquakeEvent]:
+    event = EarthquakeEvent(
+        id=uuid.uuid4(),
+        source="notification-concurrency-test",
+        canonical_source_id=f"notification-concurrency-{uuid.uuid4().hex}",
+        event_type="formal",
+        origin_time=datetime(2026, 10, 3, 0, 0, tzinfo=UTC),
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.2"),
+        place="notification concurrency fixture",
+        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+        lifecycle_state="formal_triggered",
+    )
+    session.add(event)
+    await session.flush()
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source="notification-concurrency-test",
+        source_message_id=uuid.uuid4().hex,
+        message_kind="formal",
+        checksum=uuid.uuid4().hex,
+        payload={"event_id": str(event.id)},
+    )
+    session.add(raw)
+    await session.flush()
+    revision = EarthquakeRevision(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        raw_message_id=raw.id,
+        revision_no=1,
+        revision_kind="formal",
+        origin_time=event.origin_time,
+        longitude=event.longitude,
+        latitude=event.latitude,
+        depth_km=event.depth_km,
+        magnitude=event.magnitude,
+        place=event.place,
+        is_current=True,
+        ingested_at=datetime(2026, 10, 3, 0, 1, tzinfo=UTC),
+    )
+    session.add(revision)
+    await session.flush()
+    leader = User(
+        id=uuid.uuid4(),
+        username=f"notification-concurrency-{uuid.uuid4().hex[:8]}",
+        password_hash="not-used",
+        role="group_leader",
+        workgroup=workgroup_code,
+        is_active=True,
+    )
+    session.add(leader)
+    await session.flush()
+    service = RosterService()
+    await service.replace_group_members(
+        session,
+        workgroup_code,
+        [MemberInput(leader.id, DutyRole.LEADER)],
+        actor="system",
+    )
+    await service.snapshot_for_event(session, event.id)
+    await service.set_attendance(
+        session,
+        event.id,
+        workgroup_code,
+        leader.id,
+        "present",
+        "system",
+    )
+    task = WorkgroupTask(
+        event_id=event.id,
+        trigger_revision_id=revision.id,
+        task_code=f"notification-concurrency-{uuid.uuid4().hex}",
+        source_type="ad_hoc",
+        workgroup_code=workgroup_code,
+        title="Notification concurrency fixture",
+        instruction="Complete the task.",
+        priority=100,
+        status="pending",
+        timeliness_state="on_time",
+        phase_code="within_30m",
+        activated_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+        due_at=datetime(2026, 10, 3, 2, 0, tzinfo=UTC),
+        row_version=1,
+        created_by="system",
+        created_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 10, 3, 1, 0, tzinfo=UTC),
+    )
+    session.add(task)
+    await session.flush()
+    return task, leader, event
 
 
 async def _deliveries_for(session, task_id: uuid.UUID) -> list[NotificationDelivery]:
@@ -365,6 +476,61 @@ async def test_test_drill_external_channels_are_suppressed_during_active_formal(
     assert await session.get(EarthquakeEvent, formal.id) is not None
 
 
+async def test_dispatch_suppresses_pending_test_external_when_formal_becomes_active(
+    session,
+    event_factory,
+    task_factory,
+):
+    formal = await event_factory(
+        event_type="formal",
+        lifecycle_state="not_applicable",
+    )
+    test_event = await event_factory(
+        event_type="test",
+        lifecycle_state="not_applicable",
+    )
+    task, leader = await task_factory(event=test_event)
+    delivery = NotificationDelivery(
+        event_id=test_event.id,
+        task_id=task.id,
+        recipient_user_id=leader.id,
+        intent_type="assigned",
+        channel="wecom",
+        dedupe_key="assigned",
+        status="pending",
+        attempt_count=0,
+        available_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    session.add(delivery)
+    await session.flush()
+
+    formal.lifecycle_state = "formal_triggered"
+    await session.flush()
+    wecom_adapter = RecordingInAppAdapter()
+    in_app_adapter = RecordingInAppAdapter()
+    result = await NotificationService(
+        adapters={
+            "wecom": wecom_adapter,
+            "in_app": in_app_adapter,
+        }
+    ).dispatch_pending(session, limit=10)
+
+    assert result.fallback_sent == 1
+    assert wecom_adapter.calls == []
+    await session.refresh(delivery)
+    assert delivery.status == "fallback_sent"
+    fallback_row = await session.scalar(
+        select(NotificationDelivery).where(
+            NotificationDelivery.event_id == test_event.id,
+            NotificationDelivery.task_id == task.id,
+            NotificationDelivery.recipient_user_id == leader.id,
+            NotificationDelivery.channel == "in_app",
+            NotificationDelivery.dedupe_key == "assigned",
+        )
+    )
+    assert fallback_row is not None
+
+
 async def test_external_channels_are_not_suppressed_without_active_formal(
     session,
     event_factory,
@@ -396,3 +562,70 @@ async def test_external_channels_are_not_suppressed_without_active_formal(
     assert {"in_app", "wecom", "email", "phone"} <= {
         row.channel for row in rows
     }
+
+
+async def test_concurrent_scheduler_runs_do_not_duplicate_deliveries(
+    isolated_session_factory,
+):
+    async with isolated_session_factory() as seed_session:
+        async with seed_session.begin():
+            task, leader, event = await _seed_notification_task(seed_session)
+            task_id = task.id
+            leader_id = leader.id
+            event_id = event.id
+            raw_id = await seed_session.scalar(
+                select(EarthquakeRevision.raw_message_id).where(
+                    EarthquakeRevision.event_id == event_id
+                )
+            )
+
+    observed_at = datetime(2026, 10, 3, 1, 0, tzinfo=UTC)
+    scheduler = DeadlineScheduler(channels=("in_app", "wecom"))
+
+    async def insert_one():
+        async with isolated_session_factory() as current_session:
+            async with current_session.begin():
+                loaded_task = await current_session.get(WorkgroupTask, task_id)
+                assert loaded_task is not None
+                return await scheduler._ensure_deliveries(
+                    current_session,
+                    loaded_task,
+                    leader_id,
+                    intent_type="assigned",
+                    dedupe_key="assigned",
+                    observed_at=observed_at,
+                    allowed_channels=("in_app",),
+                    existing=set(),
+                )
+
+    results = await asyncio.gather(insert_one(), insert_one())
+
+    assert sorted(results) == [0, 1]
+    async with isolated_session_factory() as verify_session:
+        rows = (
+            await verify_session.scalars(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.task_id == task_id,
+                    NotificationDelivery.intent_type == "assigned",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+
+    async with isolated_session_factory() as cleanup_session:
+        async with cleanup_session.begin():
+            await cleanup_session.execute(
+                delete(WorkgroupMembership).where(
+                    WorkgroupMembership.user_id == leader_id
+                )
+            )
+            await cleanup_session.execute(
+                delete(User).where(User.id == leader_id)
+            )
+            await cleanup_session.execute(
+                delete(EarthquakeEvent).where(EarthquakeEvent.id == event_id)
+            )
+            if raw_id is not None:
+                await cleanup_session.execute(
+                    delete(RawMessage).where(RawMessage.id == raw_id)
+                )

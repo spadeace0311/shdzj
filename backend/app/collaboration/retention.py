@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,8 +41,8 @@ class CollaborationRetentionService:
     ) -> CollaborationRetentionResult:
         observed_at = _as_utc(observed_at)
         result = CollaborationRetentionResult()
-        for event_type, age_days in (("test", 400), ("drill", 730)):
-            cutoff = observed_at - timedelta(days=age_days)
+        for event_type in ("test", "drill"):
+            cutoff = self._cutoff_for(event_type, observed_at)
             deleted, protected, batches = await self._purge_event_type(
                 session,
                 event_type=event_type,
@@ -89,10 +90,11 @@ class CollaborationRetentionService:
                 select(EarthquakeEvent)
                 .where(
                     EarthquakeEvent.event_type == event_type,
-                    EarthquakeEvent.origin_time < cutoff,
+                    EarthquakeEvent.origin_time <= cutoff,
                 )
                 .order_by(EarthquakeEvent.id)
                 .limit(self._batch_size)
+                .with_for_update()
             )
             if cursor_id is not None:
                 statement = statement.where(EarthquakeEvent.id > cursor_id)
@@ -115,40 +117,53 @@ class CollaborationRetentionService:
         session: AsyncSession,
         event_id: object,
     ) -> bool:
-        active_task_id = await session.scalar(
-            select(WorkgroupTask.id)
+        tasks = (
+            await session.scalars(
+                select(WorkgroupTask)
             .where(
                 WorkgroupTask.event_id == event_id,
-                WorkgroupTask.status.in_(ACTIVE_TASK_STATUSES),
             )
-            .limit(1)
+                .with_for_update()
+            )
         )
-        if active_task_id is not None:
+        if any(task.status in ACTIVE_TASK_STATUSES for task in tasks):
             return True
 
-        active_outbox_id = await session.scalar(
-            select(EventLifecycleOutbox.id)
-            .where(
-                EventLifecycleOutbox.event_id == event_id,
-                EventLifecycleOutbox.status.in_(ACTIVE_OUTBOX_STATUSES),
+        outboxes = (
+            await session.scalars(
+                select(EventLifecycleOutbox)
+                .where(EventLifecycleOutbox.event_id == event_id)
+                .with_for_update()
             )
-            .limit(1)
         )
-        if active_outbox_id is not None:
+        if any(row.status in ACTIVE_OUTBOX_STATUSES for row in outboxes):
             return True
 
-        active_assessment_id = await session.scalar(
-            select(AssessmentRun.id)
-            .where(
-                AssessmentRun.event_id == event_id,
-                AssessmentRun.status.in_(ACTIVE_ASSESSMENT_STATUSES),
+        assessments = (
+            await session.scalars(
+                select(AssessmentRun)
+                .where(AssessmentRun.event_id == event_id)
+                .with_for_update()
             )
-            .limit(1)
         )
-        return active_assessment_id is not None
+        return any(row.status in ACTIVE_ASSESSMENT_STATUSES for row in assessments)
+
+    @staticmethod
+    def _cutoff_for(event_type: str, observed_at: datetime) -> datetime:
+        if event_type == "test":
+            return observed_at - timedelta(days=400)
+        if event_type == "drill":
+            return _subtract_calendar_years(observed_at, 2)
+        raise ValueError(f"unsupported event type: {event_type}")
 
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("observed_at must include timezone information")
     return value.astimezone(UTC)
+
+
+def _subtract_calendar_years(value: datetime, years: int) -> datetime:
+    target_year = value.year - years
+    target_day = min(value.day, calendar.monthrange(target_year, value.month)[1])
+    return value.replace(year=target_year, day=target_day)

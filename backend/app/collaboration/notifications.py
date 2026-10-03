@@ -9,7 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.collaboration.models import NotificationDelivery
-from app.collaboration.scheduler import DeadlineScheduler, SchedulerResult
+from app.collaboration.scheduler import (
+    ACTIVE_LIVE_EVENT_STATES,
+    EXTERNAL_CHANNELS,
+    DeadlineScheduler,
+    SchedulerResult,
+)
+from app.events.models import EarthquakeEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,9 +77,25 @@ class NotificationService:
                 .with_for_update(skip_locked=True)
             )
         ).all()
+        active_formal = await self._has_active_live_formal(session)
 
         result = DispatchResult()
         for delivery in rows:
+            event = await session.get(EarthquakeEvent, delivery.event_id)
+            if event is not None and self._suppress_external(
+                delivery.channel,
+                event,
+                active_formal,
+            ):
+                delivery.status = "fallback_sent"
+                delivery.sent_at = now
+                await self._ensure_in_app_delivery(session, delivery, now)
+                result = _replace(
+                    result,
+                    processed=result.processed + 1,
+                    fallback_sent=result.fallback_sent + 1,
+                )
+                continue
             result = await self._process_delivery(
                 session,
                 delivery,
@@ -82,6 +104,32 @@ class NotificationService:
             )
         await session.flush()
         return result
+
+    @staticmethod
+    async def _has_active_live_formal(
+        session: AsyncSession,
+    ) -> bool:
+        event_id = await session.scalar(
+            select(EarthquakeEvent.id)
+            .where(
+                EarthquakeEvent.event_type == "formal",
+                EarthquakeEvent.lifecycle_state.in_(ACTIVE_LIVE_EVENT_STATES),
+            )
+            .limit(1)
+        )
+        return event_id is not None
+
+    @staticmethod
+    def _suppress_external(
+        channel: str,
+        event: EarthquakeEvent,
+        active_formal: bool,
+    ) -> bool:
+        return (
+            channel in EXTERNAL_CHANNELS
+            and active_formal
+            and event.event_type in {"test", "drill"}
+        )
 
     async def _process_delivery(
         self,
