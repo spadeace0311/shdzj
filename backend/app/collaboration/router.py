@@ -1,7 +1,6 @@
 from collections.abc import AsyncIterator
 import json
 import logging
-from pathlib import Path
 from uuid import UUID
 
 from fastapi import (
@@ -17,13 +16,14 @@ from fastapi import (
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.artifacts.storage import ArtifactStore, StoredArtifactFile
+from app.artifacts.storage import ArtifactStore
 from app.auth.router import get_current_user, require_role
 from app.auth.service import AuthUser
 from app.collaboration.domain import DutyRole
 from app.collaboration.purge import (
     EventNotFoundError,
     SuperadminPurgeService,
+    cleanup_purged_event,
 )
 from app.collaboration.repository import CollaborationRepository
 from app.collaboration.roster import (
@@ -226,15 +226,12 @@ async def set_group_attendance(
     current_user: AuthUser = Depends(get_current_user),
 ) -> AttendanceResponse:
     try:
-        if (
-            current_user.role != "superadmin"
-            and not await service.can_manage_attendance(
-                session,
-                event_id,
-                code,
-                request.user_id,
-                current_user.username,
-            )
+        if current_user.role != "superadmin" and not await service.can_manage_attendance(
+            session,
+            event_id,
+            code,
+            request.user_id,
+            current_user.username,
         ):
             raise PermissionError("Insufficient permissions")
         attendance = await service.set_attendance(
@@ -246,10 +243,7 @@ async def set_group_attendance(
             current_user.username,
         )
         memberships = await service.list_group_memberships(session, code)
-        usernames = {
-            membership.user_id: user.username
-            for membership, user in memberships
-        }
+        usernames = {membership.user_id: user.username for membership, user in memberships}
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
@@ -299,9 +293,7 @@ async def list_collaboration_tasks(
 
     responses: list[WorkgroupTaskResponse] = []
     for task in tasks:
-        responses.append(
-            await _task_response(session, service, task, current_user)
-        )
+        responses.append(await _task_response(session, service, task, current_user))
     return responses
 
 
@@ -500,9 +492,7 @@ async def cancel_collaboration_task(
     request: TaskCancelRequest,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
-    temporary_service: TemporaryTaskService = Depends(
-        get_temporary_task_service
-    ),
+    temporary_service: TemporaryTaskService = Depends(get_temporary_task_service),
     current_user: AuthUser = Depends(get_current_user),
     if_match: str = Header(alias="If-Match"),
     idempotency_key: str | None = Header(
@@ -547,9 +537,7 @@ async def update_collaboration_task(
     request: TemporaryTaskUpdateRequest,
     session: AsyncSession = Depends(get_roster_session),
     service: CollaborationTaskService = Depends(get_task_service),
-    temporary_service: TemporaryTaskService = Depends(
-        get_temporary_task_service
-    ),
+    temporary_service: TemporaryTaskService = Depends(get_temporary_task_service),
     current_user: AuthUser = Depends(get_current_user),
     if_match: str = Header(alias="If-Match"),
     idempotency_key: str | None = Header(
@@ -572,9 +560,7 @@ async def update_collaboration_task(
                 instruction=request.instruction,
                 priority=request.priority,
                 due_at=request.due_at,
-                continues_until_cancelled=(
-                    request.continues_until_cancelled
-                ),
+                continues_until_cancelled=(request.continues_until_cancelled),
                 idempotency_key=idempotency_key,
             )
         else:
@@ -616,9 +602,7 @@ async def list_task_deliverables(
         )
         if not readable:
             raise PermissionError("Insufficient permissions")
-        deliverables = await service.repository.list_task_deliverables(
-            session, task_id
-        )
+        deliverables = await service.repository.list_task_deliverables(session, task_id)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
@@ -626,8 +610,7 @@ async def list_task_deliverables(
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
     return [
-        await _deliverable_response(session, service, deliverable)
-        for deliverable in deliverables
+        await _deliverable_response(session, service, deliverable) for deliverable in deliverables
     ]
 
 
@@ -892,36 +875,25 @@ async def purge_event(
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
-    if not _delete_storage_paths(result.storage_paths, artifact_store):
+    try:
+        async with session.begin():
+            cleanup_succeeded = await cleanup_purged_event(
+                session,
+                event_id,
+                result.storage_paths,
+                artifact_store,
+            )
+    except SQLAlchemyError as exc:
+        raise _storage_unavailable() from exc
+
+    if not cleanup_succeeded:
+        logger.warning(
+            "event purge object cleanup incomplete event_id=%s paths=%s",
+            event_id,
+            result.storage_paths,
+        )
         raise _storage_unavailable()
     return Response(status_code=204)
-
-
-def _delete_storage_paths(
-    storage_paths: tuple[str, ...],
-    artifact_store: ArtifactStore,
-) -> bool:
-    deleted_all = True
-    for relative_path in storage_paths:
-        try:
-            managed_path = artifact_store.resolve(relative_path)
-            artifact_store.delete_unreferenced(
-                StoredArtifactFile(
-                    file_name=Path(relative_path).name,
-                    relative_path=relative_path,
-                    managed_path=managed_path,
-                    size_bytes=0,
-                    checksum="",
-                )
-            )
-        except (OSError, ValueError):
-            deleted_all = False
-            logger.warning(
-                "event purge object cleanup failed path=%s",
-                relative_path,
-                exc_info=True,
-            )
-    return deleted_all
 
 
 def _membership_response(membership, user) -> MembershipResponse:
@@ -939,8 +911,7 @@ def _membership_response(membership, user) -> MembershipResponse:
 
 def _event_group_response(group: EventRosterGroup) -> EventWorkgroupResponse:
     usernames = {
-        UUID(str(entry["user_id"])): str(entry["username"])
-        for entry in _group_entries(group)
+        UUID(str(entry["user_id"])): str(entry["username"]) for entry in _group_entries(group)
     }
     return EventWorkgroupResponse(
         code=group.code,
@@ -949,12 +920,8 @@ def _event_group_response(group: EventRosterGroup) -> EventWorkgroupResponse:
         roster_version=group.roster_version,
         roster_fingerprint=group.roster_fingerprint,
         leader=_roster_member_response(group.leader) if group.leader else None,
-        deputies=[
-            _roster_member_response(entry) for entry in group.deputies
-        ],
-        members=[
-            _roster_member_response(entry) for entry in group.members
-        ],
+        deputies=[_roster_member_response(entry) for entry in group.deputies],
+        members=[_roster_member_response(entry) for entry in group.members],
         attendance=[
             _attendance_response(item, username=usernames.get(item.user_id))
             for item in group.attendance
@@ -977,9 +944,7 @@ def _roster_member_response(entry: dict[str, object]) -> RosterMemberResponse:
         username=str(entry["username"]),
         duty_role=DutyRole(str(entry["duty_role"])),
         deputy_order=(
-            int(entry["deputy_order"])
-            if entry.get("deputy_order") is not None
-            else None
+            int(entry["deputy_order"]) if entry.get("deputy_order") is not None else None
         ),
     )
 
@@ -1017,9 +982,7 @@ async def _task_response(
     task,
     current_user: AuthUser,
 ) -> WorkgroupTaskResponse:
-    contributors = await service.repository.list_contributors(
-        session, task.id
-    )
+    contributors = await service.repository.list_contributors(session, task.id)
     _, can_work, can_confirm = await _task_access(
         session,
         service,
@@ -1081,29 +1044,22 @@ async def _task_access(
         task.workgroup_code,
         actor.id,
     )
-    if (
-        membership is None
-        or membership.duty_role not in {"leader", "deputy", "member"}
-    ):
+    if membership is None or membership.duty_role not in {"leader", "deputy", "member"}:
         return False, False, False
 
-    snapshot = (
-        await service.roster_service.repository.get_roster_snapshot(
-            session,
-            task.event_id,
-            task.workgroup_code,
-        )
+    snapshot = await service.roster_service.repository.get_roster_snapshot(
+        session,
+        task.event_id,
+        task.workgroup_code,
     )
     snapshot_role = snapshot_role_for_user(snapshot, actor.id)
     if snapshot_role != membership.duty_role:
         return False, False, False
     can_work = True
-    authority = (
-        await service.roster_service.resolve_confirming_authority(
-            session,
-            task.event_id,
-            task.workgroup_code,
-        )
+    authority = await service.roster_service.resolve_confirming_authority(
+        session,
+        task.event_id,
+        task.workgroup_code,
     )
     can_confirm = (
         can_work
@@ -1119,14 +1075,8 @@ async def _deliverable_response(
     service: DeliverableService,
     deliverable,
 ) -> DeliverableResponse:
-    versions = await service.repository.list_deliverable_versions(
-        session, deliverable.id
-    )
-    current_publication = (
-        await service.repository.get_current_publication(
-            session, deliverable.id
-        )
-    )
+    versions = await service.repository.list_deliverable_versions(session, deliverable.id)
+    current_publication = await service.repository.get_current_publication(session, deliverable.id)
     current_version_id = (
         current_publication.version_id
         if current_publication is not None
@@ -1147,9 +1097,7 @@ async def _deliverable_response(
             if current_publication is not None
             else None
         ),
-        versions=[
-            _deliverable_version_response(version) for version in versions
-        ],
+        versions=[_deliverable_version_response(version) for version in versions],
     )
 
 

@@ -4,9 +4,11 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -420,9 +422,7 @@ def test_migration_head_includes_assessment_orchestration() -> None:
 async def _assessment_orchestration_tables_exist() -> bool:
     engine = create_async_engine(settings.database_url)
     async with engine.connect() as connection:
-        table_names = await connection.run_sync(
-            lambda sync: set(inspect(sync).get_table_names())
-        )
+        table_names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     await engine.dispose()
     return {"assessment_runs", "assessment_tasks"} <= table_names
 
@@ -430,9 +430,7 @@ async def _assessment_orchestration_tables_exist() -> bool:
 async def _intensity_tables_exist() -> bool:
     engine = create_async_engine(settings.database_url)
     async with engine.connect() as connection:
-        names = await connection.run_sync(
-            lambda sync: set(inspect(sync).get_table_names())
-        )
+        names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     await engine.dispose()
     return {
         "assessment_task_attempts",
@@ -445,9 +443,7 @@ async def _loss_tables_exist() -> bool:
     engine = create_async_engine(settings.database_url)
     try:
         async with engine.connect() as connection:
-            names = await connection.run_sync(
-                lambda sync: set(inspect(sync).get_table_names())
-            )
+            names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     finally:
         await engine.dispose()
     return LOSS_TABLES <= names
@@ -457,9 +453,7 @@ async def _artifact_tables_exist() -> bool:
     engine = create_async_engine(settings.database_url)
     try:
         async with engine.connect() as connection:
-            names = await connection.run_sync(
-                lambda sync: set(inspect(sync).get_table_names())
-            )
+            names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     finally:
         await engine.dispose()
     return ARTIFACT_TABLES <= names
@@ -469,12 +463,112 @@ async def _collaboration_tables_exist() -> bool:
     engine = create_async_engine(settings.database_url)
     try:
         async with engine.connect() as connection:
-            names = await connection.run_sync(
-                lambda sync: set(inspect(sync).get_table_names())
-            )
+            names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     finally:
         await engine.dispose()
     return COLLABORATION_TABLES <= names
+
+
+async def _event_purge_receipt_schema_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            table_names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+            if "event_purge_receipts" not in table_names:
+                return {"exists": False}
+            columns = await connection.run_sync(
+                lambda sync: {
+                    column["name"] for column in inspect(sync).get_columns("event_purge_receipts")
+                }
+            )
+            indexes = await connection.run_sync(
+                lambda sync: {
+                    index["name"]: bool(index["unique"])
+                    for index in inspect(sync).get_indexes("event_purge_receipts")
+                }
+            )
+    finally:
+        await engine.dispose()
+    return {
+        "exists": True,
+        "columns": columns,
+        "indexes": indexes,
+    }
+
+
+async def _exercise_event_purge_receipt_identity() -> None:
+    event_id = uuid.uuid4()
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM event_purge_receipts
+                    WHERE event_id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+            insert_sql = text(
+                """
+                INSERT INTO event_purge_receipts (
+                    id,
+                    event_id,
+                    idempotency_key,
+                    actor,
+                    deletion_counts,
+                    storage_paths
+                )
+                VALUES (
+                    :id,
+                    :event_id,
+                    :idempotency_key,
+                    'migration-test',
+                    '{}'::jsonb,
+                    '[]'::jsonb
+                )
+                """
+            )
+            await connection.execute(
+                insert_sql,
+                {
+                    "id": uuid.uuid4(),
+                    "event_id": event_id,
+                    "idempotency_key": "first-key",
+                },
+            )
+            await connection.execute(
+                insert_sql,
+                {
+                    "id": uuid.uuid4(),
+                    "event_id": event_id,
+                    "idempotency_key": "second-key",
+                },
+            )
+            with pytest.raises(IntegrityError):
+                async with connection.begin_nested():
+                    await connection.execute(
+                        insert_sql,
+                        {
+                            "id": uuid.uuid4(),
+                            "event_id": event_id,
+                            "idempotency_key": "first-key",
+                        },
+                    )
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM event_purge_receipts
+                    WHERE event_id = :event_id
+                    """
+                ),
+                {"event_id": event_id},
+            )
+    finally:
+        await engine.dispose()
 
 
 async def _production_snapshot_item_identity_nullability() -> dict[str, bool]:
@@ -484,9 +578,7 @@ async def _production_snapshot_item_identity_nullability() -> dict[str, bool]:
             columns = await connection.run_sync(
                 lambda sync: {
                     column["name"]: column["nullable"]
-                    for column in inspect(sync).get_columns(
-                        "production_input_snapshot_items"
-                    )
+                    for column in inspect(sync).get_columns("production_input_snapshot_items")
                 }
             )
     finally:
@@ -661,9 +753,7 @@ async def _missing_snapshot_item_state() -> dict[str, object]:
     return {
         "main_count": main_count,
         "archive_count": archive_count,
-        "identity": (
-            (identity[0], identity[1]) if identity is not None else None
-        ),
+        "identity": ((identity[0], identity[1]) if identity is not None else None),
     }
 
 
@@ -854,10 +944,7 @@ async def _intensity_schema_state() -> dict[str, object]:
                 for row in unique_constraint_rows
                 if row["table_name"] in tables
             },
-            "indexes": {
-                row["indexname"]
-                for row in index_rows
-            },
+            "indexes": {row["indexname"] for row in index_rows},
         }
     finally:
         await engine.dispose()
@@ -879,11 +966,7 @@ def _intensity_added_columns(state: dict[str, object]) -> set[tuple[str, str]]:
         ("earthquake_events", "latest_assessment_run_id"),
         ("earthquake_events", "effective_assessment_run_id"),
     }
-    return {
-        (table, column)
-        for table, column in expected
-        if column in columns.get(table, set())
-    }
+    return {(table, column) for table, column in expected if column in columns.get(table, set())}
 
 
 def _intensity_added_foreign_keys(state: dict[str, object]) -> set[tuple[str, str]]:
@@ -1083,9 +1166,7 @@ async def test_0009_backfills_non_cenc_events_and_downgrade_upgrade_is_reversibl
         upgraded = await _non_cenc_lifecycle_migration_state()
 
         assert "not_applicable" in upgraded["default"]
-        upgraded_rows = {
-            row["canonical_source_id"]: row for row in upgraded["rows"]
-        }
+        upgraded_rows = {row["canonical_source_id"]: row for row in upgraded["rows"]}
         for suffix in ("manual", "test", "drill"):
             row = upgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}"]
             assert row["lifecycle_state"] == "not_applicable"
@@ -1104,8 +1185,7 @@ async def test_0009_backfills_non_cenc_events_and_downgrade_upgrade_is_reversibl
         default_row = next(
             row
             for row in defaulted["rows"]
-            if row["canonical_source_id"]
-            == f"{NON_CENC_MIGRATION_TEST_PREFIX}default"
+            if row["canonical_source_id"] == f"{NON_CENC_MIGRATION_TEST_PREFIX}default"
         )
         assert default_row["lifecycle_state"] == "not_applicable"
         assert default_row["t1_at"] is None
@@ -1114,14 +1194,10 @@ async def test_0009_backfills_non_cenc_events_and_downgrade_upgrade_is_reversibl
         downgraded = await _non_cenc_lifecycle_migration_state()
 
         assert "auto_pending" in downgraded["default"]
-        downgraded_rows = {
-            row["canonical_source_id"]: row for row in downgraded["rows"]
-        }
+        downgraded_rows = {row["canonical_source_id"]: row for row in downgraded["rows"]}
         for suffix in ("manual", "test", "drill", "default"):
             assert (
-                downgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}"][
-                    "lifecycle_state"
-                ]
+                downgraded_rows[f"{NON_CENC_MIGRATION_TEST_PREFIX}{suffix}"]["lifecycle_state"]
                 == "auto_pending"
             )
 
@@ -1270,5 +1346,37 @@ async def test_0018_collaboration_command_hall_is_reversible() -> None:
     try:
         _set_revision(LATEST_REVISION)
         assert await _collaboration_tables_exist() is True
+    finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0019_event_purge_receipts_are_reversible() -> None:
+    previous_revision = "0018_collaboration_command_hall"
+    _set_revision(previous_revision)
+    assert (await _event_purge_receipt_schema_state())["exists"] is False
+    try:
+        _set_revision(LATEST_REVISION)
+        upgraded = await _event_purge_receipt_schema_state()
+        assert upgraded["exists"] is True
+        assert upgraded["columns"] == {
+            "id",
+            "event_id",
+            "idempotency_key",
+            "actor",
+            "deletion_counts",
+            "storage_paths",
+            "purged_at",
+        }
+        assert upgraded["indexes"] == {
+            "uq_event_purge_receipt_event_key": True,
+            "ix_event_purge_receipts_purged_at": False,
+        }
+        await _exercise_event_purge_receipt_identity()
+
+        _set_revision(previous_revision)
+        assert (await _event_purge_receipt_schema_state())["exists"] is False
+
+        _set_revision(LATEST_REVISION)
+        assert (await _event_purge_receipt_schema_state())["exists"] is True
     finally:
         _set_revision(LATEST_REVISION)

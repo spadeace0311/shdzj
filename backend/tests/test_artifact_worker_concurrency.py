@@ -159,13 +159,15 @@ async def test_render_activity_heartbeats_during_long_render(
         render_concurrency=1,
         heartbeat_interval=0.01,
     )
-    async def noop_commit(*args, **kwargs):
+
+    async def noop_store(*args, **kwargs):
         del args, kwargs
+        return SimpleNamespace(checksum="a" * 64)
 
     monkeypatch.setattr(
         activities,
-        "_commit_rendered_artifact",
-        noop_commit,
+        "_store_and_commit_rendered_artifact",
+        noop_store,
     )
     source = tmp_path / "source.jpg"
     source.write_bytes(b"image")
@@ -292,6 +294,15 @@ async def test_production_worker_entry_starts_and_stops_retention(
         artifact_worker,
         "_run_retention_loop",
         retention_loop,
+    )
+
+    async def connect_temporal(_configured):
+        return object()
+
+    monkeypatch.setattr(
+        artifact_worker,
+        "_connect_temporal",
+        connect_temporal,
     )
 
     process_task = asyncio.create_task(artifact_worker._run_process("worker"))

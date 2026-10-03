@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import (
     DateTime,
@@ -25,6 +26,7 @@ from app.artifacts.models import (
     ProductionRun,
     ProductionTask,
 )
+from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.collaboration.models import (
     CollaborationOutbox,
@@ -47,6 +49,11 @@ from app.events.models import (
     EarthquakeRevision,
     EventLifecycleOutbox,
     RawMessage,
+)
+from app.event_object_locks import (
+    lock_artifact_object,
+    lock_event_write,
+    unreferenced_storage_paths,
 )
 
 
@@ -111,6 +118,7 @@ class SuperadminPurgeService:
             raise PermissionError("Insufficient permissions")
 
         key = _idempotency_key(event_id, idempotency_key)
+        await lock_event_write(session, event_id, exclusive=True)
         event = await session.scalar(
             select(EarthquakeEvent).where(EarthquakeEvent.id == event_id).with_for_update()
         )
@@ -123,13 +131,7 @@ class SuperadminPurgeService:
             .with_for_update()
         )
         if existing_receipt is not None:
-            receipt_paths = {str(path) for path in (existing_receipt.storage_paths or ())}
-            await _lock_storage_paths(session, receipt_paths)
-            storage_paths = await _unreferenced_paths(
-                session,
-                receipt_paths,
-            )
-            return _result_from_receipt(existing_receipt, storage_paths)
+            return _result_from_receipt(existing_receipt)
         if event is None:
             raise EventNotFoundError("event_not_found")
 
@@ -249,7 +251,8 @@ class SuperadminPurgeService:
             ).all()
         )
         candidate_paths = {path for path in artifact_paths | manual_paths if path}
-        await _lock_storage_paths(session, candidate_paths)
+        for storage_path in sorted(candidate_paths):
+            await lock_artifact_object(session, storage_path)
 
         if override_ids:
             await session.execute(
@@ -340,7 +343,7 @@ class SuperadminPurgeService:
         await session.delete(event)
         await session.flush()
 
-        storage_paths = await _unreferenced_paths(session, candidate_paths)
+        storage_paths = tuple(sorted(candidate_paths))
         result = PurgeResult(
             deleted_event_id=event_id,
             deleted_revision_count=len(revision_ids),
@@ -367,42 +370,36 @@ class SuperadminPurgeService:
         return result
 
 
-async def _unreferenced_paths(
+async def cleanup_purged_event(
     session: AsyncSession,
-    candidate_paths: set[str],
-) -> tuple[str, ...]:
-    unreferenced: list[str] = []
+    event_id: uuid.UUID,
+    storage_paths: tuple[str, ...],
+    artifact_store: ArtifactStore,
+) -> bool:
+    candidate_paths = {str(path) for path in storage_paths if path}
+    await lock_event_write(session, event_id, exclusive=True)
     for storage_path in sorted(candidate_paths):
-        generated_references = int(
-            await session.scalar(
-                select(func.count())
-                .select_from(GeneratedArtifact)
-                .where(GeneratedArtifact.storage_path == storage_path)
-            )
-            or 0
-        )
-        manual_references = int(
-            await session.scalar(
-                select(func.count())
-                .select_from(TaskDeliverableVersion)
-                .where(TaskDeliverableVersion.storage_key == storage_path)
-            )
-            or 0
-        )
-        if generated_references == 0 and manual_references == 0:
-            unreferenced.append(storage_path)
-    return tuple(unreferenced)
+        await lock_artifact_object(session, storage_path)
 
-
-async def _lock_storage_paths(
-    session: AsyncSession,
-    storage_paths: set[str],
-) -> None:
-    for storage_path in sorted(storage_paths):
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(" "hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"artifact-object:{storage_path}"},
-        )
+    deleted_all = True
+    for storage_path in await unreferenced_storage_paths(
+        session,
+        candidate_paths,
+    ):
+        try:
+            managed_path = artifact_store.resolve(storage_path)
+            artifact_store.delete_unreferenced(
+                StoredArtifactFile(
+                    file_name=Path(storage_path).name,
+                    relative_path=storage_path,
+                    managed_path=managed_path,
+                    size_bytes=0,
+                    checksum="",
+                )
+            )
+        except (OSError, ValueError):
+            deleted_all = False
+    return deleted_all
 
 
 def _idempotency_key(

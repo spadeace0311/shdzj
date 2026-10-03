@@ -29,14 +29,16 @@ from app.collaboration.models import (
 from app.collaboration.repository import CollaborationRepository
 from app.collaboration.roster import RosterService, snapshot_role_for_user
 from app.config import settings
+from app.event_object_locks import (
+    lock_artifact_object,
+    lock_event_write,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 
 
 class StaleTaskVersion(Exception):
     def __init__(self, expected_version: int, actual_version: int) -> None:
-        super().__init__(
-            f"expected task version {expected_version}, found {actual_version}"
-        )
+        super().__init__(f"expected task version {expected_version}, found {actual_version}")
         self.expected_version = expected_version
         self.actual_version = actual_version
 
@@ -191,9 +193,7 @@ class CollaborationTaskService:
         if already_applied:
             return task
         self._ensure_transition(task.status, TaskStatus.IN_PROGRESS)
-        if not await self._can_confirm(
-            session, task, actor_identity
-        ):
+        if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
 
         now = datetime.now(UTC)
@@ -234,16 +234,10 @@ class CollaborationTaskService:
         if already_applied:
             return task
         self._ensure_transition(task.status, TaskStatus.COMPLETED)
-        if not await self._can_confirm(
-            session, task, actor_identity
-        ):
+        if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
-        if not await self.repository.required_deliverables_satisfied(
-            session, task.id
-        ):
-            raise MissingRequiredDeliverableError(
-                "task has unsatisfied required deliverables"
-            )
+        if not await self.repository.required_deliverables_satisfied(session, task.id):
+            raise MissingRequiredDeliverableError("task has unsatisfied required deliverables")
 
         now = datetime.now(UTC)
         self._apply_transition(task, TaskStatus.COMPLETED, now=now)
@@ -285,9 +279,7 @@ class CollaborationTaskService:
         if already_applied:
             return task
         self._ensure_transition(task.status, TaskStatus.NOT_REQUIRED)
-        if not await self._can_confirm(
-            session, task, actor_identity
-        ):
+        if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
 
         now = datetime.now(UTC)
@@ -333,9 +325,7 @@ class CollaborationTaskService:
         )
         if already_applied:
             return task
-        if not await self._can_confirm(
-            session, task, actor_identity
-        ):
+        if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
 
         now = datetime.now(UTC)
@@ -383,14 +373,10 @@ class CollaborationTaskService:
         idempotency_key: str | None,
         event_type: str,
     ) -> tuple[WorkgroupTask, _Actor, bool]:
-        task = await self.repository.get_task(
-            session, task_id, for_update=True
-        )
+        task = await self.repository.get_task(session, task_id, for_update=True)
         if task is None:
             raise LookupError("task_not_found")
-        actor_identity = await _resolve_actor(
-            session, self.repository, actor
-        )
+        actor_identity = await _resolve_actor(session, self.repository, actor)
 
         if idempotency_key is not None:
             previous = await self.repository.get_event_by_idempotency_key(
@@ -422,22 +408,14 @@ class CollaborationTaskService:
         membership = await self.repository.get_active_membership(
             session, task.workgroup_code, actor.user_id
         )
-        if (
-            membership is None
-            or membership.duty_role not in _GROUP_WORK_ROLES
-        ):
+        if membership is None or membership.duty_role not in _GROUP_WORK_ROLES:
             return False
-        snapshot = (
-            await self.roster_service.repository.get_roster_snapshot(
-                session,
-                task.event_id,
-                task.workgroup_code,
-            )
+        snapshot = await self.roster_service.repository.get_roster_snapshot(
+            session,
+            task.event_id,
+            task.workgroup_code,
         )
-        return (
-            snapshot_role_for_user(snapshot, actor.user_id)
-            in _GROUP_WORK_ROLES
-        )
+        return snapshot_role_for_user(snapshot, actor.user_id) in _GROUP_WORK_ROLES
 
     async def _can_confirm(
         self,
@@ -459,10 +437,7 @@ class CollaborationTaskService:
             task.workgroup_code,
             actor.user_id,
         )
-        return (
-            membership is not None
-            and membership.duty_role == authority.role.value
-        )
+        return membership is not None and membership.duty_role == authority.role.value
 
     @staticmethod
     def _ensure_transition(
@@ -474,8 +449,7 @@ class CollaborationTaskService:
             raise ValueError(f"task status {current.value} cannot transition")
         if target_status not in ALLOWED_TRANSITIONS[current]:
             raise ValueError(
-                f"task cannot transition from {current.value} "
-                f"to {target_status.value}"
+                f"task cannot transition from {current.value} " f"to {target_status.value}"
             )
 
     @staticmethod
@@ -516,6 +490,23 @@ async def _resolve_actor(
     )
 
 
+async def _event_id_for_deliverable(
+    session: AsyncSession,
+    deliverable_id: uuid.UUID,
+) -> uuid.UUID:
+    event_id = await session.scalar(
+        select(WorkgroupTask.event_id)
+        .join(
+            TaskDeliverable,
+            TaskDeliverable.task_id == WorkgroupTask.id,
+        )
+        .where(TaskDeliverable.id == deliverable_id)
+    )
+    if event_id is None:
+        raise LookupError("deliverable_not_found")
+    return event_id
+
+
 def _validate_idempotent_replay(
     previous: CollaborationTaskEvent,
     actor: _Actor,
@@ -524,9 +515,7 @@ def _validate_idempotent_replay(
     resource_identity: dict[str, object] | None = None,
 ) -> None:
     if previous.event_type != event_type:
-        raise ValueError(
-            "idempotency key was used for a different operation"
-        )
+        raise ValueError("idempotency key was used for a different operation")
     if resource_identity is not None:
         _validate_resource_identity(previous, resource_identity)
     stored_actor_id = previous.payload.get("actor_id")
@@ -548,9 +537,7 @@ def _validate_resource_identity(
     for field, expected in resource_identity.items():
         actual = previous.payload.get(field)
         if actual is None or str(actual) != str(expected):
-            raise ValueError(
-                "idempotency key was used for a different resource"
-            )
+            raise ValueError("idempotency key was used for a different resource")
 
 
 async def _append_ledger(
@@ -670,11 +657,7 @@ class TemporaryTaskService(CollaborationTaskService):
             "title": title,
             "instruction": instruction,
             "priority": priority,
-            "due_at": (
-                due_at.isoformat()
-                if due_at is not None
-                else None
-            ),
+            "due_at": (due_at.isoformat() if due_at is not None else None),
             "continues_until_cancelled": continues_until_cancelled,
         }
         existing = await self._existing_creation(
@@ -807,9 +790,7 @@ class TemporaryTaskService(CollaborationTaskService):
 
         if task.status != TaskStatus.PENDING.value:
             if title is not None or priority is not None:
-                raise ValueError(
-                    "title and priority cannot change after a task starts"
-                )
+                raise ValueError("title and priority cannot change after a task starts")
 
         changes: dict[str, Any] = {}
         if title is not None:
@@ -832,14 +813,8 @@ class TemporaryTaskService(CollaborationTaskService):
                 continues_until_cancelled,
             )
             task.due_at = resolved_due
-            changes["due_at"] = (
-                resolved_due.isoformat()
-                if resolved_due is not None
-                else None
-            )
-            changes["continues_until_cancelled"] = (
-                resolved_due is None
-            )
+            changes["due_at"] = resolved_due.isoformat() if resolved_due is not None else None
+            changes["continues_until_cancelled"] = resolved_due is None
 
         if not changes:
             raise ValueError("no changes supplied")
@@ -932,9 +907,7 @@ class TemporaryTaskService(CollaborationTaskService):
             for_update=True,
         )
         if task is None or task.source_type != TaskSourceType.AD_HOC.value:
-            raise ValueError(
-                "idempotency key was used for a different operation"
-            )
+            raise ValueError("idempotency key was used for a different operation")
         _validate_idempotent_replay(
             previous,
             actor_identity,
@@ -955,10 +928,7 @@ class TemporaryTaskService(CollaborationTaskService):
             WorkgroupCode.COMPREHENSIVE_COORDINATION.value,
             actor.user_id,
         )
-        return (
-            membership is not None
-            and membership.duty_role in _GROUP_WORK_ROLES
-        )
+        return membership is not None and membership.duty_role in _GROUP_WORK_ROLES
 
     @staticmethod
     async def _can_manage_temporary_task(
@@ -997,13 +967,9 @@ class TemporaryTaskService(CollaborationTaskService):
         continues_until_cancelled: bool,
     ) -> datetime | None:
         if due_at is not None and continues_until_cancelled:
-            raise ValueError(
-                "due_at cannot be combined with continues_until_cancelled"
-            )
+            raise ValueError("due_at cannot be combined with continues_until_cancelled")
         if due_at is None and not continues_until_cancelled:
-            raise ValueError(
-                "due_at or continues_until_cancelled is required"
-            )
+            raise ValueError("due_at or continues_until_cancelled is required")
         return _normalize_utc(due_at)
 
     @staticmethod
@@ -1012,17 +978,13 @@ class TemporaryTaskService(CollaborationTaskService):
         continues_until_cancelled: bool | None,
     ) -> datetime | None:
         if due_at is not None and continues_until_cancelled is True:
-            raise ValueError(
-                "due_at cannot be combined with continues_until_cancelled"
-            )
+            raise ValueError("due_at cannot be combined with continues_until_cancelled")
         if continues_until_cancelled is True:
             return None
         if due_at is not None:
             return _normalize_utc(due_at)
         if continues_until_cancelled is False:
-            raise ValueError(
-                "due_at is required when continues_until_cancelled is false"
-            )
+            raise ValueError("due_at is required when continues_until_cancelled is false")
         return _normalize_utc(due_at)
 
 
@@ -1036,9 +998,7 @@ class DeliverableService:
     ) -> None:
         self.repository = repository or CollaborationRepository()
         self.roster_service = roster_service or RosterService()
-        self.artifact_store = artifact_store or ArtifactStore(
-            settings.artifact_storage_root
-        )
+        self.artifact_store = artifact_store or ArtifactStore(settings.artifact_storage_root)
 
     async def add_text_version(
         self,
@@ -1051,20 +1011,16 @@ class DeliverableService:
         idempotency_key: str | None = None,
         expected_version: int | None = None,
     ) -> TaskDeliverableVersion:
-        deliverable, task, actor_identity, previous = (
-            await self._lock_deliverable(
-                session,
-                deliverable_id,
-                actor,
-                expected_version=expected_version,
-                idempotency_key=idempotency_key,
-                event_type="deliverable_version_added",
-            )
+        deliverable, task, actor_identity, previous = await self._lock_deliverable(
+            session,
+            deliverable_id,
+            actor,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            event_type="deliverable_version_added",
         )
         if previous is not None:
-            return await self._version_from_event(
-                session, task, idempotency_key
-            )
+            return await self._version_from_event(session, task, idempotency_key)
         if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
         if not isinstance(text_result, dict) or not text_result:
@@ -1095,25 +1051,24 @@ class DeliverableService:
         idempotency_key: str | None = None,
         expected_version: int | None = None,
     ) -> TaskDeliverableVersion:
-        deliverable, task, actor_identity, previous = (
-            await self._lock_deliverable(
-                session,
-                deliverable_id,
-                actor,
-                expected_version=expected_version,
-                idempotency_key=idempotency_key,
-                event_type="deliverable_version_added",
-            )
+        event_id = await _event_id_for_deliverable(session, deliverable_id)
+        await lock_event_write(session, event_id)
+        deliverable, task, actor_identity, previous = await self._lock_deliverable(
+            session,
+            deliverable_id,
+            actor,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            event_type="deliverable_version_added",
         )
         if previous is not None:
-            return await self._version_from_event(
-                session, task, idempotency_key
-            )
+            return await self._version_from_event(session, task, idempotency_key)
         if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
 
-        stored = self.artifact_store.store_immutable_stream(
-            source,
+        stored = await self._store_manual_object(
+            session,
+            source=source,
             file_name=file_name,
         )
         return await self._create_version(
@@ -1191,20 +1146,18 @@ class DeliverableService:
         idempotency_key: str | None = None,
         expected_version: int | None = None,
     ) -> TaskDeliverablePublication:
-        deliverable, task, actor_identity, previous = (
-            await self._lock_deliverable(
-                session,
-                deliverable_id,
-                actor,
-                expected_version=expected_version,
-                idempotency_key=idempotency_key,
-                event_type="deliverable_override_published",
-            )
+        event_id = await _event_id_for_deliverable(session, deliverable_id)
+        await lock_event_write(session, event_id)
+        deliverable, task, actor_identity, previous = await self._lock_deliverable(
+            session,
+            deliverable_id,
+            actor,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            event_type="deliverable_override_published",
         )
         if previous is not None:
-            return await self._publication_from_event(
-                session, task, idempotency_key
-            )
+            return await self._publication_from_event(session, task, idempotency_key)
         if actor_identity.role != "superadmin":
             raise PermissionError("Insufficient permissions")
 
@@ -1242,15 +1195,11 @@ class DeliverableService:
         expected_version: int | None = None,
     ) -> None:
         if idempotency_key is not None:
-            previous = (
-                await self.repository.get_event_by_idempotency_key_any(
-                    session, idempotency_key
-                )
+            previous = await self.repository.get_event_by_idempotency_key_any(
+                session, idempotency_key
             )
             if previous is not None:
-                actor_identity = await _resolve_actor(
-                    session, self.repository, actor
-                )
+                actor_identity = await _resolve_actor(session, self.repository, actor)
                 _validate_idempotent_replay(
                     previous,
                     actor_identity,
@@ -1259,24 +1208,19 @@ class DeliverableService:
                 )
                 return
 
-        deliverable, task, version, actor_identity, previous = (
-            await self._lock_version(
-                session,
-                version_id,
-                actor,
-                expected_version=expected_version,
-                idempotency_key=idempotency_key,
-                event_type="deliverable_candidate_deleted",
-            )
+        deliverable, task, version, actor_identity, previous = await self._lock_version(
+            session,
+            version_id,
+            actor,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            event_type="deliverable_candidate_deleted",
         )
         if previous is not None:
             return
         if version.source_kind != DeliverableSourceKind.MANUAL.value:
             raise ValueError("only manual candidate versions can be deleted")
-        if (
-            await self.repository.publication_for_version(session, version.id)
-            is not None
-        ):
+        if await self.repository.publication_for_version(session, version.id) is not None:
             raise ValueError("published versions cannot be deleted")
 
         can_delete = actor_identity.username == version.created_by
@@ -1291,20 +1235,16 @@ class DeliverableService:
 
         stored_for_cleanup: StoredArtifactFile | None = None
         if version.storage_key is not None:
-            reference_count = (
-                await self.repository.storage_key_reference_count(
-                    session,
-                    version.storage_key,
-                    exclude_version_id=version.id,
-                )
+            reference_count = await self.repository.storage_key_reference_count(
+                session,
+                version.storage_key,
+                exclude_version_id=version.id,
             )
             if reference_count == 0:
                 stored_for_cleanup = StoredArtifactFile(
                     file_name=version.file_name or "",
                     relative_path=version.storage_key,
-                    managed_path=self.artifact_store.resolve(
-                        version.storage_key
-                    ),
+                    managed_path=self.artifact_store.resolve(version.storage_key),
                     size_bytes=version.size_bytes or 0,
                     checksum=version.checksum or "",
                 )
@@ -1340,9 +1280,7 @@ class DeliverableService:
         session: AsyncSession,
         deliverable_id: uuid.UUID,
     ) -> uuid.UUID | None:
-        return await self.repository.current_version_id(
-            session, deliverable_id
-        )
+        return await self.repository.current_version_id(session, deliverable_id)
 
     async def _publish_existing_version(
         self,
@@ -1356,36 +1294,30 @@ class DeliverableService:
         expected_version: int | None,
         event_type: str,
     ) -> TaskDeliverablePublication:
-        deliverable, task, actor_identity, previous = (
-            await self._lock_deliverable(
-                session,
-                deliverable_id,
-                actor,
-                expected_version=expected_version,
-                idempotency_key=idempotency_key,
-                event_type=event_type,
-            )
+        event_id = await _event_id_for_deliverable(session, deliverable_id)
+        await lock_event_write(session, event_id)
+        deliverable, task, actor_identity, previous = await self._lock_deliverable(
+            session,
+            deliverable_id,
+            actor,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            event_type=event_type,
         )
         if previous is not None:
             _validate_resource_identity(
                 previous,
                 {"version_id": version_id},
             )
-            return await self._publication_from_event(
-                session, task, idempotency_key
-            )
+            return await self._publication_from_event(session, task, idempotency_key)
 
-        published_role = await self._confirming_role(
-            session, task, actor_identity
-        )
+        published_role = await self._confirming_role(session, task, actor_identity)
         version = await self.repository.get_deliverable_version(
             session, version_id, for_update=True
         )
         if version is None or version.deliverable_id != deliverable.id:
             raise ValueError("version does not belong to deliverable")
-        await _validate_version_for_publication(
-            session, version, self.artifact_store
-        )
+        await _validate_version_for_publication(session, version, self.artifact_store)
         return await self._create_publication(
             session,
             deliverable,
@@ -1416,9 +1348,7 @@ class DeliverableService:
         idempotency_key: str | None,
     ) -> TaskDeliverableVersion:
         now = datetime.now(UTC)
-        version_no = await self.repository.next_deliverable_version_no(
-            session, deliverable.id
-        )
+        version_no = await self.repository.next_deliverable_version_no(session, deliverable.id)
         previous = await self.repository.latest_deliverable_version(
             session, deliverable.id, for_update=True
         )
@@ -1531,16 +1461,15 @@ class DeliverableService:
         text_result: dict[str, Any] | None,
         basis_text: str | None,
     ) -> TaskDeliverableVersion:
-        next_version = await self.repository.next_deliverable_version_no(
-            session, deliverable.id
-        )
+        next_version = await self.repository.next_deliverable_version_no(session, deliverable.id)
         previous = await self.repository.latest_deliverable_version(
             session, deliverable.id, for_update=True
         )
         if source is not None:
             if not file_name:
                 raise ValueError("file_name is required for file overrides")
-            stored = self.artifact_store.store_immutable_stream(
+            stored = await self._store_manual_object(
+                session,
                 source,
                 file_name=file_name,
             )
@@ -1570,6 +1499,28 @@ class DeliverableService:
             supersedes_version_id=previous.id if previous is not None else None,
         )
 
+    async def _store_manual_object(
+        self,
+        session: AsyncSession,
+        source: BinaryIO,
+        *,
+        file_name: str,
+    ) -> StoredArtifactFile:
+        staged = self.artifact_store.stage(source, file_name=file_name)
+        try:
+            checksum = _sha256_file(staged)
+            relative_path = self.artifact_store.relative_path_for(
+                checksum,
+                file_name=file_name,
+            )
+            await lock_artifact_object(session, relative_path)
+            return self.artifact_store.store_immutable(
+                staged,
+                file_name=file_name,
+            )
+        finally:
+            staged.unlink(missing_ok=True)
+
     async def _lock_deliverable(
         self,
         session: AsyncSession,
@@ -1585,19 +1536,13 @@ class DeliverableService:
         _Actor,
         CollaborationTaskEvent | None,
     ]:
-        deliverable = await self.repository.get_deliverable(
-            session, deliverable_id
-        )
+        deliverable = await self.repository.get_deliverable(session, deliverable_id)
         if deliverable is None:
             raise LookupError("deliverable_not_found")
-        task = await self.repository.get_task(
-            session, deliverable.task_id, for_update=True
-        )
+        task = await self.repository.get_task(session, deliverable.task_id, for_update=True)
         if task is None:
             raise LookupError("task_not_found")
-        actor_identity = await _resolve_actor(
-            session, self.repository, actor
-        )
+        actor_identity = await _resolve_actor(session, self.repository, actor)
         if idempotency_key is not None:
             previous = await self.repository.get_event_by_idempotency_key(
                 session, task.id, idempotency_key
@@ -1612,9 +1557,7 @@ class DeliverableService:
                     },
                 )
                 return deliverable, task, actor_identity, previous
-        if expected_version is not None and int(task.row_version) != int(
-            expected_version
-        ):
+        if expected_version is not None and int(task.row_version) != int(expected_version):
             raise StaleTaskVersion(
                 expected_version=int(expected_version),
                 actual_version=task.row_version,
@@ -1642,24 +1585,16 @@ class DeliverableService:
         _Actor,
         CollaborationTaskEvent | None,
     ]:
-        version = await self.repository.get_deliverable_version(
-            session, version_id
-        )
+        version = await self.repository.get_deliverable_version(session, version_id)
         if version is None:
             raise LookupError("deliverable_version_not_found")
-        deliverable = await self.repository.get_deliverable(
-            session, version.deliverable_id
-        )
+        deliverable = await self.repository.get_deliverable(session, version.deliverable_id)
         if deliverable is None:
             raise LookupError("deliverable_not_found")
-        task = await self.repository.get_task(
-            session, deliverable.task_id, for_update=True
-        )
+        task = await self.repository.get_task(session, deliverable.task_id, for_update=True)
         if task is None:
             raise LookupError("task_not_found")
-        actor_identity = await _resolve_actor(
-            session, self.repository, actor
-        )
+        actor_identity = await _resolve_actor(session, self.repository, actor)
         if idempotency_key is not None:
             previous = await self.repository.get_event_by_idempotency_key(
                 session, task.id, idempotency_key
@@ -1674,9 +1609,7 @@ class DeliverableService:
                     },
                 )
                 return deliverable, task, version, actor_identity, previous
-        if expected_version is not None and int(task.row_version) != int(
-            expected_version
-        ):
+        if expected_version is not None and int(task.row_version) != int(expected_version):
             raise StaleTaskVersion(
                 expected_version=int(expected_version),
                 actual_version=task.row_version,
@@ -1703,9 +1636,7 @@ class DeliverableService:
         )
         assert previous is not None
         version_id = uuid.UUID(str(previous.payload["version_id"]))
-        version = await self.repository.get_deliverable_version(
-            session, version_id
-        )
+        version = await self.repository.get_deliverable_version(session, version_id)
         if version is None:
             raise LookupError("deliverable_version_not_found")
         return version
@@ -1722,9 +1653,7 @@ class DeliverableService:
         )
         assert previous is not None
         publication_id = uuid.UUID(str(previous.payload["publication_id"]))
-        publication = await self.repository.get_publication(
-            session, publication_id
-        )
+        publication = await self.repository.get_publication(session, publication_id)
         if publication is None:
             raise LookupError("deliverable_publication_not_found")
         return publication
@@ -1740,22 +1669,14 @@ class DeliverableService:
         membership = await self.repository.get_active_membership(
             session, task.workgroup_code, actor.user_id
         )
-        if (
-            membership is None
-            or membership.duty_role not in _GROUP_WORK_ROLES
-        ):
+        if membership is None or membership.duty_role not in _GROUP_WORK_ROLES:
             return False
-        snapshot = (
-            await self.roster_service.repository.get_roster_snapshot(
-                session,
-                task.event_id,
-                task.workgroup_code,
-            )
+        snapshot = await self.roster_service.repository.get_roster_snapshot(
+            session,
+            task.event_id,
+            task.workgroup_code,
         )
-        return (
-            snapshot_role_for_user(snapshot, actor.user_id)
-            in _GROUP_WORK_ROLES
-        )
+        return snapshot_role_for_user(snapshot, actor.user_id) in _GROUP_WORK_ROLES
 
     async def _confirming_role(
         self,
@@ -1777,12 +1698,10 @@ class DeliverableService:
             task.workgroup_code,
             actor.user_id,
         )
-        if (
-            membership is None
-            or membership.duty_role != authority.role.value
-        ):
+        if membership is None or membership.duty_role != authority.role.value:
             raise PermissionError("Insufficient permissions")
         return authority.role.value
+
 
 async def _validate_version_for_publication(
     session: AsyncSession,

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, event, func, select
+from sqlalchemy import delete, event, func, select, text
 
 from app.artifacts.models import (
     ArtifactOverrideRequest,
@@ -25,7 +29,10 @@ from app.artifacts.repository import (
     ArtifactQuality,
     CreateProductionRunCommand,
 )
-from app.artifacts.storage import StoredArtifactFile
+from app.artifacts.renderers.base import RenderQuality, RenderResult
+from app.artifacts.storage import ArtifactStore, StoredArtifactFile
+from app.artifacts.worker import ArtifactActivities
+from app.artifacts.workflow import ArtifactTaskActivityInput
 from app.assessment.models import AssessmentRun, AssessmentTask
 from app.auth.models import User
 from app.auth.router import get_current_user
@@ -49,6 +56,7 @@ from app.collaboration.purge import (
     SuperadminPurgeService,
 )
 from app.collaboration.router import get_artifact_store, get_purge_session
+from app.collaboration.service import DeliverableService
 from app.config import settings
 from app.data_assets.models import (
     DataAsset,
@@ -618,10 +626,14 @@ async def test_superadmin_purge_removes_full_event_closure_and_preserves_shared_
     assert result.deleted_task_event_count == 1
     assert result.already_purged is False
     assert purge_fixture.shared_artifact_path == purge_fixture.artifact_path
-    assert purge_fixture.artifact_path not in result.storage_paths
+    assert purge_fixture.artifact_path in result.storage_paths
     assert purge_fixture.manual_path in result.storage_paths
-    assert purge_fixture.shared_artifact_path not in result.storage_paths
+    assert purge_fixture.shared_artifact_path in result.storage_paths
     assert purge_fixture.shared_manual_path not in result.storage_paths
+    assert set(result.storage_paths) == {
+        purge_fixture.artifact_path,
+        purge_fixture.manual_path,
+    }
 
     assert await session.get(EarthquakeEvent, purge_fixture.event_id) is None
     assert await session.get(EarthquakeRevision, purge_fixture.revision_id) is None
@@ -752,7 +764,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
     assert retry.deleted_event_id == first.deleted_event_id
     assert retry.deleted_raw_message_count == first.deleted_raw_message_count
     assert purge_fixture.manual_path in first.storage_paths
-    assert purge_fixture.manual_path not in retry.storage_paths
+    assert purge_fixture.manual_path in retry.storage_paths
 
     with pytest.raises(EventNotFoundError):
         await SuperadminPurgeService().purge_event(
@@ -761,6 +773,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
             actor=superadmin_user,
             idempotency_key="different-purge-key",
         )
+    await session.rollback()
     with pytest.raises(EventNotFoundError):
         await SuperadminPurgeService().purge_event(
             session,
@@ -768,6 +781,7 @@ async def test_purge_is_idempotent_and_missing_event_is_distinct(
             actor=superadmin_user,
             idempotency_key="never-existed",
         )
+    await session.rollback()
 
 
 class CommitAwareStore:
@@ -892,3 +906,505 @@ async def test_http_purge_retries_failed_file_cleanup_after_commit(
 
     assert state["committed"] is True
     assert state["deleted"] == [purge_fixture.manual_path]
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrentDeliverableFixture:
+    event_id: uuid.UUID
+    raw_id: uuid.UUID
+    revision_id: uuid.UUID
+    task_id: uuid.UUID
+    deliverable_id: uuid.UUID
+    actor: AuthUser
+
+
+async def _create_concurrent_deliverable_fixture(
+    session_factory,
+    *,
+    label: str,
+) -> ConcurrentDeliverableFixture:
+    now = datetime.now(UTC)
+    username = f"purge-concurrent-{label}-{uuid.uuid4().hex[:8]}"
+    async with session_factory() as session:
+        async with session.begin():
+            actor = User(
+                id=uuid.uuid4(),
+                username=username,
+                password_hash="not-used",
+                role="superadmin",
+                workgroup=None,
+                is_active=True,
+            )
+            session.add(actor)
+            event_id = uuid.uuid4()
+            earthquake_event = EarthquakeEvent(
+                id=event_id,
+                source="purge-concurrency-test",
+                canonical_source_id=f"purge-concurrent-{event_id}",
+                event_type="formal",
+                origin_time=now,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="purge concurrency fixture",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="active",
+            )
+            session.add(earthquake_event)
+            await session.flush()
+            raw = RawMessage(
+                source="purge-concurrency-test",
+                source_message_id=f"raw-{uuid.uuid4()}",
+                message_kind="formal",
+                checksum=_checksum(f"raw-{uuid.uuid4()}"),
+                payload={"event_id": str(event_id)},
+                received_at=now,
+            )
+            session.add(raw)
+            await session.flush()
+            revision = EarthquakeRevision(
+                event_id=event_id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="formal",
+                origin_time=earthquake_event.origin_time,
+                longitude=earthquake_event.longitude,
+                latitude=earthquake_event.latitude,
+                depth_km=earthquake_event.depth_km,
+                magnitude=earthquake_event.magnitude,
+                place=earthquake_event.place,
+                is_current=True,
+                ingested_at=now,
+            )
+            session.add(revision)
+            await session.flush()
+            earthquake_event.current_revision_id = revision.id
+            task = WorkgroupTask(
+                event_id=event_id,
+                trigger_revision_id=revision.id,
+                task_code=f"purge-concurrent-task-{uuid.uuid4().hex}",
+                source_type="ad_hoc",
+                workgroup_code="monitoring_forecast",
+                title="Concurrent purge task",
+                instruction="Exercise the event write barrier.",
+                priority=100,
+                status="in_progress",
+                timeliness_state="on_time",
+                phase_code="within_30m",
+                activated_at=now,
+                due_at=now + timedelta(minutes=30),
+                row_version=1,
+                created_by=username,
+            )
+            session.add(task)
+            await session.flush()
+            deliverable = TaskDeliverable(
+                task_id=task.id,
+                deliverable_code="concurrent.manual",
+                title="Concurrent manual output",
+                is_required=True,
+                requirement_kind="manual_file",
+                display_order=1,
+            )
+            session.add(deliverable)
+            await session.flush()
+            return ConcurrentDeliverableFixture(
+                event_id=event_id,
+                raw_id=raw.id,
+                revision_id=revision.id,
+                task_id=task.id,
+                deliverable_id=deliverable.id,
+                actor=AuthUser(
+                    username=actor.username,
+                    role=actor.role,
+                    workgroup=actor.workgroup,
+                ),
+            )
+
+
+async def _purge_test_event(
+    session_factory,
+    event_id: uuid.UUID,
+    *,
+    key: str,
+) -> None:
+    actor = AuthUser(
+        username="purge-concurrency-cleanup",
+        role="superadmin",
+        workgroup=None,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await SuperadminPurgeService().purge_event(
+                session,
+                event_id,
+                actor=actor,
+                idempotency_key=key,
+            )
+
+
+async def _wait_for_advisory_waiter(
+    session_factory,
+    *,
+    timeout_seconds: float = 1.0,
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        async with session_factory() as session:
+            waiting = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(text("pg_locks"))
+                    .where(
+                        text("locktype = 'advisory'"),
+                        text("granted IS FALSE"),
+                    )
+                )
+                or 0
+            )
+        if waiting:
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+class PausingDeliverableService(DeliverableService):
+    def __init__(
+        self,
+        *,
+        stored: asyncio.Event,
+        release: asyncio.Event,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._stored = stored
+        self._release = release
+
+    async def _create_version(self, *args, **kwargs):
+        self._stored.set()
+        await self._release.wait()
+        return await super()._create_version(*args, **kwargs)
+
+
+async def test_purge_does_not_delete_path_committed_by_concurrent_other_event(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    token = uuid.uuid4().hex
+    payload = f"cross-event-shared-object-{token}".encode()
+    file_name = f"shared-object-{token}.txt"
+    relative_path = store.relative_path_for(
+        hashlib.sha256(payload).hexdigest(),
+        file_name=file_name,
+    )
+    store.store_immutable_stream(BytesIO(payload), file_name=file_name)
+
+    async with session_factory() as session:
+        async with session.begin():
+            artifact = await session.get(
+                GeneratedArtifact,
+                purge_fixture.artifact_id,
+            )
+            assert artifact is not None
+            artifact.storage_path = relative_path
+            second_artifact = await session.get(
+                GeneratedArtifact,
+                purge_fixture.second_artifact_id,
+            )
+            assert second_artifact is not None
+            second_artifact.storage_path = f"{relative_path}.other-event"
+
+    concurrent = await _create_concurrent_deliverable_fixture(
+        session_factory,
+        label="other-event",
+    )
+    stored = asyncio.Event()
+    release = asyncio.Event()
+    service = PausingDeliverableService(
+        stored=stored,
+        release=release,
+        artifact_store=store,
+    )
+
+    async def write_other_event() -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                await service.add_manual_version(
+                    session,
+                    concurrent.deliverable_id,
+                    concurrent.actor,
+                    source=BytesIO(payload),
+                    file_name=file_name,
+                    mime_type="text/plain",
+                )
+
+    writer = asyncio.create_task(write_other_event())
+    await asyncio.wait_for(stored.wait(), timeout=2)
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_current_user] = lambda: superadmin_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            purge = asyncio.create_task(
+                client.delete(
+                    f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                    headers={"Idempotency-Key": "cross-event-purge"},
+                )
+            )
+            await _wait_for_advisory_waiter(session_factory)
+            release.set()
+            response = await asyncio.wait_for(purge, timeout=5)
+            assert response.status_code == 204
+    finally:
+        app.dependency_overrides.clear()
+        release.set()
+        await asyncio.wait_for(writer, timeout=5)
+
+    async with session_factory() as session:
+        version_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(TaskDeliverableVersion)
+                .where(
+                    TaskDeliverableVersion.deliverable_id == concurrent.deliverable_id,
+                    TaskDeliverableVersion.storage_key == relative_path,
+                )
+            )
+            or 0
+        )
+    assert version_count == 1
+    assert store.resolve(relative_path).is_file()
+
+
+async def test_purge_removes_artifact_stored_by_concurrent_same_event_render(
+    purge_fixture,
+    seeded_artifact_assessment,
+    session_factory,
+    superadmin_user,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repository = ArtifactProductionRepository()
+    async with session_factory() as session:
+        async with session.begin():
+            run = await repository.create_run(
+                session,
+                seeded_artifact_assessment.full_run_command(
+                    assessment_run_id=None,
+                    launch_mode="standalone",
+                    generation_scope="artifact:map.epicenter:a3v-professional",
+                    required_outputs=(("map.epicenter", "a3v-professional"),),
+                ),
+            )
+            task = await session.scalar(
+                select(ProductionTask).where(
+                    ProductionTask.production_run_id == run.id,
+                    ProductionTask.artifact_key == "map.epicenter",
+                )
+            )
+            assert task is not None
+            await repository.freeze_task_fingerprint(
+                session,
+                task.id,
+                _checksum(f"concurrent-render-{task.id}"),
+            )
+            await repository.start_task(
+                session,
+                task.id,
+                f"concurrent-render:{task.id}",
+            )
+            task_id = task.id
+            run_id = run.id
+
+    payload = b"concurrent-render-output"
+    staged_path = tmp_path / "staged-map.jpg"
+    staged_path.write_bytes(payload)
+    store = ArtifactStore(tmp_path / "artifacts")
+    checksum = hashlib.sha256(payload).hexdigest()
+    relative_path = store.relative_path_for(
+        checksum,
+        file_name="concurrent-map.jpg",
+    )
+    render_result = RenderResult(
+        path=staged_path,
+        format="jpg",
+        width=100,
+        height=80,
+        dpi=72,
+        checksum=checksum,
+        quality=RenderQuality(grade="A", needs_review=False),
+        task_status="succeeded",
+        file_name="concurrent-map.jpg",
+        render_manifest={"marker": "concurrency"},
+        non_empty_ratio=0.5,
+        size_bytes=len(payload),
+        generated_at=datetime.now(UTC),
+    )
+    activities = ArtifactActivities(
+        session_factory,
+        render_concurrency=1,
+        store=store,
+        heartbeat_interval=60,
+    )
+
+    async def fake_render(self, request, renderer):
+        del self, request, renderer
+        return staged_path, "concurrent-map.jpg", render_result
+
+    monkeypatch.setattr(ArtifactActivities, "_render_map", fake_render)
+    complete_started = asyncio.Event()
+    release_complete = asyncio.Event()
+    original_complete = ArtifactProductionRepository.complete_task
+
+    async def pause_complete(
+        self,
+        session,
+        task_id,
+        result,
+        task_status,
+    ):
+        complete_started.set()
+        await release_complete.wait()
+        return await original_complete(
+            self,
+            session,
+            task_id,
+            result,
+            task_status,
+        )
+
+    monkeypatch.setattr(
+        ArtifactProductionRepository,
+        "complete_task",
+        pause_complete,
+    )
+    request = ArtifactTaskActivityInput(
+        production_run_id=str(run_id),
+        production_task_id=str(task_id),
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        context_fingerprint="c" * 64,
+        input_fingerprint="d" * 64,
+        deadline_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    )
+    activity = asyncio.create_task(activities.render_map_artifact(request))
+    await asyncio.wait_for(complete_started.wait(), timeout=2)
+    assert store.resolve(relative_path).is_file()
+
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_current_user] = lambda: superadmin_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            purge = asyncio.create_task(
+                client.delete(
+                    f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                    headers={"Idempotency-Key": "same-event-render-purge"},
+                )
+            )
+            await _wait_for_advisory_waiter(session_factory)
+            release_complete.set()
+            response = await asyncio.wait_for(purge, timeout=5)
+            assert response.status_code == 204
+    finally:
+        app.dependency_overrides.clear()
+        release_complete.set()
+        with suppress(Exception):
+            await asyncio.wait_for(activity, timeout=5)
+
+    assert not store.resolve(relative_path).exists()
+
+
+async def test_purge_first_makes_inflight_manual_write_fail_without_orphan(
+    purge_fixture,
+    session_factory,
+    superadmin_user,
+    tmp_path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    payload = b"event-private-after-purge"
+    relative_path = store.relative_path_for(
+        hashlib.sha256(payload).hexdigest(),
+        file_name="after-purge.txt",
+    )
+    username = f"purge-late-writer-{uuid.uuid4().hex[:8]}"
+    actor = User(
+        id=uuid.uuid4(),
+        username=username,
+        password_hash="not-used",
+        role="superadmin",
+        workgroup=None,
+        is_active=True,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(actor)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    service = PausingDeliverableService(
+        stored=started,
+        release=release,
+        artifact_store=store,
+    )
+
+    original_add_manual_version = service.add_manual_version
+
+    async def pause_before_write(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_add_manual_version(*args, **kwargs)
+
+    service.add_manual_version = pause_before_write
+
+    async def late_write() -> None:
+        async with session_factory() as session:
+            async with session.begin():
+                await service.add_manual_version(
+                    session,
+                    purge_fixture.deliverable_id,
+                    AuthUser(
+                        username=actor.username,
+                        role=actor.role,
+                        workgroup=actor.workgroup,
+                    ),
+                    source=BytesIO(payload),
+                    file_name="after-purge.txt",
+                    mime_type="text/plain",
+                )
+
+    writer = asyncio.create_task(late_write())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    app.dependency_overrides[get_artifact_store] = lambda: store
+    app.dependency_overrides[get_current_user] = lambda: superadmin_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.delete(
+                f"/api/v1/admin/events/{purge_fixture.event_id}/purge",
+                headers={"Idempotency-Key": "purge-before-manual-write"},
+            )
+            assert response.status_code == 204
+        release.set()
+        with pytest.raises(LookupError):
+            await asyncio.wait_for(writer, timeout=5)
+    finally:
+        app.dependency_overrides.clear()
+        release.set()
+        with suppress(Exception):
+            await asyncio.wait_for(writer, timeout=5)
+
+    assert not store.resolve(relative_path).exists()

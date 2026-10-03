@@ -5,13 +5,12 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.artifacts.catalog import load_catalog
@@ -35,6 +34,11 @@ from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.artifacts.validation import ArtifactValidator, ValidationResult
 from app.assessment.models import AssessmentRun
 from app.config import settings
+from app.event_object_locks import (
+    lock_artifact_object,
+    lock_event_write,
+    storage_path_reference_count,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 
 
@@ -98,9 +102,7 @@ class ArtifactOverrideResponse:
             artifact_id=uuid.UUID(str(body["artifact_id"])),
             production_run_id=uuid.UUID(str(body["production_run_id"])),
             production_task_id=uuid.UUID(str(body["production_task_id"])),
-            artifact_publication_id=uuid.UUID(
-                str(body["artifact_publication_id"])
-            ),
+            artifact_publication_id=uuid.UUID(str(body["artifact_publication_id"])),
             status=str(body["status"]),
             generation_seq=int(body["generation_seq"]),
             file_name=str(body["file_name"]),
@@ -172,13 +174,8 @@ class ArtifactProductionService:
                 revision = await session.get(EarthquakeRevision, revision_id)
                 if assessment_run is None or event is None or revision is None:
                     raise LookupError("artifact production inputs were not found")
-                if (
-                    assessment_run.event_id != event.id
-                    or assessment_run.revision_id != revision.id
-                ):
-                    raise ValueError(
-                        "assessment run does not match event and revision"
-                    )
+                if assessment_run.event_id != event.id or assessment_run.revision_id != revision.id:
+                    raise ValueError("assessment run does not match event and revision")
                 required_outputs = self._catalog.full_required_outputs()
                 command = CreateProductionRunCommand(
                     assessment_run_id=assessment_run.id,
@@ -210,8 +207,7 @@ class ArtifactProductionService:
                     deadline_basis_at=run.deadline_basis_at,
                     deadline_at=run.deadline_at,
                     required_outputs=tuple(
-                        (task.artifact_key, task.output_profile)
-                        for task in tasks
+                        (task.artifact_key, task.output_profile) for task in tasks
                     ),
                     task_ids=tuple(task.id for task in tasks),
                 )
@@ -254,9 +250,7 @@ class ArtifactProductionService:
                     revision_id=revision.id,
                 )
                 command = CreateProductionRunCommand(
-                    assessment_run_id=(
-                        parent.assessment_run_id if parent is not None else None
-                    ),
+                    assessment_run_id=(parent.assessment_run_id if parent is not None else None),
                     event_id=event.id,
                     revision_id=revision.id,
                     revision_no=revision.revision_no,
@@ -266,9 +260,7 @@ class ArtifactProductionService:
                     deadline_at=now + timedelta(seconds=300),
                     deadline_kind="rebuild_deadline",
                     catalog_version=self._catalog.catalog_version,
-                    generation_scope=(
-                        f"artifact:{artifact_key}:{output_profile}"
-                    ),
+                    generation_scope=(f"artifact:{artifact_key}:{output_profile}"),
                     required_outputs=((artifact_key, output_profile),),
                     rebuild_parent_run_id=parent.id if parent is not None else None,
                     snapshot={
@@ -288,9 +280,7 @@ class ArtifactProductionService:
                     "artifact_key": artifact_key,
                     "output_profile": output_profile,
                     "old_current_artifact_id": (
-                        str(old_publication.artifact_id)
-                        if old_publication is not None
-                        else None
+                        str(old_publication.artifact_id) if old_publication is not None else None
                     ),
                     "new_production_run_id": str(run.id),
                     "reason": reason,
@@ -303,8 +293,7 @@ class ArtifactProductionService:
                     deadline_basis_at=run.deadline_basis_at,
                     deadline_at=run.deadline_at,
                     required_outputs=tuple(
-                        (task.artifact_key, task.output_profile)
-                        for task in tasks
+                        (task.artifact_key, task.output_profile) for task in tasks
                     ),
                     task_ids=tuple(task.id for task in tasks),
                 )
@@ -323,18 +312,13 @@ class ArtifactProductionService:
                 if production_run_id is None:
                     raise LookupError("artifact production task not found")
                 await session.execute(
-                    text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtextextended(:lock_key, 0))"
-                    ),
+                    text("SELECT pg_advisory_xact_lock(" "hashtextextended(:lock_key, 0))"),
                     {
                         "lock_key": f"artifact-task-write:{production_run_id}",
                     },
                 )
                 initial_status = await session.scalar(
-                    select(ProductionTask.status).where(
-                        ProductionTask.id == production_task_id
-                    )
+                    select(ProductionTask.status).where(ProductionTask.id == production_task_id)
                 )
                 if initial_status is None:
                     raise LookupError("artifact production task not found")
@@ -369,10 +353,7 @@ class ArtifactProductionService:
                 bindings = (
                     await session.scalars(
                         select(ArtifactTaskDependencyBinding)
-                        .where(
-                            ArtifactTaskDependencyBinding.production_task_id
-                            == task.id
-                        )
+                        .where(ArtifactTaskDependencyBinding.production_task_id == task.id)
                         .order_by(
                             ArtifactTaskDependencyBinding.dependency_kind,
                             ArtifactTaskDependencyBinding.dependency_key,
@@ -395,8 +376,7 @@ class ArtifactProductionService:
                         item.dependency_output_profile,
                     )
                     for item in bindings
-                    if item.resolution_status in {"bound", "degraded"}
-                    and not item.is_optional
+                    if item.resolution_status in {"bound", "degraded"} and not item.is_optional
                 }
                 if not hard_identities <= resolved_hard:
                     raise ValueError("hard task dependencies are not ready")
@@ -457,12 +437,8 @@ class ArtifactOverrideService:
         max_override_bytes: int | None = None,
         lease_seconds: float = 60.0,
         poll_interval: float = 0.05,
-        after_stage_before_store_hook: (
-            Callable[[], Awaitable[None]] | None
-        ) = None,
-        before_cleanup_reference_check_hook: (
-            Callable[[], Awaitable[None]] | None
-        ) = None,
+        after_stage_before_store_hook: (Callable[[], Awaitable[None]] | None) = None,
+        before_cleanup_reference_check_hook: (Callable[[], Awaitable[None]] | None) = None,
     ) -> None:
         self._session_factory = session_factory
         if catalog is None and repository is not None:
@@ -491,9 +467,7 @@ class ArtifactOverrideService:
         self._lease_seconds = lease_seconds
         self._poll_interval = poll_interval
         self._after_stage_before_store_hook = after_stage_before_store_hook
-        self._before_cleanup_reference_check_hook = (
-            before_cleanup_reference_check_hook
-        )
+        self._before_cleanup_reference_check_hook = before_cleanup_reference_check_hook
 
     @staticmethod
     def endpoint_for(
@@ -574,9 +548,7 @@ class ArtifactOverrideService:
                 request_fingerprint=request_fingerprint,
             )
             if claim.status == "succeeded":
-                return ArtifactOverrideResponse.from_body(
-                    claim.response_body or {}
-                )
+                return ArtifactOverrideResponse.from_body(claim.response_body or {})
             validation = self._validator.validate(
                 staged,
                 definition,
@@ -599,96 +571,76 @@ class ArtifactOverrideService:
             )
             if self._after_stage_before_store_hook is not None:
                 await self._after_stage_before_store_hook()
-            async with self._object_guard(object_relative_path):
-                stored = self._store.store_immutable(
-                    staged,
-                    file_name=file_name,
+            try:
+                async with self._session_factory() as session:
+                    async with session.begin():
+                        await lock_event_write(session, event_id)
+                        await lock_artifact_object(
+                            session,
+                            object_relative_path,
+                        )
+                        stored = self._store.store_immutable(
+                            staged,
+                            file_name=file_name,
+                        )
+                        response = await self._commit_override(
+                            session,
+                            context=context,
+                            definition=definition,
+                            claim=claim,
+                            stored=stored,
+                            validation=validation,
+                            actor_id=actor_id,
+                            reason=reason,
+                            expected_current_artifact_id=expected_current_artifact_id,
+                        )
+                committed = True
+                return response
+            except (
+                IdempotencyConflictError,
+                ArtifactOverrideLeaseError,
+            ) as error:
+                await self._persist_failure(
+                    claim.id,
+                    claim.lease_generation,
+                    error_category="conflict",
+                    summary=str(error),
+                    error_type=type(error).__name__,
+                    response_status=409,
                 )
-                try:
-                    response = await self._commit_override(
-                        context=context,
-                        definition=definition,
-                        claim=claim,
-                        stored=stored,
-                        validation=validation,
-                        actor_id=actor_id,
-                        reason=reason,
-                        expected_current_artifact_id=expected_current_artifact_id,
+                raise
+            finally:
+                if stored is not None and not committed:
+                    await self._delete_if_unreferenced(
+                        event_id,
+                        stored,
                     )
-                    committed = True
-                    return response
-                except (
-                    IdempotencyConflictError,
-                    ArtifactOverrideLeaseError,
-                ) as error:
-                    await self._persist_failure(
-                        claim.id,
-                        claim.lease_generation,
-                        error_category="conflict",
-                        summary=str(error),
-                        error_type=type(error).__name__,
-                        response_status=409,
-                    )
-                    raise
-                finally:
-                    if stored is not None and not committed:
-                        await self._delete_if_unreferenced(stored)
         finally:
             if staged is not None:
                 staged.unlink(missing_ok=True)
 
     async def _delete_if_unreferenced(
         self,
+        event_id: uuid.UUID,
         stored: StoredArtifactFile,
     ) -> None:
-        if self._before_cleanup_reference_check_hook is not None:
-            await self._before_cleanup_reference_check_hook()
-        if await self._is_storage_path_referenced(stored.relative_path):
-            return
-        self._store.delete_unreferenced(stored)
-
-    async def _is_storage_path_referenced(self, relative_path: str) -> bool:
         async with self._session_factory() as session:
-            artifact_count = await session.scalar(
-                select(func.count())
-                .select_from(GeneratedArtifact)
-                .where(GeneratedArtifact.storage_path == relative_path)
-            )
-            publication_count = await session.scalar(
-                select(func.count())
-                .select_from(ArtifactPublication)
-                .where(
-                    ArtifactPublication.artifact_id.in_(
-                        select(GeneratedArtifact.id).where(
-                            GeneratedArtifact.storage_path == relative_path
-                        )
+            async with session.begin():
+                await lock_event_write(session, event_id)
+                await lock_artifact_object(
+                    session,
+                    stored.relative_path,
+                )
+                if self._before_cleanup_reference_check_hook is not None:
+                    await self._before_cleanup_reference_check_hook()
+                if (
+                    await storage_path_reference_count(
+                        session,
+                        stored.relative_path,
                     )
-                )
-            )
-        return bool(artifact_count) or bool(publication_count)
-
-    @asynccontextmanager
-    async def _object_guard(self, relative_path: str):
-        lock_key = f"artifact-object:{relative_path}"
-        async with self._session_factory() as session:
-            connection = await session.connection()
-            await connection.execute(
-                text(
-                    "SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"
-                ),
-                {"lock_key": lock_key},
-            )
-            try:
-                yield
-            finally:
-                await connection.execute(
-                    text(
-                        "SELECT pg_advisory_unlock("
-                        "hashtextextended(:lock_key, 0))"
-                    ),
-                    {"lock_key": lock_key},
-                )
-                await session.rollback()
+                    == 0
+                ):
+                    self._store.delete_unreferenced(stored)
 
     async def _load_context(
         self,
@@ -706,13 +658,8 @@ class ArtifactOverrideService:
                 raise LookupError("artifact override inputs were not found")
             if revision.event_id != event.id:
                 raise ValueError("override revision does not belong to event")
-            if (
-                event.current_revision_id != revision.id
-                or not revision.is_current
-            ):
-                raise IdempotencyConflictError(
-                    "override revision is no longer current"
-                )
+            if event.current_revision_id != revision.id or not revision.is_current:
+                raise IdempotencyConflictError("override revision is no longer current")
             parent = await self._repository.get_current_full_run(
                 session,
                 event_id=event.id,
@@ -723,9 +670,7 @@ class ArtifactOverrideService:
                 "revision_id": revision.id,
                 "revision_no": revision.revision_no,
                 "production_mode": _production_mode(revision.revision_kind),
-                "assessment_run_id": (
-                    parent.assessment_run_id if parent is not None else None
-                ),
+                "assessment_run_id": (parent.assessment_run_id if parent is not None else None),
                 "definition": definition,
             }
 
@@ -769,8 +714,7 @@ class ArtifactOverrideService:
                     select(ArtifactOverrideRequest).where(
                         ArtifactOverrideRequest.actor_id == actor_id,
                         ArtifactOverrideRequest.endpoint == endpoint,
-                        ArtifactOverrideRequest.idempotency_key
-                        == idempotency_key,
+                        ArtifactOverrideRequest.idempotency_key == idempotency_key,
                     )
                 )
         if row is None:
@@ -788,9 +732,7 @@ class ArtifactOverrideService:
         *,
         request_fingerprint: str,
     ) -> ArtifactOverrideRequest:
-        deadline = datetime.now(UTC) + timedelta(
-            seconds=self._lease_seconds + 5
-        )
+        deadline = datetime.now(UTC) + timedelta(seconds=self._lease_seconds + 5)
         while True:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -811,10 +753,7 @@ class ArtifactOverrideService:
                         raise _override_failure(row)
                     if row.status == "processing":
                         now = datetime.now(UTC)
-                        if (
-                            row.lease_expires_at is None
-                            or row.lease_expires_at <= now
-                        ):
+                        if row.lease_expires_at is None or row.lease_expires_at <= now:
                             recovered = await self._recover_committed_record(
                                 session,
                                 row,
@@ -896,8 +835,7 @@ class ArtifactOverrideService:
             {
                 "id": row.id,
                 "claimed_at": now,
-                "lease_expires_at": now
-                + timedelta(seconds=self._lease_seconds),
+                "lease_expires_at": now + timedelta(seconds=self._lease_seconds),
                 "now": now,
             },
         )
@@ -957,6 +895,7 @@ class ArtifactOverrideService:
 
     async def _commit_override(
         self,
+        session,
         *,
         context: Mapping[str, Any],
         definition: ArtifactDefinition,
@@ -975,144 +914,126 @@ class ArtifactOverrideService:
         artifact_key = definition.artifact_key
         output_profile = definition.output_profile
 
-        async with self._session_factory() as session:
-            async with session.begin():
-                event = await session.get(
-                    EarthquakeEvent,
-                    event_id,
-                    with_for_update=True,
-                )
-                if event is None or event.current_revision_id != revision_id:
-                    raise IdempotencyConflictError(
-                        "override revision is no longer current"
-                    )
-                if assessment_run_id is not None:
-                    assessment = await session.get(
-                        AssessmentRun,
-                        assessment_run_id,
-                        with_for_update=True,
-                    )
-                    if assessment is None:
-                        raise LookupError("override assessment run not found")
+        event = await session.get(
+            EarthquakeEvent,
+            event_id,
+            with_for_update=True,
+        )
+        if event is None or event.current_revision_id != revision_id:
+            raise IdempotencyConflictError("override revision is no longer current")
+        if assessment_run_id is not None:
+            assessment = await session.get(
+                AssessmentRun,
+                assessment_run_id,
+                with_for_update=True,
+            )
+            if assessment is None:
+                raise LookupError("override assessment run not found")
 
-                artifact_result = ArtifactGenerationResult(
-                    file_name=stored.file_name,
-                    format=definition.format,
-                    storage_path=stored.relative_path,
-                    checksum=stored.checksum,
-                    size_bytes=stored.size_bytes,
-                    quality=ArtifactQuality(
-                        grade=definition.quality_policy,
-                        needs_review=False,
-                    ),
-                    width=(
-                        validation.dimensions[0]
-                        if validation.dimensions is not None
-                        else None
-                    ),
-                    height=(
-                        validation.dimensions[1]
-                        if validation.dimensions is not None
-                        else None
-                    ),
-                    page_count=validation.page_count,
-                    generated_at=now,
-                    publication_mode="superadmin_override",
-                    render_manifest={
-                        "override": {
-                            "actor_id": actor_id,
-                            "reason": reason,
-                            "request_fingerprint": claim.request_fingerprint,
-                        }
-                    },
+        artifact_result = ArtifactGenerationResult(
+            file_name=stored.file_name,
+            format=definition.format,
+            storage_path=stored.relative_path,
+            checksum=stored.checksum,
+            size_bytes=stored.size_bytes,
+            quality=ArtifactQuality(
+                grade=definition.quality_policy,
+                needs_review=False,
+            ),
+            width=(validation.dimensions[0] if validation.dimensions is not None else None),
+            height=(validation.dimensions[1] if validation.dimensions is not None else None),
+            page_count=validation.page_count,
+            generated_at=now,
+            publication_mode="superadmin_override",
+            render_manifest={
+                "override": {
+                    "actor_id": actor_id,
+                    "reason": reason,
+                    "request_fingerprint": claim.request_fingerprint,
+                }
+            },
+        )
+        command = CreateProductionRunCommand(
+            assessment_run_id=assessment_run_id,
+            event_id=event.id,
+            revision_id=revision_id,
+            revision_no=int(context["revision_no"]),
+            production_mode=production_mode,
+            launch_mode="standalone",
+            deadline_basis_at=now,
+            deadline_at=now + timedelta(seconds=300),
+            deadline_kind="rebuild_deadline",
+            catalog_version=self._catalog.catalog_version,
+            generation_scope=f"artifact:{artifact_key}:{output_profile}",
+            required_outputs=((artifact_key, output_profile),),
+            snapshot={
+                "launch": "standalone",
+                "source": "superadmin_override",
+                "requested_by": actor_id,
+                "reason": reason,
+                "artifact_key": artifact_key,
+                "output_profile": output_profile,
+                "request_fingerprint": claim.request_fingerprint,
+            },
+            artifact_result=artifact_result,
+            published_by=actor_id,
+            forced=True,
+        )
+        publication_check_started_at = datetime.now(UTC)
+        run, task, artifact, publication = await self._repository.create_override_run(
+            session, command
+        )
+        if expected_current_artifact_id is not None:
+            superseded = await session.scalar(
+                select(ArtifactPublication)
+                .where(
+                    ArtifactPublication.event_id == event.id,
+                    ArtifactPublication.artifact_key == artifact_key,
+                    ArtifactPublication.output_profile == output_profile,
+                    ArtifactPublication.production_mode == production_mode,
+                    ArtifactPublication.superseded_at >= publication_check_started_at,
                 )
-                command = CreateProductionRunCommand(
-                    assessment_run_id=assessment_run_id,
-                    event_id=event.id,
-                    revision_id=revision_id,
-                    revision_no=int(context["revision_no"]),
-                    production_mode=production_mode,
-                    launch_mode="standalone",
-                    deadline_basis_at=now,
-                    deadline_at=now + timedelta(seconds=300),
-                    deadline_kind="rebuild_deadline",
-                    catalog_version=self._catalog.catalog_version,
-                    generation_scope=f"artifact:{artifact_key}:{output_profile}",
-                    required_outputs=((artifact_key, output_profile),),
-                    snapshot={
-                        "launch": "standalone",
-                        "source": "superadmin_override",
-                        "requested_by": actor_id,
-                        "reason": reason,
-                        "artifact_key": artifact_key,
-                        "output_profile": output_profile,
-                        "request_fingerprint": claim.request_fingerprint,
-                    },
-                    artifact_result=artifact_result,
-                    published_by=actor_id,
-                    forced=True,
+                .order_by(
+                    ArtifactPublication.superseded_at.desc(),
+                    ArtifactPublication.id.desc(),
                 )
-                publication_check_started_at = datetime.now(UTC)
-                run, task, artifact, publication = (
-                    await self._repository.create_override_run(session, command)
+                .limit(1)
+            )
+            if superseded is None or superseded.artifact_id != expected_current_artifact_id:
+                raise IdempotencyConflictError(
+                    "expected current artifact id does not match publication"
                 )
-                if expected_current_artifact_id is not None:
-                    superseded = await session.scalar(
-                        select(ArtifactPublication)
-                        .where(
-                            ArtifactPublication.event_id == event.id,
-                            ArtifactPublication.artifact_key == artifact_key,
-                            ArtifactPublication.output_profile == output_profile,
-                            ArtifactPublication.production_mode == production_mode,
-                            ArtifactPublication.superseded_at
-                            >= publication_check_started_at,
-                        )
-                        .order_by(
-                            ArtifactPublication.superseded_at.desc(),
-                            ArtifactPublication.id.desc(),
-                        )
-                        .limit(1)
-                    )
-                    if (
-                        superseded is None
-                        or superseded.artifact_id != expected_current_artifact_id
-                    ):
-                        raise IdempotencyConflictError(
-                            "expected current artifact id does not match publication"
-                        )
 
-                response = ArtifactOverrideResponse(
-                    artifact_id=artifact.id,
-                    production_run_id=run.id,
-                    production_task_id=task.id,
-                    artifact_publication_id=publication.id,
-                    status=run.status,
-                    generation_seq=run.generation_seq,
-                    file_name=artifact.file_name,
-                    checksum=artifact.checksum,
-                    size_bytes=artifact.size_bytes,
-                    generated_at=artifact.generated_at,
-                )
-                request_row = await session.scalar(
-                    select(ArtifactOverrideRequest)
-                    .where(ArtifactOverrideRequest.id == claim.id)
-                    .with_for_update()
-                )
-                if (
-                    request_row is None
-                    or request_row.status != "processing"
-                    or request_row.lease_generation != claim.lease_generation
-                ):
-                    raise ArtifactOverrideLeaseError(
-                        "override lease generation changed before commit"
-                    )
-                request_row.status = "succeeded"
-                request_row.response_status = 200
-                request_row.response_body = response.to_body()
-                request_row.production_run_id = run.id
-                request_row.artifact_id = artifact.id
-                request_row.completed_at = datetime.now(UTC)
-                return response
+        response = ArtifactOverrideResponse(
+            artifact_id=artifact.id,
+            production_run_id=run.id,
+            production_task_id=task.id,
+            artifact_publication_id=publication.id,
+            status=run.status,
+            generation_seq=run.generation_seq,
+            file_name=artifact.file_name,
+            checksum=artifact.checksum,
+            size_bytes=artifact.size_bytes,
+            generated_at=artifact.generated_at,
+        )
+        request_row = await session.scalar(
+            select(ArtifactOverrideRequest)
+            .where(ArtifactOverrideRequest.id == claim.id)
+            .with_for_update()
+        )
+        if (
+            request_row is None
+            or request_row.status != "processing"
+            or request_row.lease_generation != claim.lease_generation
+        ):
+            raise ArtifactOverrideLeaseError("override lease generation changed before commit")
+        request_row.status = "succeeded"
+        request_row.response_status = 200
+        request_row.response_body = response.to_body()
+        request_row.production_run_id = run.id
+        request_row.artifact_id = artifact.id
+        request_row.completed_at = datetime.now(UTC)
+        return response
 
 
 def _production_mode(revision_kind: str) -> str:
@@ -1207,9 +1128,7 @@ def _input_fingerprint(
                 "dependency_key": binding.dependency_key,
                 "dependency_output_profile": binding.dependency_output_profile,
                 "bound_entity_id": (
-                    str(binding.bound_entity_id)
-                    if binding.bound_entity_id is not None
-                    else None
+                    str(binding.bound_entity_id) if binding.bound_entity_id is not None else None
                 ),
                 "bound_version": binding.bound_version,
                 "bound_checksum": binding.bound_checksum,

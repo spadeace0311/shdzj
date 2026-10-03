@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ from app.artifacts.renderers.map_renderer import (
 )
 from app.artifacts.renderers.pptx_renderer import PptxRenderer
 from app.artifacts.service import ArtifactProductionService
-from app.artifacts.storage import ArtifactStore
+from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.artifacts.validation import ArtifactValidator
 from app.artifacts.workflow import (
     ArtifactDependencyWaitInput,
@@ -64,6 +65,11 @@ from app.artifacts.workflow import (
 )
 from app.config import Settings, settings
 from app.db import SessionFactory
+from app.event_object_locks import (
+    lock_artifact_object,
+    lock_event_write,
+    storage_path_reference_count,
+)
 from app.events.models import EarthquakeEvent, EarthquakeRevision
 from sqlalchemy import select
 
@@ -189,11 +195,9 @@ class ArtifactActivities:
                 async with session.begin():
                     task = await session.scalar(
                         select(ProductionTask).where(
-                            ProductionTask.production_run_id
-                            == request.production_run_id,
+                            ProductionTask.production_run_id == request.production_run_id,
                             ProductionTask.artifact_key == request.artifact_key,
-                            ProductionTask.output_profile
-                            == request.output_profile,
+                            ProductionTask.output_profile == request.output_profile,
                         )
                     )
                     if task is None:
@@ -212,9 +216,7 @@ class ArtifactActivities:
 
                     elif task.status in {"succeeded", "degraded"}:
                         if not task.input_fingerprint:
-                            raise ValueError(
-                                "completed task has no input fingerprint"
-                            )
+                            raise ValueError("completed task has no input fingerprint")
                         return ArtifactTaskActivityInput(
                             production_run_id=str(run.id),
                             production_task_id=str(task.id),
@@ -293,9 +295,7 @@ class ArtifactActivities:
                         )
                         run = await session.get(ProductionRun, ready_run_id)
                         if run is None:
-                            raise LookupError(
-                                "artifact production run not found"
-                            )
+                            raise LookupError("artifact production run not found")
                         return ArtifactTaskActivityInput(
                             production_run_id=str(run.id),
                             production_task_id=str(started.id),
@@ -320,21 +320,13 @@ class ArtifactActivities:
                     request,
                     renderer,
                 )
-                stored = self._artifact_store.store_immutable(
+                stored = await self._store_and_commit_rendered_artifact(
+                    request,
                     staged,
-                    file_name=official_name,
+                    official_name,
+                    render_result,
                 )
-                try:
-                    await self._commit_rendered_artifact(
-                        request,
-                        stored.file_name,
-                        stored.relative_path,
-                        stored.checksum,
-                        stored.size_bytes,
-                        render_result,
-                    )
-                finally:
-                    staged.unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 return {
                     "production_run_id": request.production_run_id,
                     "production_task_id": request.production_task_id,
@@ -372,21 +364,13 @@ class ArtifactActivities:
                     request,
                     ArtifactKind.DOCX,
                 )
-                stored = self._artifact_store.store_immutable(
+                stored = await self._store_and_commit_rendered_artifact(
+                    request,
                     staged,
-                    file_name=official_name,
+                    official_name,
+                    render_result,
                 )
-                try:
-                    await self._commit_rendered_artifact(
-                        request,
-                        stored.file_name,
-                        stored.relative_path,
-                        stored.checksum,
-                        stored.size_bytes,
-                        render_result,
-                    )
-                finally:
-                    staged.unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 return {
                     "production_run_id": request.production_run_id,
                     "production_task_id": request.production_task_id,
@@ -418,21 +402,13 @@ class ArtifactActivities:
                     request,
                     ArtifactKind.PPTX,
                 )
-                stored = self._artifact_store.store_immutable(
+                stored = await self._store_and_commit_rendered_artifact(
+                    request,
                     staged,
-                    file_name=official_name,
+                    official_name,
+                    render_result,
                 )
-                try:
-                    await self._commit_rendered_artifact(
-                        request,
-                        stored.file_name,
-                        stored.relative_path,
-                        stored.checksum,
-                        stored.size_bytes,
-                        render_result,
-                    )
-                finally:
-                    staged.unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 return {
                     "production_run_id": request.production_run_id,
                     "production_task_id": request.production_task_id,
@@ -476,12 +452,10 @@ class ArtifactActivities:
                 ).all()
                 try:
                     for artifact_row in artifacts:
-                        path = self._artifact_store.resolve(
-                            artifact_row.storage_path
+                        path = self._artifact_store.resolve(artifact_row.storage_path)
+                        definition = load_catalog(settings.artifact_catalog_path).get(
+                            artifact_row.artifact_key, artifact_row.output_profile
                         )
-                        definition = load_catalog(
-                            settings.artifact_catalog_path
-                        ).get(artifact_row.artifact_key, artifact_row.output_profile)
                         result = self._artifact_validator.validate(
                             path,
                             definition,
@@ -510,12 +484,10 @@ class ArtifactActivities:
                 return {
                     "status": "validated",
                     "completed_count": sum(
-                        task.status in {"succeeded", "degraded"}
-                        for task in tasks
+                        task.status in {"succeeded", "degraded"} for task in tasks
                     ),
                     "failed_count": sum(
-                        task.status in {"failed", "timed_out", "canceled"}
-                        for task in tasks
+                        task.status in {"failed", "timed_out", "canceled"} for task in tasks
                     ),
                 }
 
@@ -583,22 +555,16 @@ class ArtifactActivities:
                 return {
                     "status": finalized.status,
                     "completed_count": sum(
-                        task.status in {"succeeded", "degraded"}
-                        for task in tasks
+                        task.status in {"succeeded", "degraded"} for task in tasks
                     ),
                     "failed_count": sum(
-                        task.status in {"failed", "timed_out", "canceled"}
-                        for task in tasks
+                        task.status in {"failed", "timed_out", "canceled"} for task in tasks
                     ),
                     "publication_failed_count": len(publication_failures),
                     "publication_status": (
                         "completed"
                         if not publication_failures
-                        else (
-                            "partial"
-                            if len(publication_failures) < len(artifacts)
-                            else "failed"
-                        )
+                        else ("partial" if len(publication_failures) < len(artifacts) else "failed")
                     ),
                 }
 
@@ -659,12 +625,10 @@ class ArtifactActivities:
                 return {
                     "status": run.status,
                     "completed_count": sum(
-                        task.status in {"succeeded", "degraded"}
-                        for task in tasks
+                        task.status in {"succeeded", "degraded"} for task in tasks
                     ),
                     "failed_count": sum(
-                        task.status in {"failed", "timed_out", "canceled"}
-                        for task in tasks
+                        task.status in {"failed", "timed_out", "canceled"} for task in tasks
                     ),
                 }
 
@@ -687,12 +651,10 @@ class ArtifactActivities:
                 return {
                     "status": run.status,
                     "completed_count": sum(
-                        task.status in {"succeeded", "degraded"}
-                        for task in tasks
+                        task.status in {"succeeded", "degraded"} for task in tasks
                     ),
                     "failed_count": sum(
-                        task.status in {"failed", "timed_out", "canceled"}
-                        for task in tasks
+                        task.status in {"failed", "timed_out", "canceled"} for task in tasks
                     ),
                 }
 
@@ -746,56 +708,121 @@ class ArtifactActivities:
         os.close(descriptor)
         Path(name).unlink(missing_ok=True)
         output = Path(name)
-        renderer = (
-            PptxRenderer()
-            if kind == ArtifactKind.PPTX
-            else DocxRenderer()
-        )
+        renderer = PptxRenderer() if kind == ArtifactKind.PPTX else DocxRenderer()
         result = await renderer.render(spec, output)
         return result.path, result.file_name, result
 
     async def _commit_rendered_artifact(
         self,
+        session,
         request: ArtifactTaskActivityInput,
-        file_name: str,
-        storage_path: str,
-        checksum: str,
-        size_bytes: int,
+        stored: StoredArtifactFile,
         render_result: RenderResult,
     ) -> None:
         quality = render_result.quality
         marker = render_result.render_manifest.get("marker")
         result = ArtifactGenerationResult(
-            file_name=file_name,
-            format=Path(file_name).suffix.lstrip("."),
-            storage_path=storage_path,
-            checksum=checksum,
-            size_bytes=size_bytes,
+            file_name=stored.file_name,
+            format=Path(stored.file_name).suffix.lstrip("."),
+            storage_path=stored.relative_path,
+            checksum=stored.checksum,
+            size_bytes=stored.size_bytes,
             quality=ArtifactQuality(
                 grade=quality.grade,
                 needs_review=quality.needs_review,
                 degradation_reasons=quality.degradation_reasons,
             ),
             marker={"marker": marker} if marker is not None else None,
-            width=(
-                render_result.width if render_result.width > 0 else None
-            ),
-            height=(
-                render_result.height if render_result.height > 0 else None
-            ),
+            width=(render_result.width if render_result.width > 0 else None),
+            height=(render_result.height if render_result.height > 0 else None),
             page_count=render_result.page_count,
             render_manifest=render_result.render_manifest,
             generated_at=render_result.generated_at or datetime.now(UTC),
             task_status=render_result.task_status,
         )
+        await ArtifactProductionRepository().complete_task(
+            session,
+            request.production_task_id,
+            result,
+            render_result.task_status,
+        )
+
+    async def _store_and_commit_rendered_artifact(
+        self,
+        request: ArtifactTaskActivityInput,
+        staged: Path,
+        file_name: str,
+        render_result: RenderResult,
+    ) -> StoredArtifactFile:
+        checksum = _sha256_path(staged)
+        relative_path = self._artifact_store.relative_path_for(
+            checksum,
+            file_name=file_name,
+        )
+        stored: StoredArtifactFile | None = None
+        event_id: uuid.UUID | None = None
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    event_id = await session.scalar(
+                        select(ProductionRun.event_id)
+                        .join(
+                            ProductionTask,
+                            ProductionTask.production_run_id == ProductionRun.id,
+                        )
+                        .where(ProductionTask.id == request.production_task_id)
+                    )
+                    if event_id is None:
+                        raise LookupError("artifact production task not found")
+                    await lock_event_write(session, event_id)
+                    await lock_artifact_object(session, relative_path)
+                    task_exists = await session.scalar(
+                        select(ProductionTask.id).where(
+                            ProductionTask.id == request.production_task_id
+                        )
+                    )
+                    if task_exists is None:
+                        raise LookupError("artifact production task not found")
+                    stored = self._artifact_store.store_immutable(
+                        staged,
+                        file_name=file_name,
+                    )
+                    await self._commit_rendered_artifact(
+                        session,
+                        request,
+                        stored,
+                        render_result,
+                    )
+            assert stored is not None
+            return stored
+        except BaseException:
+            if stored is not None and event_id is not None:
+                await self._cleanup_unreferenced_artifact(
+                    event_id,
+                    stored,
+                )
+            raise
+
+    async def _cleanup_unreferenced_artifact(
+        self,
+        event_id: uuid.UUID,
+        stored: StoredArtifactFile,
+    ) -> None:
         async with self._session_factory() as session:
             async with session.begin():
-                await ArtifactProductionRepository().complete_task(
+                await lock_event_write(session, event_id)
+                await lock_artifact_object(
                     session,
-                    request.production_task_id,
-                    result,
-                    render_result.task_status,
+                    stored.relative_path,
                 )
+                if (
+                    await storage_path_reference_count(
+                        session,
+                        stored.relative_path,
+                    )
+                    == 0
+                ):
+                    self._artifact_store.delete_unreferenced(stored)
 
     async def _cancel_task(self, request: ArtifactTaskActivityInput) -> None:
         async with self._session_factory() as session:
@@ -844,8 +871,7 @@ def _phase_groups_from_tasks(
         hard_product_keys = {
             str(dep.get("key"))
             for dep in (task.depends_on or ())
-            if isinstance(dep, dict)
-            and dep.get("kind") == DependencyKind.ASSESSMENT_PRODUCT.value
+            if isinstance(dep, dict) and dep.get("kind") == DependencyKind.ASSESSMENT_PRODUCT.value
         }
         if "intensity.fusion" in hard_product_keys:
             intensity.append(output)
@@ -869,10 +895,7 @@ def _idempotency_key(
     output_profile: str,
     fingerprint: str,
 ) -> str:
-    return (
-        f"artifact:{production_run_id}:{artifact_key}:"
-        f"{output_profile}:{fingerprint}"
-    )
+    return f"artifact:{production_run_id}:{artifact_key}:" f"{output_profile}:{fingerprint}"
 
 
 async def _assessment_failed_for_run(session: object, run: ProductionRun) -> bool:
@@ -881,9 +904,7 @@ async def _assessment_failed_for_run(session: object, run: ProductionRun) -> boo
     from app.assessment.models import AssessmentRun
 
     status = await session.scalar(
-        select(AssessmentRun.status).where(
-            AssessmentRun.id == run.assessment_run_id
-        )
+        select(AssessmentRun.status).where(AssessmentRun.id == run.assessment_run_id)
     )
     return status == "failed"
 
@@ -1025,9 +1046,7 @@ async def _run_retention_loop(
                 "replay": result.replay_deleted,
                 "failed": result.failed_deletions,
                 "protected_publications": result.protected_publication_count,
-                "protection_reasons": dict(
-                    result.protected_publication_reasons
-                ),
+                "protection_reasons": dict(result.protected_publication_reasons),
             }
             logger.info(
                 "artifact retention completed counts=%s",
@@ -1121,6 +1140,17 @@ def _install_signal_handlers(
             loop.add_signal_handler(signum, stop_event.set)
         except (NotImplementedError, RuntimeError):
             signal.signal(signum, lambda _signum, _frame: stop_event.set())
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 async def _run_process(mode: str) -> None:
