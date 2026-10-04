@@ -1,0 +1,135 @@
+- asset_key: shanghai.shelter.emergency
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, address, capacity, level, authority, updated_at]
+  crs: EPSG:4326
+  artifact_usage: [map.shelter_emergency, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.road.network
+  data_type: vector
+  geometry_type: line
+  required_fields: [road_id, name, road_class, oneway, speed_limit]
+  crs: EPSG:4326
+  artifact_usage: [map.transport, doc.spatial_distances]
+  classification: B
+
+- asset_key: shanghai.pga.raster
+  data_type: raster
+  geometry_type: null
+  required_fields: [pixel_value, unit, coordinate_system, valid_extent]
+  crs: EPSG:4326
+  artifact_usage: [map.pga_zoning]
+  classification: B
+
+- asset_key: shanghai.historical.earthquakes
+  data_type: table
+  geometry_type: null
+  required_fields: [event_id, origin_time, longitude, latitude, magnitude, depth_km, place, source, disaster_flag]
+  crs: EPSG:4326
+  artifact_usage: [map.historical_earthquakes, doc.background, doc.historical_catalog]
+  classification: B
+
+- asset_key: shanghai.reservoir
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, reservoir_type, capacity, risk_level, authority, updated_at]
+  crs: EPSG:4326
+  artifact_usage: [map.reservoirs, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.hazard_source
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, category, risk_level, authority, updated_at]
+  crs: EPSG:4326
+  artifact_usage: [map.hazard_sources, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.education.school
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, school_level, address, capacity, building_area, updated_at]
+  crs: EPSG:4326
+  artifact_usage: [map.schools, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.health.hospital
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, hospital_level, address, beds, emergency_capacity, updated_at]
+  crs: EPSG:4326
+  artifact_usage: [map.hospitals, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.metro
+  data_type: vector
+  geometry_type: line-and-point
+  required_fields: [id, name, feature_kind, line_name, station_name, geometry]
+  crs: EPSG:4326
+  artifact_usage: [map.metro]
+  classification: B
+
+- asset_key: shanghai.seismic_station
+  data_type: vector
+  geometry_type: point
+  required_fields: [station_code, name, network, longitude, latitude, elevation, status]
+  crs: EPSG:4326
+  artifact_usage: [map.seismic_stations]
+  classification: B
+
+- asset_key: shanghai.rescue_team
+  data_type: vector
+  geometry_type: point
+  required_fields: [team_id, name, category, authority, personnel, base_address]
+  crs: EPSG:4326
+  artifact_usage: [map.rescue_teams, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.cultural_relic
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, protection_level, address, authority]
+  crs: EPSG:4326
+  artifact_usage: [map.cultural_relics, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.key_target
+  data_type: vector
+  geometry_type: point-or-polygon
+  required_fields: [id, name, category, criticality, address, authority]
+  crs: EPSG:4326
+  artifact_usage: [map.key_targets, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.lifeline
+  data_type: vector
+  geometry_type: point-line-or-polygon
+  required_fields: [id, name, category, criticality, authority]
+  crs: EPSG:4326
+  artifact_usage: [map.key_targets, doc.key_targets]
+  classification: B
+
+- asset_key: shanghai.distance.reference_points
+  data_type: vector
+  geometry_type: point
+  required_fields: [id, name, category, longitude, latitude]
+  crs: EPSG:4326
+  artifact_usage: [map.city_distances, doc.spatial_distances]
+  classification: B
+
+- asset_key: basemap.gaode.offline
+  data_type: basemap
+  geometry_type: tile
+  required_fields: [zoom_levels, coverage_bounds, tile_count, format, generated_at, max_age_days, source_statement, checksum]
+  crs: EPSG:3857
+  artifact_usage: [basemap]
+  classification: required
+
+- asset_key: basemap.tianditu.offline
+  data_type: basemap
+  geometry_type: tile
+  required_fields: [zoom_levels, coverage_bounds, tile_count, format, generated_at, max_age_days, source_statement, checksum]
+  crs: EPSG:3857
+  artifact_usage: [basemap]
+  classification: required

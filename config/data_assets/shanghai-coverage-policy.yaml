@@ -1,0 +1,24 @@
+version: "shanghai-data-asset-coverage-v1"
+region_id: "shanghai"
+region_profile_path: "/config/intensity/shanghai-region.yaml"
+warning_ratio: 0.99
+error_ratio: 0.95
+coverage_rules:
+  "shanghai.admin.city":
+    mode: "full"
+    basis: "asset"
+  "shanghai.admin.county":
+    mode: "full"
+    basis: "asset"
+  "shanghai.admin.town":
+    mode: "full"
+    basis: "asset"
+  "shanghai.gdp.raster":
+    mode: "full"
+    basis: "region"
+  "shanghai.dem.raster":
+    mode: "full"
+    basis: "region"
+  "shanghai.fault":
+    mode: "partial"
+    basis: "asset"

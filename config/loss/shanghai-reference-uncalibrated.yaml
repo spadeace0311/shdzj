@@ -1,0 +1,103 @@
+version: "shanghai-loss-reference-v1"
+calibration_status: "reference_uncalibrated"
+test_only: false
+provenance:
+  requires_review: true
+  owner: "上海市地震局信息中心应急技术组"
+  review_requirement: "每项系数必须登记来源、版本、适用震级烈度、单位、有效日期和审核人"
+models:
+  building_damage:
+    model_id: "building-structure-matrix-v1"
+    formula_version: "building-structure-matrix-v1"
+    applicable_region: "shanghai"
+    input_contract:
+      - "exposure"
+      - "town_intensity_shares"
+      - "parameter_set"
+    output_contract:
+      - "building_damage"
+    source_citations: []
+    source_requirements:
+      - "逐结构、逐烈度、逐破坏状态易损性比例"
+      - "结构面积字段与年代结构映射"
+      - "上海历史震例校核说明"
+    scenarios:
+      low: {}
+      central: {}
+      high: {}
+  population_impact:
+    model_id: "population-intensity-v1"
+    formula_version: "population-intensity-v1"
+    applicable_region: "shanghai"
+    input_contract:
+      - "exposure"
+      - "town_intensity_shares"
+      - "parameter_set"
+    output_contract:
+      - "population_impact"
+    source_citations: []
+    source_requirements:
+      - "受灾人口起始烈度"
+      - "逐烈度紧急安置比例"
+      - "临时避难人口比例"
+    scenarios:
+      low: {}
+      central: {}
+      high: {}
+  casualties:
+    model_id: "casualty-building-intensity-v1"
+    formula_version: "casualty-building-intensity-v1"
+    applicable_region: "shanghai"
+    input_contract:
+      - "building_damage"
+      - "population_impact"
+      - "parameter_set"
+    output_contract:
+      - "casualties"
+    source_citations: []
+    source_requirements:
+      - "死亡模型 a、b、c 系数"
+      - "逐烈度死伤比"
+      - "逐破坏状态压埋面积系数"
+      - "城市类型压埋除数和时段系数"
+    scenarios:
+      low: {}
+      central: {}
+      high: {}
+  economic_loss:
+    model_id: "economic-building-loss-v1"
+    formula_version: "economic-building-loss-v1"
+    applicable_region: "shanghai"
+    input_contract:
+      - "building_damage"
+      - "parameter_set"
+    output_contract:
+      - "economic_loss"
+    source_citations: []
+    source_requirements:
+      - "逐结构重置单价"
+      - "逐结构单位面积室内财产值"
+      - "逐破坏状态损失比"
+    scenarios:
+      low: {}
+      central: {}
+      high: {}
+  resource_demand:
+    model_id: "resource-linear-demand-v1"
+    formula_version: "resource-linear-demand-v1"
+    applicable_region: "shanghai"
+    input_contract:
+      - "building_damage"
+      - "population_impact"
+      - "casualties"
+      - "parameter_set"
+    output_contract:
+      - "resource_demand"
+    source_citations: []
+    source_requirements:
+      - "每类资源的基础量或输入权重及单位"
+      - "资源参数的适用场景和有效日期"
+    scenarios:
+      low: {}
+      central: {}
+      high: {}

@@ -1,0 +1,275 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    command: ["postgres", "-c", "max_connections=300"]
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB is required}"
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGIS_GDAL_ENABLED_DRIVERS: "GTiff"
+    expose:
+      - "5432"
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      JWT_SECRET: "${JWT_SECRET:?JWT_SECRET is required}"
+      SUPERADMIN_INITIAL_PASSWORD: "${SUPERADMIN_INITIAL_PASSWORD:?SUPERADMIN_INITIAL_PASSWORD is required}"
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  data-asset-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    command: ["python", "-m", "app.data_assets.worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  temporal-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: temporal
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+    volumes:
+      - temporal_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER is required}"
+      POSTGRES_PWD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGRES_SEEDS: temporal-postgres
+    expose:
+      - "7233"
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: "http://localhost:${TEMPORAL_UI_PORT:-8088}"
+    ports:
+      - "${TEMPORAL_UI_BIND_HOST:-127.0.0.1}:${TEMPORAL_UI_PORT:-8088}:8080"
+    depends_on:
+      temporal:
+        condition: service_started
+
+  assessment-dispatcher:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "true"
+      TEMPORAL_ADDRESS: temporal:7233
+      ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS: "${ASSESSMENT_WORKFLOW_SAFETY_TIMEOUT_SECONDS:-1800}"
+    command: ["python", "-m", "app.assessment.worker", "dispatcher"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  temporal-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+    command: ["python", "-m", "app.assessment.worker", "worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  artifact-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+      ARTIFACT_RENDER_CONCURRENCY: "${ARTIFACT_RENDER_CONCURRENCY:-4}"
+      ARTIFACT_BROWSER_POOL_SIZE: "${ARTIFACT_BROWSER_POOL_SIZE:-2}"
+    command: ["python", "-m", "app.artifacts.worker", "worker"]
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.process_health", "worker"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  artifact-dispatcher:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      ASSESSMENT_DISPATCHER_ENABLED: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+    command: ["python", "-m", "app.artifacts.worker", "dispatcher"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+      - ${ARTIFACT_BASEMAP_HOST_DIR:-../data/basemaps}:/var/lib/artifacts/basemaps
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.process_health", "dispatcher"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  collaboration-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      COLLABORATION_WORKER_ENABLED: "true"
+    command: ["python", "-m", "app.collaboration.worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - ${DATA_ASSET_STORAGE_HOST_DIR:-../data/data-assets}:/var/lib/data-assets
+      - artifact-data:/var/lib/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.process_health", "collaboration"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  collector:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      CENC_COLLECTOR_ENABLED: "true"
+      FAN_API_KEY: "${FAN_API_KEY:-}"
+      FAN_APP_ID: "${FAN_APP_ID:-}"
+      CENC_APP_ID: "${CENC_APP_ID:-}"
+      COLLECTOR_SPOOL_DIR: "/var/lib/collector-spool"
+    command: ["python", "-m", "app.collector.main"]
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - collector-spool:/var/lib/collector-spool
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ../frontend
+    command: ["npm", "run", "dev"]
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  temporal_postgres_data:
+  frontend_node_modules:
+  collector-spool:
+  artifact-data:
