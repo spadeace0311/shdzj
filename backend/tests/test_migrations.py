@@ -16,7 +16,7 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0023_workgroup_backfill"
+LATEST_REVISION = "0024_ai_knowledge_qa"
 PREVIOUS_REVISION = "0022_cleanup_namespace"
 CLEANUP_INTENT_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"

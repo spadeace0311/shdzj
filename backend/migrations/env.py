@@ -20,7 +20,9 @@ from app.db import Base
 from app.events import models as event_models  # noqa: F401
 from app import event_object_cleanup as event_object_cleanup_models  # noqa: F401
 from app.intensity import models as intensity_models  # noqa: F401
+from app.knowledge import models as knowledge_models  # noqa: F401
 from app.loss import models as loss_models  # noqa: F401
+from app.qa import models as qa_models  # noqa: F401
 from app.regions import models as region_models  # noqa: F401
 
 config = context.config

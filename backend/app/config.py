@@ -78,6 +78,25 @@ class Settings(BaseSettings):
     collaboration_worker_batch_size: int = 50
     collaboration_outbox_max_attempts: int = 10
     collaboration_outbox_lease_seconds: int = 60
+    knowledge_storage_root: str = "/var/lib/knowledge"
+    knowledge_max_upload_bytes: int = 1_073_741_824
+    knowledge_worker_poll_seconds: float = 1.0
+    knowledge_worker_batch_size: int = 20
+    knowledge_job_max_attempts: int = 5
+    knowledge_job_lease_seconds: int = 120
+    qdrant_url: str = "http://qdrant:6333"
+    qdrant_collection_prefix: str = "shanghai-knowledge"
+    embedding_service_url: str = "http://embedding:8080"
+    embedding_model_name: str = "BAAI/bge-m3"
+    reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
+    online_search_enabled: bool = False
+    deepseek_api_key: SecretStr = SecretStr("")
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-flash"
+    deepseek_timeout_seconds: float = 60.0
+    deepseek_max_retries: int = 2
+    qa_tool_timeout_seconds: float = 1.5
+    qa_max_parallel_tools: int = 6
 
     @property
     def resolved_fan_app_id(self) -> str:
@@ -209,6 +228,39 @@ class Settings(BaseSettings):
             raise ValueError("COLLABORATION_OUTBOX_MAX_ATTEMPTS must be between 1 and 100")
         if self.collaboration_outbox_lease_seconds <= 0:
             raise ValueError("COLLABORATION_OUTBOX_LEASE_SECONDS must be positive")
+        return self
+
+    @model_validator(mode="after")
+    def validate_knowledge_configuration(self) -> "Settings":
+        required_values = (
+            ("KNOWLEDGE_STORAGE_ROOT", self.knowledge_storage_root),
+            ("QDRANT_URL", self.qdrant_url),
+            ("QDRANT_COLLECTION_PREFIX", self.qdrant_collection_prefix),
+            ("EMBEDDING_SERVICE_URL", self.embedding_service_url),
+            ("EMBEDDING_MODEL_NAME", self.embedding_model_name),
+            ("RERANKER_MODEL_NAME", self.reranker_model_name),
+            ("DEEPSEEK_BASE_URL", self.deepseek_base_url),
+            ("DEEPSEEK_MODEL", self.deepseek_model),
+        )
+        for name, value in required_values:
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+        if self.knowledge_max_upload_bytes < 1:
+            raise ValueError("KNOWLEDGE_MAX_UPLOAD_BYTES must be positive")
+        if not 1 <= self.knowledge_worker_batch_size <= 1_000:
+            raise ValueError("KNOWLEDGE_WORKER_BATCH_SIZE must be between 1 and 1000")
+        if not 1 <= self.knowledge_job_max_attempts <= 100:
+            raise ValueError("KNOWLEDGE_JOB_MAX_ATTEMPTS must be between 1 and 100")
+        if self.knowledge_worker_poll_seconds <= 0:
+            raise ValueError("KNOWLEDGE_WORKER_POLL_SECONDS must be positive")
+        if self.knowledge_job_lease_seconds <= 0:
+            raise ValueError("KNOWLEDGE_JOB_LEASE_SECONDS must be positive")
+        if self.deepseek_timeout_seconds <= 0:
+            raise ValueError("DEEPSEEK_TIMEOUT_SECONDS must be positive")
+        if self.qa_tool_timeout_seconds <= 0:
+            raise ValueError("QA_TOOL_TIMEOUT_SECONDS must be positive")
+        if not 1 <= self.qa_max_parallel_tools <= 16:
+            raise ValueError("QA_MAX_PARALLEL_TOOLS must be between 1 and 16")
         return self
 
 
