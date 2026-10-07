@@ -126,6 +126,7 @@
 - Create: `backend/app/knowledge/domain.py`
 - Create: `backend/app/knowledge/models.py`
 - Create: `backend/app/qa/__init__.py`
+- Create: `backend/app/qa/domain.py`
 - Create: `backend/app/qa/models.py`
 - Create: `backend/migrations/versions/0024_ai_knowledge_qa.py`
 - Modify: `backend/app/config.py`
@@ -525,7 +526,7 @@ class KnowledgeVersionResponse(BaseModel):
 
 1. `publish()` 锁定 source 和目标 version；仅允许 `indexed` 版本发布。
 2. 将同 source 原 `published` 版本改为 `indexed`，再把目标版本改为 `published`。
-3. 创建或激活目标版本对应的 `KnowledgeIndexVersion`，写入 `KnowledgeAuditLog`。
+3. 创建或激活目标版本对应的 `KnowledgeIndexVersion`，写入 `QaAdminAuditLog`，其中 `resource_type="knowledge_version"`、`resource_id` 为目标版本 UUID。
 4. `rollback()` 只切换发布指针到已存在的 `indexed` 历史版本，不修改历史版本内容。
 5. 两个方法都在单事务内完成；目标不是 `indexed` 或 source 不匹配时抛出领域异常。
 
