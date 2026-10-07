@@ -164,6 +164,28 @@ async def test_retry_job_requeues_failed_job(
         await _delete_actor_data(session_factory)
 
 
+async def test_retry_job_resets_dead_letter_attempt_count(
+    knowledge_client,
+    session_factory,
+) -> None:
+    job_id = await _seed_dead_letter_job(session_factory)
+    try:
+        response = await knowledge_client.post(
+            f"/api/v1/knowledge/jobs/{job_id}/retry"
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert response.json()["attempt_count"] == 0
+
+        async with session_factory() as session:
+            job = await session.get(KnowledgeJob, job_id)
+            assert job is not None
+            assert job.status == "queued"
+            assert job.attempt_count == 0
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def _seed_indexed_versions(session_factory):
     async with session_factory() as session:
         async with session.begin():
@@ -244,6 +266,40 @@ async def _seed_failed_job(session_factory):
                 job_type="ingest",
                 status="failed",
                 last_error="synthetic failure",
+            )
+            session.add(job)
+            await session.flush()
+            return job.id
+
+
+async def _seed_dead_letter_job(session_factory):
+    async with session_factory() as session:
+        async with session.begin():
+            source = KnowledgeSource(
+                source_key=f"local.dead-letter.{uuid4()}",
+                title="API Dead Letter Source",
+                layer="local_authority",
+                source_type="preplan",
+                access_level="internal",
+                created_by=API_ACTOR,
+            )
+            session.add(source)
+            await session.flush()
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version="v1",
+                status="failed",
+                created_by=API_ACTOR,
+            )
+            session.add(version)
+            await session.flush()
+            job = KnowledgeJob(
+                version_id=version.id,
+                job_type="ingest",
+                status="dead_letter",
+                attempt_count=5,
+                max_attempts=5,
+                last_error="retry budget exhausted",
             )
             session.add(job)
             await session.flush()

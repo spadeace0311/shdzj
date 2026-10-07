@@ -160,6 +160,62 @@ async def test_rollback_switches_pointer_without_changing_content(
         await _delete_actor_data(session_factory)
 
 
+async def test_rollback_requires_existing_index_pointer(session_factory) -> None:
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                source = await _create_source(session)
+                target = await _create_version(
+                    session,
+                    source.id,
+                    "v1",
+                    "indexed",
+                    checksum="target-checksum",
+                )
+                current = await _create_version(
+                    session,
+                    source.id,
+                    "v2",
+                    "published",
+                    checksum="current-checksum",
+                )
+                session.add(
+                    KnowledgeIndexVersion(
+                        source_version_id=current.id,
+                        version="v2",
+                        status="published",
+                        collection_name="shanghai-knowledge-source",
+                        embedding_model="BAAI/bge-m3",
+                        reranker_model="BAAI/bge-reranker-v2-m3",
+                    )
+                )
+                await session.flush()
+
+        with pytest.raises(ValueError, match="index pointer"):
+            async with session.begin():
+                await KnowledgePublicationService().rollback(
+                    session,
+                    target.id,
+                    PUBLICATION_ACTOR,
+                    "rollback without index",
+                )
+
+        async with session_factory() as session:
+            stored_target = await session.get(KnowledgeSourceVersion, target.id)
+            stored_current = await session.get(
+                KnowledgeSourceVersion,
+                current.id,
+            )
+            assert stored_target is not None
+            assert stored_target.status == "indexed"
+            assert stored_target.checksum == "target-checksum"
+            assert stored_current is not None
+            assert stored_current.status == "published"
+            assert stored_current.checksum == "current-checksum"
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_publish_rejects_non_indexed_version(session_factory) -> None:
     try:
         async with session_factory() as session:

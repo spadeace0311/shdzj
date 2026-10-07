@@ -23,6 +23,10 @@ class KnowledgeVersionNotIndexedError(KnowledgePublicationError):
     """Raised when a non-indexed version is targeted for publication."""
 
 
+class KnowledgeIndexPointerMissingError(KnowledgePublicationError):
+    """Raised when rollback has no active index pointer to restore."""
+
+
 class KnowledgePublicationService:
     def __init__(
         self,
@@ -120,12 +124,6 @@ class KnowledgePublicationService:
             for_update=True,
         )
         now = datetime.now(UTC)
-        for published_version in previous:
-            published_version.status = "indexed"
-            await self._mark_index_version_indexed(
-                session,
-                published_version.id,
-            )
         await self._activate_index_version(
             session,
             source,
@@ -133,6 +131,12 @@ class KnowledgePublicationService:
             now,
             create_if_missing=False,
         )
+        for published_version in previous:
+            published_version.status = "indexed"
+            await self._mark_index_version_indexed(
+                session,
+                published_version.id,
+            )
         target.status = "published"
         target.published_at = now
         session.add(
@@ -188,7 +192,9 @@ class KnowledgePublicationService:
         )
         if existing is None:
             if not create_if_missing:
-                return
+                raise KnowledgeIndexPointerMissingError(
+                    "rollback target has no active index pointer"
+                )
             session.add(
                 KnowledgeIndexVersion(
                     source_version_id=target.id,

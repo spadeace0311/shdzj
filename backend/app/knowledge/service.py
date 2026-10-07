@@ -236,6 +236,7 @@ class KnowledgeService:
         }:
             raise ValueError("only failed knowledge jobs can be retried")
         job.status = KnowledgeJobStatus.QUEUED.value
+        job.attempt_count = 0
         job.available_at = datetime.now(UTC)
         job.lease_expires_at = None
         job.last_error = None
