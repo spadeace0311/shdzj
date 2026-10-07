@@ -13,6 +13,7 @@ from app.command_hall.router import router as command_hall_router
 from app.data_assets.router import router as data_assets_router
 from app.db import SessionFactory
 from app.events.router import router as events_router
+from app.knowledge.router import router as knowledge_router
 from app.loss.router import router as loss_router
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ app.include_router(events_router)
 app.include_router(collector_router)
 app.include_router(command_hall_router)
 app.include_router(data_assets_router)
+app.include_router(knowledge_router)
 
 
 @app.get("/health")

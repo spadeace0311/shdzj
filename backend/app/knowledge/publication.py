@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.knowledge.models import (
+    KnowledgeIndexVersion,
+    KnowledgeSource,
+    KnowledgeSourceVersion,
+)
+from app.knowledge.repository import KnowledgeRepository
+from app.qa.models import QaAdminAuditLog
+
+
+class KnowledgePublicationError(ValueError):
+    """Base error for invalid knowledge publication operations."""
+
+
+class KnowledgeVersionNotIndexedError(KnowledgePublicationError):
+    """Raised when a non-indexed version is targeted for publication."""
+
+
+class KnowledgePublicationService:
+    def __init__(
+        self,
+        repository: KnowledgeRepository | None = None,
+    ) -> None:
+        self._repository = repository or KnowledgeRepository()
+
+    async def publish(
+        self,
+        session: AsyncSession,
+        version_id: UUID,
+        actor: str,
+        reason: str,
+    ) -> KnowledgeSourceVersion:
+        target = await self._repository.get_version(
+            session,
+            version_id,
+            for_update=True,
+        )
+        if target is None:
+            raise LookupError("knowledge source version not found")
+        if target.status != "indexed":
+            raise KnowledgeVersionNotIndexedError(
+                "only indexed knowledge versions can be published"
+            )
+        source = await self._lock_source(session, target.source_id)
+        previous = await self._repository.list_published_versions(
+            session,
+            source.id,
+            exclude_id=target.id,
+            for_update=True,
+        )
+        now = datetime.now(UTC)
+        for published_version in previous:
+            published_version.status = "indexed"
+            await self._mark_index_version_indexed(
+                session,
+                published_version.id,
+            )
+        await self._activate_index_version(
+            session,
+            source,
+            target,
+            now,
+            create_if_missing=True,
+        )
+        target.status = "published"
+        target.published_at = now
+        session.add(
+            QaAdminAuditLog(
+                resource_type="knowledge_version",
+                resource_id=str(target.id),
+                action="publish",
+                actor=actor,
+                details={
+                    "reason": reason,
+                    "old_version_ids": [
+                        str(published_version.id)
+                        for published_version in previous
+                    ],
+                    "old_version_id": (
+                        str(previous[0].id) if previous else None
+                    ),
+                    "new_version_id": str(target.id),
+                },
+                created_at=now,
+            )
+        )
+        await session.flush()
+        return target
+
+    async def rollback(
+        self,
+        session: AsyncSession,
+        version_id: UUID,
+        actor: str,
+        reason: str,
+    ) -> KnowledgeSourceVersion:
+        target = await self._repository.get_version(
+            session,
+            version_id,
+            for_update=True,
+        )
+        if target is None:
+            raise LookupError("knowledge source version not found")
+        if target.status != "indexed":
+            raise KnowledgeVersionNotIndexedError(
+                "rollback target must be an indexed knowledge version"
+            )
+        source = await self._lock_source(session, target.source_id)
+        previous = await self._repository.list_published_versions(
+            session,
+            source.id,
+            exclude_id=target.id,
+            for_update=True,
+        )
+        now = datetime.now(UTC)
+        for published_version in previous:
+            published_version.status = "indexed"
+            await self._mark_index_version_indexed(
+                session,
+                published_version.id,
+            )
+        await self._activate_index_version(
+            session,
+            source,
+            target,
+            now,
+            create_if_missing=False,
+        )
+        target.status = "published"
+        target.published_at = now
+        session.add(
+            QaAdminAuditLog(
+                resource_type="knowledge_version",
+                resource_id=str(target.id),
+                action="rollback",
+                actor=actor,
+                details={
+                    "reason": reason,
+                    "old_version_ids": [
+                        str(published_version.id)
+                        for published_version in previous
+                    ],
+                    "old_version_id": (
+                        str(previous[0].id) if previous else None
+                    ),
+                    "new_version_id": str(target.id),
+                },
+                created_at=now,
+            )
+        )
+        await session.flush()
+        return target
+
+    async def _lock_source(
+        self,
+        session: AsyncSession,
+        source_id: UUID,
+    ) -> KnowledgeSource:
+        source = await self._repository.get_source(
+            session,
+            source_id,
+            for_update=True,
+        )
+        if source is None:
+            raise LookupError("knowledge source not found")
+        return source
+
+    async def _activate_index_version(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSource,
+        target: KnowledgeSourceVersion,
+        now: datetime,
+        *,
+        create_if_missing: bool,
+    ) -> None:
+        existing = await self._repository.get_index_version(
+            session,
+            target.id,
+            for_update=True,
+        )
+        if existing is None:
+            if not create_if_missing:
+                return
+            session.add(
+                KnowledgeIndexVersion(
+                    source_version_id=target.id,
+                    version=target.version,
+                    status="published",
+                    collection_name=(
+                        f"{settings.qdrant_collection_prefix}-{source.source_key}"
+                    ),
+                    embedding_model=settings.embedding_model_name,
+                    reranker_model=settings.reranker_model_name,
+                    chunk_count=0,
+                    manifest={},
+                    activated_at=now,
+                )
+            )
+        else:
+            existing.status = "published"
+            existing.activated_at = now
+        await session.flush()
+
+    async def _mark_index_version_indexed(
+        self,
+        session: AsyncSession,
+        source_version_id: UUID,
+    ) -> None:
+        existing = await self._repository.get_index_version(
+            session,
+            source_version_id,
+            for_update=True,
+        )
+        if existing is not None:
+            existing.status = "indexed"
