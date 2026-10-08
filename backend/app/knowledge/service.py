@@ -265,6 +265,14 @@ class KnowledgeService:
             raise ValueError(
                 "only indexed or published knowledge versions can be rebuilt"
             )
+        pending_jobs = await self._repository.list_pending_jobs(
+            session,
+            version_id=version.id,
+            job_type="index",
+        )
+        for pending_job in pending_jobs:
+            if pending_job.request_payload.get("force") is True:
+                return _job_response(pending_job)
         job = await self._queue_job(
             session,
             version.id,

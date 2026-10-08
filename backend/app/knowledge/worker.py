@@ -272,7 +272,6 @@ class KnowledgeWorker:
             version,
             source,
             chunks,
-            force_rebuild=force_rebuild,
         )
         version.indexed_at = self._now()
         if force_rebuild:
@@ -517,8 +516,6 @@ async def _build_index(
     version: KnowledgeSourceVersion,
     source: KnowledgeSource,
     chunks: list[KnowledgeChunk],
-    *,
-    force_rebuild: bool,
 ) -> None:
     index_version = await session.scalar(
         select(KnowledgeIndexVersion)
@@ -562,10 +559,8 @@ async def _build_index(
     await session.flush()
 
     version.status = KnowledgeVersionStatus.EMBEDDING.value
-    await index.ensure_collection(index_version)
-    if force_rebuild:
-        await index.delete_version(index_version, version.id)
     batch = await embeddings.embed([chunk.text for chunk in chunks])
+    await index.ensure_collection(index_version)
     indexed_chunks = [
         IndexedChunk(
             chunk_id=chunk.id,

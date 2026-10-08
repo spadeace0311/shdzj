@@ -111,7 +111,7 @@ asyncio.run(main())
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm --no-deps -T api python -c $check
 ```
 
-若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，删除当前版本的 Qdrant 点位，再从 PostgreSQL 切片完整重新写入；published 版本的发布状态保持不变。
+若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，先从 PostgreSQL 切片生成完整 embeddings，再以稳定 point ID upsert，避免失败时破坏仍可检索的 published 点位；published 版本的发布状态保持不变。同一版本已有 pending forced rebuild 时返回同一 job，不重复排队。
 
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/versions/<version_id>/rebuild" `

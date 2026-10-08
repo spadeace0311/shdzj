@@ -29,15 +29,15 @@ cp .env.example .env
 - `JWT_SECRET`
 - `SUPERADMIN_INITIAL_PASSWORD`
 
-## 启动与停止
+## 隔离启动与停止
 
-构建镜像，先启动数据库并完成迁移，再启动全部服务：
+顶层快速开始用于隔离验证，固定使用 Compose project `codex-task15`。构建镜像，先启动数据库并完成迁移，再启动全部服务：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml build
-docker compose --env-file .env -f infra/compose.yaml up -d postgres
-docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose --env-file .env -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 build
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d postgres
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d
 ```
 
 启动后访问：
@@ -62,14 +62,16 @@ npm run dev
 停止：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml down
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 down
 ```
 
 停止并清除数据库卷（用于本地环境重置）：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml down -v
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 down -v
 ```
+
+生产部署必须使用显式且环境唯一的 project，并将上述命令中的 `codex-task15` 替换为 `--project-name <environment-project>`；不要复用验证 project 的容器或卷。
 
 ## 测试
 

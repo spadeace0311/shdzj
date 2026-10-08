@@ -136,3 +136,26 @@ class KnowledgeRepository:
             KnowledgeJob.id.desc(),
         )
         return list((await session.scalars(statement)).all())
+
+    async def list_pending_jobs(
+        self,
+        session: AsyncSession,
+        *,
+        version_id: UUID,
+        job_type: str,
+    ) -> list[KnowledgeJob]:
+        statement = (
+            select(KnowledgeJob)
+            .where(
+                KnowledgeJob.version_id == version_id,
+                KnowledgeJob.job_type == job_type,
+                KnowledgeJob.status.in_(
+                    (
+                        "queued",
+                        "running",
+                    )
+                ),
+            )
+            .order_by(KnowledgeJob.created_at, KnowledgeJob.id)
+        )
+        return list((await session.scalars(statement)).all())

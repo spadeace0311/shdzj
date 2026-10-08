@@ -214,6 +214,43 @@ async def test_rebuild_version_route_queues_forced_index_job(
         await _delete_actor_data(session_factory)
 
 
+async def test_rebuild_version_route_reuses_pending_forced_job(
+    knowledge_client,
+    session_factory,
+) -> None:
+    try:
+        _previous_id, version_id = await _seed_indexed_versions(session_factory)
+
+        first = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/rebuild",
+            json={"reason": "first rebuild request"},
+        )
+        second = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/rebuild",
+            json={"reason": "duplicate rebuild request"},
+        )
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert first.json()["id"] == second.json()["id"]
+
+        async with session_factory() as session:
+            jobs = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeJob).where(
+                            KnowledgeJob.version_id == version_id,
+                            KnowledgeJob.job_type == "index",
+                        )
+                    )
+                ).all()
+            )
+        assert len(jobs) == 1
+        assert jobs[0].request_payload["force"] is True
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_retry_job_requeues_failed_job(
     knowledge_client,
     session_factory,

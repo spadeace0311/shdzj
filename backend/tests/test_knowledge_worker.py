@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from sqlalchemy import delete, select
@@ -122,14 +122,24 @@ async def test_force_index_job_rebuilds_published_version(
     session_factory,
 ):
     try:
-        version_id = await _seed_published_indexed_version(session_factory)
+        version_id, chunk_ids = await _seed_published_indexed_version(
+            session_factory
+        )
+        expected_point_ids = {
+            uuid5(NAMESPACE_URL, str(chunk_id)) for chunk_id in chunk_ids
+        }
+        index = _FakeIndex(
+            points={
+                point_id: version_id
+                for point_id in expected_point_ids
+            }
+        )
         await _seed_job(
             session_factory,
             version_id,
             "index",
             payload={"force": True, "reason": "restore empty collection"},
         )
-        index = _FakeIndex()
         embeddings = _FakeEmbeddings()
         worker = KnowledgeWorker(index=index, embeddings=embeddings)
 
@@ -146,9 +156,56 @@ async def test_force_index_job_rebuilds_published_version(
             assert index_version is not None
             assert version.status == KnowledgeVersionStatus.PUBLISHED.value
             assert index_version.status == KnowledgeVersionStatus.PUBLISHED.value
-            assert index.deleted_version_ids == [version_id]
+            assert index.deleted_version_ids == []
             assert index.upsert_count == 1
+            assert index.upserted_point_ids == [
+                uuid5(NAMESPACE_URL, str(chunk_id)) for chunk_id in chunk_ids
+            ]
+            assert index.retrieve(version_id) == expected_point_ids
             assert embeddings.embed_count == 1
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+@pytest.mark.parametrize("failure_stage", ["embedding", "upsert"])
+async def test_force_rebuild_failure_keeps_published_points_retrievable(
+    session_factory,
+    failure_stage: str,
+):
+    try:
+        version_id, chunk_ids = await _seed_published_indexed_version(
+            session_factory
+        )
+        old_points = {
+            uuid5(NAMESPACE_URL, str(chunk_id)): version_id
+            for chunk_id in chunk_ids
+        }
+        index = _FakeIndex(
+            points=old_points,
+            fail_upsert=failure_stage == "upsert",
+        )
+        embeddings = (
+            _FailingEmbeddings()
+            if failure_stage == "embedding"
+            else _FakeEmbeddings()
+        )
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "failure safety"},
+        )
+        worker = KnowledgeWorker(index=index, embeddings=embeddings)
+
+        assert await _process_one(session_factory, worker) is True
+
+        async with session_factory() as session:
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            assert version is not None
+            assert version.status == KnowledgeVersionStatus.PUBLISHED.value
+        assert index.deleted_version_ids == []
+        assert index.retrieve(version_id) == set(old_points)
+        assert index.points == old_points
     finally:
         await _delete_actor_data(session_factory)
 
@@ -318,9 +375,17 @@ async def _process_one(session_factory, worker: KnowledgeWorker) -> bool:
 
 
 class _FakeIndex:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        points: dict[UUID, UUID] | None = None,
+        fail_upsert: bool = False,
+    ) -> None:
         self.deleted_version_ids: list[UUID] = []
         self.upsert_count = 0
+        self.upserted_point_ids: list[UUID] = []
+        self.points = dict(points or {})
+        self.fail_upsert = fail_upsert
 
     async def ensure_collection(self, index_version: KnowledgeIndexVersion) -> None:
         del index_version
@@ -332,6 +397,11 @@ class _FakeIndex:
     ) -> None:
         del index_version
         self.deleted_version_ids.append(version_id)
+        self.points = {
+            point_id: stored_version_id
+            for point_id, stored_version_id in self.points.items()
+            if stored_version_id != version_id
+        }
 
     async def upsert_chunks(
         self,
@@ -339,8 +409,26 @@ class _FakeIndex:
         chunks: list[IndexedChunk],
         embeddings: EmbeddingBatch,
     ) -> None:
-        del index_version, chunks, embeddings
+        del index_version, embeddings
         self.upsert_count += 1
+        self.upserted_point_ids = [
+            uuid5(NAMESPACE_URL, str(chunk.chunk_id)) for chunk in chunks
+        ]
+        if self.fail_upsert:
+            raise RuntimeError("qdrant upsert failed")
+        for point_id, chunk in zip(
+            self.upserted_point_ids,
+            chunks,
+            strict=True,
+        ):
+            self.points[point_id] = chunk.version_id
+
+    def retrieve(self, version_id: UUID) -> set[UUID]:
+        return {
+            point_id
+            for point_id, stored_version_id in self.points.items()
+            if stored_version_id == version_id
+        }
 
 
 class _FakeEmbeddings:
@@ -353,6 +441,12 @@ class _FakeEmbeddings:
             dense=[[0.1] * DENSE_DIMENSIONS for _ in texts],
             sparse=[{} for _ in texts],
         )
+
+
+class _FailingEmbeddings:
+    async def embed(self, texts: list[str]) -> EmbeddingBatch:
+        del texts
+        raise RuntimeError("embedding unavailable")
 
 
 async def _seed_uploaded_version_and_job(
@@ -443,7 +537,9 @@ async def _seed_version_and_job(
             return version.id
 
 
-async def _seed_published_indexed_version(session_factory) -> UUID:
+async def _seed_published_indexed_version(
+    session_factory,
+) -> tuple[UUID, list[UUID]]:
     async with session_factory() as session:
         async with session.begin():
             source = KnowledgeSource(
@@ -464,6 +560,7 @@ async def _seed_published_indexed_version(session_factory) -> UUID:
             )
             session.add(version)
             await session.flush()
+            chunk_ids = [uuid4(), uuid4()]
             index_version = KnowledgeIndexVersion(
                 source_version_id=version.id,
                 version="v1",
@@ -473,19 +570,23 @@ async def _seed_published_indexed_version(session_factory) -> UUID:
                 ),
                 embedding_model=settings.embedding_model_name,
                 reranker_model=settings.reranker_model_name,
-                chunk_count=1,
+                chunk_count=len(chunk_ids),
             )
             session.add(index_version)
             await session.flush()
-            session.add(
-                KnowledgeChunk(
-                    version_id=version.id,
-                    chunk_no=1,
-                    section_path=["重建"],
-                    checksum="c" * 64,
-                    search_text="上海市活动断层距离测试",
-                    text="上海市活动断层距离测试",
-                )
+            session.add_all(
+                [
+                    KnowledgeChunk(
+                        id=chunk_id,
+                        version_id=version.id,
+                        chunk_no=chunk_no,
+                        section_path=["重建"],
+                        checksum=str(chunk_no) * 64,
+                        search_text=f"上海市活动断层距离测试 {chunk_no}",
+                        text=f"上海市活动断层距离测试 {chunk_no}",
+                    )
+                    for chunk_no, chunk_id in enumerate(chunk_ids, start=1)
+                ]
             )
             session.add(
                 KnowledgeJob(
@@ -497,7 +598,7 @@ async def _seed_published_indexed_version(session_factory) -> UUID:
                 )
             )
             await session.flush()
-            return version.id
+            return version.id, chunk_ids
 
 
 async def _seed_publishable_versions(session_factory):
