@@ -163,11 +163,12 @@ class RerankerAdapter(_ModelServiceAdapter):
             )
         results: list[RerankResult] = []
         for index, score in enumerate(scores):
-            if not _is_finite_number(score):
-                raise RerankerUnavailableError(
-                    "reranker service returned a non-finite score"
-                )
-            results.append(RerankResult(index=index, score=float(score)))
+            score_value = _coerce_finite_float(
+                score,
+                error_type=RerankerUnavailableError,
+                message="reranker service returned a non-finite score",
+            )
+            results.append(RerankResult(index=index, score=score_value))
         return results
 
 
@@ -200,33 +201,54 @@ def _parse_embedding_response(
             raise EmbeddingUnavailableError(
                 f"embedding service returned {len(vector) if isinstance(vector, list) else 'non-list'} dense dimensions"
             )
-        if not all(_is_finite_number(value) for value in vector):
-            raise EmbeddingUnavailableError(
-                "embedding service returned a non-finite vector"
-            )
-        normalized_dense.append([float(value) for value in vector])
+        normalized_dense.append(
+            [
+                _coerce_finite_float(
+                    value,
+                    error_type=EmbeddingUnavailableError,
+                    message="embedding service returned a non-finite vector",
+                )
+                for value in vector
+            ]
+        )
         if not isinstance(weights, dict):
             raise EmbeddingUnavailableError("embedding sparse vector is not a mapping")
         normalized_weights: dict[int, float] = {}
         for token_id, value in weights.items():
-            if not _is_finite_number(value):
-                raise EmbeddingUnavailableError(
-                    "embedding service returned a non-finite sparse weight"
-                )
             try:
                 parsed_token_id = int(str(token_id))
             except ValueError as exc:
                 raise EmbeddingUnavailableError(
                     "embedding service returned an invalid sparse token id"
                 ) from exc
-            normalized_weights[parsed_token_id] = float(value)
+            normalized_weights[parsed_token_id] = _coerce_finite_float(
+                value,
+                error_type=EmbeddingUnavailableError,
+                message="embedding service returned a non-finite sparse weight",
+            )
         normalized_sparse.append(normalized_weights)
     return normalized_dense, normalized_sparse
 
 
 def _is_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
+
+
+def _coerce_finite_float(
+    value: Any,
+    *,
+    error_type: type[RuntimeError],
+    message: str,
+) -> float:
+    if not _is_finite_number(value):
+        raise error_type(message)
+    try:
+        return float(value)
+    except (OverflowError, ValueError) as exc:
+        raise error_type(message) from exc

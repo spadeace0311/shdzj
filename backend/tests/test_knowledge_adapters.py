@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -121,6 +123,53 @@ async def test_embedding_adapter_rejects_non_finite_sparse_value() -> None:
             await adapter.embed(["document"])
 
 
+async def test_embedding_adapter_rejects_oversized_integer_dense_value() -> None:
+    huge_integer = 10**1000
+    dense = [huge_integer] + [0.1] * 1023
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=json.dumps(
+                {
+                    "dense": [dense],
+                    "sparse": [{"1": 0.5}],
+                }
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = EmbeddingAdapter(
+            base_url=BASE_URL,
+            client=client,
+        )
+        with pytest.raises(EmbeddingUnavailableError):
+            await adapter.embed(["document"])
+
+
+async def test_embedding_adapter_rejects_oversized_integer_sparse_value() -> None:
+    huge_integer = 10**1000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=json.dumps(
+                {
+                    "dense": [[0.1] * 1024],
+                    "sparse": [{"1": huge_integer}],
+                }
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = EmbeddingAdapter(
+            base_url=BASE_URL,
+            client=client,
+        )
+        with pytest.raises(EmbeddingUnavailableError):
+            await adapter.embed(["document"])
+
+
 async def test_embedding_adapter_health_is_false_for_starting_service() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
@@ -154,6 +203,19 @@ async def test_reranker_adapter_preserves_original_indices() -> None:
 async def test_reranker_adapter_rejects_non_finite_scores() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"scores": [float("nan")]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = RerankerAdapter(
+            base_url=BASE_URL,
+            client=client,
+        )
+        with pytest.raises(RerankerUnavailableError):
+            await adapter.rerank("query", ["document"])
+
+
+async def test_reranker_adapter_rejects_oversized_integer_score() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=json.dumps({"scores": [10**1000]}))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         adapter = RerankerAdapter(

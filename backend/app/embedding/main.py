@@ -39,10 +39,7 @@ async def health() -> HealthResponse:
     if runtime.is_loaded:
         return HealthResponse(status="ok")
     if getattr(runtime, "load_error", None) is not None:
-        return HealthResponse(
-            status="error",
-            detail=getattr(runtime, "load_error"),
-        )
+        return HealthResponse(status="error", detail="model runtime unavailable")
     return HealthResponse(status="starting")
 
 
@@ -57,7 +54,10 @@ async def embed(request: EmbedRequest) -> EmbedResponse:
     try:
         output = await runtime.embed(request.texts)
     except EmbeddingRuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=503,
+            detail="embedding model is unavailable",
+        ) from exc
     return EmbedResponse(
         dense=output["dense"],
         sparse=output["sparse"],
@@ -75,5 +75,8 @@ async def rerank(request: RerankRequest) -> RerankResponse:
     try:
         scores = await runtime.rerank(request.query, request.documents)
     except EmbeddingRuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=503,
+            detail="reranker model is unavailable",
+        ) from exc
     return RerankResponse(scores=scores)

@@ -49,6 +49,7 @@ class BgeRuntime:
         self._reranker = None
         self._loaded = False
         self._load_error: str | None = None
+        self._load_cause: BaseException | None = None
 
     @property
     def is_loaded(self) -> bool:
@@ -58,6 +59,10 @@ class BgeRuntime:
     def load_error(self) -> str | None:
         return self._load_error
 
+    @property
+    def load_cause(self) -> BaseException | None:
+        return self._load_cause
+
     async def load(self) -> None:
         if self._loaded:
             return
@@ -66,22 +71,27 @@ class BgeRuntime:
             self._reranker = self._load_reranker_model()
         except Exception as exc:
             self._loaded = False
-            self._load_error = str(exc)
+            self._load_cause = exc
+            self._load_error = "local embedding models failed to load"
             raise EmbeddingRuntimeError("local embedding models failed to load") from exc
         self._loaded = True
         self._load_error = None
+        self._load_cause = None
 
     async def embed(self, texts: list[str]) -> dict[str, Any]:
         if not self._loaded:
             raise EmbeddingRuntimeError("embedding model is not loaded")
-        output = self._embedding.encode(
-            texts,
-            batch_size=self._config.batch_size,
-            max_length=self._config.max_length,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
-        )
+        try:
+            output = self._embedding.encode(
+                texts,
+                batch_size=self._config.batch_size,
+                max_length=self._config.max_length,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+            )
+        except Exception as exc:
+            raise EmbeddingRuntimeError("embedding inference failed") from exc
         return {
             "dense": self._normalize_dense(output.get("dense_vecs"), len(texts)),
             "sparse": self._normalize_sparse(output.get("lexical_weights"), len(texts)),
@@ -94,15 +104,22 @@ class BgeRuntime:
     ) -> list[float]:
         if not self._loaded:
             raise EmbeddingRuntimeError("reranker model is not loaded")
-        scores = self._reranker.compute_score(
-            [[query, document] for document in documents],
-            normalize=True,
-        )
+        try:
+            scores = self._reranker.compute_score(
+                [[query, document] for document in documents],
+                normalize=True,
+            )
+        except Exception as exc:
+            raise EmbeddingRuntimeError("reranker inference failed") from exc
         normalized: list[float] = []
         for score in scores:
-            if not _is_finite_number(score):
-                raise EmbeddingRuntimeError("reranker returned a non-finite score")
-            normalized.append(float(score))
+            normalized.append(
+                _coerce_finite_float(
+                    score,
+                    error_type=EmbeddingRuntimeError,
+                    message="reranker returned a non-finite score",
+                )
+            )
         return normalized
 
     def _load_embedding_model(self) -> Any:
@@ -144,9 +161,16 @@ class BgeRuntime:
                 raise EmbeddingRuntimeError(
                     f"embedding model returned {len(vector)} dense dimensions"
                 )
-            if not all(_is_finite_number(value) for value in vector):
-                raise EmbeddingRuntimeError("embedding model returned a non-finite vector")
-            normalized.append([float(value) for value in vector])
+            normalized.append(
+                [
+                    _coerce_finite_float(
+                        value,
+                        error_type=EmbeddingRuntimeError,
+                        message="embedding model returned a non-finite vector",
+                    )
+                    for value in vector
+                ]
+            )
         return normalized
 
     def _normalize_sparse(
@@ -164,11 +188,11 @@ class BgeRuntime:
                 raise EmbeddingRuntimeError("embedding sparse vector is not a mapping")
             normalized_weights: dict[str, float] = {}
             for token_id, value in weights.items():
-                if not _is_finite_number(value):
-                    raise EmbeddingRuntimeError(
-                        "embedding model returned a non-finite sparse weight"
-                    )
-                normalized_weights[str(token_id)] = float(value)
+                normalized_weights[str(token_id)] = _coerce_finite_float(
+                    value,
+                    error_type=EmbeddingRuntimeError,
+                    message="embedding model returned a non-finite sparse weight",
+                )
             normalized.append(normalized_weights)
         return normalized
 
@@ -187,11 +211,27 @@ def _positive_int_from_env(name: str, default: int) -> int:
 
 
 def _is_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
+
+
+def _coerce_finite_float(
+    value: Any,
+    *,
+    error_type: type[RuntimeError],
+    message: str,
+) -> float:
+    if not _is_finite_number(value):
+        raise error_type(message)
+    try:
+        return float(value)
+    except (OverflowError, ValueError) as exc:
+        raise error_type(message) from exc
 
 
 _runtime: BgeRuntime | None = None
