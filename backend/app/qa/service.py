@@ -471,16 +471,15 @@ class QuestionOrchestrator:
                 raise
             except Exception:
                 text = locals().get("text", "") or ""
-                partial_status = "partial" if text else "failed"
                 await self._finish_partial(
                     answer_id,
                     started_at,
                     text,
                     pack,
                     ["model_interrupted"],
-                    status=partial_status,
+                    status="partial",
                 )
-                terminal_status = partial_status
+                terminal_status = "partial"
                 yield AnswerEvent(
                     "error",
                     {"code": "model_interrupted", "recoverable": True},
@@ -689,7 +688,7 @@ class QuestionOrchestrator:
                 text,
                 pack,
                 degraded_reasons,
-                status="partial" if text else "failed",
+                status="partial",
             )
         except Exception:
             pass

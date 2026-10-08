@@ -132,9 +132,20 @@ async def get_qa_session(
 async def ask_qa_question(
     session_id: UUID,
     request: QaQuestionCreate,
+    session: AsyncSession = Depends(get_session),
+    repository: QaRepository = Depends(get_qa_repository),
     orchestrator: QuestionOrchestrator = Depends(get_question_orchestrator),
     current_user: AuthUser = Depends(get_current_user),
 ) -> StreamingResponse:
+    try:
+        await repository.get_session(
+            session,
+            session_id,
+            current_user,
+        )
+    except (LookupError, PermissionError, SQLAlchemyError) as exc:
+        raise _map_qa_error(exc) from exc
+
     async def event_stream():
         try:
             async for event in orchestrator.ask(

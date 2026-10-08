@@ -1,168 +1,144 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import re
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete, func, select
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
-from app.main import app
-from app.qa.router import get_qa_repository, get_question_orchestrator
-from app.qa.schemas import (
-    QaAnswerView,
-    QaFeedbackResponse,
-    QaSessionCreate,
-    QaSessionResponse,
+from app.config import settings
+from app.db import SessionFactory
+from app.knowledge.index import RetrievedEvidence
+from app.knowledge.models import (
+    KnowledgeIndexVersion,
+    KnowledgeSnapshot,
+    KnowledgeSource,
+    KnowledgeSourceVersion,
 )
-from app.qa.service import AnswerEvent
+from app.knowledge.retrieval import RetrievalResult
+from app.main import app
+from app.qa.domain import ExecutionPlan, KnowledgeQuery, ToolCallPlan
+from app.qa.models import QaAnswer, QaCitation, QaQuestion, QaSession, QaToolCall
+from app.qa.repository import QaRepository
+from app.qa.router import get_question_orchestrator
+from app.qa.schemas import QaSessionCreate
+from app.qa.service import AnswerEvent, QuestionOrchestrator
+from app.qa.tools.registry import (
+    EmptyToolInput,
+    ToolExecution,
+    ToolRegistry,
+    ToolResult,
+)
+
+QA_API_ACTOR = "qa-api-integration"
+QA_API_OTHER_ACTOR = "qa-api-other-user"
 
 
-@dataclass(slots=True)
-class FakeSession:
-    id: UUID
-    event_id: UUID | None
-    snapshot_id: UUID
+@pytest.fixture(autouse=True)
+async def _dispose_engine_between_tests():
+    from app.db import engine
+
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
-class FakeQaRepository:
-    def __init__(self, event_id: UUID, snapshot_id: UUID) -> None:
-        self.event_id = event_id
-        self.snapshot_id = snapshot_id
-        self.created: list[QaSessionCreate] = []
-        self.deleted: list[UUID] = []
-        self.feedback: list[tuple[UUID, object]] = []
+class FakeDeepSeek:
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        *,
+        chunks: list[str] | None = None,
+        stream_error: Exception | None = None,
+    ) -> None:
+        self.plan_result = plan
+        self.chunks = chunks or []
+        self.stream_error = stream_error
 
-    async def create_session(self, session, user, request) -> QaSessionResponse:
-        del session
-        self.created.append(request)
-        session_id = uuid4()
-        now = datetime.now(UTC)
-        return QaSessionResponse(
-            id=session_id,
-            created_by=user.username,
-            event_id=request.event_id,
-            snapshot_id=self.snapshot_id,
-            title=request.title,
-            created_at=now,
-            updated_at=now,
+    async def plan(self, question, context, tool_catalog):
+        del question, context, tool_catalog
+        return self.plan_result
+
+    async def stream_answer(self, question, context, evidence, tool_results):
+        del question, context, evidence, tool_results
+        for chunk in self.chunks:
+            yield chunk
+        if self.stream_error is not None:
+            raise self.stream_error
+
+
+class FakeRetriever:
+    def __init__(self, evidence: list[RetrievedEvidence] | None = None) -> None:
+        self.evidence = evidence or []
+
+    async def search(self, query, filters, limit=20):
+        del query, filters, limit
+        return RetrievalResult(
+            evidence=tuple(self.evidence),
+            degraded=False,
+            degradation_reason=(),
         )
 
-    async def list_sessions(self, session, user, limit, cursor):
-        del session, user, limit, cursor
-        return []
 
-    async def get_session(self, session, session_id, user) -> QaSessionResponse:
-        del session, user
-        now = datetime.now(UTC)
-        return QaSessionResponse(
-            id=session_id,
-            created_by="viewer",
-            event_id=self.event_id,
-            snapshot_id=self.snapshot_id,
-            title="测试会话",
-            created_at=now,
-            updated_at=now,
-        )
+class StaticExecutionRegistry(ToolRegistry):
+    def __init__(self, executions: list[ToolExecution]) -> None:
+        super().__init__()
+        self.executions = executions
 
-    async def get_answer(self, session, answer_id, user) -> QaAnswerView:
-        del session, user
-        return QaAnswerView(
-            id=answer_id,
-            question_id=uuid4(),
-            session_id=uuid4(),
-            status="completed",
-            text="最近断裂带约 18.2 公里。",
-            structured=None,
-            citation_keys=["C1"],
-            degraded_reasons=[],
-            duration_ms=41,
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            citations=[],
-            tool_calls=[],
-            map_actions=[],
-        )
+    def get(self, name: str):
+        if name in {execution.name for execution in self.executions}:
+            return SimpleNamespace(name=name, input_model=EmptyToolInput)
+        return None
 
-    async def record_feedback(self, session, answer_id, user, request) -> QaFeedbackResponse:
-        del session, user
-        self.feedback.append((answer_id, request))
-        return QaFeedbackResponse(
-            id=uuid4(),
-            answer_id=answer_id,
-            created_by="viewer",
-            helpful=request.helpful,
-            rating=request.rating,
-            comment=request.comment,
-            created_at=datetime.now(UTC),
-        )
-
-    async def delete_answer(self, session, answer_id, actor) -> None:
-        del session, actor
-        self.deleted.append(answer_id)
-
-
-class FakeOrchestrator:
-    def __init__(self, event_id: UUID) -> None:
-        self.event_id = event_id
-        self.calls: list[tuple[str, UUID, AuthUser]] = []
-
-    async def ask(self, question, *, session_id, user):
-        self.calls.append((question, session_id, user))
-        answer_id = uuid4()
-        yield AnswerEvent("retrieval", {"answer_id": str(answer_id), "count": 5, "degraded": False})
-        yield AnswerEvent("tool", {"name": "fault.nearest", "status": "ok", "duration_ms": 41})
-        yield AnswerEvent("answer_started", {"answer_id": str(answer_id)})
-        yield AnswerEvent("answer_delta", {"text": "最近断裂带约 18.2 公里。"})
-        yield AnswerEvent(
-            "answer_completed",
-            {
-                "answer_id": str(answer_id),
-                "status": "completed",
-                "citations": [{"citation_key": "C1"}],
-            },
-        )
+    async def execute_plan(self, calls, context):
+        del calls, context
+        return list(self.executions)
 
 
 @pytest.fixture
-async def qa_client():
-    event_id = uuid4()
-    snapshot_id = uuid4()
-    repository = FakeQaRepository(event_id, snapshot_id)
-    orchestrator = FakeOrchestrator(event_id)
+async def qa_db():
+    ids = await _seed_knowledge_index()
+    try:
+        yield ids
+    finally:
+        await _cleanup_qa_data(ids)
+
+
+@pytest.fixture
+async def qa_client(qa_db):
     previous_user = app.dependency_overrides.get(get_current_user)
-    previous_repository = app.dependency_overrides.get(get_qa_repository)
     previous_orchestrator = app.dependency_overrides.get(get_question_orchestrator)
+    orchestrator = _orchestrator(
+        chunks=["最近断裂带约 18.2 公里。 [C1]"],
+    )
     app.dependency_overrides[get_current_user] = lambda: AuthUser(
-        username="viewer",
+        username=QA_API_ACTOR,
         role="viewer",
         workgroup=None,
     )
-    app.dependency_overrides[get_qa_repository] = lambda: repository
     app.dependency_overrides[get_question_orchestrator] = lambda: orchestrator
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://testserver",
         ) as client:
-            client.event_id = event_id
-            client.snapshot_id = snapshot_id
-            client.repository = repository
             client.orchestrator = orchestrator
             yield client
     finally:
         _restore_override(app, get_current_user, previous_user)
-        _restore_override(app, get_qa_repository, previous_repository)
         _restore_override(app, get_question_orchestrator, previous_orchestrator)
 
 
 async def test_question_stream_has_ordered_events(qa_client) -> None:
     session = await qa_client.post(
         "/api/v1/qa/sessions",
-        json={"title": "断层距离", "event_id": str(qa_client.event_id)},
+        json={"title": "断层距离", "event_id": None},
     )
     assert session.status_code == 201
 
@@ -175,6 +151,14 @@ async def test_question_stream_has_ordered_events(qa_client) -> None:
     body = response.text
     assert body.index("event: retrieval") < body.index("event: answer_completed")
     assert '"citation_key":"C1"' in body
+
+    async with SessionFactory() as db:
+        answer_id = UUID(_answer_id_from_sse(body))
+        answer = await db.get(QaAnswer, answer_id)
+        assert answer is not None
+        assert answer.status == "completed"
+        assert answer.text is not None
+        assert answer.citation_keys == ["C1"]
 
 
 async def test_question_requires_authentication() -> None:
@@ -200,26 +184,62 @@ async def test_viewer_cannot_use_superadmin_delete(qa_client) -> None:
     assert response.status_code == 403
 
 
-async def test_create_session_locks_server_snapshot(qa_client) -> None:
+async def test_create_session_locks_server_snapshot(qa_client, qa_db) -> None:
     forged_snapshot = str(uuid4())
     forged_index = str(uuid4())
     response = await qa_client.post(
         "/api/v1/qa/sessions",
         json={
             "title": "锁定快照",
-            "event_id": str(qa_client.event_id),
+            "event_id": None,
             "snapshot_id": forged_snapshot,
             "index_version_id": forged_index,
         },
     )
     assert response.status_code == 201
-    assert response.json()["snapshot_id"] == str(qa_client.snapshot_id)
     assert response.json()["snapshot_id"] not in {forged_snapshot, forged_index}
-    assert qa_client.repository.created[0].title == "锁定快照"
+
+    async with SessionFactory() as session:
+        qa_session = await session.get(QaSession, UUID(response.json()["id"]))
+        assert qa_session is not None
+        assert str(qa_session.snapshot_id) == response.json()["snapshot_id"]
+        assert qa_session.snapshot_id != UUID(forged_snapshot)
+
+
+async def test_question_rejects_other_users_session(qa_client, session_factory) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            other_session = await QaRepository().create_session(
+                session,
+                AuthUser(
+                    username=QA_API_OTHER_ACTOR,
+                    role="viewer",
+                    workgroup=None,
+                ),
+                QaSessionCreate(title="其他用户会话", event_id=None),
+            )
+        other_session_id = other_session.id
+
+    before = await _question_count(other_session_id)
+    response = await qa_client.post(
+        f"/api/v1/qa/sessions/{other_session_id}/questions",
+        json={"question": "越权提问"},
+    )
+    assert response.status_code == 403
+    assert await _question_count(other_session_id) == before
 
 
 async def test_get_answer_and_feedback_routes(qa_client) -> None:
-    answer_id = uuid4()
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "读取答案", "event_id": None},
+    )
+    response = await qa_client.post(
+        f"/api/v1/qa/sessions/{session.json()['id']}/questions",
+        json={"question": "震中距最近断裂带多少公里？"},
+    )
+    answer_id = _answer_id_from_sse(response.text)
+
     answer = await qa_client.get(f"/api/v1/qa/answers/{answer_id}")
     assert answer.status_code == 200
     assert answer.json()["status"] == "completed"
@@ -231,7 +251,103 @@ async def test_get_answer_and_feedback_routes(qa_client) -> None:
     )
     assert feedback.status_code == 201
     assert feedback.json()["rating"] == 5
-    assert qa_client.repository.feedback[0][0] == answer_id
+
+
+async def test_stream_disconnect_persists_existing_text_as_partial(
+    qa_db,
+    session_factory,
+) -> None:
+    session_id = await _create_qa_session()
+    executions = [_tool_execution()]
+    orchestrator = _orchestrator(
+        chunks=["已有文本"],
+        stream_error=asyncio.CancelledError(),
+        executions=executions,
+    )
+
+    answer_id = None
+    with pytest.raises(asyncio.CancelledError):
+        async for event in orchestrator.ask(
+            "已有结论是什么？",
+            session_id=session_id,
+            user=_viewer(),
+        ):
+            if event.type == "answer_started":
+                answer_id = UUID(event.data["answer_id"])
+
+    assert answer_id is not None
+    async with SessionFactory() as session:
+        answer = await session.get(QaAnswer, answer_id)
+        assert answer is not None
+        assert answer.status == "partial"
+        assert answer.text == "已有文本"
+        assert await _count(session, QaToolCall, answer_id=answer_id) == 1
+        assert await _count(session, QaCitation, answer_id=answer_id) == 1
+
+
+async def test_stream_disconnect_without_text_is_partial(
+    qa_db,
+    session_factory,
+) -> None:
+    session_id = await _create_qa_session()
+    executions = [_tool_execution()]
+    orchestrator = _orchestrator(
+        chunks=[],
+        stream_error=asyncio.CancelledError(),
+        executions=executions,
+    )
+
+    answer_id = None
+    with pytest.raises(asyncio.CancelledError):
+        async for event in orchestrator.ask(
+            "尚无文本的问题",
+            session_id=session_id,
+            user=_viewer(),
+        ):
+            if event.type == "answer_started":
+                answer_id = UUID(event.data["answer_id"])
+
+    assert answer_id is not None
+    async with SessionFactory() as session:
+        answer = await session.get(QaAnswer, answer_id)
+        assert answer is not None
+        assert answer.status == "partial"
+        assert answer.text is None
+        assert await _count(session, QaToolCall, answer_id=answer_id) == 1
+        assert await _count(session, QaCitation, answer_id=answer_id) == 1
+
+
+async def test_stream_close_without_text_is_partial(
+    qa_db,
+    session_factory,
+) -> None:
+    session_id = await _create_qa_session()
+    executions = [_tool_execution()]
+    orchestrator = _orchestrator(
+        chunks=[],
+        executions=executions,
+    )
+
+    stream = orchestrator.ask(
+        "关闭前尚无文本的问题",
+        session_id=session_id,
+        user=_viewer(),
+    )
+    answer_id = None
+    async for event in stream:
+        if event.type == "answer_started":
+            answer_id = UUID(event.data["answer_id"])
+            break
+    await stream.aclose()
+
+    assert answer_id is not None
+    async with SessionFactory() as session:
+        answer = await session.get(QaAnswer, answer_id)
+        assert answer is not None
+        assert answer.status == "partial"
+        assert answer.text is None
+        assert await _count(session, QaToolCall, answer_id=answer_id) == 1
+        assert await _count(session, QaCitation, answer_id=answer_id) == 1
 
 
 def test_format_sse_uses_compact_json_and_named_event() -> None:
@@ -242,6 +358,171 @@ def test_format_sse_uses_compact_json_and_named_event() -> None:
         'event: answer_delta\n'
         'data: {"text":"最近断裂带为..."}\n\n'
     )
+
+
+def _viewer() -> AuthUser:
+    return AuthUser(username=QA_API_ACTOR, role="viewer", workgroup=None)
+
+
+def _plan(*, with_tool: bool = False) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent="knowledge_query",
+        tool_calls=(
+            [ToolCallPlan(name="fault.nearest", arguments={})]
+            if with_tool
+            else []
+        ),
+        knowledge_queries=[KnowledgeQuery(text="断层距离", top_k=5)],
+        map_intents=[],
+        clarification=None,
+    )
+
+
+def _evidence() -> RetrievedEvidence:
+    return RetrievedEvidence(
+        chunk_id=uuid4(),
+        version_id=uuid4(),
+        source_title="上海地震应急预案",
+        layer="local_authority",
+        access_level="internal",
+        text="上海市地震应急预案规定响应分级。",
+        section_path=("第三章",),
+        page_from=12,
+        page_to=12,
+        source_uri=None,
+        checksum="b" * 64,
+        scores={"rerank": 0.9},
+    )
+
+
+def _tool_execution() -> ToolExecution:
+    return ToolExecution(
+        name="fault.nearest",
+        result=ToolResult.ok(
+            value={"distance_km": 18.2},
+            unit="km",
+            source="shanghai.fault",
+            version="v1",
+            parameters={},
+        ),
+    )
+
+
+def _orchestrator(
+    *,
+    chunks: list[str],
+    stream_error: Exception | None = None,
+    executions: list[ToolExecution] | None = None,
+) -> QuestionOrchestrator:
+    executions = executions or []
+    return QuestionOrchestrator(
+        deepseek=FakeDeepSeek(
+            _plan(with_tool=bool(executions)),
+            chunks=chunks,
+            stream_error=stream_error,
+        ),
+        retriever=FakeRetriever([_evidence()]),
+        registry=StaticExecutionRegistry(executions),
+    )
+
+
+async def _create_qa_session() -> UUID:
+    async with SessionFactory() as session:
+        async with session.begin():
+            qa_session = await QaRepository().create_session(
+                session,
+                _viewer(),
+                QaSessionCreate(title="流断开测试", event_id=None),
+            )
+            return qa_session.id
+
+
+async def _seed_knowledge_index() -> dict[str, object]:
+    now = datetime.now(UTC)
+    async with SessionFactory() as session:
+        async with session.begin():
+            source = KnowledgeSource(
+                source_key=f"qa-api.{uuid4()}",
+                title="QA API Source",
+                layer="local_authority",
+                source_type="preplan",
+                access_level="internal",
+                created_by=QA_API_ACTOR,
+            )
+            session.add(source)
+            await session.flush()
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version="v1",
+                status="indexed",
+                checksum="a" * 64,
+                created_by=QA_API_ACTOR,
+            )
+            session.add(version)
+            await session.flush()
+            index_version = KnowledgeIndexVersion(
+                source_version_id=version.id,
+                version="v1",
+                status="published",
+                collection_name=f"shanghai-knowledge-{uuid4()}",
+                embedding_model=settings.embedding_model_name,
+                reranker_model=settings.reranker_model_name,
+                manifest={},
+                activated_at=now,
+            )
+            session.add(index_version)
+            await session.flush()
+            return {
+                "source_id": source.id,
+                "version_id": version.id,
+                "index_version_id": index_version.id,
+            }
+
+
+async def _cleanup_qa_data(ids: dict[str, object]) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(QaSession).where(
+                    QaSession.created_by.in_(
+                        [QA_API_ACTOR, QA_API_OTHER_ACTOR]
+                    )
+                )
+            )
+            await session.execute(
+                delete(KnowledgeSnapshot).where(
+                    KnowledgeSnapshot.index_version_id
+                    == ids["index_version_id"]
+                )
+            )
+            await session.execute(
+                delete(KnowledgeSourceVersion).where(
+                    KnowledgeSourceVersion.id == ids["version_id"]
+                )
+            )
+            await session.execute(
+                delete(KnowledgeSource).where(
+                    KnowledgeSource.id == ids["source_id"]
+                )
+            )
+
+
+async def _question_count(session_id: UUID) -> int:
+    async with SessionFactory() as session:
+        return await _count(session, QaQuestion, session_id=session_id)
+
+
+async def _count(session, model, **filters) -> int:
+    statement = select(func.count()).select_from(model)
+    for key, value in filters.items():
+        statement = statement.where(getattr(model, key) == value)
+    return await session.scalar(statement) or 0
+
+
+def _answer_id_from_sse(body: str) -> str:
+    match = re.search(r'"answer_id":"([0-9a-f-]+)"', body)
+    assert match is not None
+    return match.group(1)
 
 
 def _restore_override(app, dependency, previous) -> None:
