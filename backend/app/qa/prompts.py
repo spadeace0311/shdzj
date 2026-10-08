@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+QA_PROMPT_VERSION = "2026-10-08.2"
+
 
 PLAN_SYSTEM_PROMPT = """
 你是上海地震应急辅助决策系统的知识问答计划器。

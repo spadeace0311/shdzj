@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 
 from app.auth.router import get_current_user
@@ -166,6 +167,11 @@ async def test_superadmin_can_purge_operation_logs_with_filters(purge_client) ->
     assert str(filters.answer_id) == str(answer_id)
     assert filters.actor == "alice"
     assert filters.before.isoformat() == before
+
+
+def test_operation_log_actor_filter_has_maximum_length() -> None:
+    with pytest.raises(ValidationError, match="actor"):
+        OperationLogPurgeFilters(actor="a" * 65)
 
 
 @pytest.mark.parametrize(

@@ -181,6 +181,72 @@ def test_plan_uses_chat_completions_json_response_format() -> None:
     assert captured["payload"]["response_format"] == {"type": "json_object"}
 
 
+def test_plan_exposes_actual_response_model_version_when_present() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash-2026-10",
+                "choices": [
+                    {
+                        "message": {
+                            "content": plan_json(
+                                {
+                                    "intent": "distance",
+                                    "tool_calls": [],
+                                    "knowledge_queries": [],
+                                    "map_intents": [],
+                                    "clarification": None,
+                                }
+                            )
+                        }
+                    }
+                ],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = DeepSeekAdapter(make_settings(), client=client)
+
+    async def run() -> None:
+        await adapter.plan("问题", {}, [])
+        await client.aclose()
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert adapter.last_response_model == "deepseek-flash-2026-10"
+
+
+def test_plan_exposes_missing_response_model_version_as_none() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return chat_response(
+            plan_json(
+                {
+                    "intent": "distance",
+                    "tool_calls": [],
+                    "knowledge_queries": [],
+                    "map_intents": [],
+                    "clarification": None,
+                }
+            )
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = DeepSeekAdapter(make_settings(), client=client)
+
+    async def run() -> None:
+        await adapter.plan("问题", {}, [])
+        await client.aclose()
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert adapter.last_response_model is None
+
+
 def test_plan_retries_connection_errors_then_succeeds() -> None:
     calls = 0
 

@@ -218,6 +218,24 @@ def test_plan_validator_normalizes_tool_arguments() -> None:
     )
 
 
+def test_plan_validator_rejects_clarification_with_tool_calls() -> None:
+    plan = {
+        "intent": "distance",
+        "tool_calls": [
+            {
+                "name": "fault.nearest",
+                "arguments": {"event_id": "e1"},
+            }
+        ],
+        "knowledge_queries": [],
+        "map_intents": [],
+        "clarification": "请明确要查询的具体区域",
+    }
+
+    with pytest.raises(PlanValidationError, match="mutually exclusive"):
+        PlanValidator().validate(plan, FakeRegistry())
+
+
 def test_plan_payload_serialization_stays_under_cap() -> None:
     plan = {
         "intent": "distance",

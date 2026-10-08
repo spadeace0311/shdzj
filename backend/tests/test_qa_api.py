@@ -27,6 +27,7 @@ from app.main import app
 from app.qa.domain import ExecutionPlan, KnowledgeQuery, ToolCallPlan
 from app.qa.models import QaAnswer, QaCitation, QaQuestion, QaSession, QaToolCall
 from app.qa.repository import QaRepository
+from app.qa.prompts import QA_PROMPT_VERSION
 from app.qa.router import get_deepseek_adapter, get_question_orchestrator
 from app.qa.schemas import QaSessionCreate
 from app.qa.service import AnswerEvent, QuestionOrchestrator
@@ -117,6 +118,7 @@ async def qa_client(qa_db):
     previous_orchestrator = app.dependency_overrides.get(get_question_orchestrator)
     orchestrator = _orchestrator(
         chunks=["最近断裂带约 18.2 公里。 [C1]"],
+        executions=[_tool_execution()],
     )
     app.dependency_overrides[get_current_user] = lambda: AuthUser(
         username=QA_API_ACTOR,
@@ -224,6 +226,21 @@ async def test_question_requires_authentication() -> None:
     assert response.status_code == 401
 
 
+async def test_question_rejects_text_over_configured_max_length(qa_client) -> None:
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "超长问题", "event_id": None},
+    )
+    assert session.status_code == 201
+
+    response = await qa_client.post(
+        f"/api/v1/qa/sessions/{session.json()['id']}/questions",
+        json={"question": "问" * 2001},
+    )
+
+    assert response.status_code == 422
+
+
 async def test_viewer_cannot_use_superadmin_delete(qa_client) -> None:
     answer_id = uuid4()
     response = await qa_client.delete(f"/api/v1/admin/qa/answers/{answer_id}")
@@ -297,6 +314,55 @@ async def test_get_answer_and_feedback_routes(qa_client) -> None:
     )
     assert feedback.status_code == 201
     assert feedback.json()["rating"] == 5
+
+
+async def test_completed_answer_persists_qa_audit_provenance(qa_client) -> None:
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "审计追踪", "event_id": None},
+    )
+    assert session.status_code == 201
+    orchestrator = _orchestrator(
+        chunks=["最近断裂带约 18.2 公里。 [C1]"],
+        executions=[_tool_execution()],
+    )
+    previous_orchestrator = app.dependency_overrides.get(get_question_orchestrator)
+    app.dependency_overrides[get_question_orchestrator] = lambda: orchestrator
+    try:
+        response = await qa_client.post(
+            f"/api/v1/qa/sessions/{session.json()['id']}/questions",
+            json={"question": "震中距最近断裂带多少公里？"},
+        )
+    finally:
+        _restore_override(
+            app,
+            get_question_orchestrator,
+            previous_orchestrator,
+        )
+    assert response.status_code == 200
+    answer_id = UUID(_answer_id_from_sse(response.text))
+
+    async with SessionFactory() as db:
+        answer = await db.get(QaAnswer, answer_id)
+        assert answer is not None
+        assert answer.model_name == settings.deepseek_model
+        assert answer.model_version is None
+        assert answer.prompt_version == QA_PROMPT_VERSION
+        assert answer.execution_plan["intent"] == "knowledge_query"
+        assert answer.execution_plan["tool_calls"] == [
+            {"name": "fault.nearest", "arguments": {}}
+        ]
+        assert answer.tool_call_summary == [
+            {
+                "name": "fault.nearest",
+                "status": "ok",
+                "duration_ms": 0,
+                "source": "shanghai.fault",
+                "version": "v1",
+            }
+        ]
+        assert "question" not in answer.execution_plan
+        assert "deepseek_api_key" not in repr(answer.execution_plan)
 
 
 async def test_stream_disconnect_persists_existing_text_as_partial(

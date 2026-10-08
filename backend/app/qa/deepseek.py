@@ -62,6 +62,7 @@ class DeepSeekAdapter:
         self._settings = settings
         self._client = client
         self._base_url = settings.deepseek_base_url.rstrip("/")
+        self.last_response_model: str | None = None
 
     async def plan(
         self,
@@ -240,6 +241,10 @@ class DeepSeekAdapter:
             raise DeepSeekMalformedResponseError(
                 "DeepSeek returned a non-object response"
             ) from None
+        response_model = body.get("model")
+        self.last_response_model = (
+            response_model if isinstance(response_model, str) else None
+        )
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
             raise DeepSeekMalformedResponseError(
@@ -276,6 +281,9 @@ class DeepSeekAdapter:
             raise DeepSeekMalformedResponseError(
                 "DeepSeek returned a non-object stream event"
             ) from None
+        response_model = event.get("model")
+        if isinstance(response_model, str):
+            self.last_response_model = response_model
         if "choices" not in event:
             return None
         choices = event["choices"]

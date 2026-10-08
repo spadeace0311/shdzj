@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+MAX_QUESTION_LENGTH = 2000
+MAX_QA_ACTOR_LENGTH = 64
+
 
 class QaAnswerStatus(StrEnum):
     RUNNING = "running"

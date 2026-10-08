@@ -27,11 +27,13 @@ from app.knowledge.snapshot import (
 )
 from app.qa.access import AccessPolicy
 from app.qa.deepseek import DeepSeekAdapter
-from app.qa.domain import ExecutionPlan
+from app.qa.domain import MAX_QUESTION_LENGTH, ExecutionPlan
 from app.qa.evidence import EvidenceBuilder, EvidencePack
 from app.qa.map_actions import MapActionBuilder, ValidatedMapAction
 from app.qa.models import QaAnswer, QaCitation, QaMapAction, QaQuestion, QaSession, QaToolCall
 from app.qa.planner import PlanValidationError, PlanValidator
+from app.qa.provenance import NumericProvenanceValidator
+from app.qa.prompts import QA_PROMPT_VERSION
 from app.qa.tools import ToolContext, ToolRegistry, build_default_registry
 from app.qa.tools.registry import ToolExecution
 
@@ -78,6 +80,8 @@ class StoredQaSession:
 class QaStateStore(Protocol):
     async def load_session(self, session_id: UUID) -> StoredQaSession: ...
 
+    async def load_history(self, session_id: UUID, limit: int) -> list[dict[str, Any]]: ...
+
     async def start_answer(self, session_id: UUID, question: str) -> UUID: ...
 
     async def record_tool_calls(
@@ -108,6 +112,7 @@ class QaStateStore(Protocol):
         citation_keys: list[str],
         degraded_reasons: list[str],
         duration_ms: int,
+        audit: dict[str, Any],
     ) -> None: ...
 
     async def get_answer(self, answer_id: UUID) -> QaAnswer: ...
@@ -132,6 +137,38 @@ class _SqlAlchemyQaStateStore:
                 qa_session.snapshot_id,
             )
             return _stored_session(qa_session, snapshot)
+
+    async def load_history(
+        self,
+        session_id: UUID,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(QaQuestion, QaAnswer)
+                    .join(QaAnswer, QaAnswer.question_id == QaQuestion.id)
+                    .where(
+                        QaQuestion.session_id == session_id,
+                        QaAnswer.status.in_(
+                            ("completed", "partial", "unavailable")
+                        ),
+                    )
+                    .order_by(QaQuestion.created_at.desc(), QaAnswer.id.desc())
+                    .limit(limit)
+                )
+            ).all()
+        history = [
+            {
+                "question": question.question_text,
+                "status": answer.status,
+                "text": _bounded_history_text(answer.text),
+                "created_at": _isoformat(answer.completed_at),
+            }
+            for question, answer in rows
+        ]
+        history.reverse()
+        return history
 
     async def start_answer(self, session_id: UUID, question: str) -> UUID:
         async with self._session_factory() as session:
@@ -228,6 +265,7 @@ class _SqlAlchemyQaStateStore:
         citation_keys: list[str],
         degraded_reasons: list[str],
         duration_ms: int,
+        audit: dict[str, Any],
     ) -> None:
         async with self._session_factory() as session:
             async with session.begin():
@@ -239,6 +277,13 @@ class _SqlAlchemyQaStateStore:
                 if answer is None:
                     raise LookupError("qa answer not found")
                 answer.status = status
+                answer.model_name = audit.get("model_name")
+                answer.model_version = audit.get("model_version")
+                answer.prompt_version = audit.get("prompt_version")
+                answer.execution_plan = _json_safe(audit.get("execution_plan") or {})
+                answer.tool_call_summary = _json_safe(
+                    audit.get("tool_call_summary") or []
+                )
                 answer.text = text
                 answer.structured = _json_safe(structured)
                 answer.citation_keys = list(citation_keys)
@@ -297,6 +342,8 @@ class QuestionOrchestrator:
         self._access = access_policy or AccessPolicy()
         self._map_actions = map_action_builder or MapActionBuilder()
         self._evidence = evidence_builder or EvidenceBuilder()
+        self._provenance = NumericProvenanceValidator()
+        self._model_name = runtime_settings.deepseek_model
         self._streaming = streaming
 
     async def ask(
@@ -307,7 +354,11 @@ class QuestionOrchestrator:
         user: AuthUser,
     ) -> AsyncIterator[AnswerEvent]:
         started_at = perf_counter()
-        if not isinstance(question, str) or not question.strip():
+        if (
+            not isinstance(question, str)
+            or not question.strip()
+            or len(question.strip()) > MAX_QUESTION_LENGTH
+        ):
             yield AnswerEvent(
                 "error",
                 {"code": "invalid_question", "recoverable": False},
@@ -316,6 +367,7 @@ class QuestionOrchestrator:
 
         try:
             stored = await self._store.load_session(session_id)
+            history = await self._store.load_history(session_id, 4)
         except LookupError:
             yield AnswerEvent(
                 "error",
@@ -325,6 +377,7 @@ class QuestionOrchestrator:
 
         answer_id = await self._store.start_answer(session_id, question.strip())
         terminal_status: str | None = None
+        audit = _empty_audit(self._model_name)
         try:
             if not self._access.can_read_event(user, stored.event_id):
                 await self._finish(
@@ -335,6 +388,7 @@ class QuestionOrchestrator:
                     structured={"missing": ["event_access"]},
                     citation_keys=[],
                     degraded_reasons=["event_access"],
+                    audit=audit,
                 )
                 terminal_status = "unavailable"
                 yield AnswerEvent(
@@ -346,10 +400,15 @@ class QuestionOrchestrator:
             try:
                 raw_plan = await self._deepseek.plan(
                     question,
-                    _planning_context(stored, user),
+                    _planning_context(stored, user, history),
                     self._registry.catalog(),
                 )
                 plan = self._validator.validate(raw_plan, self._registry)
+                audit = _plan_audit(
+                    audit,
+                    plan,
+                    _deepseek_response_model(self._deepseek),
+                )
             except (PlanValidationError, Exception) as exc:
                 del exc
                 await self._finish(
@@ -360,6 +419,7 @@ class QuestionOrchestrator:
                     structured={"missing": ["valid_execution_plan"]},
                     citation_keys=[],
                     degraded_reasons=["plan_unavailable"],
+                    audit=audit,
                 )
                 terminal_status = "unavailable"
                 yield AnswerEvent(
@@ -368,11 +428,46 @@ class QuestionOrchestrator:
                 )
                 return
 
+            if plan.clarification:
+                clarification = plan.clarification
+                await self._finish(
+                    answer_id,
+                    started_at,
+                    status="unavailable",
+                    text=clarification,
+                    structured={
+                        "clarification": clarification,
+                        "response_required": True,
+                    },
+                    citation_keys=[],
+                    degraded_reasons=["clarification_requested"],
+                    audit=audit,
+                )
+                terminal_status = "unavailable"
+                yield AnswerEvent(
+                    "answer_started",
+                    {"answer_id": str(answer_id)},
+                )
+                yield AnswerEvent(
+                    "answer_delta",
+                    {"text": clarification},
+                )
+                yield AnswerEvent(
+                    "answer_completed",
+                    {
+                        "answer_id": str(answer_id),
+                        "status": "unavailable",
+                        "clarification": clarification,
+                    },
+                )
+                return
+
             retrieval_result, executions = await asyncio.gather(
                 self._retrieve(plan, stored),
                 self._execute_tools(plan, stored, user),
             )
             await self._store.record_tool_calls(answer_id, executions)
+            audit = _tool_audit(audit, executions)
 
             pack = self._evidence.build(
                 retrieval_result.evidence,
@@ -403,6 +498,7 @@ class QuestionOrchestrator:
                     structured={"missing": ["knowledge_evidence"]},
                     citation_keys=[],
                     degraded_reasons=["knowledge_evidence"],
+                    audit=audit,
                 )
                 terminal_status = "unavailable"
                 yield AnswerEvent(
@@ -442,15 +538,14 @@ class QuestionOrchestrator:
                         if not safe_chunk:
                             continue
                         text += safe_chunk
-                        yield AnswerEvent("answer_delta", {"text": safe_chunk})
                     trailing_text = stream_citations.finish()
                     if trailing_text:
                         text += trailing_text
-                        yield AnswerEvent(
-                            "answer_delta",
-                            {"text": trailing_text},
-                        )
                     stream_invalid_citation_keys = stream_citations.invalid_keys
+                    audit = _model_version_audit(
+                        audit,
+                        _deepseek_response_model(self._deepseek),
+                    )
                 else:
                     draft = await self._deepseek.answer(
                         question,
@@ -462,25 +557,40 @@ class QuestionOrchestrator:
                     draft_structured = dict(draft.structured)
                     draft_citation_keys = list(draft.citation_keys)
                     draft_degraded = list(draft.degraded_reasons)
-                    yield AnswerEvent("answer_delta", {"text": text})
+                    audit = _model_version_audit(
+                        audit,
+                        _deepseek_response_model(self._deepseek),
+                    )
             except asyncio.CancelledError:
+                audit = _model_version_audit(
+                    audit,
+                    _deepseek_response_model(self._deepseek),
+                )
                 await self._finish_partial(
                     answer_id,
                     started_at,
                     text,
                     pack,
                     [],
+                    executions,
+                    audit=audit,
                 )
                 terminal_status = "partial"
                 raise
             except Exception:
                 text = locals().get("text", "") or ""
+                audit = _model_version_audit(
+                    audit,
+                    _deepseek_response_model(self._deepseek),
+                )
                 await self._finish_partial(
                     answer_id,
                     started_at,
                     text,
                     pack,
                     ["model_interrupted"],
+                    executions,
+                    audit=audit,
                     status="partial",
                 )
                 terminal_status = "partial"
@@ -509,15 +619,30 @@ class QuestionOrchestrator:
                 degraded_reasons.append("invalid_citation_key")
 
             structured = dict(draft_structured)
+            provenance = self._provenance.validate(
+                text,
+                executions=executions,
+                model_evidence=pack.model_evidence,
+            )
+            terminal_answer_status = "completed"
+            if not provenance.safe:
+                text = provenance.clean_text
+                missing = structured.get("missing")
+                if not isinstance(missing, list):
+                    missing = []
+                structured["missing"] = _ordered_unique(
+                    [*missing, "unproven_numeric_claim"]
+                )
+                structured["unverified_claim_kinds"] = list(
+                    provenance.unverified_claim_kinds
+                )
+                degraded_reasons.append("unproven_numeric_claim")
+                terminal_answer_status = "partial"
+
             if pack.conflict_notes:
                 structured["conflict_notes"] = list(pack.conflict_notes)
-                disclosed = _append_conflict_notes(text, pack.conflict_notes)
-                if disclosed != text:
-                    yield AnswerEvent(
-                        "answer_delta",
-                        {"text": disclosed[len(text) :]},
-                    )
-                text = disclosed
+                if terminal_answer_status == "completed":
+                    text = _append_conflict_notes(text, pack.conflict_notes)
             if pack.authority_notes:
                 structured["authority_notes"] = list(pack.authority_notes)
 
@@ -526,18 +651,24 @@ class QuestionOrchestrator:
             if invalid_citation_keys:
                 structured["invalid_citation_keys"] = invalid_citation_keys
 
-            actions = self._map_actions.build(plan.map_intents, executions)
+            actions = self._map_actions.build(
+                plan.map_intents,
+                executions,
+                snapshot_id=stored.snapshot_id,
+            )
             await self._store.record_map_actions(answer_id, actions)
+            yield AnswerEvent("answer_delta", {"text": text})
             await self._finish(
                 answer_id,
                 started_at,
-                status="completed",
+                status=terminal_answer_status,
                 text=text,
                 structured=structured or None,
                 citation_keys=citation_keys,
                 degraded_reasons=degraded_reasons,
+                audit=audit,
             )
-            terminal_status = "completed"
+            terminal_status = terminal_answer_status
 
             for action in actions:
                 yield AnswerEvent("map_action", action.to_dict())
@@ -545,7 +676,7 @@ class QuestionOrchestrator:
                 "answer_completed",
                 {
                     "answer_id": str(answer_id),
-                    "status": "completed",
+                    "status": terminal_answer_status,
                     "citations": [citation.to_event_dict() for citation in pack.citations],
                 },
             )
@@ -557,6 +688,8 @@ class QuestionOrchestrator:
                     locals().get("text", "") or "",
                     locals().get("pack"),
                     ["orchestration_interrupted"],
+                    locals().get("executions", []),
+                    audit=locals().get("audit"),
                 )
 
     async def finalize(self, answer_id: UUID | str) -> QaAnswer:
@@ -656,8 +789,10 @@ class QuestionOrchestrator:
         text: str,
         pack: EvidencePack | None,
         degraded_reasons: list[str],
+        executions: list[ToolExecution],
         *,
         status: str = "partial",
+        audit: dict[str, Any] | None = None,
     ) -> None:
         cleaned_text = text
         citation_keys: list[str] = []
@@ -668,6 +803,19 @@ class QuestionOrchestrator:
                 [],
             )
         structured: dict[str, Any] = {}
+        if cleaned_text:
+            provenance = self._provenance.validate(
+                cleaned_text,
+                executions=executions,
+                model_evidence=pack.model_evidence if pack is not None else [],
+            )
+            if not provenance.safe:
+                cleaned_text = provenance.clean_text
+                structured["missing"] = ["unproven_numeric_claim"]
+                structured["unverified_claim_kinds"] = list(
+                    provenance.unverified_claim_kinds
+                )
+                degraded_reasons.append("unproven_numeric_claim")
         if pack is not None and pack.conflict_notes:
             structured["conflict_notes"] = list(pack.conflict_notes)
         if pack is not None and pack.authority_notes:
@@ -680,6 +828,7 @@ class QuestionOrchestrator:
             structured=structured or None,
             citation_keys=citation_keys,
             degraded_reasons=_ordered_unique(degraded_reasons),
+            audit=audit or _empty_audit(self._model_name),
         )
 
     async def _safe_finish_partial(
@@ -689,6 +838,9 @@ class QuestionOrchestrator:
         text: str,
         pack: EvidencePack | None,
         degraded_reasons: list[str],
+        executions: list[ToolExecution],
+        *,
+        audit: dict[str, Any] | None = None,
     ) -> None:
         try:
             await self._finish_partial(
@@ -697,7 +849,9 @@ class QuestionOrchestrator:
                 text,
                 pack,
                 degraded_reasons,
+                executions,
                 status="partial",
+                audit=audit,
             )
         except Exception:
             pass
@@ -712,6 +866,7 @@ class QuestionOrchestrator:
         structured: dict[str, Any] | None,
         citation_keys: list[str],
         degraded_reasons: list[str],
+        audit: dict[str, Any] | None = None,
     ) -> None:
         await self._store.finish_answer(
             answer_id,
@@ -721,6 +876,7 @@ class QuestionOrchestrator:
             citation_keys=citation_keys,
             degraded_reasons=degraded_reasons,
             duration_ms=max(0, round((perf_counter() - started_at) * 1000)),
+            audit=audit or _empty_audit(self._model_name),
         )
 
 
@@ -746,9 +902,73 @@ def _stored_session(
     )
 
 
+def _empty_audit(model_name: str) -> dict[str, Any]:
+    return {
+        "model_name": model_name,
+        "model_version": None,
+        "prompt_version": QA_PROMPT_VERSION,
+        "execution_plan": None,
+        "tool_call_summary": [],
+    }
+
+
+def _plan_audit(
+    audit: dict[str, Any],
+    plan: ExecutionPlan,
+    response_model: str | None,
+) -> dict[str, Any]:
+    return {
+        **audit,
+        "model_version": response_model or audit.get("model_version"),
+        "execution_plan": _json_safe(asdict(plan)),
+    }
+
+
+def _tool_audit(
+    audit: dict[str, Any],
+    executions: Iterable[ToolExecution],
+) -> dict[str, Any]:
+    summary = [
+        {
+            "name": execution.name,
+            "status": str(execution.result.status),
+            "duration_ms": round(execution.duration_ms),
+            "source": execution.result.source,
+            "version": execution.result.version,
+        }
+        for execution in executions
+    ]
+    return {**audit, "tool_call_summary": summary}
+
+
+def _model_version_audit(
+    audit: dict[str, Any],
+    response_model: str | None,
+) -> dict[str, Any]:
+    if response_model is None:
+        return audit
+    return {**audit, "model_version": response_model}
+
+
+def _deepseek_response_model(adapter: Any) -> str | None:
+    response_model = getattr(adapter, "last_response_model", None)
+    return response_model if isinstance(response_model, str) else None
+
+
+def _bounded_history_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return text[:1200]
+
+
+def _isoformat(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def _planning_context(
     stored: StoredQaSession,
     user: AuthUser,
+    recent_history: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
         "user": {
@@ -759,6 +979,7 @@ def _planning_context(
         "session": {
             "id": str(stored.id),
             "title": stored.title,
+            "recent_history": list(recent_history),
         },
         "snapshot": {
             "id": str(stored.snapshot_id),

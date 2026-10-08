@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.qa.domain import MAX_QA_ACTOR_LENGTH, MAX_QUESTION_LENGTH
+
 
 class QaSessionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -25,7 +27,7 @@ class QaSessionResponse(BaseModel):
 
 
 class QaQuestionCreate(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_LENGTH)
 
 
 class QaCitationResponse(BaseModel):
@@ -100,7 +102,7 @@ class QaAnswerView(BaseModel):
 class OperationLogPurgeFilters(BaseModel):
     event_id: UUID | None = None
     answer_id: UUID | None = None
-    actor: str | None = None
+    actor: str | None = Field(default=None, max_length=MAX_QA_ACTOR_LENGTH)
     before: datetime | None = None
 
 

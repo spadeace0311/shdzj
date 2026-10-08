@@ -97,6 +97,8 @@ class MapActionBuilder:
         self,
         map_intents: Iterable[MapIntent | Mapping[str, Any]],
         tool_results: Iterable[Any],
+        *,
+        snapshot_id: object | None = None,
     ) -> list[ValidatedMapAction]:
         results = list(tool_results)
         actions: list[ValidatedMapAction] = []
@@ -116,6 +118,10 @@ class MapActionBuilder:
             if sourced is None:
                 continue
             source_tool, normalized = sourced
+            if snapshot_id is not None:
+                normalized.setdefault("provenance", {})["snapshot_id"] = str(
+                    snapshot_id
+                )
             now = self._clock()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=UTC)
@@ -185,32 +191,358 @@ def _source_action(
     results: list[Any],
 ) -> tuple[str | None, dict[str, Any]] | None:
     if action_type == "set_layers":
-        return None, payload
+        return _set_layers_action(payload, results)
 
     if action_type == "fit_bounds":
         execution, bounds = _result_with_bounds(results)
         if execution is None or bounds is None:
             return None
         payload["bounds"] = bounds
+        _add_provenance(
+            payload,
+            execution,
+            "bounds_tool",
+            "bounds_source",
+            "bounds_version",
+        )
         return _execution_name(execution), payload
 
     target_ref = payload["target_ref"]
     if action_type == "buffer":
-        match = _result_for_target(
+        radius_match = _result_for_target(
             target_ref,
             results,
             required_number="radius_km",
         )
-        if match is None:
+        if radius_match is None:
             return None
-        execution, radius = match
+        radius_execution, radius = radius_match
         payload["radius_km"] = radius
-        return _execution_name(execution), payload
+        target_execution, target_record = _materialize_target(
+            target_ref,
+            results,
+        )
+        if target_execution is None or target_record is None:
+            return None
+        feature_id = _feature_id(target_record, target_ref)
+        if feature_id is None:
+            return None
+        center_execution, center = _coordinates_for_target(
+            target_ref,
+            results,
+            preferred_execution=target_execution,
+        )
+        if center_execution is None or center is None:
+            return None
+        payload["feature_id"] = feature_id
+        payload["center"] = center
+        _add_provenance(
+            payload,
+            target_execution,
+            "target_tool",
+            "target_source",
+            "target_version",
+        )
+        _add_provenance(
+            payload,
+            radius_execution,
+            "radius_tool",
+            "radius_source",
+            "radius_version",
+        )
+        _add_coordinate_provenance(payload, center_execution)
+        return _execution_name(radius_execution), payload
 
-    execution = _result_for_target(target_ref, results)
-    if execution is None:
+    target_execution, target_record = _materialize_target(target_ref, results)
+    if target_execution is None or target_record is None:
         return None
-    return _execution_name(execution), payload
+    feature_id = _feature_id(target_record, target_ref)
+    if feature_id is None:
+        return None
+    payload["feature_id"] = feature_id
+    coordinate_execution = target_execution
+    coordinates = _coordinates(target_record)
+    if coordinates is None:
+        coordinate_execution, coordinates = _coordinates_for_target(
+            target_ref,
+            results,
+            preferred_execution=target_execution,
+        )
+    if action_type == "locate" and (
+        coordinate_execution is None or coordinates is None
+    ):
+        return None
+    if coordinates is not None:
+        payload["coordinates"] = coordinates
+    _add_provenance(
+        payload,
+        target_execution,
+        "target_tool",
+        "target_source",
+        "target_version",
+    )
+    if coordinates is not None and coordinate_execution is not None:
+        _add_coordinate_provenance(payload, coordinate_execution)
+    return _execution_name(target_execution), payload
+
+
+def _set_layers_action(
+    payload: dict[str, Any],
+    results: list[Any],
+) -> tuple[None, dict[str, Any]] | None:
+    visible: list[str] = []
+    source_tools: list[str] = []
+    layer_sources: dict[str, Any] = {}
+    for execution in results:
+        if not _is_successful(execution):
+            continue
+        layer = _layer_for_tool(_execution_name(execution))
+        if layer is None or layer in visible:
+            continue
+        visible.append(layer)
+        tool_name = _execution_name(execution)
+        source_tools.append(tool_name)
+        result = getattr(
+            execution,
+            "result",
+            getattr(execution, "tool_result", None),
+        )
+        layer_sources[layer] = {
+            "tool_name": tool_name,
+            "source": getattr(result, "source", None),
+            "version": getattr(result, "version", None),
+        }
+    if not visible:
+        return None
+    payload["layers"] = visible
+    payload["visibility"] = {
+        layer: layer in visible for layer in sorted(_ALLOWED_LAYERS)
+    }
+    payload["source_tools"] = source_tools
+    payload["provenance"] = {
+        "derivation": "successful_tool_executions",
+        "source_tools": list(source_tools),
+        "layer_sources": layer_sources,
+    }
+    return None, payload
+
+
+def _materialize_target(
+    target_ref: str,
+    results: list[Any],
+) -> tuple[Any | None, Mapping[str, Any] | None]:
+    namespace, _, reference = target_ref.partition(":")
+    namespace = namespace.lower()
+    reference = reference.strip().lower()
+    for execution in results:
+        if not _is_successful(execution):
+            continue
+        value = _execution_value(execution)
+        if not _target_matches(
+            namespace,
+            reference,
+            _execution_name(execution),
+            value,
+        ):
+            continue
+        record = _target_record(
+            value,
+            namespace,
+            reference,
+            _execution_name(execution),
+        )
+        if record is not None:
+            return execution, record
+    return None, None
+
+
+def _target_record(
+    value: Any,
+    namespace: str,
+    reference: str,
+    tool_name: str,
+) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping) and _mapping_matches_target(
+        value,
+        namespace,
+        reference,
+        tool_name,
+    ):
+        return value
+    for record in _iter_mappings(value):
+        if _mapping_matches_target(record, namespace, reference, tool_name):
+            return record
+    return None
+
+
+def _mapping_matches_target(
+    record: Mapping[str, Any],
+    namespace: str,
+    reference: str,
+    tool_name: str,
+) -> bool:
+    tool_parts = tool_name.lower().split(".", 1)
+    symbolic_tool_target = (
+        len(tool_parts) > 1
+        and reference
+        in {
+            tool_parts[1],
+            tool_parts[1].removeprefix("get_"),
+            tool_parts[1].removeprefix("search_"),
+        }
+    )
+    namespace_ids = _namespace_identifier_keys(namespace)
+    if reference in {"nearest", "epicenter", "lookup"} or symbolic_tool_target:
+        return bool(namespace_ids and any(key in record for key in namespace_ids))
+    return any(
+        _normalized_identifier(record.get(key)) == reference
+        for key in namespace_ids
+    )
+
+
+def _coordinates_for_target(
+    target_ref: str,
+    results: list[Any],
+    *,
+    preferred_execution: Any,
+) -> tuple[Any | None, list[float] | None]:
+    preferred_value = _execution_value(preferred_execution)
+    coordinates = _coordinates(preferred_value)
+    if coordinates is not None:
+        return preferred_execution, coordinates
+    for execution in results:
+        if not _is_successful(execution):
+            continue
+        coordinates = _coordinates(_execution_value(execution))
+        if coordinates is not None:
+            return execution, coordinates
+    return None, None
+
+
+def _coordinates(value: Any) -> list[float] | None:
+    if isinstance(value, Mapping):
+        direct = _coordinate_pair(value)
+        if direct is not None:
+            return direct
+        for child in value.values():
+            coordinates = _coordinates(child)
+            if coordinates is not None:
+                return coordinates
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            coordinates = _coordinates(child)
+            if coordinates is not None:
+                return coordinates
+    return None
+
+
+def _coordinate_pair(value: Mapping[str, Any]) -> list[float] | None:
+    longitude = _number(value.get("longitude"))
+    latitude = _number(value.get("latitude"))
+    if longitude is None or latitude is None:
+        coordinates = value.get("coordinates")
+        if (
+            isinstance(coordinates, (list, tuple))
+            and len(coordinates) == 2
+            and all(_number(item) is not None for item in coordinates)
+        ):
+            longitude, latitude = (
+                float(coordinates[0]),
+                float(coordinates[1]),
+            )
+    if longitude is None or latitude is None:
+        return None
+    if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+        return None
+    return [longitude, latitude]
+
+
+def _feature_id(
+    record: Mapping[str, Any],
+    target_ref: str,
+) -> str | None:
+    namespace, _, _reference = target_ref.partition(":")
+    for key in _namespace_identifier_keys(namespace.lower()):
+        value = record.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value)
+    for key in _TARGET_IDENTIFIER_KEYS:
+        value = record.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value)
+    return None
+
+
+def _namespace_identifier_keys(namespace: str) -> tuple[str, ...]:
+    if namespace == "fault":
+        return ("fault_key", "business_key")
+    if namespace == "historical":
+        return ("historical_event_id", "event_id", "business_key")
+    if namespace in {"region", "area", "population", "loss"}:
+        return ("area_code", "business_key")
+    if namespace == "artifact":
+        return ("artifact_id", "publication_id", "business_key")
+    return ("event_id", "revision_id")
+
+
+def _iter_mappings(value: Any) -> Iterable[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _iter_mappings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_mappings(child)
+
+
+def _normalized_identifier(value: Any) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    return str(value).strip().lower()
+
+
+def _layer_for_tool(tool_name: str) -> str | None:
+    namespace = tool_name.split(".", 1)[0].lower()
+    return {
+        "event": "epicenter",
+        "fault": "faults",
+        "seismicity": "historical_earthquakes",
+        "exposure": "population",
+        "intensity": "intensity",
+        "loss": "loss",
+        "artifact": "artifacts",
+    }.get(namespace)
+
+
+def _add_provenance(
+    payload: dict[str, Any],
+    execution: Any,
+    tool_key: str,
+    source_key: str,
+    version_key: str,
+) -> None:
+    result = getattr(
+        execution,
+        "result",
+        getattr(execution, "tool_result", None),
+    )
+    provenance = payload.setdefault("provenance", {})
+    provenance[tool_key] = _execution_name(execution)
+    provenance[source_key] = getattr(result, "source", None)
+    provenance[version_key] = getattr(result, "version", None)
+
+
+def _add_coordinate_provenance(
+    payload: dict[str, Any],
+    execution: Any,
+) -> None:
+    _add_provenance(
+        payload,
+        execution,
+        "coordinates_tool",
+        "coordinates_source",
+        "coordinates_version",
+    )
 
 
 def _result_with_bounds(

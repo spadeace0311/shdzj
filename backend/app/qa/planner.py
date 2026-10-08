@@ -58,7 +58,7 @@ class PlanPayload(BaseModel):
         max_length=5,
     )
     map_intents: list[MapIntentPayload] = Field(default_factory=list)
-    clarification: str | None = None
+    clarification: str | None = Field(default=None, max_length=1000)
 
 
 def _validation_message(exc: ValidationError) -> str:
@@ -93,6 +93,11 @@ class PlanValidator:
             parsed = PlanPayload.model_validate(payload)
         except ValidationError as exc:
             raise PlanValidationError(f"unknown field: {_validation_message(exc)}") from None
+
+        if parsed.clarification and parsed.tool_calls:
+            raise PlanValidationError(
+                "clarification and tool_calls are mutually exclusive"
+            )
 
         names = [call.name for call in parsed.tool_calls]
         if len(names) != len(set(names)):

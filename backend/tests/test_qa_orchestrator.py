@@ -68,6 +68,10 @@ class FakeStore:
             raise LookupError("qa session not found")
         return self.stored_session
 
+    async def load_history(self, session_id: UUID, limit: int) -> list[dict]:
+        del session_id, limit
+        return []
+
     async def start_answer(self, session_id: UUID, question: str) -> UUID:
         del session_id, question
         answer_id = uuid4()
@@ -100,8 +104,9 @@ class FakeStore:
         citation_keys: list[str],
         degraded_reasons: list[str],
         duration_ms: int,
+        audit: dict | None = None,
     ) -> None:
-        del duration_ms
+        del duration_ms, audit
         self.answers[answer_id] = replace(
             self.answers[answer_id],
             status=status,
@@ -113,6 +118,54 @@ class FakeStore:
 
     async def get_answer(self, answer_id: UUID):
         return self.answers[answer_id]
+
+
+class HistoryStore(FakeStore):
+    def __init__(self, stored_session: StoredSession) -> None:
+        super().__init__(stored_session)
+        self.history = [
+            {
+                "question": "当前事件是什么？",
+                "status": "completed",
+                "text": "当前事件为 2026 年 10 月测试事件。",
+                "tool_names": ["event.get_context"],
+            }
+        ]
+        self.requested_limit: int | None = None
+
+    async def load_history(self, session_id: UUID, limit: int) -> list[dict]:
+        del session_id
+        self.requested_limit = limit
+        return list(self.history)
+
+
+class AuditStore(FakeStore):
+    def __init__(self, stored_session: StoredSession) -> None:
+        super().__init__(stored_session)
+        self.audit_records: list[dict | None] = []
+
+    async def finish_answer(
+        self,
+        answer_id: UUID,
+        *,
+        status: str,
+        text: str | None,
+        structured: dict | None,
+        citation_keys: list[str],
+        degraded_reasons: list[str],
+        duration_ms: int,
+        audit: dict | None = None,
+    ) -> None:
+        self.audit_records.append(audit)
+        await super().finish_answer(
+            answer_id,
+            status=status,
+            text=text,
+            structured=structured,
+            citation_keys=citation_keys,
+            degraded_reasons=degraded_reasons,
+            duration_ms=duration_ms,
+        )
 
 
 class FakeDeepSeek:
@@ -882,3 +935,322 @@ async def test_multi_index_event_retrieval_uses_locked_ids_without_event_filter(
 
     assert retriever.calls[0][1].event_id is None
     assert retriever.calls[0][1].global_only is False
+
+
+async def test_streamed_fabricated_number_is_not_published_or_completed() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    plan = ExecutionPlan(
+        intent="distance",
+        tool_calls=[ToolCallPlan(name="fault.nearest", arguments={})],
+        knowledge_queries=[],
+        map_intents=[],
+        clarification=None,
+    )
+    deepseek = FakeDeepSeek(
+        plan,
+        chunks=["最近断层约 999.9 公里。 [C1]"],
+    )
+    retriever = FakeRetriever([_evidence(text="断层检索依据。")])
+    registry = StaticExecutionRegistry(
+        [
+            ToolExecution(
+                name="fault.nearest",
+                result=ToolResult.ok(
+                    value={"distance_km": 18.2, "fault_key": "f1"},
+                    unit="km",
+                    source="shanghai.fault",
+                    version="v1",
+                    parameters={},
+                ),
+            )
+        ]
+    )
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=retriever,
+        registry=registry,
+        store=store,
+    )
+
+    events = [
+        event
+        async for event in orchestrator.ask(
+            "最近断层距离是多少？",
+            session_id=stored_session.id,
+            user=_user(),
+        )
+    ]
+    emitted = "".join(
+        event.data["text"]
+        for event in events
+        if event.type == "answer_delta"
+    )
+    answer_id = next(
+        event.data["answer_id"]
+        for event in events
+        if event.type == "answer_started"
+    )
+    answer = await orchestrator.finalize(answer_id)
+
+    assert "999.9" not in emitted
+    assert "999.9" not in answer.text
+    assert answer.status == "partial"
+    assert "unproven_numeric_claim" in answer.degraded_reasons
+    completed = next(
+        event for event in events if event.type == "answer_completed"
+    )
+    assert completed.data["status"] == "partial"
+
+
+async def test_follow_up_question_receives_bounded_session_history() -> None:
+    stored_session = _stored_session()
+    store = HistoryStore(stored_session)
+    deepseek = FakeDeepSeek(_plan(queries=True), chunks=["回答。 [C1]"])
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=FakeRetriever([_evidence()]),
+        registry=ToolRegistry(),
+        store=store,
+    )
+
+    async for _event in orchestrator.ask(
+        "那最近断层呢？",
+        session_id=stored_session.id,
+        user=_user(),
+    ):
+        pass
+
+    assert store.requested_limit == 4
+    assert deepseek.plan_contexts[0]["session"]["recent_history"] == store.history
+
+
+async def test_clarification_has_explicit_response_without_answer_generation() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    plan = ExecutionPlan(
+        intent="clarification",
+        tool_calls=[],
+        knowledge_queries=[],
+        map_intents=[],
+        clarification="请明确要查询的行政区。",
+    )
+    deepseek = FakeDeepSeek(plan, chunks=["不应生成这段模型文本。"])
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=FakeRetriever(),
+        registry=ToolRegistry(),
+        store=store,
+    )
+
+    events = [
+        event
+        async for event in orchestrator.ask(
+            "人口有多少？",
+            session_id=stored_session.id,
+            user=_user(),
+        )
+    ]
+    answer_id = next(
+        event.data["answer_id"]
+        for event in events
+        if event.type == "answer_started"
+    )
+    answer = await orchestrator.finalize(answer_id)
+
+    assert deepseek.answer_call_count == 0
+    assert deepseek.stream_call_count == 0
+    assert answer.status == "unavailable"
+    assert answer.text == plan.clarification
+    assert answer.structured == {
+        "clarification": plan.clarification,
+        "response_required": True,
+    }
+    completed = next(
+        event for event in events if event.type == "answer_completed"
+    )
+    assert completed.data["clarification"] == plan.clarification
+
+
+async def test_completed_answer_persists_plan_model_and_tool_audit_summary() -> None:
+    stored_session = _stored_session()
+    store = AuditStore(stored_session)
+    plan = ExecutionPlan(
+        intent="distance",
+        tool_calls=[ToolCallPlan(name="fault.nearest", arguments={})],
+        knowledge_queries=[KnowledgeQuery(text="断层距离", top_k=5)],
+        map_intents=[],
+        clarification=None,
+    )
+    deepseek = FakeDeepSeek(plan, chunks=["距离为 18.2 公里。 [C1]"])
+    registry = StaticExecutionRegistry(
+        [
+            ToolExecution(
+                name="fault.nearest",
+                result=ToolResult.ok(
+                    value={"distance_km": 18.2, "fault_key": "f1"},
+                    unit="km",
+                    source="shanghai.fault",
+                    version="v1",
+                    parameters={},
+                ),
+                duration_ms=12.5,
+            )
+        ]
+    )
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=FakeRetriever([_evidence()]),
+        registry=registry,
+        store=store,
+        settings_override=_settings(),
+    )
+
+    async for _event in orchestrator.ask(
+        "最近断层距离是多少？",
+        session_id=stored_session.id,
+        user=_user(),
+    ):
+        pass
+
+    assert len(store.audit_records) == 1
+    audit = store.audit_records[0]
+    assert audit is not None
+    assert audit["model_name"] == "deepseek-flash"
+    assert audit["model_version"] is None
+    assert audit["prompt_version"]
+    assert audit["execution_plan"]["intent"] == "distance"
+    assert audit["execution_plan"]["tool_calls"] == [
+        {"name": "fault.nearest", "arguments": {}}
+    ]
+    assert audit["tool_call_summary"] == [
+        {
+            "name": "fault.nearest",
+            "status": "ok",
+            "duration_ms": 12,
+            "source": "shanghai.fault",
+            "version": "v1",
+        }
+    ]
+
+
+async def test_tool_executions_materialize_executable_map_action_payloads() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    plan = ExecutionPlan(
+        intent="map_tools",
+        tool_calls=[
+            ToolCallPlan(name="event.get_context", arguments={}),
+            ToolCallPlan(name="fault.nearest", arguments={}),
+            ToolCallPlan(name="seismicity.within_radius", arguments={}),
+        ],
+        knowledge_queries=[],
+        map_intents=[
+            MapIntent(
+                action_type="locate",
+                target_ref="fault:f1",
+                reason="定位最近断层",
+            ),
+            MapIntent(
+                action_type="highlight",
+                target_ref="historical:historical-1",
+                layer_id="historical_earthquakes",
+                reason="突出历史地震",
+            ),
+            MapIntent(
+                action_type="set_layers",
+                target_ref=None,
+                reason="同步结果图层",
+                layers=["epicenter"],
+            ),
+        ],
+        clarification=None,
+    )
+    deepseek = FakeDeepSeek(plan, chunks=["地图结果已生成。 [C1]"])
+    registry = StaticExecutionRegistry(
+        [
+            ToolExecution(
+                name="event.get_context",
+                result=ToolResult.ok(
+                    value={
+                        "event_id": "event-1",
+                        "longitude": 121.5,
+                        "latitude": 31.2,
+                    },
+                    source="earthquake_event",
+                    version="revision-1",
+                ),
+            ),
+            ToolExecution(
+                name="fault.nearest",
+                result=ToolResult.ok(
+                    value={
+                        "event_id": "event-1",
+                        "fault_key": "f1",
+                        "distance_km": 8.2,
+                    },
+                    source="shanghai.fault",
+                    version="v1",
+                ),
+            ),
+            ToolExecution(
+                name="seismicity.within_radius",
+                result=ToolResult.ok(
+                    value={
+                        "event_id": "event-1",
+                        "radius_km": 50,
+                        "events": [
+                            {
+                                "event_id": "historical-1",
+                                "longitude": 121.1,
+                                "latitude": 31.1,
+                            }
+                        ],
+                    },
+                    source="shanghai.historical",
+                    version="v1",
+                ),
+            ),
+        ]
+    )
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=FakeRetriever([_evidence(text="断层和历史地震地图依据。")]),
+        registry=registry,
+        store=store,
+    )
+
+    async for _event in orchestrator.ask(
+        "在地图上显示相关结果。",
+        session_id=stored_session.id,
+        user=_user(),
+    ):
+        pass
+
+    actions = store.map_actions[0][1]
+    locate = next(action for action in actions if action.action_type == "locate")
+    highlight = next(
+        action for action in actions if action.action_type == "highlight"
+    )
+    set_layers = next(
+        action for action in actions if action.action_type == "set_layers"
+    )
+
+    assert locate.payload["feature_id"] == "f1"
+    assert locate.payload["coordinates"] == [121.5, 31.2]
+    assert locate.payload["provenance"]["snapshot_id"] == str(
+        stored_session.snapshot_id
+    )
+    assert highlight.payload["feature_id"] == "historical-1"
+    assert highlight.payload["coordinates"] == [121.1, 31.1]
+    assert set_layers.payload["layers"] == [
+        "epicenter",
+        "faults",
+        "historical_earthquakes",
+    ]
+    assert set_layers.payload["visibility"]["epicenter"] is True
+    assert set_layers.payload["provenance"]["layer_sources"]["faults"] == {
+        "tool_name": "fault.nearest",
+        "source": "shanghai.fault",
+        "version": "v1",
+    }

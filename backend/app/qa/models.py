@@ -94,6 +94,19 @@ class QaAnswer(Base):
         default="running",
         server_default=text("'running'"),
     )
+    model_name: Mapped[str | None] = mapped_column(String(128))
+    model_version: Mapped[str | None] = mapped_column(String(256))
+    prompt_version: Mapped[str | None] = mapped_column(String(64))
+    execution_plan: Mapped[dict] = mapped_column(
+        JSONB,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    tool_call_summary: Mapped[list] = mapped_column(
+        JSONB,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
     structured: Mapped[dict | None] = mapped_column(JSONB)
     citation_keys: Mapped[list] = mapped_column(
         JSONB,
