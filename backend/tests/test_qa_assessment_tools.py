@@ -174,6 +174,11 @@ async def assessment_tool_fixture(
                     run_id=fixture.assessment_run_id,
                     now=now,
                 )
+                await _seed_validation_loss_product(
+                    session,
+                    run_id=fixture.assessment_run_id,
+                    now=now,
+                )
 
         yield fixture
     finally:
@@ -200,13 +205,14 @@ def context_for(
     fixture: AssessmentToolFixture,
     session,
     *,
+    revision_id: UUID | None = None,
     assessment_run_id: UUID | None = None,
 ) -> ToolContext:
     return ToolContext(
         session=session,
         user=fixture.user,
         event_id=fixture.event_id,
-        revision_id=fixture.revision_id,
+        revision_id=fixture.revision_id if revision_id is None else revision_id,
         assessment_run_id=(
             fixture.assessment_run_id
             if assessment_run_id is None
@@ -441,6 +447,50 @@ async def _seed_loss_product(
     )
 
 
+async def _seed_validation_loss_product(
+    session,
+    *,
+    run_id: UUID,
+    now: datetime,
+) -> None:
+    task = AssessmentTask(
+        run_id=run_id,
+        task_key="loss.validate",
+        task_type="loss",
+        component="qa-task9-test",
+        sequence=4,
+        status="succeeded",
+        deadline_at=now + timedelta(minutes=5),
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        LossProduct(
+            run_id=run_id,
+            task_id=task.id,
+            product_type="validation",
+            status="complete",
+            quality_grade="L2",
+            calibration_status="validated",
+            coverage_ratio=1,
+            partial_scope=False,
+            needs_review=False,
+            spatialized_estimate=False,
+            algorithm_version="loss-validation-v1",
+            parameter_version="validation-parameters-v1",
+            region_profile_version="shanghai-loss-region-v1",
+            input_fingerprint="a" * 64,
+            input_checksum="b" * 64,
+            output_checksum="c" * 64,
+            statistics={"checked_products": 5, "failed_checks": 0},
+            reason=None,
+            created_at=now,
+            completed_at=now,
+            published_at=now,
+        )
+    )
+
+
 async def test_exposure_population_uses_radius_and_locked_versions(
     assessment_tool_fixture,
     session_factory,
@@ -455,6 +505,9 @@ async def test_exposure_population_uses_radius_and_locked_versions(
     assert result.value["total_population"] == 100
     assert result.value["precision"] == 0
     assert result.value["unit"] == "人"
+    assert result.value["run_revision_id"] == str(
+        assessment_tool_fixture.revision_id
+    )
     assert result.value["regions"] == [
         {
             "area_code": "310115000001",
@@ -583,6 +636,9 @@ async def test_intensity_tool_preserves_products_and_marks_missing_instrument(
     assert result.value["run_id"] == str(
         assessment_tool_fixture.assessment_run_id
     )
+    assert result.value["run_revision_id"] == str(
+        assessment_tool_fixture.revision_id
+    )
     assert result.value["model"]["status"] == "available"
     assert result.value["model"]["quality_grade"] == "A"
     assert result.value["model"]["statistics"]["maximum"] == 6.0
@@ -626,6 +682,9 @@ async def test_loss_tool_returns_central_values_with_versions(
     assert result.value["run_id"] == str(
         assessment_tool_fixture.assessment_run_id
     )
+    assert result.value["run_revision_id"] == str(
+        assessment_tool_fixture.revision_id
+    )
     assert result.value["parameter_version"] == (
         "shanghai-reference-uncalibrated-v1"
     )
@@ -635,3 +694,76 @@ async def test_loss_tool_returns_central_values_with_versions(
     assert result.value["metrics"][0]["precision"] == 0
     assert result.value["metrics"][0]["quality_grade"] == "L1"
     assert result.value["metrics"][0]["value_status"] == "available"
+
+
+async def test_loss_tool_returns_validation_product_metadata_without_metrics(
+    assessment_tool_fixture,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        context = context_for(assessment_tool_fixture, session)
+        result = await LossMetricsTool().handle(
+            {
+                "product_type": "validation",
+                "area_scope": "city",
+                "value_type": "central",
+            },
+            context,
+        )
+
+    assert result.status == "ok"
+    assert result.limitations == ("no_metric_values",)
+    assert result.value["metrics"] == []
+    assert result.value["status"] == "complete"
+    assert result.value["quality_grade"] == "L2"
+    assert result.value["calibration_status"] == "validated"
+    assert result.value["statistics"] == {
+        "checked_products": 5,
+        "failed_checks": 0,
+    }
+    assert result.value["algorithm_version"] == "loss-validation-v1"
+    assert result.value["parameter_version"] == "validation-parameters-v1"
+    assert result.value["region_profile_version"] == (
+        "shanghai-loss-region-v1"
+    )
+    assert result.value["checksum"] == "c" * 64
+
+
+async def test_run_tools_reject_assessment_revision_mismatch(
+    assessment_tool_fixture,
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    correction = await seeded_artifact_assessment.create_correction_revision(
+        revision_no=2
+    )
+    async with session_factory() as session:
+        context = context_for(
+            assessment_tool_fixture,
+            session,
+            revision_id=correction.id,
+        )
+        results = [
+            await ExposurePopulationTool().handle({}, context),
+            await IntensityGetTool().handle({}, context),
+            await LossMetricsTool().handle(
+                {
+                    "product_type": "casualties",
+                    "area_scope": "city",
+                    "value_type": "central",
+                },
+                context,
+            ),
+        ]
+
+    expected_parameters = {
+        "event_id": str(assessment_tool_fixture.event_id),
+        "run_id": str(assessment_tool_fixture.assessment_run_id),
+        "run_revision_id": str(assessment_tool_fixture.revision_id),
+        "context_revision_id": str(correction.id),
+    }
+    for result in results:
+        assert result.status == "unavailable"
+        assert result.limitations == ("assessment_revision_mismatch",)
+        assert result.value == {}
+        assert result.parameters == expected_parameters

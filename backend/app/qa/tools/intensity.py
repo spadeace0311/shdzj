@@ -62,6 +62,12 @@ class IntensityGetTool:
                 limitations=("assessment_run_missing",),
                 parameters={"event_id": str(event_id)},
             )
+        if run.revision_id != context.revision_id:
+            return _assessment_revision_mismatch_result(
+                context,
+                run,
+                event_id,
+            )
 
         products = await self._intensity_repository.list_products(
             context.session,
@@ -79,6 +85,7 @@ class IntensityGetTool:
             value={
                 "event_id": str(event_id),
                 "run_id": str(run.id),
+                "run_revision_id": str(run.revision_id),
                 **{
                     product_type: _product_payload(
                         by_type.get(product_type)
@@ -88,7 +95,11 @@ class IntensityGetTool:
             },
             source="intensity_field_products",
             version=str(run.id),
-            parameters={"event_id": str(event_id), "run_id": str(run.id)},
+            parameters={
+                "event_id": str(event_id),
+                "run_id": str(run.id),
+                "run_revision_id": str(run.revision_id),
+            },
         )
 
 
@@ -149,3 +160,23 @@ def _product_payload(product: dict[str, Any] | None) -> dict[str, Any]:
         "statistics": dict(product.get("statistics") or {}),
         "checksum": product.get("output_checksum"),
     }
+
+
+def _assessment_revision_mismatch_result(
+    context: ToolContext,
+    run: AssessmentRun,
+    event_id: object,
+) -> ToolResult:
+    return ToolResult.unavailable(
+        limitations=("assessment_revision_mismatch",),
+        parameters={
+            "event_id": str(event_id),
+            "run_id": str(run.id),
+            "run_revision_id": str(run.revision_id),
+            "context_revision_id": (
+                str(context.revision_id)
+                if context.revision_id is not None
+                else None
+            ),
+        },
+    )

@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.assessment.models import AssessmentRun
 from app.assessment.repository import AssessmentRepository
-from app.loss.models import LossMetricValue
+from app.loss.models import LossMetricValue, LossProduct
 from app.loss.repository import LossRepository
 from app.qa.tools.registry import (
     ToolContext,
@@ -74,6 +74,12 @@ class LossMetricsTool:
                 limitations=("assessment_run_missing",),
                 parameters={"event_id": str(event_id)},
             )
+        if run.revision_id != context.revision_id:
+            return _assessment_revision_mismatch_result(
+                context,
+                run,
+                event_id,
+            )
         products = await self._loss_repository.list_products(
             context.session,
             run.id,
@@ -118,45 +124,21 @@ class LossMetricsTool:
                 )
             )
         ).all()
-        if not metrics:
-            return ToolResult.not_found(
-                source="loss_metric_values",
-                version=product.output_checksum,
-                parameters={
-                    "event_id": str(event_id),
-                    "run_id": str(run.id),
-                    "product_type": product.product_type,
-                    "area_scope": arguments["area_scope"],
-                    "area_code": arguments.get("area_code"),
-                    "metric_keys": metric_keys,
-                    "value_type": arguments["value_type"],
-                },
-                limitations=("loss_metrics_not_found",),
-            )
-
         return ToolResult.ok(
             value={
                 "event_id": str(event_id),
                 "run_id": str(run.id),
-                "product_type": product.product_type,
-                "status": product.status,
-                "quality_grade": product.quality_grade,
-                "calibration_status": product.calibration_status,
-                "coverage_ratio": float(product.coverage_ratio),
-                "partial_scope": product.partial_scope,
-                "needs_review": product.needs_review,
-                "spatialized_estimate": product.spatialized_estimate,
-                "algorithm_version": product.algorithm_version,
-                "parameter_version": product.parameter_version,
-                "region_profile_version": product.region_profile_version,
-                "checksum": product.output_checksum,
+                "run_revision_id": str(run.revision_id),
+                **_product_metadata(product),
                 "metrics": [_metric_payload(metric) for metric in metrics],
             },
             source="loss_products",
             version=product.output_checksum,
+            limitations=() if metrics else ("no_metric_values",),
             parameters={
                 "event_id": str(event_id),
                 "run_id": str(run.id),
+                "run_revision_id": str(run.revision_id),
                 "product_type": product.product_type,
                 "area_scope": arguments["area_scope"],
                 "area_code": arguments.get("area_code"),
@@ -213,3 +195,54 @@ def _metric_payload(metric: LossMetricValue) -> dict[str, Any]:
         "value_status": metric.value_status,
         "note": metric.note,
     }
+
+
+def _product_metadata(product: LossProduct) -> dict[str, Any]:
+    return {
+        "product_id": str(product.id),
+        "task_id": str(product.task_id),
+        "product_type": product.product_type,
+        "status": product.status,
+        "quality_grade": product.quality_grade,
+        "calibration_status": product.calibration_status,
+        "coverage_ratio": float(product.coverage_ratio),
+        "partial_scope": product.partial_scope,
+        "needs_review": product.needs_review,
+        "spatialized_estimate": product.spatialized_estimate,
+        "algorithm_version": product.algorithm_version,
+        "parameter_version": product.parameter_version,
+        "region_profile_version": product.region_profile_version,
+        "input_fingerprint": product.input_fingerprint,
+        "input_checksum": product.input_checksum,
+        "output_checksum": product.output_checksum,
+        "checksum": product.output_checksum,
+        "statistics": dict(product.statistics or {}),
+        "reason": product.reason,
+        "created_at": _isoformat(product.created_at),
+        "completed_at": _isoformat(product.completed_at),
+        "published_at": _isoformat(product.published_at),
+    }
+
+
+def _assessment_revision_mismatch_result(
+    context: ToolContext,
+    run: AssessmentRun,
+    event_id: object,
+) -> ToolResult:
+    return ToolResult.unavailable(
+        limitations=("assessment_revision_mismatch",),
+        parameters={
+            "event_id": str(event_id),
+            "run_id": str(run.id),
+            "run_revision_id": str(run.revision_id),
+            "context_revision_id": (
+                str(context.revision_id)
+                if context.revision_id is not None
+                else None
+            ),
+        },
+    )
+
+
+def _isoformat(value: Any) -> str | None:
+    return value.isoformat() if value is not None else None

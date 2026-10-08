@@ -97,6 +97,12 @@ class ExposurePopulationTool:
                 limitations=("assessment_run_missing",),
                 parameters={"event_id": str(event_id)},
             )
+        if assessment_run.revision_id != context.revision_id:
+            return _assessment_revision_mismatch_result(
+                context,
+                assessment_run,
+                event_id,
+            )
 
         event, revision, error = await load_context_event_and_revision(
             context,
@@ -200,6 +206,8 @@ class ExposurePopulationTool:
         return ToolResult.ok(
             value={
                 "event_id": str(event.id),
+                "run_id": str(assessment_run.id),
+                "run_revision_id": str(assessment_run.revision_id),
                 "radius_km": float(radius_km),
                 "area_code": area_code,
                 "resident_population": _json_number(
@@ -236,6 +244,8 @@ class ExposurePopulationTool:
             version=population_version.version,
             parameters={
                 "event_id": str(event.id),
+                "run_id": str(assessment_run.id),
+                "run_revision_id": str(assessment_run.revision_id),
                 "radius_km": float(radius_km),
                 "area_code": area_code,
             },
@@ -293,3 +303,23 @@ def _city_prefix(area_code: str | None) -> str | None:
     ):
         return f"{area_code[:2]}%"
     return None
+
+
+def _assessment_revision_mismatch_result(
+    context: ToolContext,
+    run: AssessmentRun,
+    event_id: object,
+) -> ToolResult:
+    return ToolResult.unavailable(
+        limitations=("assessment_revision_mismatch",),
+        parameters={
+            "event_id": str(event_id),
+            "run_id": str(run.id),
+            "run_revision_id": str(run.revision_id),
+            "context_revision_id": (
+                str(context.revision_id)
+                if context.revision_id is not None
+                else None
+            ),
+        },
+    )
