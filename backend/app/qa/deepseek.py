@@ -267,8 +267,10 @@ class DeepSeekAdapter:
             raise DeepSeekMalformedResponseError(
                 "DeepSeek returned a non-object stream event"
             ) from None
-        choices = event.get("choices")
-        if choices is None or choices == []:
+        if "choices" not in event:
+            return None
+        choices = event["choices"]
+        if choices == []:
             return None
         if not isinstance(choices, list):
             raise DeepSeekMalformedResponseError(

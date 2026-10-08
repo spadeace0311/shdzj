@@ -87,6 +87,7 @@ def chat_body(body: object) -> httpx.Response:
     [
         [],
         None,
+        {"choices": None},
         {"choices": "not-a-list"},
         {"choices": [None]},
         {"choices": [{"message": None}]},
