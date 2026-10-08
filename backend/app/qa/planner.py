@@ -40,8 +40,12 @@ class MapIntentPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action_type: str = Field(min_length=1)
-    target_ref: str = Field(min_length=1)
+    target_ref: str | None = Field(default=None, min_length=1)
     reason: str = Field(min_length=1)
+    bounds: list[float] | None = None
+    radius_km: float | None = None
+    layer_id: str | None = Field(default=None, min_length=1)
+    layers: list[str] | dict[str, bool] | None = None
 
 
 class PlanPayload(BaseModel):
@@ -110,6 +114,10 @@ class PlanValidator:
                     action_type=action.action_type,
                     target_ref=action.target_ref,
                     reason=action.reason,
+                    bounds=action.bounds,
+                    radius_km=action.radius_km,
+                    layer_id=action.layer_id,
+                    layers=action.layers,
                 )
                 for action in parsed.map_intents
             ],

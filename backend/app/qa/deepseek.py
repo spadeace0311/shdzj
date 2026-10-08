@@ -321,6 +321,10 @@ class DeepSeekAdapter:
                     action_type=action.action_type,
                     target_ref=action.target_ref,
                     reason=action.reason,
+                    bounds=action.bounds,
+                    radius_km=action.radius_km,
+                    layer_id=action.layer_id,
+                    layers=action.layers,
                 )
                 for action in parsed.map_intents
             ],

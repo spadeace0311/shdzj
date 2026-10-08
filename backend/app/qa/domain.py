@@ -28,8 +28,12 @@ class KnowledgeQuery:
 @dataclass(frozen=True, slots=True)
 class MapIntent:
     action_type: str
-    target_ref: str
+    target_ref: str | None
     reason: str
+    bounds: list[float] | None = None
+    radius_km: float | None = None
+    layer_id: str | None = None
+    layers: list[str] | dict[str, bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
