@@ -145,6 +145,27 @@ GET /api/v1/assessments/runs/{run_id}/intensity/artifact/{product_id}/{band}/{z}
 
 数据资产的部署、导入、发布、故障排查、快照核验、更新逾期和备份恢复请参阅 [数据资产中心运行手册](docs/runbooks/data-asset-center.md)。
 
+## AI 知识与问答
+
+知识问答子系统由 `knowledge-worker`、`embedding` 和 `qdrant` 提供，API 通过混合检索编排调用 Qdrant 稠密/稀疏向量、PostgreSQL 三元组词法检索与 DeepSeek 生成最终回答。前端在事件详情页和指挥大厅提供“智能问策”，独立“智能问策”页面提供历史会话、引用证据、工具过程和地图动作。
+
+首次启动会向 `embedding-models` 卷下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`，之后离线复用。非敏感配置位于 `.env`，其中 `DEEPSEEK_API_KEY` 留空并由部署环境注入，不在仓库中填写。
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml up -d postgres qdrant embedding
+docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml up -d
+```
+
+十万切片混合检索性能测试与真实事件问答验收：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -m performance tests/test_qa_performance.py -v
+docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run test:e2e -- ai-knowledge-qa.spec.ts
+```
+
+模型缓存、迁移、知识源发布与回滚、Qdrant 重建、故障降级、网页白名单、快照核验、审计删除、性能核验和备份恢复请参阅 [AI 知识与问答运行手册](docs/runbooks/ai-knowledge-qa.md)。
+
 ## 工作组协同与应急指挥大厅
 
 `collaboration-worker` 消费 `collaboration.requested` Outbox，按上海预案模板生成新闻信息值守、监测预报、综合协调、震害评估、应急技术、后勤保障和中心站七个工作组的固定任务。正式事件在满足适用范围时生成 60 条任务；自动成果、人工修订、组长确认、到岗状态、期限提醒和通知降级均保留版本链和审计记录。
