@@ -359,6 +359,117 @@ async function assertCommandHallReady(page: Page): Promise<void> {
   await assertDrawerLayoutStable(page);
 }
 
+async function assertQaPanelLayout(
+  page: Page,
+  viewport: { width: number; height: number },
+): Promise<void> {
+  await expect(page.getByLabel("事件上下文问答")).toBeVisible();
+
+  const metrics = await page.evaluate(() => {
+    const panel = document.querySelector<HTMLElement>(
+      '[aria-label="事件上下文问答"]',
+    );
+    const scrim = document.querySelector<HTMLElement>(
+      ".qa-panel-layer--hall .qa-panel__scrim",
+    );
+    const headerStatus = document.querySelector<HTMLElement>(
+      ".command-hall__header-status",
+    );
+    const content = panel?.querySelector<HTMLElement>(".qa-panel__content");
+
+    const panelRect = panel?.getBoundingClientRect();
+    const scrimRect = scrim?.getBoundingClientRect();
+    const headerRect = headerStatus?.getBoundingClientRect();
+    const contentRect = content?.getBoundingClientRect();
+    const intersects = (left?: DOMRect, right?: DOMRect) =>
+      !!left &&
+      !!right &&
+      !(
+        left.right <= right.left ||
+        right.right <= left.left ||
+        left.bottom <= right.top ||
+        right.bottom <= left.top
+      );
+
+    const clipped = panel
+      ? Array.from(
+          panel.querySelectorAll<HTMLElement>(
+            "h2, h3, h4, .qa-conversation__input textarea, .qa-answer, .qa-citation strong, .qa-tool-result-list li",
+          ),
+        )
+          .filter((item) => item.innerText.trim())
+          .filter(
+            (item) =>
+              item.scrollWidth > item.clientWidth + 1 ||
+              item.scrollHeight > item.clientHeight + 1,
+          )
+          .map((item) => ({
+            text: item.innerText,
+            scrollWidth: item.scrollWidth,
+            clientWidth: item.clientWidth,
+            scrollHeight: item.scrollHeight,
+            clientHeight: item.clientHeight,
+          }))
+      : [];
+
+    return {
+      panel: panelRect
+        ? {
+            left: panelRect.left,
+            top: panelRect.top,
+            right: panelRect.right,
+            bottom: panelRect.bottom,
+            width: panelRect.width,
+            scrollWidth: panel?.scrollWidth ?? 0,
+            clientWidth: panel?.clientWidth ?? 0,
+            scrollHeight: panel?.scrollHeight ?? 0,
+            clientHeight: panel?.clientHeight ?? 0,
+          }
+        : null,
+      content: contentRect
+        ? {
+            left: contentRect.left,
+            top: contentRect.top,
+            right: contentRect.right,
+            bottom: contentRect.bottom,
+            scrollWidth: content?.scrollWidth ?? 0,
+            clientWidth: content?.clientWidth ?? 0,
+            scrollHeight: content?.scrollHeight ?? 0,
+            clientHeight: content?.clientHeight ?? 0,
+          }
+        : null,
+      scrimOverlapsHeader: intersects(scrimRect, headerRect),
+      panelOverlapsHeader: intersects(panelRect, headerRect),
+      clipped,
+    };
+  });
+
+  expect(metrics.panel).not.toBeNull();
+  expect(metrics.panel!.left).toBeGreaterThanOrEqual(-1);
+  expect(metrics.panel!.top).toBeGreaterThanOrEqual(-1);
+  expect(metrics.panel!.right).toBeLessThanOrEqual(viewport.width + 1);
+  expect(metrics.panel!.bottom).toBeLessThanOrEqual(viewport.height + 1);
+  expect(metrics.panel!.width).toBeLessThanOrEqual(
+    Math.min(viewport.width * 0.4, 1600) + 1,
+  );
+  expect(metrics.scrimOverlapsHeader).toBe(false);
+  expect(metrics.panelOverlapsHeader).toBe(false);
+  expect(metrics.panel!.scrollWidth).toBeLessThanOrEqual(
+    metrics.panel!.clientWidth + 1,
+  );
+  expect(metrics.panel!.scrollHeight).toBeLessThanOrEqual(
+    metrics.panel!.clientHeight + 1,
+  );
+  expect(metrics.content).not.toBeNull();
+  expect(metrics.content!.scrollWidth).toBeLessThanOrEqual(
+    metrics.content!.clientWidth + 1,
+  );
+  expect(metrics.content!.scrollHeight).toBeLessThanOrEqual(
+    metrics.content!.clientHeight + 1,
+  );
+  expect(metrics.clipped).toEqual([]);
+}
+
 for (const viewport of VIEWPORTS) {
   test(`command hall fits ${viewport.name} with seven groups and stable drawer`, async ({
     page,
@@ -382,12 +493,7 @@ for (const viewport of VIEWPORTS) {
     await assertCommandHallReady(page);
 
     await page.getByRole("button", { name: "智能问策" }).click();
-    await expect(page.getByLabel("事件上下文问答")).toBeVisible();
-    const qaBounds = await page.getByLabel("事件上下文问答").boundingBox();
-    expect(qaBounds!.x).toBeGreaterThanOrEqual(0);
-    expect(qaBounds!.x + qaBounds!.width).toBeLessThanOrEqual(
-      viewport.width + 1,
-    );
+    await assertQaPanelLayout(page, viewport);
     await page.getByRole("button", { name: "关闭智能问策" }).click();
   });
 }

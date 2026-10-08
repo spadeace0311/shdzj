@@ -222,6 +222,11 @@ a:hover {
   max-width: 920px;
 }
 
+.page-section--qa-open {
+  max-width: calc(100% - 560px);
+  margin-left: 0;
+}
+
 .page-heading,
 .section-header {
   display: flex;
@@ -4086,6 +4091,10 @@ a:hover {
 
 .qa-panel-layer--hall {
   --qa-hall-top: 126px;
+}
+
+.qa-panel-layer--hall .qa-panel__scrim {
+  top: var(--qa-hall-top, 0);
 }
 
 .qa-panel__scrim {

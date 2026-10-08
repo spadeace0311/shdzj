@@ -20,8 +20,10 @@ import {
   streamQaQuestion,
 } from "../src/api/client";
 import { LossMap } from "../src/components/LossMap";
+import { QaPanel } from "../src/components/QaPanel";
 import { EventDetailPage } from "../src/pages/EventDetailPage";
 import { CommandHallPage } from "../src/pages/CommandHallPage";
+import stylesCss from "../src/styles.css?raw";
 import {
   MapActionProvider,
   useMapActionConsumer,
@@ -277,6 +279,21 @@ function renderHall() {
   );
 }
 
+function renderQaPanel(eventId: string) {
+  return render(
+    <MapActionProvider eventId={eventId}>
+      <QaPanel eventId={eventId} mode="event" onClose={vi.fn()} />
+    </MapActionProvider>,
+  );
+}
+
+function askQuestion(question: string) {
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: question },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+}
+
 function ActionProbe() {
   const publish = useMapActionPublisher();
   const { action } = useMapActionConsumer();
@@ -485,4 +502,112 @@ test("command hall qa shows citations and tool results without a map", async () 
   ).toBeInTheDocument();
   expect(screen.getByText("C1")).toBeInTheDocument();
   expect(screen.getAllByText("fault.nearest").length).toBeGreaterThan(0);
+});
+
+test("stale session creation does not leak into a changed event", async () => {
+  let resolveOldSession!: (value: QaSession) => void;
+  const newSession: QaSession = {
+    ...session,
+    id: "s2",
+    event_id: "event-2",
+  };
+  createQaSessionMock
+    .mockImplementationOnce(
+      () =>
+        new Promise<QaSession>((resolve) => {
+          resolveOldSession = resolve;
+        }),
+    )
+    .mockImplementationOnce(async () => newSession);
+  streamQaQuestionMock.mockImplementation(async () => undefined);
+  getQaAnswerMock.mockResolvedValue(persistedAnswer);
+
+  const { rerender } = renderQaPanel("event-1");
+  askQuestion("旧事件问题");
+  await waitFor(() =>
+    expect(createQaSessionMock).toHaveBeenCalledTimes(1),
+  );
+
+  rerender(
+    <MapActionProvider eventId="event-2">
+      <QaPanel eventId="event-2" mode="event" onClose={vi.fn()} />
+    </MapActionProvider>,
+  );
+
+  await act(async () => {
+    resolveOldSession(session);
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "提问" })).toBeEnabled(),
+  );
+
+  askQuestion("新事件问题");
+  await waitFor(() =>
+    expect(createQaSessionMock).toHaveBeenCalledTimes(2),
+  );
+  expect(createQaSessionMock).toHaveBeenNthCalledWith(2, {
+    title: "当前问答",
+    event_id: "event-2",
+  });
+  await waitFor(() =>
+    expect(streamQaQuestionMock).toHaveBeenCalledWith(
+      "s2",
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    ),
+  );
+});
+
+test("double clicking ask creates only one session", async () => {
+  let resolveSession!: (value: QaSession) => void;
+  createQaSessionMock.mockImplementation(
+    () =>
+      new Promise<QaSession>((resolve) => {
+        resolveSession = resolve;
+      }),
+  );
+  streamQaQuestionMock.mockImplementation(async () => undefined);
+  getQaAnswerMock.mockResolvedValue(persistedAnswer);
+
+  renderQaPanel("event-1");
+  askQuestion("快速双击问题");
+
+  const askButton = screen.getByRole("button", { name: "提问" });
+  await waitFor(() => expect(askButton).toBeDisabled());
+  fireEvent.click(askButton);
+
+  expect(createQaSessionMock).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    resolveSession(session);
+  });
+  await waitFor(() => expect(askButton).toBeEnabled());
+  expect(createQaSessionMock).toHaveBeenCalledTimes(1);
+});
+
+test("event detail reserves layout width while the qa drawer is open", async () => {
+  mockEventDetailApi();
+  mockQaStream(qaEvents);
+
+  renderEventDetail();
+
+  await screen.findByText("当前修订");
+  const pageSection = document.querySelector(".page-section");
+  expect(pageSection).not.toHaveClass("page-section--qa-open");
+
+  fireEvent.click(screen.getByRole("button", { name: "智能问策" }));
+
+  expect(document.querySelector(".page-section")).toHaveClass(
+    "page-section--qa-open",
+  );
+  expect(stylesCss).toMatch(
+    /\.page-section--qa-open\s*\{[^}]*max-width:\s*calc\(100%\s*-\s*560px\);/,
+  );
+});
+
+test("hall qa scrim starts below the command hall header", () => {
+  expect(stylesCss).toMatch(
+    /\.qa-panel-layer--hall \.qa-panel__scrim\s*\{[^}]*top:\s*var\(--qa-hall-top,\s*0\);/,
+  );
 });

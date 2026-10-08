@@ -178,7 +178,10 @@ export function EventDetailPage() {
 
   return (
     <MapActionProvider eventId={eventId}>
-      <section className="page-section" aria-labelledby="detail-title">
+      <section
+        className={qaOpen ? "page-section page-section--qa-open" : "page-section"}
+        aria-labelledby="detail-title"
+      >
       <header className="page-heading">
         <div>
           <p className="eyebrow">事件详情</p>

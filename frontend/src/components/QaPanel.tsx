@@ -208,16 +208,20 @@ function mergeMapActions(
 }
 
 export function QaPanel({ eventId, mode, onClose }: QaPanelProps) {
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [events, setEvents] = useState<QaStreamEvent[]>([]);
   const [answer, setAnswer] = useState<QaAnswer | null>(null);
   const [mapActions, setMapActions] = useState<QaMapAction[]>([]);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const sessionIntentRef = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
+  const sessionInFlightRef = useRef<Promise<string | null> | null>(null);
   const publish = useMapActionPublisher();
 
   useEffect(() => {
-    setSessionId(null);
+    sessionIntentRef.current += 1;
+    sessionIdRef.current = null;
+    sessionInFlightRef.current = null;
     setEvents([]);
     setAnswer(null);
     setMapActions([]);
@@ -228,20 +232,38 @@ export function QaPanel({ eventId, mode, onClose }: QaPanelProps) {
     };
   }, [eventId]);
 
-  async function ensureSession(): Promise<string | null> {
-    if (sessionId) {
-      return sessionId;
+  function assignSessionId(nextSessionId: string) {
+    sessionIdRef.current = nextSessionId;
+  }
+
+  function ensureSession(targetEventId: string): Promise<string | null> {
+    if (sessionIdRef.current) {
+      return Promise.resolve(sessionIdRef.current);
     }
-    try {
-      const created = await createQaSession({
-        title: "当前问答",
-        event_id: eventId,
+    if (sessionInFlightRef.current) {
+      return sessionInFlightRef.current;
+    }
+
+    const requestId = ++sessionIntentRef.current;
+    const pending = createQaSession({
+      title: "当前问答",
+      event_id: targetEventId,
+    })
+      .then((created) => {
+        if (requestId !== sessionIntentRef.current) {
+          return null;
+        }
+        assignSessionId(created.id);
+        return created.id;
+      })
+      .catch(() => null)
+      .finally(() => {
+        if (requestId === sessionIntentRef.current) {
+          sessionInFlightRef.current = null;
+        }
       });
-      setSessionId(created.id);
-      return created.id;
-    } catch {
-      return null;
-    }
+    sessionInFlightRef.current = pending;
+    return pending;
   }
 
   async function handleAsk(question: string) {
@@ -249,15 +271,18 @@ export function QaPanel({ eventId, mode, onClose }: QaPanelProps) {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const nextSessionId = await ensureSession();
+    setBusy(true);
+    const nextSessionId = await ensureSession(eventId);
     if (!nextSessionId || controller.signal.aborted) {
+      if (!controller.signal.aborted) {
+        setBusy(false);
+      }
       return;
     }
 
     setEvents([]);
     setAnswer(null);
     setMapActions([]);
-    setBusy(true);
 
     const collectedEvents: QaStreamEvent[] = [];
     try {
