@@ -10,13 +10,18 @@ import type {
   QaAnswer,
   QaCitation,
   QaMapAction,
-  QaMapActionRecord,
   QaStreamEvent,
   QaToolCall,
 } from "../types";
 import { QaConversation } from "./QaConversation";
 import { QaEvidencePanel } from "./QaEvidencePanel";
 import { useMapActionPublisher } from "../qa/MapActionContext";
+import {
+  answerIdFromEvents,
+  mapActionRecordToAction,
+  parseQaMapAction,
+  qaAnswerAudit,
+} from "../qa/qaContract";
 
 interface QaPanelProps {
   eventId: string;
@@ -30,95 +35,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function numberValue(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function streamMapAction(data: Record<string, unknown>): QaMapAction | null {
-  const actionType = stringValue(data.action_type);
-  const reason = stringValue(data.reason) ?? "";
-  const validUntil = stringValue(data.valid_until) ?? "";
-  if (!actionType) {
-    return null;
-  }
-
-  if (actionType === "locate") {
-    const targetRef = stringValue(data.target_ref);
-    return targetRef
-      ? {
-          action_type: "locate",
-          target_ref: targetRef,
-          reason,
-          valid_until: validUntil,
-        }
-      : null;
-  }
-
-  if (actionType === "fit_bounds") {
-    const bounds = data.bounds;
-    if (
-      !Array.isArray(bounds) ||
-      bounds.length !== 4 ||
-      !bounds.every((value) => numberValue(value) !== null)
-    ) {
-      return null;
-    }
-    return {
-      action_type: "fit_bounds",
-      bounds: bounds as [number, number, number, number],
-      reason,
-      valid_until: validUntil,
-    };
-  }
-
-  if (actionType === "buffer") {
-    const targetRef = stringValue(data.target_ref);
-    const radius = numberValue(data.radius_km);
-    return targetRef && radius !== null
-      ? {
-          action_type: "buffer",
-          target_ref: targetRef,
-          radius_km: radius,
-          reason,
-          valid_until: validUntil,
-        }
-      : null;
-  }
-
-  if (actionType === "highlight") {
-    const targetRef = stringValue(data.target_ref);
-    const layerId = stringValue(data.layer_id);
-    return targetRef && layerId
-      ? {
-          action_type: "highlight",
-          target_ref: targetRef,
-          layer_id: layerId,
-          reason,
-          valid_until: validUntil,
-        }
-      : null;
-  }
-
-  if (actionType === "set_layers") {
-    if (
-      !Array.isArray(data.layers) ||
-      !data.layers.every(
-        (layer) => typeof layer === "string" && layer.length > 0,
-      )
-    ) {
-      return null;
-    }
-    return {
-      action_type: "set_layers",
-      layers: data.layers as string[],
-      reason,
-      valid_until: validUntil,
-    };
-  }
-
-  return null;
 }
 
 function citationsFromEvents(events: QaStreamEvent[]): QaCitation[] {
@@ -163,33 +79,6 @@ function toolsFromEvents(events: QaStreamEvent[]): QaToolCall[] {
     });
   }
   return tools;
-}
-
-function answerIdFromEvents(events: QaStreamEvent[]): string | null {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    const id = stringValue(event.data.answer_id);
-    if (
-      id &&
-      (event.type === "answer_completed" || event.type === "answer_started")
-    ) {
-      return id;
-    }
-  }
-  return null;
-}
-
-function mapActionRecordToAction(
-  record: QaMapActionRecord,
-): QaMapAction | null {
-  const payload = isRecord(record.payload) ? record.payload : {};
-  const validUntil =
-    record.valid_until ?? stringValue(payload.valid_until) ?? "";
-  return streamMapAction({
-    ...payload,
-    action_type: record.action_type,
-    valid_until: validUntil,
-  });
 }
 
 function mapActionKey(action: QaMapAction): string {
@@ -294,7 +183,7 @@ export function QaPanel({ eventId, mode, onClose }: QaPanelProps) {
             return;
           }
           if (event.type === "map_action") {
-            const action = streamMapAction(event.data);
+            const action = parseQaMapAction(event.data);
             if (action) {
               setMapActions((current) => [...current, action]);
               publish(eventId, action);
@@ -393,6 +282,15 @@ export function QaPanel({ eventId, mode, onClose }: QaPanelProps) {
             citations={citations}
             toolCalls={toolCalls}
             mapActions={mapActions}
+            structured={answer?.structured ?? null}
+            degradedReasons={answer?.degraded_reasons ?? []}
+            audit={qaAnswerAudit(answer ?? {
+              model_name: null,
+              model_version: null,
+              prompt_version: null,
+              execution_plan: null,
+              tool_call_summary: [],
+            })}
           />
         </div>
       </aside>

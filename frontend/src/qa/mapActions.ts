@@ -118,6 +118,18 @@ function validLatitude(value: number): boolean {
   return value >= -90 && value <= 90;
 }
 
+function validCoordinatePair(
+  value: [number, number] | undefined,
+): value is [number, number] {
+  if (value === undefined) {
+    return true;
+  }
+  if (!finiteNumber(value[0]) || !finiteNumber(value[1])) {
+    return false;
+  }
+  return validLongitude(value[0]) && validLatitude(value[1]);
+}
+
 function actionBase(value: unknown): value is QaMapAction {
   if (
     !isRecord(value) ||
@@ -156,6 +168,7 @@ function isLocateAction(value: QaMapAction): value is Extract<
   return (
     value.action_type === "locate" &&
     safeText(value.target_ref) &&
+    validCoordinatePair(value.coordinates) &&
     actionBase(value)
   );
 }
@@ -193,6 +206,7 @@ function isBufferAction(value: QaMapAction): value is Extract<
   return (
     value.action_type === "buffer" &&
     safeText(value.target_ref) &&
+    validCoordinatePair(value.center) &&
     finiteNumber(value.radius_km) &&
     value.radius_km >= 0.1 &&
     value.radius_km <= 500 &&
@@ -217,14 +231,23 @@ function isSetLayersAction(value: QaMapAction): value is Extract<
   QaMapAction,
   { action_type: "set_layers" }
 > {
+  if (value.action_type !== "set_layers" || !actionBase(value)) {
+    return false;
+  }
+  if (Array.isArray(value.layers)) {
+    return (
+      value.layers.length > 0 &&
+      value.layers.every(
+        (layer) => typeof layer === "string" && ALLOWED_LAYER_IDS.has(layer),
+      )
+    );
+  }
   return (
-    value.action_type === "set_layers" &&
-    Array.isArray(value.layers) &&
-    value.layers.length > 0 &&
-    value.layers.every(
-      (layer) => typeof layer === "string" && ALLOWED_LAYER_IDS.has(layer),
-    ) &&
-    actionBase(value)
+    Object.keys(value.layers).length > 0 &&
+    Object.entries(value.layers).every(
+      ([layer, visible]) =>
+        ALLOWED_LAYER_IDS.has(layer) && typeof visible === "boolean",
+    )
   );
 }
 
@@ -282,19 +305,22 @@ export function applyQaMapAction(
   map: QaActionMap,
   action: QaMapAction,
   layerCatalog: QaLayerCatalog,
-): void {
+): boolean {
   if (!isRecord(action) || !actionBase(action)) {
-    return;
+    return false;
   }
 
   if (isLocateAction(action)) {
-    const center = targetCenter(layerCatalog, action.target_ref);
+    const center =
+      (action.coordinates
+        ? action.coordinates
+        : undefined) ?? targetCenter(layerCatalog, action.target_ref);
     if (!center) {
-      return;
+      return false;
     }
     const zoom = Math.max(8, map.getZoom?.() ?? 8);
     map.flyTo({ center, zoom });
-    return;
+    return true;
   }
 
   if (isFitBoundsAction(action)) {
@@ -306,15 +332,20 @@ export function applyQaMapAction(
       ],
       { padding: 40 },
     );
-    return;
+    return true;
   }
 
   if (isBufferAction(action)) {
-    const center = targetCenter(layerCatalog, action.target_ref);
+    const center =
+      (action.center ? action.center : undefined) ??
+      targetCenter(layerCatalog, action.target_ref);
     if (!center) {
-      return;
+      return false;
     }
     const feature = circleFeature(center, action.radius_km);
+    feature.properties = {
+      feature_id: action.feature_id ?? referenceFor(action.target_ref),
+    };
     const data: GeoJSON.FeatureCollection<GeoJSON.Polygon> = {
       type: "FeatureCollection",
       features: [feature],
@@ -337,35 +368,75 @@ export function applyQaMapAction(
         },
       } satisfies LayerSpecification);
     }
-    return;
+    return true;
   }
 
   if (isHighlightAction(action)) {
     const layer = layerCatalog.layers[action.layer_id];
     if (!layer || !map.getLayer(layer.id)) {
-      return;
+      return false;
     }
     map.setFilter(layer.id, [
       "==",
       ["get", layer.featureIdProperty],
-      referenceFor(action.target_ref),
+      action.feature_id ?? referenceFor(action.target_ref),
     ]);
-    return;
+    return true;
   }
 
   if (isSetLayersAction(action)) {
-    const requested = new Set(action.layers);
+    const requested = new Set(
+      action.visibility
+        ? Object.entries(action.visibility)
+            .filter(([, visible]) => visible)
+            .map(([layer]) => layer)
+        : Array.isArray(action.layers)
+          ? action.layers
+          : Object.entries(action.layers)
+              .filter(([, visible]) => visible)
+              .map(([layer]) => layer),
+    );
+    const visibleValues =
+      action.visibility ??
+      (Array.isArray(action.layers)
+        ? Object.fromEntries(
+            Object.keys(layerCatalog.layers).map((layer) => [
+              layer,
+              requested.has(layer),
+            ]),
+          )
+        : action.layers);
+    const existingLayerIds = new Set<string>();
     for (const layer of Object.values(layerCatalog.layers)) {
-      if (!map.getLayer(layer.id)) {
+      if (map.getLayer(layer.id)) {
+        existingLayerIds.add(layer.id);
+      }
+    }
+    const missingRequestedLayer = [...requested].some(
+      (key) =>
+        !Object.values(layerCatalog.layers).some(
+          (layer) =>
+            thisLayerKey(layerCatalog, layer) === key &&
+            existingLayerIds.has(layer.id),
+        ),
+    );
+    if (missingRequestedLayer) {
+      return false;
+    }
+    for (const layer of Object.values(layerCatalog.layers)) {
+      if (!existingLayerIds.has(layer.id)) {
         continue;
       }
+      const key = thisLayerKey(layerCatalog, layer);
       map.setLayoutProperty(
         layer.id,
         "visibility",
-        requested.has(thisLayerKey(layerCatalog, layer)) ? "visible" : "none",
+        (visibleValues[key] ?? false) ? "visible" : "none",
       );
     }
+    return true;
   }
+  return false;
 }
 
 function thisLayerKey(

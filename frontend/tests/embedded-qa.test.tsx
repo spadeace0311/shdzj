@@ -6,9 +6,11 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import * as maplibregl from "maplibre-gl";
 import { beforeEach, expect, test, vi } from "vitest";
 
 import {
+  clearAccessToken,
   createQaSession,
   getAssessmentProduction,
   getCommandHallOverview,
@@ -16,6 +18,7 @@ import {
   getEvent,
   getLossAssessment,
   getQaAnswer,
+  setAccessToken,
   streamCommandHall,
   streamQaQuestion,
 } from "../src/api/client";
@@ -44,6 +47,69 @@ import type {
   QaToolCall,
 } from "../src/types";
 
+interface MockEmbeddedMap {
+  options: Record<string, unknown>;
+  sources: Map<string, Record<string, unknown>>;
+  layers: Map<string, Record<string, unknown>>;
+  addSource: ReturnType<typeof vi.fn>;
+  addLayer: ReturnType<typeof vi.fn>;
+  getSource: ReturnType<typeof vi.fn>;
+  getLayer: ReturnType<typeof vi.fn>;
+  getZoom: ReturnType<typeof vi.fn>;
+  flyTo: ReturnType<typeof vi.fn>;
+  fitBounds: ReturnType<typeof vi.fn>;
+  setFilter: ReturnType<typeof vi.fn>;
+  setLayoutProperty: ReturnType<typeof vi.fn>;
+  setPaintProperty: ReturnType<typeof vi.fn>;
+  removeLayer: ReturnType<typeof vi.fn>;
+  removeSource: ReturnType<typeof vi.fn>;
+  on: ReturnType<typeof vi.fn>;
+  remove: ReturnType<typeof vi.fn>;
+}
+
+vi.mock("maplibre-gl", () => {
+  const maps: MockEmbeddedMap[] = [];
+  return {
+    Map: vi.fn((options: Record<string, unknown>) => {
+      const sources = new Map<string, Record<string, unknown>>();
+      const layers = new Map<string, Record<string, unknown>>();
+      const map: MockEmbeddedMap = {
+        options,
+        sources,
+        layers,
+        addSource: vi.fn((id: string, source: Record<string, unknown>) => {
+          sources.set(id, source);
+        }),
+        addLayer: vi.fn((layer: Record<string, unknown>) => {
+          layers.set(layer.id as string, layer);
+        }),
+        getSource: vi.fn((id: string) => sources.get(id)),
+        getLayer: vi.fn((id: string) => layers.get(id)),
+        getZoom: vi.fn(() => 9.5),
+        flyTo: vi.fn(),
+        fitBounds: vi.fn(),
+        setFilter: vi.fn(),
+        setLayoutProperty: vi.fn(),
+        setPaintProperty: vi.fn(),
+        removeLayer: vi.fn((id: string) => {
+          layers.delete(id);
+        }),
+        removeSource: vi.fn((id: string) => {
+          sources.delete(id);
+        }),
+        on: vi.fn(),
+        remove: vi.fn(() => {
+          sources.clear();
+          layers.clear();
+        }),
+      };
+      maps.push(map);
+      return map;
+    }),
+    __maps: maps,
+  };
+});
+
 vi.mock("../src/api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/api/client")>();
   return {
@@ -69,6 +135,10 @@ const getLossAssessmentMock = vi.mocked(getLossAssessment);
 const getQaAnswerMock = vi.mocked(getQaAnswer);
 const streamCommandHallMock = vi.mocked(streamCommandHall);
 const streamQaQuestionMock = vi.mocked(streamQaQuestion);
+
+function embeddedMapModule(): { __maps: MockEmbeddedMap[] } {
+  return maplibregl as unknown as { __maps: MockEmbeddedMap[] };
+}
 
 const eventDetail: EventDetail = {
   id: "event-1",
@@ -160,6 +230,29 @@ const persistedAnswer: QaAnswer = {
   citations: [citation],
   tool_calls: [toolCall],
   map_actions: [],
+};
+
+const auditedAnswer: QaAnswer = {
+  ...persistedAnswer,
+  structured: {
+    nearest_fault_km: 12.4,
+    notes: ["工具值与文档值一致"],
+  },
+  degraded_reasons: ["reranker_unavailable"],
+  model_name: "deepseek-chat",
+  model_version: "chat-v1",
+  prompt_version: "qa-2026-10-08",
+  execution_plan: {
+    intent: "knowledge_query",
+  },
+  tool_call_summary: [
+    {
+      name: "fault.nearest",
+      status: "ok",
+      source: "shanghai.fault",
+      version: "v1",
+    },
+  ],
 };
 
 const qaEvents: QaStreamEvent[] = [
@@ -336,6 +429,7 @@ function LossActionHarness({ action }: { action: QaMapAction }) {
 }
 
 beforeEach(() => {
+  clearAccessToken();
   createQaSessionMock.mockReset();
   getAssessmentProductionMock.mockReset();
   getCommandHallOverviewMock.mockReset();
@@ -345,9 +439,11 @@ beforeEach(() => {
   getQaAnswerMock.mockReset();
   streamCommandHallMock.mockReset();
   streamQaQuestionMock.mockReset();
+  embeddedMapModule().__maps.length = 0;
 });
 
 test("event detail opens qa panel with the current event and publishes map action", async () => {
+  setAccessToken("embedded-qa-token");
   mockEventDetailApi();
   mockQaStream([
     ...qaEvents,
@@ -356,7 +452,10 @@ test("event detail opens qa panel with the current event and publishes map actio
       data: {
         action_type: "locate",
         target_ref: "fault:f1",
+        coordinates: [121.5, 31.2],
+        feature_id: "f1",
         reason: "定位最近断层",
+        valid_until: "2099-01-01T00:00:00Z",
       },
     },
   ]);
@@ -380,6 +479,11 @@ test("event detail opens qa panel with the current event and publishes map actio
       "locate",
     ),
   );
+  const map = embeddedMapModule().__maps.at(-1);
+  expect(map?.flyTo).toHaveBeenCalledWith({
+    center: [121.5, 31.2],
+    zoom: 9.5,
+  });
   expect(createQaSessionMock).toHaveBeenCalledWith({
     title: "当前问答",
     event_id: "event-1",
@@ -504,6 +608,50 @@ test("command hall qa shows citations and tool results without a map", async () 
   expect(screen.getAllByText("fault.nearest").length).toBeGreaterThan(0);
 });
 
+test("embedded qa renders structured, degraded and audit results", async () => {
+  mockQaStream(qaEvents);
+  getQaAnswerMock.mockResolvedValue(auditedAnswer);
+
+  renderQaPanel("event-1");
+  askQuestion("查看结构化与审计结果");
+
+  expect(await screen.findByTestId("qa-structured")).toHaveTextContent(
+    "nearest_fault_km",
+  );
+  expect(screen.getByTestId("qa-degraded")).toHaveTextContent(
+    "reranker_unavailable",
+  );
+  const audit = screen.getByTestId("qa-audit");
+  expect(audit).toHaveTextContent("deepseek-chat");
+  expect(audit).toHaveTextContent("chat-v1");
+  expect(audit).toHaveTextContent("qa-2026-10-08");
+  expect(audit).toHaveTextContent("knowledge_query");
+});
+
+test("embedded qa recovers from an answer_id carried by answer_delta", async () => {
+  const recoveryEvents: QaStreamEvent[] = [
+    { type: "retrieval", data: { answer_id: "a1", count: 1 } },
+    {
+      type: "answer_delta",
+      data: { answer_id: "a1", text: "断流前部分结果。" },
+    },
+    {
+      type: "error",
+      data: { answer_id: "a1", code: "stream_failed", recoverable: true },
+    },
+  ];
+  mockQaStream(recoveryEvents);
+  getQaAnswerMock.mockResolvedValue(persistedAnswer);
+
+  renderQaPanel("event-1");
+  askQuestion("从任意事件恢复");
+
+  expect(
+    await screen.findByText("距最近断层 12.4 公里。"),
+  ).toBeInTheDocument();
+  expect(getQaAnswerMock).toHaveBeenCalledWith("a1");
+});
+
 test("stale session creation does not leak into a changed event", async () => {
   let resolveOldSession!: (value: QaSession) => void;
   const newSession: QaSession = {
@@ -602,12 +750,12 @@ test("event detail reserves layout width while the qa drawer is open", async () 
     "page-section--qa-open",
   );
   expect(stylesCss).toMatch(
-    /\.page-section--qa-open\s*\{[^}]*max-width:\s*calc\(100%\s*-\s*560px\);/,
+    /\.page-section--qa-open\s*\{[^}]*max-width:\s*min\(1720px,\s*calc\(100%\s*-\s*560px\)\);/,
   );
 });
 
 test("hall qa scrim starts below the command hall header", () => {
   expect(stylesCss).toMatch(
-    /\.qa-panel-layer--hall \.qa-panel__scrim\s*\{[^}]*top:\s*var\(--qa-hall-top,\s*0\);/,
+    /\.qa-panel-layer--hall \.qa-panel__scrim\s*,\s*\.qa-panel-layer--event \.qa-panel__scrim\s*\{[^}]*top:\s*var\(--qa-hall-top,\s*0\);/,
   );
 });

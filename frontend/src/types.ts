@@ -332,7 +332,7 @@ export interface QaCitation {
   citation_key: string;
   source_title: string;
   version_label: string;
-  locator: string;
+  locator: string | null;
   excerpt: string;
   source_uri: string | null;
   checksum: string;
@@ -351,11 +351,58 @@ export interface QaToolCall {
 }
 
 export type QaMapAction =
-  | { action_type: "locate"; target_ref: string; reason: string; valid_until: string }
-  | { action_type: "fit_bounds"; bounds: [number, number, number, number]; reason: string; valid_until: string }
-  | { action_type: "buffer"; target_ref: string; radius_km: number; reason: string; valid_until: string }
-  | { action_type: "highlight"; target_ref: string; layer_id: string; reason: string; valid_until: string }
-  | { action_type: "set_layers"; layers: string[]; reason: string; valid_until: string };
+  | {
+      action_type: "locate";
+      target_ref: string;
+      reason: string;
+      valid_until: string;
+      coordinates?: [number, number];
+      feature_id?: string;
+      provenance?: Record<string, unknown>;
+      source_tool?: string | null;
+    }
+  | {
+      action_type: "fit_bounds";
+      bounds: [number, number, number, number];
+      reason: string;
+      valid_until: string;
+      provenance?: Record<string, unknown>;
+      source_tool?: string | null;
+    }
+  | {
+      action_type: "buffer";
+      target_ref: string;
+      radius_km: number;
+      reason: string;
+      valid_until: string;
+      center?: [number, number];
+      feature_id?: string;
+      provenance?: Record<string, unknown>;
+      source_tool?: string | null;
+    }
+  | {
+      action_type: "highlight";
+      target_ref: string;
+      layer_id: string;
+      reason: string;
+      valid_until: string;
+      feature_id?: string;
+      coordinates?: [number, number];
+      provenance?: Record<string, unknown>;
+      source_tool?: string | null;
+    }
+  | {
+      action_type: "set_layers";
+      layers: string[] | Record<string, boolean>;
+      reason: string;
+      valid_until: string;
+      visibility?: Record<string, boolean>;
+      source_tools?: string[];
+      provenance?: Record<string, unknown>;
+      source_tool?: string | null;
+    };
+
+export type QaLayerVisibility = Record<string, boolean>;
 
 export interface QaMapActionRecord {
   id: string;
@@ -364,6 +411,14 @@ export interface QaMapActionRecord {
   payload: Record<string, unknown>;
   valid_until: string | null;
   created_at: string;
+}
+
+export interface QaAnswerAudit {
+  model_name: string | null;
+  model_version: string | null;
+  prompt_version: string | null;
+  execution_plan: Record<string, unknown> | null;
+  tool_call_summary: Array<Record<string, unknown>>;
 }
 
 export interface QaAnswer {
@@ -382,6 +437,11 @@ export interface QaAnswer {
   citations: QaCitation[];
   tool_calls: QaToolCall[];
   map_actions: QaMapActionRecord[];
+  model_name?: string | null;
+  model_version?: string | null;
+  prompt_version?: string | null;
+  execution_plan?: Record<string, unknown> | null;
+  tool_call_summary?: Array<Record<string, unknown>>;
 }
 
 export interface QaStreamEvent {

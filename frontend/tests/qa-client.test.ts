@@ -14,6 +14,51 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function responseWithSpiedReader(
+  chunks: Uint8Array[],
+  headers: Record<string, string> = {
+    "Content-Type": "text/event-stream",
+  },
+): {
+  response: Response;
+  releaseLock: () => ReturnType<typeof vi.fn> | undefined;
+  cancel: () => ReturnType<typeof vi.fn> | undefined;
+} {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+    },
+  });
+  const response = new Response(stream, { status: 200, headers });
+  let releaseLock: ReturnType<typeof vi.fn> | undefined;
+  let cancel: ReturnType<typeof vi.fn> | undefined;
+
+  vi.spyOn(response.body!, "getReader").mockImplementation(() => {
+    // The spy replaces the body method, so the bound prototype method must be
+    // called directly to avoid recursive lookup.
+    const originalReader = (
+      Object.getPrototypeOf(response.body) as ReadableStream<Uint8Array>
+    ).getReader.call(response.body);
+    releaseLock = vi.spyOn(
+      originalReader,
+      "releaseLock",
+    ) as unknown as ReturnType<typeof vi.fn>;
+    cancel = vi.spyOn(
+      originalReader,
+      "cancel",
+    ) as unknown as ReturnType<typeof vi.fn>;
+    return originalReader;
+  });
+
+  return {
+    response,
+    releaseLock: () => releaseLock,
+    cancel: () => cancel,
+  };
+}
+
 
 test("parses named SSE events split across chunks", async () => {
   setAccessToken("test-token");
@@ -130,6 +175,92 @@ test("throws ApiError when SSE data is not valid JSON", async () => {
   await expect(
     streamQaQuestion("s1", "问题", () => undefined),
   ).rejects.toMatchObject({ name: "ApiError", status: 0 });
+});
+
+test("rejects a successful non-SSE response before reading its body", async () => {
+  setAccessToken("test-token");
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+
+  await expect(
+    streamQaQuestion("s1", "问题", () => undefined),
+  ).rejects.toThrow("事件流响应格式错误");
+});
+
+test("reports direct fetch rejection as an explicit stream connection error", async () => {
+  setAccessToken("test-token");
+  vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("offline"));
+
+  await expect(
+    streamQaQuestion("s1", "问题", () => undefined),
+  ).rejects.toMatchObject({
+    name: "ApiError",
+    status: 0,
+    message: "事件流连接失败，请稍后重试",
+  });
+});
+
+test("cancels and releases the reader after an SSE parse error", async () => {
+  setAccessToken("test-token");
+  const { response, releaseLock, cancel } = responseWithSpiedReader([
+    new TextEncoder().encode("event: retrieval\ndata: not-json\n\n"),
+  ]);
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+
+  await expect(
+    streamQaQuestion("s1", "问题", () => undefined),
+  ).rejects.toMatchObject({ name: "ApiError", status: 0 });
+
+  expect(cancel()).toHaveBeenCalled();
+  expect(releaseLock()).toHaveBeenCalled();
+});
+
+test("cancels and releases the reader after a network read error", async () => {
+  setAccessToken("test-token");
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        new TextEncoder().encode(
+          'event: answer_delta\ndata: {"answer_id":"a1","text":"部分"}\n\n',
+        ),
+      );
+    },
+    pull(controller) {
+      controller.error(new TypeError("network interrupted"));
+    },
+  });
+  const response = new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+  let releaseLock: ReturnType<typeof vi.fn> | undefined;
+  let cancel: ReturnType<typeof vi.fn> | undefined;
+  vi.spyOn(response.body!, "getReader").mockImplementation(() => {
+    const reader = (
+      Object.getPrototypeOf(response.body) as ReadableStream<Uint8Array>
+    ).getReader.call(response.body);
+    releaseLock = vi.spyOn(
+      reader,
+      "releaseLock",
+    ) as unknown as ReturnType<typeof vi.fn>;
+    cancel = vi.spyOn(
+      reader,
+      "cancel",
+    ) as unknown as ReturnType<typeof vi.fn>;
+    return reader;
+  });
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+
+  await expect(
+    streamQaQuestion("s1", "问题", () => undefined),
+  ).rejects.toThrow("事件流连接中断，请稍后重试");
+
+  expect(cancel).toHaveBeenCalled();
+  expect(releaseLock).toHaveBeenCalled();
 });
 
 

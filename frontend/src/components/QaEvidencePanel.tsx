@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import type {
+  QaAnswerAudit,
   QaCitation,
   QaMapAction,
   QaToolCall,
@@ -10,6 +11,9 @@ interface QaEvidencePanelProps {
   citations: QaCitation[];
   toolCalls: QaToolCall[];
   mapActions: QaMapAction[];
+  structured?: Record<string, unknown> | null;
+  degradedReasons?: string[];
+  audit?: QaAnswerAudit | null;
 }
 
 function checksumPrefix(value: string): string {
@@ -31,10 +35,92 @@ function actionLabel(action: QaMapAction): string {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function StructuredValue({
+  value,
+  depth = 0,
+}: {
+  value: unknown;
+  depth?: number;
+}) {
+  if (value === null || value === undefined) {
+    return <span>-</span>;
+  }
+  if (Array.isArray(value)) {
+    if (depth >= 4) {
+      return <span>[...]</span>;
+    }
+    return (
+      <ul className="qa-structured-list">
+        {value.map((item, index) => (
+          <li key={index}>
+            <StructuredValue value={item} depth={depth + 1} />
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      return <span>-</span>;
+    }
+    if (depth >= 4) {
+      return <span>{"{...}"}</span>;
+    }
+    return (
+      <dl className="qa-structured-object">
+        {entries.map(([key, item]) => (
+          <div key={key}>
+            <dt>{key}</dt>
+            <dd>
+              <StructuredValue value={item} depth={depth + 1} />
+            </dd>
+          </div>
+        ))}
+      </dl>
+    );
+  }
+  return <span>{String(value)}</span>;
+}
+
+export function QaStructuredResult({
+  value,
+}: {
+  value: Record<string, unknown>;
+}) {
+  return (
+    <section
+      className="qa-structured-result"
+      data-testid="qa-structured"
+      aria-label="结构化结果"
+    >
+      <h2>结构化结果</h2>
+      <StructuredValue value={value} />
+    </section>
+  );
+}
+
+function auditValue(value: string | null | undefined): string {
+  return value || "-";
+}
+
+function auditIntent(
+  value: Record<string, unknown> | null,
+): string {
+  return typeof value?.intent === "string" ? value.intent : "-";
+}
+
 export function QaEvidencePanel({
   citations,
   toolCalls,
   mapActions,
+  structured = null,
+  degradedReasons = [],
+  audit = null,
 }: QaEvidencePanelProps) {
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(
     () => new Set(),
@@ -131,7 +217,49 @@ export function QaEvidencePanel({
           </ul>
         )}
       </div>
+
+      {structured ? <QaStructuredResult value={structured} /> : null}
+
+      {degradedReasons.length > 0 ? (
+        <div
+          className="qa-evidence-panel__section"
+          data-testid="qa-degraded"
+        >
+          <h2>降级原因</h2>
+          <ul className="qa-tool-result-list">
+            {degradedReasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {audit ? (
+        <div
+          className="qa-evidence-panel__section qa-audit"
+          data-testid="qa-audit"
+        >
+          <h2>模型与提示词审计</h2>
+          <dl className="qa-audit__facts">
+            <div>
+              <dt>模型</dt>
+              <dd>{auditValue(audit.model_name)}</dd>
+            </div>
+            <div>
+              <dt>模型版本</dt>
+              <dd>{auditValue(audit.model_version)}</dd>
+            </div>
+            <div>
+              <dt>提示词版本</dt>
+              <dd>{auditValue(audit.prompt_version)}</dd>
+            </div>
+            <div>
+              <dt>执行意图</dt>
+              <dd>{auditIntent(audit.execution_plan)}</dd>
+            </div>
+          </dl>
+        </div>
+      ) : null}
     </section>
   );
 }
-

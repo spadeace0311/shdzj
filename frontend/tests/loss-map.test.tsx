@@ -5,12 +5,18 @@ import * as maplibregl from "maplibre-gl";
 import { buildLossTileRequest, LossMap } from "../src/components/LossMap";
 import { LossAssessmentPanel } from "../src/components/LossAssessmentPanel";
 import { clearAccessToken, setAccessToken } from "../src/api/client";
+import {
+  MapActionProvider,
+  useMapActionPublisher,
+} from "../src/qa/MapActionContext";
+import { QA_LAYER_CATALOG } from "../src/qa/mapActions";
 import type {
   IntensityGridArtifact,
   LossAreaFeature,
   LossGridArtifact,
   LossProductSummary,
   LossResult,
+  QaMapAction,
 } from "../src/types";
 
 interface MockMap {
@@ -30,6 +36,10 @@ interface MockMap {
   addLayer: ReturnType<typeof vi.fn>;
   getSource: ReturnType<typeof vi.fn>;
   getLayer: ReturnType<typeof vi.fn>;
+  getZoom: ReturnType<typeof vi.fn>;
+  flyTo: ReturnType<typeof vi.fn>;
+  fitBounds: ReturnType<typeof vi.fn>;
+  setFilter: ReturnType<typeof vi.fn>;
   setLayoutProperty: ReturnType<typeof vi.fn>;
   setPaintProperty: ReturnType<typeof vi.fn>;
   removeLayer: ReturnType<typeof vi.fn>;
@@ -82,6 +92,10 @@ vi.mock("maplibre-gl", () => {
       ),
       getSource: vi.fn((id: string) => sources.get(id)),
       getLayer: vi.fn((id: string) => layers.get(id)),
+      getZoom: vi.fn(() => 9.5),
+      flyTo: vi.fn(),
+      fitBounds: vi.fn(),
+      setFilter: vi.fn(),
       setLayoutProperty: vi.fn(
         (id: string, key: string, value: unknown) => {
           layoutProps.set(id, {
@@ -163,6 +177,42 @@ vi.mock("maplibre-gl", () => {
     __maps: maps,
   };
 });
+
+function LossActionHarness({ action }: { action: QaMapAction }) {
+  const publish = useMapActionPublisher();
+  return (
+    <div>
+      <button type="button" onClick={() => publish("event-1", action)}>
+        publish loss action
+      </button>
+      <LossMap
+        center={[31.2, 121.5]}
+        tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
+        townFeatures={[]}
+        gridArtifact={null}
+        fusedIntensityArtifact={null}
+      />
+    </div>
+  );
+}
+
+async function renderLossActionHarness(action: QaMapAction) {
+  setAccessToken("loss-map-test-token");
+  const utils = render(
+    <MapActionProvider eventId="event-1">
+      <LossActionHarness action={action} />
+    </MapActionProvider>,
+  );
+  await waitFor(() => expect(mapModule().__maps.length).toBeGreaterThan(0));
+  const map = mapModule().__maps.at(-1) as MockMap;
+  await waitFor(() =>
+    expect(map.getSource("loss-map-amap")).toBeTruthy(),
+  );
+  return {
+    ...utils,
+    map,
+  };
+}
 
 const townFeature: LossAreaFeature = {
   area_scope: "town",
@@ -606,6 +656,130 @@ it("resets a stale selected product when run products change", async () => {
     expect((screen.getByLabelText("空间化产品") as HTMLSelectElement).value).toBe(
       "p2",
     ),
+  );
+});
+
+it("executes frozen QA coordinates through LossMap MapLibre methods", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "locate",
+    target_ref: "fault:f1",
+    reason: "定位最近断层",
+    valid_until: "2099-01-01T00:00:00Z",
+    coordinates: [121.5, 31.2],
+    feature_id: "f1",
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "locate",
+    ),
+  );
+  expect(map.flyTo).toHaveBeenCalledWith({
+    center: [121.5, 31.2],
+    zoom: 9.5,
+  });
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
+it("does not claim success when a QA map action cannot be applied", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "locate",
+    target_ref: "unknown:target",
+    reason: "定位未知目标",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(""),
+  );
+  expect(screen.getByTestId("loss-map-action-error")).toHaveTextContent(
+    /地图动作/,
+  );
+  expect(map.flyTo).not.toHaveBeenCalled();
+});
+
+it("applies frozen bounds, buffer center and highlighted feature IDs", async () => {
+  const boundsMap = await renderLossActionHarness({
+    action_type: "fit_bounds",
+    bounds: [120.9, 30.7, 122.0, 31.7],
+    reason: "适配范围",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "fit_bounds",
+    ),
+  );
+  expect(boundsMap.map.fitBounds).toHaveBeenCalledWith(
+    [
+      [120.9, 30.7],
+      [122.0, 31.7],
+    ],
+    { padding: 40 },
+  );
+  boundsMap.unmount();
+
+  const bufferMap = await renderLossActionHarness({
+    action_type: "buffer",
+    target_ref: "event:epicenter",
+    radius_km: 50,
+    center: [121.5, 31.2],
+    feature_id: "event-1",
+    reason: "绘制影响范围",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "buffer",
+    ),
+  );
+  expect(bufferMap.map.addSource).toHaveBeenCalledWith(
+    "qa-buffer",
+    expect.objectContaining({ type: "geojson" }),
+  );
+});
+
+it("executes dictionary set_layers visibility through MapLibre", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "set_layers",
+    layers: {
+      epicenter: true,
+      faults: false,
+    },
+    visibility: {
+      epicenter: true,
+      faults: false,
+      population: false,
+    },
+    reason: "图层联动",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+  for (const layer of Object.values(QA_LAYER_CATALOG.layers)) {
+    map.layers.set(layer.id, { id: layer.id });
+  }
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "set_layers",
+    ),
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "qa-epicenter",
+    "visibility",
+    "visible",
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "qa-faults",
+    "visibility",
+    "none",
   );
 });
 

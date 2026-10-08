@@ -53,9 +53,8 @@ function answerId(
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
     if (
-      (event.type === "answer_completed" ||
-        event.type === "answer_started") &&
-      typeof event.data.answer_id === "string"
+      typeof event.data.answer_id === "string" &&
+      event.data.answer_id.length > 0
     ) {
       return event.data.answer_id;
     }

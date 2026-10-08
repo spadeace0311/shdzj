@@ -143,6 +143,7 @@ export function LossMap({
     fusedIntensityArtifact?.bands[0]?.name ?? "",
   );
   const [lastActionType, setLastActionType] = useState("");
+  const [lastActionError, setLastActionError] = useState("");
   const currentEventId = useMapActionEventId();
   const { eventId: actionEventId, action: latestAction } =
     useMapActionConsumer();
@@ -151,19 +152,34 @@ export function LossMap({
   useEffect(() => {
     if (
       !latestAction ||
-      actionEventId !== currentEventId ||
       isQaMapActionExpired(latestAction)
     ) {
       return;
     }
 
-    setLastActionType(latestAction.action_type);
-    if (mapRef.current && mapReady) {
-      applyQaMapAction(
+    if (actionEventId !== currentEventId) {
+      setLastActionType("");
+      setLastActionError("");
+      return;
+    }
+    if (!mapRef.current || !mapReady) {
+      return;
+    }
+    setLastActionType("");
+    setLastActionError("");
+    try {
+      const applied = applyQaMapAction(
         mapRef.current as unknown as QaActionMap,
         latestAction,
         QA_LAYER_CATALOG,
       );
+      if (applied) {
+        setLastActionType(latestAction.action_type);
+      } else {
+        setLastActionError("地图动作未执行");
+      }
+    } catch {
+      setLastActionError("地图动作执行失败");
     }
   }, [actionEventId, currentEventId, latestAction, mapReady]);
 
@@ -581,6 +597,15 @@ export function LossMap({
           >
             {lastActionType}
           </span>
+          {lastActionError ? (
+            <span
+              className="loss-map__action-error"
+              data-testid="loss-map-action-error"
+              role="alert"
+            >
+              {lastActionError}
+            </span>
+          ) : null}
         </div>
       </div>
       <div className="loss-map__canvas" ref={containerRef} />

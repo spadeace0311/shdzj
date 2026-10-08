@@ -223,6 +223,25 @@ const persistedStructuredAnswer: QaAnswer = {
   map_actions: [mapActionRecord],
 };
 
+const persistedAuditedAnswer = {
+  ...persistedStructuredAnswer,
+  degraded_reasons: ["qdrant_unavailable"],
+  model_name: "deepseek-chat",
+  model_version: "chat-v1",
+  prompt_version: "qa-2026-10-08",
+  execution_plan: {
+    intent: "knowledge_query",
+  },
+  tool_call_summary: [
+    {
+      name: "fault.nearest",
+      status: "ok",
+      source: "shanghai.fault",
+      version: "v1",
+    },
+  ],
+} as QaAnswer;
+
 const workflowEvents: QaStreamEvent[] = [
   {
     type: "retrieval",
@@ -481,6 +500,30 @@ test("renders structured results without opening links", async () => {
   expect(screen.queryByRole("link")).not.toBeInTheDocument();
 });
 
+test("renders degraded reasons and model prompt audit metadata", async () => {
+  mockQaApi(workflowEvents, persistedAuditedAnswer);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: "给出降级与审计结果" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+  expect(await screen.findByTestId("qa-degraded")).toHaveTextContent(
+    "qdrant_unavailable",
+  );
+  const audit = screen.getByTestId("qa-audit");
+  expect(audit).toHaveTextContent("deepseek-chat");
+  expect(audit).toHaveTextContent("chat-v1");
+  expect(audit).toHaveTextContent("qa-2026-10-08");
+  expect(audit).toHaveTextContent("knowledge_query");
+});
+
 test("recovers persisted map actions when the stream stops early", async () => {
   mockQaApi(
     workflowEvents.filter((event) => event.type !== "map_action"),
@@ -499,6 +542,69 @@ test("recovers persisted map actions when the stream stops early", async () => {
   fireEvent.click(screen.getByRole("button", { name: "提问" }));
 
   expect(await screen.findByText("缓冲区")).toBeInTheDocument();
+});
+
+test("recovers an answer ID from any SSE event without answer_started", async () => {
+  mockQaApi(
+    [
+      { type: "retrieval", data: { answer_id: "a1", count: 1 } },
+      {
+        type: "answer_delta",
+        data: { answer_id: "a1", text: "断流前已收到部分结果。" },
+      },
+      {
+        type: "error",
+        data: { answer_id: "a1", code: "stream_failed", recoverable: true },
+      },
+    ],
+    persistedStructuredAnswer,
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: "断流前恢复答案" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+  expect(
+    await screen.findByText("最近断裂带约 18.2 公里。"),
+  ).toBeInTheDocument();
+  expect(getQaAnswerMock).toHaveBeenCalledWith("a1");
+});
+
+test("keeps a previous conversation when returning to its session", async () => {
+  mockQaApi(workflowEvents, persistedStructuredAnswer);
+  listQaSessionsMock.mockResolvedValue([session, secondSession]);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  await screen.findByRole("button", { name: "当前问答" });
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: "保留当前会话回答" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+  expect(
+    await screen.findByText("最近断裂带约 18.2 公里。"),
+  ).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "历史问答 2" }));
+  expect(
+    screen.queryByText("最近断裂带约 18.2 公里。"),
+  ).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "当前问答" }));
+  expect(
+    await screen.findByText("最近断裂带约 18.2 公里。"),
+  ).toBeInTheDocument();
 });
 
 test("passes the current event epicenter into QaMap", async () => {
@@ -711,6 +817,54 @@ test("applyQaMapAction executes the five valid action types", () => {
     "visibility",
     "none",
   );
+});
+
+test("applyQaMapAction consumes frozen dictionary layer visibility", () => {
+  const map = makeActionMap();
+
+  applyQaMapAction(
+    map,
+    {
+      action_type: "set_layers",
+      layers: {
+        faults: false,
+        epicenter: true,
+      },
+      visibility: {
+        faults: false,
+        epicenter: true,
+      },
+      reason: "图层联动",
+      valid_until: "2026-10-08T00:10:00Z",
+    },
+    testCatalog,
+  );
+
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "qa-faults",
+    "visibility",
+    "none",
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "qa-epicenter",
+    "visibility",
+    "visible",
+  );
+});
+
+test("applyQaMapAction rejects non-finite frozen coordinates", () => {
+  const map = makeActionMap();
+
+  applyQaMapAction(
+    map,
+    {
+      ...validAction("locate"),
+      coordinates: [Number.NaN, 31.2],
+    } as QaMapAction,
+    testCatalog,
+  );
+
+  expect(map.flyTo).not.toHaveBeenCalled();
 });
 
 test("applyQaMapAction rejects unknown and invalid actions", () => {

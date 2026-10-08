@@ -857,6 +857,10 @@ export async function streamQaQuestion(
   if (!response.ok) {
     throw new ApiError(await parseError(response), response.status);
   }
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
+    throw new ApiError("事件流响应格式错误", 0);
+  }
   if (response.body === null) {
     throw new ApiError("事件流响应为空", 0);
   }
@@ -867,13 +871,15 @@ export async function streamQaQuestion(
     { stream: true } as TextDecoderOptions,
   );
   let buffer = "";
-  const cancelReader = () => {
-    void reader.cancel().catch(() => undefined);
+  const cancelReader = async () => {
+    await reader.cancel().catch(() => undefined);
   };
+  let handleAbort: (() => void) | undefined;
   if (signal) {
-    signal.addEventListener("abort", cancelReader, { once: true });
+    handleAbort = () => void cancelReader();
+    signal.addEventListener("abort", handleAbort, { once: true });
     if (signal.aborted) {
-      cancelReader();
+      void cancelReader();
     }
   }
 
@@ -914,15 +920,20 @@ export async function streamQaQuestion(
     if (signal?.aborted || isAbortError(error)) {
       return;
     }
+    await cancelReader();
     if (error instanceof ApiError) {
       throw error;
     }
     throw new ApiError("事件流连接中断，请稍后重试", 0);
   } finally {
-    if (signal) {
-      signal.removeEventListener("abort", cancelReader);
+    if (signal && handleAbort) {
+      signal.removeEventListener("abort", handleAbort);
     }
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // The read loop may already have released the lock after cancellation.
+    }
   }
 }
 
