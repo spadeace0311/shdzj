@@ -24,6 +24,14 @@ from app.embedding.schemas import DENSE_DIMENSIONS, EmbeddingBatch
 from app.knowledge.models import KnowledgeIndexVersion
 
 
+class KnowledgeIndexConfigurationError(ValueError):
+    """Raised when retrieval is missing the active index version."""
+
+
+class KnowledgeIndexNotPublishedError(ValueError):
+    """Raised when a non-published index version is used for vector search."""
+
+
 @dataclass(frozen=True, slots=True)
 class KnowledgeFilters:
     source_ids: tuple[UUID, ...] = ()
@@ -182,6 +190,7 @@ class KnowledgeIndex:
         filters: KnowledgeFilters,
         limit: int,
     ) -> list[RetrievedEvidence]:
+        _require_published_index_version(index_version)
         if len(vector) != DENSE_DIMENSIONS:
             raise ValueError(
                 f"dense vector must contain {DENSE_DIMENSIONS} dimensions"
@@ -190,7 +199,7 @@ class KnowledgeIndex:
             collection_name=_collection_name(index_version),
             query=vector,
             using="dense",
-            query_filter=_qdrant_filter(filters),
+            query_filter=_qdrant_filter(filters, index_version),
             limit=limit,
             with_payload=True,
         )
@@ -206,6 +215,7 @@ class KnowledgeIndex:
         filters: KnowledgeFilters,
         limit: int,
     ) -> list[RetrievedEvidence]:
+        _require_published_index_version(index_version)
         indices = sorted(sparse)
         response = await self._client.query_points(
             collection_name=_collection_name(index_version),
@@ -214,7 +224,7 @@ class KnowledgeIndex:
                 values=[float(sparse[index]) for index in indices],
             ),
             using="sparse",
-            query_filter=_qdrant_filter(filters),
+            query_filter=_qdrant_filter(filters, index_version),
             limit=limit,
             with_payload=True,
         )
@@ -225,11 +235,24 @@ class KnowledgeIndex:
 
 
 def _collection_name(index_version: KnowledgeIndexVersion) -> str:
-    return f"{settings.qdrant_collection_prefix}-{index_version.version}"
+    collection_name = index_version.collection_name.strip()
+    if not collection_name:
+        raise KnowledgeIndexConfigurationError(
+            "knowledge index version is missing a collection name"
+        )
+    return collection_name
 
 
-def _qdrant_filter(filters: KnowledgeFilters) -> Filter | None:
-    conditions: list[FieldCondition] = []
+def _qdrant_filter(
+    filters: KnowledgeFilters,
+    index_version: KnowledgeIndexVersion,
+) -> Filter:
+    conditions: list[FieldCondition] = [
+        FieldCondition(
+            key="version_id",
+            match=MatchValue(value=str(index_version.source_version_id)),
+        )
+    ]
     if filters.source_ids:
         conditions.append(
             _match_any("source_id", [str(value) for value in filters.source_ids])
@@ -252,13 +275,20 @@ def _qdrant_filter(filters: KnowledgeFilters) -> Filter | None:
                 range=DatetimeRange(lte=filters.published_before),
             )
         )
-    if not conditions:
-        return None
     return Filter(must=conditions)
 
 
 def _match_any(key: str, values: list[str]) -> FieldCondition:
     return FieldCondition(key=key, match=MatchAny(any=values))
+
+
+def _require_published_index_version(
+    index_version: KnowledgeIndexVersion,
+) -> None:
+    if index_version.status != "published":
+        raise KnowledgeIndexNotPublishedError(
+            "only published knowledge index versions can be searched"
+        )
 
 
 def _evidence_from_point(

@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
+from app.config import settings
 from app.knowledge.models import (
     KnowledgeIndexVersion,
     KnowledgeSource,
@@ -89,6 +90,53 @@ async def test_publish_promotes_indexed_version_and_audits(
             )
             assert audit is not None
             assert audit.actor == PUBLICATION_ACTOR
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_publish_populates_index_manifest_and_global_collection_name(
+    session_factory,
+) -> None:
+    try:
+        event_id = uuid4()
+        async with session_factory() as session:
+            async with session.begin():
+                source = await _create_source(session)
+                target = await _create_version(
+                    session,
+                    source.id,
+                    "v1",
+                    "indexed",
+                    checksum="d" * 64,
+                    source_uri="https://example.invalid/preplan",
+                    metadata={"event_id": str(event_id)},
+                )
+
+        async with session_factory() as session:
+            async with session.begin():
+                published = await KnowledgePublicationService().publish(
+                    session,
+                    target.id,
+                    PUBLICATION_ACTOR,
+                    "release metadata",
+                )
+
+        async with session_factory() as session:
+            index_version = await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == target.id
+                )
+            )
+            assert index_version is not None
+            assert index_version.collection_name == (
+                f"{settings.qdrant_collection_prefix}-{source.source_key}"
+            )
+            assert index_version.manifest == {
+                "source_title": source.title,
+                "source_uri": "https://example.invalid/preplan",
+                "event_id": str(event_id),
+                "published_at": published.published_at.isoformat(),
+            }
     finally:
         await _delete_actor_data(session_factory)
 
@@ -262,6 +310,7 @@ async def _create_version(
     *,
     checksum: str | None = None,
     source_uri: str | None = None,
+    metadata: dict | None = None,
 ) -> KnowledgeSourceVersion:
     stored = KnowledgeSourceVersion(
         source_id=source_id,
@@ -269,6 +318,7 @@ async def _create_version(
         status=status,
         source_uri=source_uri,
         checksum=checksum,
+        version_metadata=metadata or {},
         created_by=PUBLICATION_ACTOR,
     )
     session.add(stored)

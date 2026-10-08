@@ -2,15 +2,36 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
+import pytest
+
 from app.embedding.schemas import EmbeddingBatch, RerankResult
 from app.knowledge.adapters import RerankerUnavailableError
-from app.knowledge.index import RetrievedEvidence
+from app.knowledge.index import (
+    KnowledgeIndexConfigurationError,
+    RetrievedEvidence,
+)
+from app.knowledge.models import KnowledgeIndexVersion
 from app.knowledge.retrieval import (
     HybridRetriever,
     KnowledgeFilters,
     PostgresLexicalIndex,
     _trigram_pattern,
 )
+
+
+def _published_index_version() -> KnowledgeIndexVersion:
+    return KnowledgeIndexVersion(
+        id=uuid4(),
+        source_version_id=uuid4(),
+        version="v1",
+        status="published",
+        collection_name=f"shanghai-knowledge-{uuid4()}",
+        embedding_model="BAAI/bge-m3",
+        reranker_model="BAAI/bge-reranker-v2-m3",
+        chunk_count=0,
+        manifest={},
+        activated_at=None,
+    )
 
 
 def _evidence(
@@ -51,6 +72,21 @@ class FailingQdrantIndex:
     async def search_sparse(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
         raise RuntimeError("qdrant unavailable")
+
+
+class UnexpectedQdrantIndex:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def search_dense(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        self.call_count += 1
+        raise AssertionError("Qdrant should not be called without an index version")
+
+    async def search_sparse(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        self.call_count += 1
+        raise AssertionError("Qdrant should not be called without an index version")
 
 
 class FakePostgresIndex:
@@ -155,6 +191,7 @@ async def test_hybrid_retriever_falls_back_to_postgres() -> None:
         qdrant=FailingQdrantIndex(),
         postgres=postgres,
         reranker=None,
+        index_version=_published_index_version(),
     )
 
     result = await retriever.search(
@@ -182,6 +219,7 @@ async def test_rrf_promotes_chunks_present_in_dense_and_sparse() -> None:
         qdrant=qdrant,
         postgres=postgres,
         reranker=None,
+        index_version=_published_index_version(),
     ).search("断裂带", KnowledgeFilters(), limit=10)
 
     chunk_ids = [evidence.chunk_id for evidence in result.evidence]
@@ -208,6 +246,7 @@ async def test_reranker_reorders_top_candidates() -> None:
         qdrant=FakeQdrantIndex(dense=dense, sparse=[]),
         postgres=FakePostgresIndex(evidence=[], include_expected=False),
         reranker=reranker,
+        index_version=_published_index_version(),
     ).search("query", KnowledgeFilters(), limit=2)
 
     assert [evidence.chunk_id for evidence in result.evidence] == [
@@ -227,6 +266,7 @@ async def test_reranker_unavailable_preserves_rrf_order() -> None:
         qdrant=FakeQdrantIndex(dense=dense, sparse=[]),
         postgres=FakePostgresIndex(evidence=[], include_expected=False),
         reranker=FailingReranker(),
+        index_version=_published_index_version(),
     ).search("query", KnowledgeFilters(), limit=2)
 
     assert [evidence.chunk_id for evidence in result.evidence] == [first, second]
@@ -239,11 +279,28 @@ async def test_retriever_returns_retrieval_unavailable_when_all_routes_fail() ->
         qdrant=FailingQdrantIndex(),
         postgres=FailingPostgresIndex(),
         reranker=None,
+        index_version=_published_index_version(),
     ).search("query", KnowledgeFilters(), limit=3)
 
     assert result.evidence == ()
     assert result.degraded is True
     assert "retrieval_unavailable" in result.degradation_reason
+
+
+async def test_hybrid_retriever_requires_active_index_version() -> None:
+    qdrant = UnexpectedQdrantIndex()
+    retriever = HybridRetriever(
+        embedding=FakeEmbeddingAdapter(),
+        qdrant=qdrant,
+        postgres=FakePostgresIndex(evidence=[], include_expected=False),
+        reranker=None,
+        index_version=None,
+    )
+
+    with pytest.raises(KnowledgeIndexConfigurationError):
+        await retriever.search("query", KnowledgeFilters(), limit=3)
+
+    assert qdrant.call_count == 0
 
 
 def test_trigram_pattern_escapes_like_wildcards_and_backslash() -> None:

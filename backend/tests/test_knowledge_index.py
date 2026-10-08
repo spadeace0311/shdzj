@@ -4,8 +4,14 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import pytest
+
 from app.embedding.schemas import EmbeddingBatch
-from app.knowledge.index import IndexedChunk, KnowledgeIndex
+from app.knowledge.index import (
+    IndexedChunk,
+    KnowledgeIndex,
+    KnowledgeIndexNotPublishedError,
+)
 from app.knowledge.models import KnowledgeIndexVersion
 from app.knowledge.retrieval import KnowledgeFilters
 from qdrant_client.models import Distance
@@ -15,13 +21,16 @@ def _index_version(
     *,
     version: str = "v1",
     manifest: dict | None = None,
+    collection_name: str | None = None,
+    source_version_id: UUID | None = None,
+    status: str = "published",
 ) -> KnowledgeIndexVersion:
     return KnowledgeIndexVersion(
         id=uuid4(),
-        source_version_id=uuid4(),
+        source_version_id=source_version_id or uuid4(),
         version=version,
-        status="published",
-        collection_name=f"shanghai-knowledge-{version}",
+        status=status,
+        collection_name=collection_name or f"shanghai-knowledge-{version}",
         embedding_model="BAAI/bge-m3",
         reranker_model="BAAI/bge-reranker-v2-m3",
         chunk_count=2,
@@ -267,6 +276,78 @@ async def test_search_sparse_uses_sorted_bge_token_ids() -> None:
     assert client.queries[0]["using"] == "sparse"
 
 
+async def test_search_isolates_sources_with_same_version_string() -> None:
+    client = FakeQdrantClient()
+    source_version_a = uuid4()
+    source_version_b = uuid4()
+    index_a = _index_version(
+        version="v1",
+        collection_name="source-a",
+        source_version_id=source_version_a,
+    )
+    index_b = _index_version(
+        version="v1",
+        collection_name="source-b",
+        source_version_id=source_version_b,
+    )
+    client.query_responses.append(
+        _query_response(
+            chunk_id=uuid4(),
+            source_id=uuid4(),
+            version_id=source_version_a,
+            score=0.9,
+        )
+    )
+    client.query_responses.append(
+        _query_response(
+            chunk_id=uuid4(),
+            source_id=uuid4(),
+            version_id=source_version_b,
+            score=0.8,
+        )
+    )
+    index = KnowledgeIndex(client=client)
+
+    result_a = await index.search_dense(
+        index_a,
+        [0.1] * 1024,
+        KnowledgeFilters(),
+        limit=3,
+    )
+    result_b = await index.search_dense(
+        index_b,
+        [0.2] * 1024,
+        KnowledgeFilters(),
+        limit=3,
+    )
+
+    assert client.queries[0]["collection_name"] == "source-a"
+    assert client.queries[1]["collection_name"] == "source-b"
+    assert _mandatory_version_filter(client.queries[0]["query_filter"]) == str(
+        source_version_a
+    )
+    assert _mandatory_version_filter(client.queries[1]["query_filter"]) == str(
+        source_version_b
+    )
+    assert result_a[0].version_id == source_version_a
+    assert result_b[0].version_id == source_version_b
+
+
+async def test_search_rejects_non_published_index_version() -> None:
+    client = FakeQdrantClient()
+    index_version = _index_version(status="indexed")
+
+    with pytest.raises(KnowledgeIndexNotPublishedError):
+        await KnowledgeIndex(client=client).search_dense(
+            index_version,
+            [0.1] * 1024,
+            KnowledgeFilters(),
+            limit=3,
+        )
+
+    assert client.queries == []
+
+
 async def test_delete_version_filters_by_version_payload() -> None:
     client = FakeQdrantClient()
     version_id = uuid4()
@@ -278,3 +359,11 @@ async def test_delete_version_filters_by_version_payload() -> None:
     condition = selector.filter.must[0]
     assert condition.key == "version_id"
     assert condition.match.value == str(version_id)
+
+
+def _mandatory_version_filter(query_filter: object) -> str:
+    return next(
+        condition.match.value
+        for condition in query_filter.must
+        if condition.key == "version_id"
+    )

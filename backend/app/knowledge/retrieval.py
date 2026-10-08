@@ -13,8 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.knowledge.adapters import EmbeddingAdapter, RerankerAdapter
 from app.knowledge.index import (
     IndexedChunk,
+    KnowledgeIndexConfigurationError,
     KnowledgeFilters,
     KnowledgeIndex,
+    KnowledgeIndexNotPublishedError,
     RetrievedEvidence,
 )
 from app.knowledge.models import (
@@ -138,6 +140,14 @@ class HybridRetriever:
             raise ValueError("query must not be blank")
         if limit < 1:
             raise ValueError("limit must be positive")
+        if self._index_version is None:
+            raise KnowledgeIndexConfigurationError(
+                "an active knowledge index version is required for retrieval"
+            )
+        if self._index_version.status != "published":
+            raise KnowledgeIndexNotPublishedError(
+                "only published knowledge index versions can be retrieved"
+            )
 
         reasons: list[str] = []
         candidate_limit = limit * 3
@@ -343,8 +353,10 @@ def _ordered_reasons(reasons: list[str]) -> list[str]:
 __all__ = [
     "HybridRetriever",
     "IndexedChunk",
+    "KnowledgeIndexConfigurationError",
     "KnowledgeFilters",
     "KnowledgeIndex",
+    "KnowledgeIndexNotPublishedError",
     "PostgresLexicalIndex",
     "RetrievalResult",
     "RetrievedEvidence",

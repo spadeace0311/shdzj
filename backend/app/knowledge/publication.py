@@ -206,13 +206,14 @@ class KnowledgePublicationService:
                     embedding_model=settings.embedding_model_name,
                     reranker_model=settings.reranker_model_name,
                     chunk_count=0,
-                    manifest={},
+                    manifest=_build_index_manifest(source, target, now),
                     activated_at=now,
                 )
             )
         else:
             existing.status = "published"
             existing.activated_at = now
+            existing.manifest = _build_index_manifest(source, target, now)
         await session.flush()
 
     async def _mark_index_version_indexed(
@@ -227,3 +228,32 @@ class KnowledgePublicationService:
         )
         if existing is not None:
             existing.status = "indexed"
+
+
+def _build_index_manifest(
+    source: KnowledgeSource,
+    target: KnowledgeSourceVersion,
+    now: datetime,
+) -> dict:
+    manifest = {
+        "source_title": source.title,
+        "published_at": now.isoformat(),
+    }
+    if target.source_uri is not None:
+        manifest["source_uri"] = target.source_uri
+    event_id = _event_id_from_metadata(target.version_metadata)
+    if event_id is not None:
+        manifest["event_id"] = str(event_id)
+    return manifest
+
+
+def _event_id_from_metadata(metadata: dict | None) -> UUID | None:
+    value = (metadata or {}).get("event_id")
+    if value is None or value == "":
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
