@@ -10,6 +10,7 @@ import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ManualEventPage } from "./pages/ManualEventPage";
+import { SmartQaPage } from "./pages/SmartQaPage";
 import { WorkgroupTasksPage } from "./pages/WorkgroupTasksPage";
 
 interface ConsoleShellProps {
@@ -55,6 +56,12 @@ function ConsoleShell({
               className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
             >
               事件列表
+            </NavLink>
+            <NavLink
+              to="/qa"
+              className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
+            >
+              智能问策
             </NavLink>
             <NavLink
               to="/manual"
@@ -107,6 +114,7 @@ function ConsoleShell({
         <main className="app-main">
           <Routes>
             <Route path="/" element={<EventListPage />} />
+            <Route path="/qa" element={<SmartQaPage />} />
             <Route path="/events/:eventId" element={<EventDetailPage />} />
             <Route path="/manual" element={<ManualEventPage />} />
             <Route path="/collector" element={<CollectorStatusPage />} />

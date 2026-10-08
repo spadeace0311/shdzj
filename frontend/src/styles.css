@@ -3660,3 +3660,352 @@ a:hover {
     font-size: 20px;
   }
 }
+
+.smart-qa-page {
+  min-width: 0;
+}
+
+.smart-qa-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 460px;
+  gap: 16px;
+  align-items: start;
+}
+
+.smart-qa-left,
+.smart-qa-center,
+.smart-qa-right {
+  min-width: 0;
+}
+
+.smart-qa-left,
+.smart-qa-right {
+  position: sticky;
+  top: 84px;
+}
+
+.smart-qa-left {
+  display: grid;
+  gap: 12px;
+}
+
+.smart-qa-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 108px);
+  overflow-y: auto;
+}
+
+.smart-qa-panel,
+.qa-conversation,
+.qa-evidence-panel,
+.qa-map {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.smart-qa-panel {
+  padding: 14px;
+}
+
+.smart-qa-panel h2,
+.qa-evidence-panel h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.smart-qa-panel > .primary-button {
+  width: 100%;
+}
+
+.smart-qa-session-list {
+  display: grid;
+  gap: 6px;
+}
+
+.smart-qa-session {
+  width: 100%;
+  min-height: 36px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--text);
+  padding: 8px 10px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.smart-qa-session:hover,
+.smart-qa-session--active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.smart-qa-event {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.qa-conversation {
+  display: grid;
+  min-height: 360px;
+  align-content: start;
+  gap: 16px;
+  padding: 18px;
+}
+
+.qa-conversation__input {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.qa-conversation__input label {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.qa-conversation__input textarea {
+  min-width: 0;
+  min-height: 44px;
+  max-height: 160px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  padding: 9px 10px;
+  color: var(--text);
+  resize: vertical;
+}
+
+.qa-conversation__body {
+  display: grid;
+  gap: 12px;
+}
+
+.qa-conversation__status {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.qa-answer {
+  overflow-wrap: anywhere;
+  border-left: 4px solid var(--blue);
+  background: var(--blue-soft);
+  color: var(--text);
+  line-height: 1.7;
+  padding: 13px 15px;
+  white-space: pre-wrap;
+}
+
+.qa-answer--final {
+  border-left-color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.qa-tool-list,
+.qa-tool-result-list,
+.qa-map-action-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.qa-conversation__error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #e3b5b5;
+  border-radius: 5px;
+  background: var(--red-soft);
+  color: var(--red);
+  padding: 9px 11px;
+  font-size: 13px;
+}
+
+.qa-feedback {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.qa-feedback button {
+  min-height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+.qa-empty {
+  margin: 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  padding: 12px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.qa-evidence-panel {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+}
+
+.qa-evidence-panel__section {
+  min-width: 0;
+}
+
+.qa-citation-list {
+  display: grid;
+  gap: 8px;
+}
+
+.qa-citation {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  padding: 10px;
+}
+
+.qa-citation__toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.qa-citation__key {
+  display: inline-grid;
+  min-width: 28px;
+  min-height: 22px;
+  place-items: center;
+  border-radius: 3px;
+  background: var(--blue-soft);
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.qa-citation__toggle strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.qa-citation__meta {
+  display: grid;
+  grid-template-columns: 0.8fr 1.1fr 1fr;
+  gap: 1px;
+  overflow: hidden;
+  margin: 9px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--line);
+}
+
+.qa-citation__meta > div {
+  min-width: 0;
+  background: var(--surface);
+  padding: 7px 8px;
+}
+
+.qa-citation__meta dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.qa-citation__meta dd {
+  overflow: hidden;
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qa-citation__excerpt {
+  overflow-wrap: anywhere;
+  margin: 9px 0 0;
+  border-left: 3px solid var(--teal);
+  background: var(--surface);
+  color: var(--text);
+  line-height: 1.6;
+  padding: 9px 10px;
+}
+
+.qa-tool-result-list li,
+.qa-map-action-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.qa-map {
+  flex: 0 0 auto;
+  min-height: 320px;
+  overflow: hidden;
+}
+
+.qa-map__canvas {
+  position: relative;
+  width: 100%;
+  height: 380px;
+  min-height: 320px;
+  background: #dfe6ec;
+}
+
+.qa-map__canvas .maplibregl-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+@media (max-width: 1380px) {
+  .smart-qa-layout {
+    grid-template-columns: 280px minmax(0, 1fr) 430px;
+  }
+}
+
+@media (min-width: 5000px) and (min-height: 1800px) {
+  .smart-qa-layout {
+    gap: 22px;
+  }
+
+  .smart-qa-panel,
+  .qa-conversation,
+  .qa-evidence-panel {
+    padding: 22px 24px;
+  }
+
+  .qa-conversation__input textarea {
+    min-height: 68px;
+  }
+
+  .qa-map__canvas {
+    height: 620px;
+  }
+}
