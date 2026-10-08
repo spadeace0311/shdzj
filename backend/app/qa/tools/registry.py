@@ -11,13 +11,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import config
 from app.artifacts.models import ProductionInputSnapshotItem
 from app.auth.service import AuthUser
 from app.data_assets.models import DataAssetVersion
 from app.data_assets.snapshot_service import DataAssetSnapshotService
+from app.db import SessionFactory
 from app.knowledge.models import KnowledgeSnapshot
 
 settings = config.settings
@@ -183,8 +184,10 @@ class ToolRegistry:
         tools: Iterable[ToolDefinition] | None = None,
         *,
         settings: config.Settings | None = None,
+        session_factory: async_sessionmaker[AsyncSession] = SessionFactory,
     ) -> None:
         self._settings = settings or config.settings
+        self._session_factory = session_factory
         self._tools: dict[str, ToolDefinition] = {}
         for definition in tools or ():
             self.register(definition)
@@ -233,7 +236,7 @@ class ToolRegistry:
             self._settings.qa_tool_timeout_seconds,
         )
         try:
-            result = await _execute_handler(
+            result = await self._execute_handler(
                 definition.handler,
                 normalized,
                 context,
@@ -260,6 +263,34 @@ class ToolRegistry:
         parameters = dict(result.parameters)
         parameters.update(normalized)
         return replace(result, parameters=parameters)
+
+    async def _execute_handler(
+        self,
+        handler: ToolHandler,
+        arguments: dict[str, Any],
+        context: ToolContext,
+        timeout_seconds: float,
+    ) -> ToolResult:
+        if context.session is None:
+            return await _invoke_handler(
+                handler,
+                arguments,
+                context,
+                timeout_seconds,
+            )
+
+        # A cancelled asyncpg query can poison its connection; isolate tool I/O.
+        tool_session = self._session_factory()
+        tool_context = replace(context, session=tool_session)
+        try:
+            return await _invoke_handler(
+                handler,
+                arguments,
+                tool_context,
+                timeout_seconds,
+            )
+        finally:
+            await _dispose_tool_session(tool_session)
 
     async def execute_plan(
         self,
@@ -336,20 +367,25 @@ class ToolRegistry:
         return [execution for execution in executions if execution is not None]
 
 
-async def _execute_handler(
+async def _invoke_handler(
     handler: ToolHandler,
     arguments: dict[str, Any],
     context: ToolContext,
     timeout_seconds: float,
 ) -> ToolResult:
-    async def invoke() -> ToolResult:
-        async with asyncio.timeout(timeout_seconds):
-            return await handler(arguments, context)
+    async with asyncio.timeout(timeout_seconds):
+        return await handler(arguments, context)
 
-    if context.session is None:
-        return await invoke()
-    async with context.session.begin_nested():
-        return await invoke()
+
+async def _dispose_tool_session(session: AsyncSession) -> None:
+    try:
+        await session.rollback()
+    except Exception:
+        pass
+    try:
+        await session.close()
+    except Exception:
+        pass
 
 
 async def resolve_locked_asset_version(

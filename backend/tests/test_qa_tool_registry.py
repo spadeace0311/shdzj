@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 
 from app.auth.service import AuthUser
 from app.events.models import EarthquakeEvent, RawMessage
@@ -349,10 +349,11 @@ async def test_tool_definition_marks_all_session_backed_tools_non_parallel() -> 
     )
 
 
-async def test_tool_registry_savepoint_recovers_after_database_error(
+async def test_tool_registry_isolates_database_error_from_caller_session(
     session_factory,
 ) -> None:
-    registry = ToolRegistry()
+    registry = ToolRegistry(session_factory=session_factory)
+    source = "qa-tool-db-error-test"
 
     async def failing_db_handler(arguments, context):
         await context.session.execute(
@@ -371,51 +372,63 @@ async def test_tool_registry_savepoint_recovers_after_database_error(
         )
     )
 
-    async with session_factory() as session:
-        context = ToolContext(
-            session=session,
-            user=AuthUser(
-                username="qa-test",
-                role="viewer",
-                workgroup=None,
-            ),
-            event_id=None,
-            revision_id=None,
-            assessment_run_id=None,
-            snapshot_id=uuid4(),
-            index_version_id=uuid4(),
-        )
-        await session.begin()
-        marker = RawMessage(
-            source="qa-savepoint-tool-test",
-            source_message_id=str(uuid4()),
-            message_kind="test",
-            checksum=uuid4().hex + uuid4().hex,
-            payload={},
-            received_at=datetime.now(UTC),
-        )
-        session.add(marker)
-        await session.flush()
+    try:
+        async with session_factory() as caller_session:
+            context = ToolContext(
+                session=caller_session,
+                user=AuthUser(
+                    username="qa-test",
+                    role="viewer",
+                    workgroup=None,
+                ),
+                event_id=None,
+                revision_id=None,
+                assessment_run_id=None,
+                snapshot_id=uuid4(),
+                index_version_id=uuid4(),
+            )
+            await caller_session.begin()
+            marker = RawMessage(
+                source=source,
+                source_message_id=str(uuid4()),
+                message_kind="test",
+                checksum=uuid4().hex + uuid4().hex,
+                payload={},
+                received_at=datetime.now(UTC),
+            )
+            caller_session.add(marker)
+            await caller_session.flush()
 
-        result = await registry.execute("test.db_error", {}, context)
-        recovered = await session.scalar(text("SELECT PostGIS_Version()"))
-        preserved = await session.scalar(
-            select(RawMessage.id).where(RawMessage.id == marker.id)
-        )
-        await session.rollback()
+            result = await registry.execute("test.db_error", {}, context)
+            recovered = await caller_session.scalar(
+                text("SELECT PostGIS_Version()")
+            )
+            preserved = await caller_session.scalar(
+                select(RawMessage.id).where(RawMessage.id == marker.id)
+            )
+            await caller_session.commit()
 
-    assert result.status == "unavailable"
-    assert result.value == {"error_type": "ProgrammingError"}
-    assert recovered is not None
-    assert preserved == marker.id
+        assert result.status == "unavailable"
+        assert result.value == {"error_type": "ProgrammingError"}
+        assert recovered is not None
+        assert preserved == marker.id
+    finally:
+        async with session_factory() as cleanup_session:
+            await cleanup_session.execute(
+                delete(RawMessage).where(RawMessage.source == source)
+            )
+            await cleanup_session.commit()
 
 
-async def test_tool_registry_savepoint_recovers_after_database_timeout(
+async def test_tool_registry_timeout_does_not_poison_caller_transaction(
     session_factory,
 ) -> None:
-    registry = ToolRegistry()
+    registry = ToolRegistry(session_factory=session_factory)
+    source = "qa-tool-timeout-test"
+    tool_sessions = []
 
     async def slow_db_handler(arguments, context):
+        tool_sessions.append(context.session)
         await context.session.execute(text("SELECT pg_sleep(1)"))
         return ToolResult.ok(value={})
 
@@ -430,28 +443,62 @@ async def test_tool_registry_savepoint_recovers_after_database_timeout(
         )
     )
 
-    async with session_factory() as session:
-        context = ToolContext(
-            session=session,
-            user=AuthUser(
-                username="qa-test",
-                role="viewer",
-                workgroup=None,
-            ),
-            event_id=None,
-            revision_id=None,
-            assessment_run_id=None,
-            snapshot_id=uuid4(),
-            index_version_id=uuid4(),
-        )
-        await session.begin()
-        result = await registry.execute("test.db_timeout", {}, context)
-        recovered = await session.scalar(text("SELECT PostGIS_Version()"))
-        await session.rollback()
+    try:
+        async with session_factory() as caller_session:
+            context = ToolContext(
+                session=caller_session,
+                user=AuthUser(
+                    username="qa-test",
+                    role="viewer",
+                    workgroup=None,
+                ),
+                event_id=None,
+                revision_id=None,
+                assessment_run_id=None,
+                snapshot_id=uuid4(),
+                index_version_id=uuid4(),
+            )
+            await caller_session.begin()
+            warmup = await caller_session.scalar(text("SELECT 1"))
+            marker = RawMessage(
+                source=source,
+                source_message_id=str(uuid4()),
+                message_kind="test",
+                checksum=uuid4().hex + uuid4().hex,
+                payload={},
+                received_at=datetime.now(UTC),
+            )
+            caller_session.add(marker)
+            await caller_session.flush()
 
-    assert result.status == "unavailable"
-    assert result.limitations == ("tool_timeout",)
-    assert recovered is not None
+            result = await registry.execute("test.db_timeout", {}, context)
+            recovered = await caller_session.scalar(
+                text("SELECT PostGIS_Version()")
+            )
+            preserved = await caller_session.scalar(
+                select(RawMessage.id).where(RawMessage.id == marker.id)
+            )
+            await caller_session.commit()
+
+        async with session_factory() as verifier_session:
+            committed = await verifier_session.scalar(
+                select(RawMessage.id).where(RawMessage.id == marker.id)
+            )
+
+        assert warmup == 1
+        assert result.status == "unavailable"
+        assert result.limitations == ("tool_timeout",)
+        assert recovered is not None
+        assert preserved == marker.id
+        assert committed == marker.id
+        assert tool_sessions
+        assert tool_sessions[0] is not caller_session
+    finally:
+        async with session_factory() as cleanup_session:
+            await cleanup_session.execute(
+                delete(RawMessage).where(RawMessage.source == source)
+            )
+            await cleanup_session.commit()
 
 
 def test_tool_catalog_is_sorted_and_exposes_input_schema() -> None:
