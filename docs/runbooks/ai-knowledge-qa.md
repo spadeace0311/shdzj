@@ -113,6 +113,8 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15
 
 若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，先从 PostgreSQL 切片生成完整 embeddings，再以稳定 point ID upsert，避免失败时破坏仍可检索的 published 点位；published 版本的发布状态保持不变。同一版本已有 pending forced rebuild 时返回同一 job，不重复排队。
 
+强制重建只 upsert 当前 PostgreSQL 切片对应的稳定 point ID，不删除孤儿或历史 stale points。当前 chunk 在正常生命周期内不可变，重建不会替换或删除现有 chunk ID，因此保留这些点不会污染当前版本的检索结果。若重试耗尽，只有 `index` job 进入 `dead_letter`，原有 `indexed`/`published` 版本状态和旧 Qdrant 点位保持不变。若未来流程开始替换或删除 chunk ID，必须先引入临时 collection/alias 切换，或在成功 upsert 后按 version 执行 stale-point 清理，并补充失败安全、清理后置条件和旧点保留测试；不得恢复到 upsert 前直接删除 published 点位。
+
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/versions/<version_id>/rebuild" `
   -H "Authorization: Bearer <token>" `

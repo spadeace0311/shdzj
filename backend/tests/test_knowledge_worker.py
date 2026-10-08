@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -210,15 +211,99 @@ async def test_force_rebuild_failure_keeps_published_points_retrievable(
         await _delete_actor_data(session_factory)
 
 
+@pytest.mark.parametrize("failure_stage", ["embedding", "upsert"])
+async def test_force_rebuild_exhaustion_keeps_published_version_healthy(
+    session_factory,
+    failure_stage: str,
+):
+    try:
+        version_id, chunk_ids = await _seed_published_indexed_version(
+            session_factory
+        )
+        old_points = {
+            uuid5(NAMESPACE_URL, str(chunk_id)): version_id
+            for chunk_id in chunk_ids
+        }
+        index = _FakeIndex(
+            points=old_points,
+            fail_upsert=failure_stage == "upsert",
+        )
+        embeddings = (
+            _FailingEmbeddings()
+            if failure_stage == "embedding"
+            else _FakeEmbeddings()
+        )
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "retry exhaustion"},
+            max_attempts=2,
+        )
+        current_time = [datetime.now(UTC)]
+        worker = KnowledgeWorker(
+            index=index,
+            embeddings=embeddings,
+            now=lambda: current_time[0],
+        )
+
+        assert await _process_one(session_factory, worker) is True
+        async with session_factory() as session:
+            job = await session.scalar(
+                select(KnowledgeJob).where(
+                    KnowledgeJob.version_id == version_id,
+                    KnowledgeJob.request_payload["force"].as_boolean(),
+                )
+            )
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            assert job is not None
+            assert job.status == KnowledgeJobStatus.QUEUED.value
+            assert job.attempt_count == 1
+            assert version is not None
+            assert version.status == KnowledgeVersionStatus.PUBLISHED.value
+        assert index.retrieve(version_id) == set(old_points)
+
+        current_time[0] += timedelta(seconds=3)
+        assert await _process_one(session_factory, worker) is True
+
+        async with session_factory() as session:
+            job = await session.scalar(
+                select(KnowledgeJob).where(
+                    KnowledgeJob.version_id == version_id,
+                    KnowledgeJob.request_payload["force"].as_boolean(),
+                )
+            )
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            index_version = await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == version_id
+                )
+            )
+            assert job is not None
+            assert job.status == KnowledgeJobStatus.DEAD_LETTER.value
+            assert job.attempt_count == 2
+            assert version is not None
+            assert version.status == KnowledgeVersionStatus.PUBLISHED.value
+            assert index_version is not None
+            assert index_version.status == KnowledgeVersionStatus.PUBLISHED.value
+        assert index.deleted_version_ids == []
+        assert index.retrieve(version_id) == set(old_points)
+        assert index.points == old_points
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+@pytest.mark.parametrize("job_type", ["ingest", "index"])
 async def test_worker_dead_letters_after_attempt_budget(
     session_factory,
     tmp_path: Path,
+    job_type: str,
 ):
     try:
         version_id = await _seed_version_and_job(
             session_factory,
             status=KnowledgeVersionStatus.UPLOADED.value,
-            job_type="ingest",
+            job_type=job_type,
             attempt_count=1,
             max_attempts=2,
         )
@@ -664,6 +749,7 @@ async def _seed_job(
     job_type: str,
     *,
     payload: dict | None = None,
+    max_attempts: int | None = None,
 ) -> None:
     async with session_factory() as session:
         async with session.begin():
@@ -671,7 +757,11 @@ async def _seed_job(
                 version_id=version_id,
                 job_type=job_type,
                 status=KnowledgeJobStatus.QUEUED.value,
-                max_attempts=settings.knowledge_job_max_attempts,
+                max_attempts=(
+                    max_attempts
+                    if max_attempts is not None
+                    else settings.knowledge_job_max_attempts
+                ),
                 request_payload=payload or {},
             )
             session.add(job)

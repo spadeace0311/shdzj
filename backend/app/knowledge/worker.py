@@ -412,7 +412,17 @@ async def _mark_failure(
         job.available_at = now
         job.lease_expires_at = None
         job.completed_at = now
-        if version is not None:
+        preserve_healthy_rebuild_target = (
+            job.job_type == "index"
+            and job.request_payload.get("force") is True
+            and version is not None
+            and version.status
+            in {
+                KnowledgeVersionStatus.INDEXED.value,
+                KnowledgeVersionStatus.PUBLISHED.value,
+            }
+        )
+        if version is not None and not preserve_healthy_rebuild_target:
             version.status = KnowledgeVersionStatus.FAILED.value
             version.failure_reason = safe_error
     else:
