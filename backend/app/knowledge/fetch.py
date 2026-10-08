@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
+import httpx
 import yaml
 
 
@@ -32,6 +33,57 @@ class FetchClient(Protocol):
 
 
 AddressResolver = Any
+
+
+class PinnedAddressTransport(httpx.AsyncBaseTransport):
+    """Rewrite validated requests to the resolved IP so HTTPX cannot rebind."""
+
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._transport = transport or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(
+        self,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        validated = request.extensions.get("ssrf_validated_addresses")
+        if not validated:
+            raise UnsafeUrlError("request is not pinned to a validated address")
+        original_host = request.url.host
+        if original_host is None:
+            raise UnsafeUrlError("request is missing a host")
+
+        address = str(validated[0])
+        url = request.url.copy_with(host=address)
+        headers = request.headers.copy()
+        headers["host"] = _host_header(request.url)
+        extensions = dict(request.extensions)
+        try:
+            ipaddress.ip_address(original_host)
+        except ValueError:
+            extensions["sni_hostname"] = original_host
+        pinned_request = httpx.Request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            stream=request.stream,
+            extensions=extensions,
+        )
+        return await self._transport.handle_async_request(pinned_request)
+
+
+def build_pinned_http_client(
+    *,
+    timeout: float = 30.0,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=PinnedAddressTransport(),
+        timeout=timeout,
+        follow_redirects=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +185,15 @@ async def fetch_web_document(
     current_url = url
     for redirect_count in range(policy.max_redirects + 1):
         validate_fetch_url(current_url, policy)
-        await _validate_resolved_addresses(current_url, resolver)
-        async with _stream_request(client, current_url) as response:
+        validated_addresses = await _validate_resolved_addresses(
+            current_url,
+            resolver,
+        )
+        async with _stream_request(
+            client,
+            current_url,
+            validated_addresses,
+        ) as response:
             if response.status_code in _REDIRECT_STATUS_CODES:
                 location = response.headers.get("location")
                 if location is None:
@@ -203,16 +262,21 @@ def _validate_target(url: str, policy: FetchPolicy) -> None:
         raise UnsafeUrlError("domain is not in the allowed source whitelist")
 
 
-async def _validate_resolved_addresses(url: str, resolver: Any) -> None:
+async def _validate_resolved_addresses(
+    url: str,
+    resolver: Any,
+) -> tuple[str, ...]:
     parsed = urlsplit(url)
     host = parsed.hostname
     if host is None:
         raise UnsafeUrlError("URL is missing a host")
     try:
-        ipaddress.ip_address(host)
-        return
+        ip = ipaddress.ip_address(host)
     except ValueError:
         pass
+    else:
+        _ensure_global_unicast(ip)
+        return (host,)
 
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     if resolver is not None:
@@ -225,12 +289,15 @@ async def _validate_resolved_addresses(url: str, resolver: Any) -> None:
         raise UnsafeUrlError("DNS resolver returned an invalid result")
     if not addresses:
         raise UnsafeUrlError("DNS did not resolve the host")
+    validated: list[str] = []
     for address in addresses:
         try:
             ip = ipaddress.ip_address(str(address).split("%", 1)[0])
         except ValueError as exc:
             raise UnsafeUrlError("DNS returned an invalid address") from exc
         _ensure_global_unicast(ip)
+        validated.append(str(ip))
+    return tuple(validated)
 
 
 async def _system_resolve(host: str, port: int) -> list[str]:
@@ -259,13 +326,33 @@ def _ensure_global_unicast(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
 
 
 @asynccontextmanager
-async def _stream_request(client: Any, url: str) -> Any:
+async def _stream_request(
+    client: Any,
+    url: str,
+    validated_addresses: tuple[str, ...],
+) -> Any:
+    extensions = {"ssrf_validated_addresses": validated_addresses}
     if hasattr(client, "stream"):
-        async with client.stream("GET", url, follow_redirects=False) as response:
+        async with client.stream(
+            "GET",
+            url,
+            follow_redirects=False,
+            extensions=extensions,
+        ) as response:
             yield response
     else:
-        response = await client.get(url, follow_redirects=False)
+        response = await client.get(
+            url,
+            follow_redirects=False,
+            extensions=extensions,
+        )
         yield response
+
+
+def _host_header(url: httpx.URL) -> str:
+    if url.port in {None, 80, 443}:
+        return str(url.host)
+    return f"{url.host}:{url.port}"
 
 
 def _validate_content_type(

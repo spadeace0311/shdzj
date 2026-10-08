@@ -8,6 +8,7 @@ import pytest
 from app.knowledge.fetch import (
     FetchPolicy,
     OnlineSearchDisabledError,
+    PinnedAddressTransport,
     UnsafeUrlError,
     fetch_web_document,
     validate_fetch_url,
@@ -232,3 +233,80 @@ async def test_fetch_stops_after_max_redirects() -> None:
                 resolver=resolver,
                 online_search_enabled=True,
             )
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_uses_validated_ip_and_preserves_host_sni() -> None:
+    policy = FetchPolicy.from_yaml(
+        {
+            "allowed_domains": ["cea.gov.cn"],
+            "allowed_content_types": ["text/html"],
+        }
+    )
+    recording = _RecordingTransport(
+        [
+            httpx.Response(
+                302,
+                headers={"location": "https://www.cea.gov.cn/next"},
+            ),
+            httpx.Response(
+                200,
+                content=b"ok",
+                headers={"content-type": "text/html"},
+            ),
+        ]
+    )
+
+    async def resolver(host: str, port: int = 443) -> list[str]:
+        del port
+        return {
+            "cea.gov.cn": ["93.184.216.34"],
+            "www.cea.gov.cn": ["93.184.216.35"],
+        }[host]
+
+    async with httpx.AsyncClient(
+        transport=PinnedAddressTransport(transport=recording)
+    ) as client:
+        fetched = await fetch_web_document(
+            "https://cea.gov.cn/report",
+            policy,
+            client,
+            resolver=resolver,
+            online_search_enabled=True,
+        )
+
+    assert fetched.final_url == "https://www.cea.gov.cn/next"
+    assert [request.url.host for request in recording.requests] == [
+        "93.184.216.34",
+        "93.184.216.35",
+    ]
+    assert recording.requests[0].headers["host"] == "cea.gov.cn"
+    assert recording.requests[1].headers["host"] == "www.cea.gov.cn"
+    assert recording.requests[0].extensions["sni_hostname"] == "cea.gov.cn"
+    assert recording.requests[1].extensions["sni_hostname"] == "www.cea.gov.cn"
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_rejects_unvalidated_request() -> None:
+    recording = _RecordingTransport([])
+
+    async with httpx.AsyncClient(
+        transport=PinnedAddressTransport(transport=recording)
+    ) as client:
+        with pytest.raises(UnsafeUrlError, match="pinned"):
+            await client.get("https://cea.gov.cn/report")
+
+    assert recording.requests == []
+
+
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self.responses = responses
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(
+        self,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        self.requests.append(request)
+        return self.responses[len(self.requests) - 1]

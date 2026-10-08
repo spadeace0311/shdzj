@@ -19,6 +19,7 @@ from app.knowledge.chunker import chunk_document
 from app.knowledge.domain import KnowledgeJobStatus, KnowledgeVersionStatus
 from app.knowledge.fetch import (
     FetchPolicy,
+    build_pinned_http_client,
     fetch_web_document,
     load_fetch_policy,
 )
@@ -38,6 +39,7 @@ from app.knowledge.storage import KnowledgeFileStore
 
 _FETCH_TIMEOUT_SECONDS = 30.0
 _SUPPORTED_JOB_TYPES = {"fetch", "ingest", "index", "publish", "rollback"}
+_REPEATABLE_JOB_TYPES = {"fetch", "ingest", "index"}
 
 
 class KnowledgeWorker:
@@ -80,7 +82,14 @@ class KnowledgeWorker:
 
         try:
             async with session.begin_nested():
-                if await self._existing_success(session, job.version_id, job.job_type):
+                if (
+                    job.job_type in _REPEATABLE_JOB_TYPES
+                    and await self._existing_success(
+                        session,
+                        job.version_id,
+                        job.job_type,
+                    )
+                ):
                     await _mark_success(session, job.id, self._now())
                 else:
                     await self._dispatch(session, job)
@@ -134,9 +143,8 @@ class KnowledgeWorker:
                 online_search_enabled=settings.online_search_enabled,
             )
         else:
-            async with httpx.AsyncClient(
+            async with build_pinned_http_client(
                 timeout=_FETCH_TIMEOUT_SECONDS,
-                follow_redirects=False,
             ) as client:
                 fetched = await fetch_web_document(
                     source_uri,
@@ -248,24 +256,44 @@ class KnowledgeWorker:
     async def _handle_publish(self, session: AsyncSession, job: KnowledgeJob) -> None:
         actor = str(job.request_payload.get("actor") or "knowledge-worker")
         reason = str(job.request_payload.get("reason") or "worker publish")
+        version = await _version_for_update(session, job.version_id)
+        if version.status == KnowledgeVersionStatus.PUBLISHED.value:
+            job.result_payload = {
+                "status": "already_published",
+                "version_id": str(version.id),
+            }
+            return
         version = await self._publication.publish(
             session,
             job.version_id,
             actor,
             reason,
         )
-        job.result_payload = {"version_id": str(version.id)}
+        job.result_payload = {
+            "status": "published",
+            "version_id": str(version.id),
+        }
 
     async def _handle_rollback(self, session: AsyncSession, job: KnowledgeJob) -> None:
         actor = str(job.request_payload.get("actor") or "knowledge-worker")
         reason = str(job.request_payload.get("reason") or "worker rollback")
+        version = await _version_for_update(session, job.version_id)
+        if version.status == KnowledgeVersionStatus.PUBLISHED.value:
+            job.result_payload = {
+                "status": "already_published",
+                "version_id": str(version.id),
+            }
+            return
         version = await self._publication.rollback(
             session,
             job.version_id,
             actor,
             reason,
         )
-        job.result_payload = {"version_id": str(version.id)}
+        job.result_payload = {
+            "status": "published",
+            "version_id": str(version.id),
+        }
 
 
 async def run_worker() -> None:

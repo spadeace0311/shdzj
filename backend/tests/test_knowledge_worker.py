@@ -222,6 +222,60 @@ async def test_worker_publish_and_rollback_use_publication_service(
         await _delete_actor_data(session_factory)
 
 
+async def test_lifecycle_jobs_execute_even_after_prior_success(
+    session_factory,
+):
+    try:
+        previous_id, current_id = await _seed_publishable_versions(session_factory)
+        worker = KnowledgeWorker(
+            publication=KnowledgePublicationService(),
+            index=_FakeIndex(),
+            embeddings=_FakeEmbeddings(),
+        )
+
+        async def run(version_id: UUID, job_type: str, reason: str) -> None:
+            await _seed_job(
+                session_factory,
+                version_id,
+                job_type,
+                payload={"actor": WORKER_ACTOR, "reason": reason},
+            )
+            assert await _process_one(session_factory, worker) is True
+
+        await run(previous_id, "publish", "release v1")
+        await run(current_id, "publish", "release v2")
+        await run(previous_id, "rollback", "rollback v1")
+        await run(previous_id, "publish", "publish v1 again")
+
+        async with session_factory() as session:
+            previous = await session.get(KnowledgeSourceVersion, previous_id)
+            current = await session.get(KnowledgeSourceVersion, current_id)
+            final_publish = await session.scalar(
+                select(KnowledgeJob)
+                .where(
+                    KnowledgeJob.version_id == previous_id,
+                    KnowledgeJob.job_type == "publish",
+                )
+                .order_by(
+                    KnowledgeJob.created_at.desc(),
+                    KnowledgeJob.id.desc(),
+                )
+                .limit(1)
+            )
+            assert previous is not None
+            assert current is not None
+            assert previous.status == KnowledgeVersionStatus.PUBLISHED.value
+            assert current.status == KnowledgeVersionStatus.INDEXED.value
+            assert final_publish is not None
+            assert final_publish.status == KnowledgeJobStatus.SUCCEEDED.value
+            assert final_publish.result_payload == {
+                "status": "already_published",
+                "version_id": str(previous_id),
+            }
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def _process_one(session_factory, worker: KnowledgeWorker) -> bool:
     async with session_factory() as session:
         async with session.begin():
