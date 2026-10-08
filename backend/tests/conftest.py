@@ -139,18 +139,17 @@ async def seeded_100k_knowledge_index():
     )
 
     collection_name = f"{settings.qdrant_collection_prefix}-{BENCHMARK_SOURCE_KEY}"
-
-    await engine.dispose()
-    async with SessionFactory() as db:
-        async with db.begin():
-            await db.execute(
-                delete(KnowledgeSource).where(
-                    KnowledgeSource.source_key == BENCHMARK_SOURCE_KEY
-                )
-            )
-
     qdrant = AsyncQdrantClient(url=settings.qdrant_url)
     try:
+        await engine.dispose()
+        async with SessionFactory() as db:
+            async with db.begin():
+                await db.execute(
+                    delete(KnowledgeSource).where(
+                        KnowledgeSource.source_key == BENCHMARK_SOURCE_KEY
+                    )
+                )
+
         if await qdrant.collection_exists(collection_name):
             await qdrant.delete_collection(collection_name)
 
@@ -255,17 +254,23 @@ async def seeded_100k_knowledge_index():
             if await qdrant.collection_exists(collection_name):
                 await qdrant.delete_collection(collection_name)
         finally:
-            await qdrant.close()
-
-    await engine.dispose()
-    async with SessionFactory() as db:
-        async with db.begin():
-            await db.execute(
-                delete(KnowledgeSource).where(
-                    KnowledgeSource.source_key == BENCHMARK_SOURCE_KEY
-                )
-            )
-    await engine.dispose()
+            try:
+                await qdrant.close()
+            finally:
+                try:
+                    await engine.dispose()
+                finally:
+                    try:
+                        async with SessionFactory() as db:
+                            async with db.begin():
+                                await db.execute(
+                                    delete(KnowledgeSource).where(
+                                        KnowledgeSource.source_key
+                                        == BENCHMARK_SOURCE_KEY
+                                    )
+                                )
+                    finally:
+                        await engine.dispose()
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@
 本手册覆盖 `knowledge-worker`、`embedding`、`qdrant`、问答 API、DeepSeek 配置、知识源生命周期、事件快照、审计删除、十万切片性能测试以及备份恢复。所有 Compose 命令统一使用：
 
 ```text
-docker compose --env-file .env -f infra/compose.yaml ...
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 ...
 ```
 
 不要输出 `.env`、密码、Token、API Key 或连接串；本手册只使用占位符。
@@ -26,14 +26,14 @@ docker compose --env-file .env -f infra/compose.yaml ...
 `embedding` 服务使用 `embedding-models:/models` 卷，`HF_HOME=/models/huggingface`。首次启动会下载 `EMBEDDING_MODEL_NAME` 与 `RERANKER_MODEL_NAME` 两个模型，之后复用同一卷即可离线运行。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml up -d embedding
-docker compose --env-file .env -f infra/compose.yaml logs -f embedding
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d embedding
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 logs -f embedding
 ```
 
 模型就绪后 `/health` 返回 `status: ok`；加载中返回 `starting`；加载失败返回 `error`。嵌入服务无模型时 `POST /v1/embed` 与 `POST /v1/rerank` 返回 `503`，问答链路会记录 `embedding_unavailable` 或 `reranker_unavailable` 降级。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm --no-deps api python -c "import httpx; print(httpx.get('http://embedding:8080/health', timeout=5).json())"
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm --no-deps api python -c "import httpx; print(httpx.get('http://embedding:8080/health', timeout=5).json())"
 ```
 
 ## 环境变量与密钥轮换
@@ -43,7 +43,7 @@ docker compose --env-file .env -f infra/compose.yaml run --rm --no-deps api pyth
 轮换 `DEEPSEEK_API_KEY` 或超级管理员密码时，编辑 `.env` 后按顺序重启依赖该值的服务，不打印新值：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml up -d api embedding knowledge-worker
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d api embedding knowledge-worker
 ```
 
 `JWT_SECRET`、`POSTGRES_PASSWORD`、`SUPERADMIN_INITIAL_PASSWORD` 等运行时密钥的最小长度为 16 字符，且不得使用占位值。JWT 与超级管理员密码轮换流程见 [地震事件接入基础子系统运行手册](event-ingestion-foundation.md)。
@@ -51,10 +51,10 @@ docker compose --env-file .env -f infra/compose.yaml up -d api embedding knowled
 ## 迁移和启动顺序
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml build api embedding knowledge-worker frontend
-docker compose --env-file .env -f infra/compose.yaml up -d postgres qdrant embedding
-docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose --env-file .env -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 build api embedding knowledge-worker frontend
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d postgres qdrant embedding
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d
 ```
 
 `knowledge-worker` 与 `api` 只有在 `qdrant` 健康且 `embedding` 已启动后才开始工作。迁移头包含 AI 知识与问答表，启动后可用 `alembic current` 核验。
@@ -76,12 +76,13 @@ curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/sources/<source_id>/ver
   -F "version=<version>" `
   -F "file=@<path>"
 
-# URL 入库与发布/回滚
-curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/sources/<source_id>/versions" `
+# URL 入库
+curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/sources/<source_id>/url-versions" `
   -H "Authorization: Bearer <token>" `
   -H "Content-Type: application/json" `
   -d "{\"version\":\"<version>\",\"source_uri\":\"https://www.sh.gov.cn/<path>\"}"
 
+# 发布/回滚
 curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/versions/<version_id>/publish" `
   -H "Authorization: Bearer <token>" `
   -H "Content-Type: application/json" `
@@ -107,14 +108,19 @@ async def main():
 
 asyncio.run(main())
 '@
-docker compose --env-file .env -f infra/compose.yaml run --rm --no-deps -T api python -c $check
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm --no-deps -T api python -c $check
 ```
 
-若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，重新排队 `index` 任务即可让 `knowledge-worker` 复用 PostgreSQL 切片并重新写入 Qdrant：
+若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，删除当前版本的 Qdrant 点位，再从 PostgreSQL 切片完整重新写入；published 版本的发布状态保持不变。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DELETE FROM knowledge_jobs WHERE version_id = '<version_id>' AND job_type = 'index' AND status = 'succeeded'; INSERT INTO knowledge_jobs (id, version_id, job_type, status) VALUES (gen_random_uuid(), '<version_id>', 'index', 'queued');"
+curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/versions/<version_id>/rebuild" `
+  -H "Authorization: Bearer <token>" `
+  -H "Content-Type: application/json" `
+  -d "{\"reason\":\"restore missing qdrant collection\"}"
 ```
+
+后置核验：`GET /api/v1/knowledge/jobs` 中该 version 的最新 `index` job 必须为 `succeeded`，`result_payload.status` 必须为 `rebuilt`，`result_payload.chunk_count` 等于 `knowledge_index_versions.chunk_count`；`GET /api/v1/knowledge/versions/<version_id>` 的版本状态必须仍为 `indexed` 或 `published`。Qdrant 集合必须存在且对应 `version_id` 的点位数与上述 `chunk_count` 一致。
 
 ## DeepSeek、嵌入和重排故障降级
 
@@ -141,7 +147,7 @@ URL 入库受 `config/knowledge/source-whitelist.yaml` 约束：仅允许 `http`
 核验某事件会话的快照指纹：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, event_id, index_version_id, fingerprint, manifest FROM knowledge_snapshots WHERE event_id = '<event_id>';"
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 exec -T postgres sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, event_id, index_version_id, fingerprint, manifest FROM knowledge_snapshots WHERE event_id = \$q\$<event_id>\$q\$;"'
 ```
 
 ## 问答审计和超级管理员删除
@@ -160,21 +166,32 @@ curl.exe -X DELETE "http://127.0.0.1:8000/api/v1/admin/knowledge/versions/<versi
 性能测试使用确定性假嵌入与假重排，真实写入测试 Qdrant 与 PostgreSQL，测量混合检索编排端到端延迟；真实 BGE 推理延迟在部署健康检查中单独记录。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml up -d postgres qdrant
-docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -m performance tests/test_qa_performance.py -v
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d postgres qdrant
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api pytest -m performance tests/test_qa_performance.py -v
 ```
 
-阈值：100000 个 500..1000 中文字符切片下，20 次请求排序后第 19 个（索引 18）P95 延迟不超过 1.0 秒，且每次请求返回非空证据。测试结束会删除 Qdrant 集合和 benchmark 数据行。
+默认 `pytest -q` 通过 `addopts=-m 'not performance'` 排除 `performance` 标记；只有显式 `-m performance` 才会运行十万切片测试。阈值：100000 个 500..1000 中文字符切片下，20 次请求排序后第 19 个（索引 18）P95 延迟不超过 1.0 秒，且每次请求返回非空证据。测试结束无论 setup、用例主体或 Qdrant 清理是否失败，都会继续删除 Qdrant 集合和 benchmark PostgreSQL 数据行。
 
 ## 备份、恢复和磁盘扩容
 
 PostgreSQL 逻辑备份：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" > knowledge-qa-backup.sql
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 exec -T postgres sh -lc "pg_dump --encoding=UTF8 -U \`$POSTGRES_USER -d \`$POSTGRES_DB" |
+  Set-Content -LiteralPath knowledge-qa-backup.sql -Encoding utf8NoBOM
 ```
 
-恢复时先停止写入，再用 `psql -f` 导入。`qdrant-data` 与 `embedding-models` 卷以及 `KNOWLEDGE_STORAGE_HOST_DIR`（默认 `../data/knowledge`）按各自生命周期独立备份；恢复模型卷可避免重复下载，恢复 Qdrant 卷后再从 PostgreSQL 重建索引以校验一致性。
+恢复时先停止写入，再导入 UTF-8 备份：
+
+```powershell
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Get-Content -LiteralPath knowledge-qa-backup.sql -Raw -Encoding utf8 |
+  docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 exec -T postgres sh -lc "psql -v ON_ERROR_STOP=1 -U \`$POSTGRES_USER -d \`$POSTGRES_DB"
+```
+
+`qdrant-data` 与 `embedding-models` 卷以及 `KNOWLEDGE_STORAGE_HOST_DIR`（默认 `../data/knowledge`）按各自生命周期独立备份；恢复模型卷可避免重复下载，恢复 Qdrant 卷后再从 PostgreSQL 重建索引以校验一致性。
 
 磁盘扩容时先扩展 Docker Desktop 磁盘，再迁移 `KNOWLEDGE_STORAGE_HOST_DIR` 或卷所在位置。不要在未备份现有数据的情况下删除 `qdrant-data`、`embedding-models` 或 PostgreSQL 卷。

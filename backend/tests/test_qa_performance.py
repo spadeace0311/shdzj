@@ -22,6 +22,14 @@ async def test_hybrid_retrieval_p95_under_one_second_on_100k_chunks(
         )
         latencies.append(time.perf_counter() - started)
         assert result.evidence
-    p95 = sorted(latencies)[18]
+    ordered = sorted(latencies)
+    p95 = ordered[18]
+    print(
+        "qa-performance "
+        f"min={ordered[0]:.6f}s "
+        f"max={ordered[-1]:.6f}s "
+        f"p95={p95:.6f}s "
+        f"latencies={[round(value, 6) for value in latencies]}"
+    )
     assert seeded_100k_knowledge_index.chunk_count >= 100_000
     assert p95 <= 1.0

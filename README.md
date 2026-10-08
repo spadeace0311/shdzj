@@ -73,25 +73,25 @@ docker compose --env-file .env -f infra/compose.yaml down -v
 
 ## 测试
 
-后端单元测试和静态检查：
+以下隔离验证命令固定使用 Compose project `codex-task15`，避免触碰本机默认 project 的容器和卷。普通 `pytest -q` 默认排除 `performance` 标记，性能测试必须显式使用 `-m performance`。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -v
-docker compose --env-file .env -f infra/compose.yaml run --rm api ruff check app tests
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api pytest -v
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api ruff check app tests
 ```
 
 固定上海损失性能基准：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -m performance tests/test_loss_performance.py -v
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api pytest -m performance tests/test_loss_performance.py -v
 ```
 
 前端单元测试、类型检查和构建：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm test
-docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run typecheck
-docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run build
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm frontend npm test
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm frontend npm run typecheck
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm frontend npm run build
 ```
 
 ## CENC 实时采集
@@ -152,16 +152,16 @@ GET /api/v1/assessments/runs/{run_id}/intensity/artifact/{product_id}/{band}/{z}
 首次启动会向 `embedding-models` 卷下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3`，之后离线复用。非敏感配置位于 `.env`，其中 `DEEPSEEK_API_KEY` 留空并由部署环境注入，不在仓库中填写。
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml up -d postgres qdrant embedding
-docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose --env-file .env -f infra/compose.yaml up -d
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d postgres qdrant embedding
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d
 ```
 
 十万切片混合检索性能测试与真实事件问答验收：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml run --rm api pytest -m performance tests/test_qa_performance.py -v
-docker compose --env-file .env -f infra/compose.yaml run --rm frontend npm run test:e2e -- ai-knowledge-qa.spec.ts
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api pytest -m performance tests/test_qa_performance.py -v
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm frontend npm run test:e2e -- ai-knowledge-qa.spec.ts
 ```
 
 模型缓存、迁移、知识源发布与回滚、Qdrant 重建、故障降级、网页白名单、快照核验、审计删除、性能核验和备份恢复请参阅 [AI 知识与问答运行手册](docs/runbooks/ai-knowledge-qa.md)。
@@ -189,10 +189,10 @@ E2E 使用真实登录和真实后端数据库，准备测试事件、39 项专�
 干净环境的准备顺序如下。先构建后端、迁移数据库、启动 API、`collaboration-worker`、成果 Worker 和 Temporal Worker：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml build
-docker compose --env-file .env -f infra/compose.yaml up -d postgres temporal-postgres temporal
-docker compose --env-file .env -f infra/compose.yaml run --rm api alembic upgrade head
-docker compose --env-file .env -f infra/compose.yaml up -d `
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 build
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d postgres temporal-postgres temporal
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d `
   api collaboration-worker artifact-worker artifact-dispatcher `
   temporal-worker assessment-dispatcher
 ```
@@ -203,7 +203,7 @@ docker compose --env-file .env -f infra/compose.yaml up -d `
 $env:E2E_SUPERADMIN_USERNAME = "<你的超级管理员用户名>"
 $env:E2E_SUPERADMIN_PASSWORD = "<你的超级管理员密码>"
 $env:E2E_VIEWER_USERNAME = "e2e-viewer"
-docker compose --env-file .env -f infra/compose.yaml run --rm -T `
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm -T `
   -e E2E_SUPERADMIN_USERNAME `
   -e E2E_SUPERADMIN_PASSWORD `
   -e E2E_VIEWER_USERNAME `
@@ -214,8 +214,8 @@ docker compose --env-file .env -f infra/compose.yaml run --rm -T `
 确认 PostgreSQL、API 和 Worker 已就绪：
 
 ```powershell
-docker compose --env-file .env -f infra/compose.yaml ps
-docker compose --env-file .env -f infra/compose.yaml exec collaboration-worker `
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 ps
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 exec collaboration-worker `
   python -m app.process_health collaboration
 Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Compress
 ```
@@ -248,9 +248,9 @@ npm run test:e2e -- e2e/command-hall.spec.ts e2e/workgroup-tasks.spec.ts
 
 ```powershell
 # 先停止 Vite 和 Playwright。
-docker compose --env-file .env -f infra/compose.yaml down --remove-orphans
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 down --remove-orphans
 # 仅对一次性验收数据库执行：
-# docker compose --env-file .env -f infra/compose.yaml down -v --remove-orphans
+# docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 down -v --remove-orphans
 ```
 
 页面 UI 的登录和事件列表请求始终通过 Vite 的 `/api` 代理转发。宿主机直接运行前端时，`VITE_API_PROXY_TARGET` 应指向实际 API 地址。`E2E_API_BASE_URL` 只改变 Playwright `APIRequestContext` 的控制请求，不会把页面 UI 的 API 基地址改成其他值。不要输出 `.env`、密码、Token、API Key 或连接串。
@@ -273,8 +273,8 @@ Alembic revision、测试数量或 E2E 范围：
 
 - Docker Desktop `4.92.0`、Docker Engine `29.8.0` 正常运行。
 - PostgreSQL `16`、PostGIS `3.4.3` 容器正常运行，当时 Alembic 已迁移至 `0004_users`。
-- `docker compose --env-file .env -f infra/compose.yaml config --quiet` 通过。
-- `docker compose --env-file .env -f infra/compose.yaml build api` 通过。
+- `docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 config --quiet` 通过。
+- `docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 build api` 通过。
 - 当时后端测试套件在真实 PostgreSQL/PostGIS 环境下为 `180 passed`（其中 `test_event_tables_and_postgis_exist` 直接验证建表结果和 PostGIS 扩展），Ruff 检查通过。
 - API `/health` 返回 `200`；正式报接入后返回重大响应和服务响应二级，并能从详情接口读取。
 - 当时前端 `npm test` 为 `23 passed`，`npm run typecheck` 和 `npm run build` 通过。

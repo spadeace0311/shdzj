@@ -88,6 +88,48 @@ async def test_upload_creates_queued_ingest_job(
         await _delete_actor_data(session_factory)
 
 
+async def test_url_version_route_queues_fetch_job(
+    knowledge_client,
+    session_factory,
+) -> None:
+    try:
+        source = await knowledge_client.post(
+            "/api/v1/knowledge/sources",
+            json={
+                "source_key": f"local.url.{uuid4()}",
+                "title": "上海市公开知识网页",
+                "layer": "public_reference",
+                "source_type": "web",
+                "access_level": "public",
+            },
+        )
+        assert source.status_code == 201
+
+        response = await knowledge_client.post(
+            (
+                "/api/v1/knowledge/sources/"
+                f"{source.json()['id']}/url-versions"
+            ),
+            json={
+                "version": "2026.1",
+                "source_uri": "https://www.sh.gov.cn/example.html",
+                "metadata": {"topic": "preplan"},
+            },
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "registered"
+
+        jobs = await knowledge_client.get("/api/v1/knowledge/jobs")
+        assert jobs.status_code == 200
+        assert jobs.json()[0]["job_type"] == "fetch"
+        assert jobs.json()[0]["status"] == "queued"
+        assert jobs.json()[0]["request_payload"]["source_uri"] == (
+            "https://www.sh.gov.cn/example.html"
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_viewer_cannot_write(
     knowledge_client,
     session_factory,
@@ -145,6 +187,29 @@ async def test_publish_and_rollback_routes(
 
         audit = await _audit_resource(session_factory, previous_id, "rollback")
         assert audit is not None
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_rebuild_version_route_queues_forced_index_job(
+    knowledge_client,
+    session_factory,
+) -> None:
+    try:
+        _previous_id, version_id = await _seed_indexed_versions(session_factory)
+
+        response = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/rebuild",
+            json={"reason": "restore empty qdrant collection"},
+        )
+
+        assert response.status_code == 202
+        assert response.json()["job_type"] == "index"
+        assert response.json()["status"] == "queued"
+        assert response.json()["request_payload"]["force"] is True
+        assert response.json()["request_payload"]["reason"] == (
+            "restore empty qdrant collection"
+        )
     finally:
         await _delete_actor_data(session_factory)
 

@@ -36,7 +36,7 @@ test("answers with citation, tool process and map action", async ({ page }) => {
   await expect(
     page.locator(".qa-citation__key").filter({ hasText: "C1" }),
   ).toBeVisible();
-  await expect(page.getByTestId("loss-map-last-action")).not.toHaveTextContent(
-    "none",
+  await expect(page.getByTestId("loss-map-last-action")).toHaveText(
+    /^(locate|fit_bounds|buffer|highlight|set_layers)$/,
   );
 });

@@ -49,6 +49,7 @@ dev = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+addopts = "-m 'not performance'"
 markers = [
   "performance: integration benchmarks that use the full configured grid",
   "windows_mdb: read-only Microsoft Access ODBC integration tests",

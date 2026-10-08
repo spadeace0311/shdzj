@@ -118,6 +118,41 @@ async def test_duplicate_successful_job_is_idempotent(
         await _delete_actor_data(session_factory)
 
 
+async def test_force_index_job_rebuilds_published_version(
+    session_factory,
+):
+    try:
+        version_id = await _seed_published_indexed_version(session_factory)
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "restore empty collection"},
+        )
+        index = _FakeIndex()
+        embeddings = _FakeEmbeddings()
+        worker = KnowledgeWorker(index=index, embeddings=embeddings)
+
+        assert await _process_one(session_factory, worker) is True
+
+        async with session_factory() as session:
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            index_version = await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == version_id
+                )
+            )
+            assert version is not None
+            assert index_version is not None
+            assert version.status == KnowledgeVersionStatus.PUBLISHED.value
+            assert index_version.status == KnowledgeVersionStatus.PUBLISHED.value
+            assert index.deleted_version_ids == [version_id]
+            assert index.upsert_count == 1
+            assert embeddings.embed_count == 1
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_worker_dead_letters_after_attempt_budget(
     session_factory,
     tmp_path: Path,
@@ -284,10 +319,19 @@ async def _process_one(session_factory, worker: KnowledgeWorker) -> bool:
 
 class _FakeIndex:
     def __init__(self) -> None:
+        self.deleted_version_ids: list[UUID] = []
         self.upsert_count = 0
 
     async def ensure_collection(self, index_version: KnowledgeIndexVersion) -> None:
         del index_version
+
+    async def delete_version(
+        self,
+        index_version: KnowledgeIndexVersion,
+        version_id: UUID,
+    ) -> None:
+        del index_version
+        self.deleted_version_ids.append(version_id)
 
     async def upsert_chunks(
         self,
@@ -395,6 +439,63 @@ async def _seed_version_and_job(
                 max_attempts=max_attempts,
             )
             session.add(job)
+            await session.flush()
+            return version.id
+
+
+async def _seed_published_indexed_version(session_factory) -> UUID:
+    async with session_factory() as session:
+        async with session.begin():
+            source = KnowledgeSource(
+                source_key=f"worker.rebuild.{uuid4()}",
+                title="Worker Rebuild Source",
+                layer="local_authority",
+                source_type="preplan",
+                access_level="internal",
+                created_by=WORKER_ACTOR,
+            )
+            session.add(source)
+            await session.flush()
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version="v1",
+                status=KnowledgeVersionStatus.PUBLISHED.value,
+                created_by=WORKER_ACTOR,
+            )
+            session.add(version)
+            await session.flush()
+            index_version = KnowledgeIndexVersion(
+                source_version_id=version.id,
+                version="v1",
+                status=KnowledgeVersionStatus.PUBLISHED.value,
+                collection_name=(
+                    f"{settings.qdrant_collection_prefix}-{source.source_key}"
+                ),
+                embedding_model=settings.embedding_model_name,
+                reranker_model=settings.reranker_model_name,
+                chunk_count=1,
+            )
+            session.add(index_version)
+            await session.flush()
+            session.add(
+                KnowledgeChunk(
+                    version_id=version.id,
+                    chunk_no=1,
+                    section_path=["重建"],
+                    checksum="c" * 64,
+                    search_text="上海市活动断层距离测试",
+                    text="上海市活动断层距离测试",
+                )
+            )
+            session.add(
+                KnowledgeJob(
+                    version_id=version.id,
+                    job_type="index",
+                    status=KnowledgeJobStatus.SUCCEEDED.value,
+                    max_attempts=settings.knowledge_job_max_attempts,
+                    request_payload={},
+                )
+            )
             await session.flush()
             return version.id
 

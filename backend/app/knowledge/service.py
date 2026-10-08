@@ -244,6 +244,39 @@ class KnowledgeService:
         await session.flush()
         return _job_response(job)
 
+    async def rebuild_index(
+        self,
+        session: AsyncSession,
+        actor: str,
+        version_id: UUID,
+        reason: str,
+    ) -> KnowledgeJobResponse:
+        version = await self._repository.get_version(
+            session,
+            version_id,
+            for_update=True,
+        )
+        if version is None:
+            raise LookupError("knowledge source version not found")
+        if version.status not in {
+            KnowledgeVersionStatus.INDEXED.value,
+            KnowledgeVersionStatus.PUBLISHED.value,
+        }:
+            raise ValueError(
+                "only indexed or published knowledge versions can be rebuilt"
+            )
+        job = await self._queue_job(
+            session,
+            version.id,
+            job_type="index",
+            payload={
+                "force": True,
+                "actor": actor,
+                "reason": reason,
+            },
+        )
+        return _job_response(job)
+
     async def enqueue_job(
         self,
         session: AsyncSession,

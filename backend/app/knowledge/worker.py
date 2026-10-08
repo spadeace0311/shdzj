@@ -80,10 +80,12 @@ class KnowledgeWorker:
         if job is None:
             return False
 
+        force_rebuild = bool(job.request_payload.get("force"))
         try:
             async with session.begin_nested():
                 if (
                     job.job_type in _REPEATABLE_JOB_TYPES
+                    and not force_rebuild
                     and await self._existing_success(
                         session,
                         job.version_id,
@@ -92,7 +94,11 @@ class KnowledgeWorker:
                 ):
                     await _mark_success(session, job.id, self._now())
                 else:
-                    await self._dispatch(session, job)
+                    await self._dispatch(
+                        session,
+                        job,
+                        force_rebuild=force_rebuild,
+                    )
                     await _mark_success(session, job.id, self._now())
         except Exception as exc:
             await _mark_failure(session, job.id, exc, self._now())
@@ -115,14 +121,24 @@ class KnowledgeWorker:
             .limit(1)
         )
 
-    async def _dispatch(self, session: AsyncSession, job: KnowledgeJob) -> None:
+    async def _dispatch(
+        self,
+        session: AsyncSession,
+        job: KnowledgeJob,
+        *,
+        force_rebuild: bool,
+    ) -> None:
         if job.job_type not in _SUPPORTED_JOB_TYPES:
             raise ValueError(f"unsupported knowledge job type: {job.job_type}")
         if job.job_type == "fetch":
             await self._handle_fetch(session, job)
             return
         if job.job_type in {"ingest", "index"}:
-            await self._handle_ingest(session, job)
+            await self._handle_ingest(
+                session,
+                job,
+                force_rebuild=force_rebuild,
+            )
             return
         if job.job_type == "publish":
             await self._handle_publish(session, job)
@@ -198,7 +214,13 @@ class KnowledgeWorker:
             },
         )
 
-    async def _handle_ingest(self, session: AsyncSession, job: KnowledgeJob) -> None:
+    async def _handle_ingest(
+        self,
+        session: AsyncSession,
+        job: KnowledgeJob,
+        *,
+        force_rebuild: bool,
+    ) -> None:
         version = await _version_for_update(session, job.version_id)
         source = await session.get(KnowledgeSource, version.source_id)
         if source is None:
@@ -211,7 +233,8 @@ class KnowledgeWorker:
             .with_for_update()
         )
         if (
-            existing_chunks
+            not force_rebuild
+            and existing_chunks
             and existing_index is not None
             and version.status
             in {
@@ -249,9 +272,15 @@ class KnowledgeWorker:
             version,
             source,
             chunks,
+            force_rebuild=force_rebuild,
         )
-        version.status = KnowledgeVersionStatus.INDEXED.value
         version.indexed_at = self._now()
+        if force_rebuild:
+            job.result_payload = {
+                "status": "rebuilt",
+                "version_id": str(version.id),
+                "chunk_count": len(chunks),
+            }
 
     async def _handle_publish(self, session: AsyncSession, job: KnowledgeJob) -> None:
         actor = str(job.request_payload.get("actor") or "knowledge-worker")
@@ -488,11 +517,20 @@ async def _build_index(
     version: KnowledgeSourceVersion,
     source: KnowledgeSource,
     chunks: list[KnowledgeChunk],
+    *,
+    force_rebuild: bool,
 ) -> None:
     index_version = await session.scalar(
         select(KnowledgeIndexVersion)
         .where(KnowledgeIndexVersion.source_version_id == version.id)
         .with_for_update()
+    )
+    version_was_published = (
+        version.status == KnowledgeVersionStatus.PUBLISHED.value
+    )
+    index_was_published = (
+        index_version is not None
+        and index_version.status == KnowledgeVersionStatus.PUBLISHED.value
     )
     manifest = {
         "source_title": source.title,
@@ -519,11 +557,14 @@ async def _build_index(
         index_version.collection_name = collection_name
         index_version.chunk_count = len(chunks)
         index_version.manifest = manifest
-        index_version.status = KnowledgeVersionStatus.INDEXED.value
+        if not index_was_published:
+            index_version.status = KnowledgeVersionStatus.INDEXED.value
     await session.flush()
 
     version.status = KnowledgeVersionStatus.EMBEDDING.value
     await index.ensure_collection(index_version)
+    if force_rebuild:
+        await index.delete_version(index_version, version.id)
     batch = await embeddings.embed([chunk.text for chunk in chunks])
     indexed_chunks = [
         IndexedChunk(
@@ -542,6 +583,10 @@ async def _build_index(
         for chunk in chunks
     ]
     await index.upsert_chunks(index_version, indexed_chunks, batch)
+    if version_was_published:
+        version.status = KnowledgeVersionStatus.PUBLISHED.value
+    else:
+        version.status = KnowledgeVersionStatus.INDEXED.value
 
 
 async def _queue_job(

@@ -107,6 +107,30 @@ async def create_knowledge_file_version(
         raise _map_error(exc) from exc
 
 
+@router.post(
+    "/sources/{source_id}/url-versions",
+    response_model=KnowledgeVersionResponse,
+    status_code=202,
+)
+async def create_knowledge_url_version(
+    source_id: UUID,
+    request: KnowledgeVersionCreate,
+    session: AsyncSession = Depends(get_session),
+    service: KnowledgeService = Depends(get_knowledge_service),
+    current_user: AuthUser = Depends(require_role(*_WRITE_ROLES)),
+) -> KnowledgeVersionResponse:
+    try:
+        async with session.begin():
+            return await service.create_url_version(
+                session,
+                current_user.username,
+                source_id,
+                request,
+            )
+    except (LookupError, ValueError, IntegrityError, SQLAlchemyError) as exc:
+        raise _map_error(exc) from exc
+
+
 @router.get(
     "/versions/{version_id}",
     response_model=KnowledgeVersionResponse,
@@ -120,6 +144,30 @@ async def get_knowledge_version(
     try:
         return await service.get_version(session, version_id)
     except (LookupError, ValueError, SQLAlchemyError) as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/versions/{version_id}/rebuild",
+    response_model=KnowledgeJobResponse,
+    status_code=202,
+)
+async def rebuild_knowledge_version(
+    version_id: UUID,
+    request: KnowledgeLifecycleRequest,
+    session: AsyncSession = Depends(get_session),
+    service: KnowledgeService = Depends(get_knowledge_service),
+    current_user: AuthUser = Depends(require_role(*_PUBLISH_ROLES)),
+) -> KnowledgeJobResponse:
+    try:
+        async with session.begin():
+            return await service.rebuild_index(
+                session,
+                current_user.username,
+                version_id,
+                request.reason,
+            )
+    except (LookupError, ValueError, IntegrityError, SQLAlchemyError) as exc:
         raise _map_error(exc) from exc
 
 
