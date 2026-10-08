@@ -143,7 +143,7 @@ def register_event_tools(registry: ToolRegistry) -> None:
             input_model=EventContextInput,
             handler=context_tool.handle,
             timeout_seconds=1.5,
-            parallel_safe=True,
+            parallel_safe=False,
         )
     )
     registry.register(
@@ -153,7 +153,7 @@ def register_event_tools(registry: ToolRegistry) -> None:
             input_model=EventRevisionInput,
             handler=revision_tool.handle,
             timeout_seconds=1.5,
-            parallel_safe=True,
+            parallel_safe=False,
         )
     )
 

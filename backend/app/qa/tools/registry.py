@@ -233,8 +233,12 @@ class ToolRegistry:
             self._settings.qa_tool_timeout_seconds,
         )
         try:
-            async with asyncio.timeout(timeout_seconds):
-                result = await definition.handler(normalized, context)
+            result = await _execute_handler(
+                definition.handler,
+                normalized,
+                context,
+                timeout_seconds,
+            )
         except TimeoutError:
             return ToolResult.unavailable(
                 limitations=("tool_timeout",),
@@ -265,6 +269,8 @@ class ToolRegistry:
         executions: list[ToolExecution | None] = [None] * len(calls)
         limit = max(1, self._settings.qa_max_parallel_tools)
         semaphore = asyncio.Semaphore(limit)
+        # AsyncSession is stateful; never overlap calls that share one.
+        allow_parallel = context.session is None
 
         async def execute_safe(index: int) -> ToolExecution:
             call = calls[index]
@@ -285,7 +291,11 @@ class ToolRegistry:
         index = 0
         while index < len(calls):
             definition = self.get(str(calls[index].name))
-            if definition is None or not definition.parallel_safe:
+            if (
+                definition is None
+                or not definition.parallel_safe
+                or not allow_parallel
+            ):
                 call = calls[index]
                 started_at = perf_counter()
                 result = await self.execute(
@@ -304,7 +314,11 @@ class ToolRegistry:
             batch_end = index + 1
             while batch_end < len(calls):
                 batch_definition = self.get(str(calls[batch_end].name))
-                if batch_definition is None or not batch_definition.parallel_safe:
+                if (
+                    batch_definition is None
+                    or not batch_definition.parallel_safe
+                    or not allow_parallel
+                ):
                     break
                 batch_end += 1
             batch_indices = range(index, batch_end)
@@ -320,6 +334,22 @@ class ToolRegistry:
             index = batch_end
 
         return [execution for execution in executions if execution is not None]
+
+
+async def _execute_handler(
+    handler: ToolHandler,
+    arguments: dict[str, Any],
+    context: ToolContext,
+    timeout_seconds: float,
+) -> ToolResult:
+    async def invoke() -> ToolResult:
+        async with asyncio.timeout(timeout_seconds):
+            return await handler(arguments, context)
+
+    if context.session is None:
+        return await invoke()
+    async with context.session.begin_nested():
+        return await invoke()
 
 
 async def resolve_locked_asset_version(
