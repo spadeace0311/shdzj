@@ -78,6 +78,74 @@ def chat_response(content: str) -> httpx.Response:
     )
 
 
+def chat_body(body: object) -> httpx.Response:
+    return httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [],
+        None,
+        {"choices": "not-a-list"},
+        {"choices": [None]},
+        {"choices": [{"message": None}]},
+        {"choices": [{"message": {"content": None}}]},
+    ],
+)
+def test_plan_rejects_malformed_response_containers(body: object) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return chat_body(body)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = DeepSeekAdapter(make_settings(max_retries=0), client=client)
+
+    async def run() -> None:
+        with pytest.raises(DeepSeekMalformedResponseError):
+            await adapter.plan("问题", {}, [])
+        await client.aclose()
+
+    import asyncio
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        [],
+        None,
+        {"choices": "not-a-list"},
+        {"choices": [None]},
+        {"choices": [{"delta": None}]},
+        {"choices": [{"delta": "not-an-object"}]},
+        {"choices": [{"delta": {"content": 123}}]},
+    ],
+)
+def test_stream_rejects_malformed_response_containers(event: object) -> None:
+    content = f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=content.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = DeepSeekAdapter(make_settings(), client=client)
+
+    async def run() -> None:
+        with pytest.raises(DeepSeekMalformedResponseError):
+            async for _chunk in adapter.stream_answer("问题", {}, [], []):
+                pass
+        await client.aclose()
+
+    import asyncio
+
+    asyncio.run(run())
+
+
 def test_plan_uses_chat_completions_json_response_format() -> None:
     captured: dict = {}
 
@@ -320,8 +388,10 @@ def test_stream_answer_yields_delta_content_and_preserves_emitted_text() -> None
         'data: {"choices":[{"delta":{"content":"第一段"}}]}\n\n'
         "data: not-json\n\n"
     )
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
         return httpx.Response(
             200,
             content=content.encode(),
@@ -342,3 +412,4 @@ def test_stream_answer_yields_delta_content_and_preserves_emitted_text() -> None
 
     asyncio.run(run())
     assert chunks == ["第一段"]
+    assert captured["payload"]["stream"] is True

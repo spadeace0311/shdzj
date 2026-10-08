@@ -105,6 +105,7 @@ class DeepSeekAdapter:
         self._require_api_key()
         messages = build_answer_messages(question, context, evidence, tool_results)
         payload = self._request_payload(messages, response_format=None)
+        payload["stream"] = True
         headers = self._headers()
 
         if self._client is not None:
@@ -141,15 +142,8 @@ class DeepSeekAdapter:
                             raise DeepSeekMalformedResponseError(
                                 "DeepSeek returned malformed stream JSON"
                             ) from None
-                        choices = event.get("choices", [])
-                        if not choices:
-                            continue
-                        content = choices[0].get("delta", {}).get("content")
+                        content = self._extract_stream_content(event)
                         if content:
-                            if not isinstance(content, str):
-                                raise DeepSeekMalformedResponseError(
-                                    "DeepSeek returned non-text stream content"
-                                ) from None
                             yield content
             except _RETRYABLE_TRANSPORT_ERRORS:
                 raise DeepSeekRequestError(
@@ -233,12 +227,26 @@ class DeepSeekAdapter:
                 "DeepSeek returned malformed JSON"
             ) from None
 
-        choices = body.get("choices", [])
-        if not choices:
+        if not isinstance(body, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a non-object response"
+            ) from None
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
             raise DeepSeekMalformedResponseError(
                 "DeepSeek returned a response without choices"
             ) from None
-        content = choices[0].get("message", {}).get("content")
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a malformed choice"
+            ) from None
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a malformed message"
+            ) from None
+        content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise DeepSeekMalformedResponseError(
                 f"DeepSeek returned an empty {kind} response"
@@ -253,6 +261,37 @@ class DeepSeekAdapter:
             raise DeepSeekMalformedResponseError(
                 f"DeepSeek returned malformed {kind} JSON"
             ) from None
+
+    def _extract_stream_content(self, event: Any) -> str | None:
+        if not isinstance(event, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a non-object stream event"
+            ) from None
+        choices = event.get("choices")
+        if choices is None or choices == []:
+            return None
+        if not isinstance(choices, list):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned malformed stream choices"
+            ) from None
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a malformed stream choice"
+            ) from None
+        delta = first_choice.get("delta")
+        if not isinstance(delta, dict):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned a malformed stream delta"
+            ) from None
+        content = delta.get("content")
+        if content is None or content == "":
+            return None
+        if not isinstance(content, str):
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek returned non-text stream content"
+            ) from None
+        return content
 
     def _coerce_execution_plan(self, payload: Any) -> ExecutionPlan:
         if not isinstance(payload, dict):
