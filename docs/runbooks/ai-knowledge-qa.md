@@ -91,9 +91,11 @@ curl.exe -X POST "http://127.0.0.1:8000/api/v1/knowledge/versions/<version_id>/p
 
 回滚使用同结构请求 `POST /api/v1/knowledge/versions/<version_id>/rollback`。任务状态通过 `GET /api/v1/knowledge/jobs` 查看；失败任务可用 `POST /api/v1/knowledge/jobs/<job_id>/retry` 重试。
 
+索引版本需要临时下线时使用 `POST /api/v1/knowledge/versions/<version_id>/disable`，请求体与发布接口相同。停用后版本不参与发布、检索或新快照，历史快照仍保留其锁定版本。使用同结构请求 `POST /api/v1/knowledge/versions/<version_id>/enable` 重新启用后，版本恢复为 `indexed`，必须再次显式发布；若 Qdrant 指针缺失或为空，则先使用 `/versions/<version_id>/rebuild` 重建。
+
 ## Qdrant 集合检查与从 PostgreSQL 重建
 
-每个发布索引版本对应一个 Qdrant 集合，集合名保存在 `knowledge_index_versions.collection_name`，默认形如 `shanghai-knowledge-<source_key>`。
+每个发布索引版本对应一个 Qdrant 集合，集合名保存在 `knowledge_index_versions.collection_name`，默认形如 `shanghai-knowledge-<source_key>`。写入前会校验稠密向量维度、稀疏向量配置和点 payload 字段；配置不一致时索引任务失败，不会覆盖旧点位。
 
 ```powershell
 $check = @'
@@ -111,7 +113,7 @@ asyncio.run(main())
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm --no-deps -T api python -c $check
 ```
 
-若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，先从 PostgreSQL 切片生成完整 embeddings，再以稳定 point ID upsert，避免失败时破坏仍可检索的 published 点位；published 版本的发布状态保持不变。同一版本已有 pending forced rebuild 时返回同一 job，不重复排队。
+若 Qdrant 集合丢失或为空，但 PostgreSQL 仍保留 `knowledge_chunks`，使用重建 API 排队强制 `index` 任务。该任务绕过既有成功 job 的幂等短路，按 `KNOWLEDGE_WORKER_BATCH_SIZE` 分批生成 embeddings 和 `PointStruct`，再以稳定 point ID 写入 staging collection。全部批次成功后才通过 Qdrant alias 原子切换；任一批次失败时 staging 被清理，仍可检索的 published 点位保持不变。同一版本已有 pending forced rebuild 时返回同一 job，不重复排队。
 
 强制重建只 upsert 当前 PostgreSQL 切片对应的稳定 point ID，不删除孤儿或历史 stale points。当前 chunk 在正常生命周期内不可变，重建不会替换或删除现有 chunk ID，因此保留这些点不会污染当前版本的检索结果。若重试耗尽，只有 `index` job 进入 `dead_letter`，原有 `indexed`/`published` 版本状态和旧 Qdrant 点位保持不变。若未来流程开始替换或删除 chunk ID，必须先引入临时 collection/alias 切换，或在成功 upsert 后按 version 执行 stale-point 清理，并补充失败安全、清理后置条件和旧点保留测试；不得恢复到 upsert 前直接删除 published 点位。
 
@@ -140,7 +142,13 @@ curl.exe "http://127.0.0.1:8000/api/v1/qa/answers/<answer_id>" -H "Authorization
 
 URL 入库受 `config/knowledge/source-whitelist.yaml` 约束：仅允许 `http`/`https`、标准端口、白名单域名、白名单内容类型，并阻断环回、私网、链路本地、组播、保留地址与云元数据地址。默认白名单为 `cea.gov.cn`、`gov.cn`、`mem.gov.cn`、`sh.gov.cn`、`samr.gov.cn`。
 
-`ONLINE_SEARCH_ENABLED=false` 时 URL 抓取被直接拒绝。内网关闭验证应确认白名单仅含公网域名，并尝试访问私有地址以确认 `UnsafeUrlError`。
+`ONLINE_SEARCH_ENABLED=false` 时 URL 抓取被直接拒绝，worker 的 refresh scan 也不会入队远程抓取。自动 scan 在 `knowledge-worker` 主循环内执行，间隔由 `KNOWLEDGE_ONLINE_REFRESH_INTERVAL_SECONDS` 控制；也可以手动触发一次扫描：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 run --rm knowledge-worker python -m app.knowledge.worker refresh-once
+```
+
+每次扫描按时间桶创建唯一的 `auto-refresh-<bucket>` 版本，重复扫描不会重复入队。内网关闭验证应确认白名单仅含公网域名，并尝试访问私有地址以确认 `UnsafeUrlError`。
 
 ## 事件知识快照核验
 

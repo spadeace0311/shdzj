@@ -5,6 +5,10 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.knowledge.domain import (
+    KnowledgeVersionDisabledError,
+    KnowledgeVersionStatus,
+)
 from app.knowledge.models import (
     KnowledgeSource,
     KnowledgeSourceVersion,
@@ -50,6 +54,10 @@ class KnowledgePublicationService:
         )
         if target is None:
             raise LookupError("knowledge source version not found")
+        if target.status == KnowledgeVersionStatus.DISABLED.value:
+            raise KnowledgeVersionDisabledError(
+                "disabled knowledge versions cannot be published"
+            )
         if target.status != "indexed":
             raise KnowledgeVersionNotIndexedError(
                 "only indexed knowledge versions can be published"
@@ -114,6 +122,10 @@ class KnowledgePublicationService:
         )
         if target is None:
             raise LookupError("knowledge source version not found")
+        if target.status == KnowledgeVersionStatus.DISABLED.value:
+            raise KnowledgeVersionDisabledError(
+                "disabled knowledge versions cannot be rolled back"
+            )
         if target.status != "indexed":
             raise KnowledgeVersionNotIndexedError(
                 "rollback target must be an indexed knowledge version"

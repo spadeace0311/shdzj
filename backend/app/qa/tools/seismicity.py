@@ -71,7 +71,7 @@ _WITHIN_RADIUS_SQL = text(
       ) DESC,
       NULLIF(properties ->> 'origin_time', '')::timestamptz DESC NULLS LAST,
       business_key
-    LIMIT 100
+    LIMIT 101
     """
 )
 
@@ -171,13 +171,14 @@ class SeismicityWithinRadiusTool:
                 },
             )
         ).mappings().all()
+        truncated = len(rows) > 100
         events = [
             _historical_event_payload(
                 business_key=row["business_key"],
                 properties=dict(row["properties"] or {}),
                 distance_km=row["distance_km"],
             )
-            for row in rows
+            for row in rows[:100]
         ]
         return ToolResult.ok(
             value={
@@ -186,10 +187,13 @@ class SeismicityWithinRadiusTool:
                 "magnitude_min": float(magnitude_min),
                 "events": events,
                 "count": len(events),
+                "matched_count": len(rows),
+                "truncated": truncated,
             },
             unit="km",
             source=HISTORICAL_EARTHQUAKE_ASSET_KEY,
             version=version.version,
+            limitations=("truncated_to_100",) if truncated else (),
             parameters={
                 "event_id": str(event.id),
                 "radius_km": float(radius_km),

@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     knowledge_max_upload_bytes: int = 1_073_741_824
     knowledge_worker_poll_seconds: float = 1.0
     knowledge_worker_batch_size: int = 20
+    knowledge_online_refresh_interval_seconds: int = 86_400
     knowledge_job_max_attempts: int = 5
     knowledge_job_lease_seconds: int = 120
     qdrant_url: str = "http://qdrant:6333"
@@ -249,6 +250,10 @@ class Settings(BaseSettings):
             raise ValueError("KNOWLEDGE_MAX_UPLOAD_BYTES must be positive")
         if not 1 <= self.knowledge_worker_batch_size <= 1_000:
             raise ValueError("KNOWLEDGE_WORKER_BATCH_SIZE must be between 1 and 1000")
+        if self.knowledge_online_refresh_interval_seconds < 60:
+            raise ValueError(
+                "KNOWLEDGE_ONLINE_REFRESH_INTERVAL_SECONDS must be at least 60"
+            )
         if not 1 <= self.knowledge_job_max_attempts <= 100:
             raise ValueError("KNOWLEDGE_JOB_MAX_ATTEMPTS must be between 1 and 100")
         if self.knowledge_worker_poll_seconds <= 0:

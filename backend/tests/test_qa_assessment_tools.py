@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from geoalchemy2.elements import WKTElement
+from pydantic import ValidationError
 from sqlalchemy import delete, select
 
 from app.assessment.models import AssessmentTask
@@ -18,11 +19,12 @@ from app.data_assets.models import (
     DataAssetVersion,
 )
 from app.db import engine
+from app.events.models import EarthquakeRevision
 from app.intensity.models import IntensityFieldProduct
 from app.loss.models import LossMetricValue, LossProduct
-from app.qa.tools.exposure import ExposurePopulationTool
+from app.qa.tools.exposure import ExposurePopulationInput, ExposurePopulationTool
 from app.qa.tools.intensity import IntensityGetTool
-from app.qa.tools.loss import LossMetricsTool
+from app.qa.tools.loss import LossMetricsInput, LossMetricsTool
 from app.qa.tools.registry import ToolContext
 
 SNAPSHOT_ASSET_KEYS = (
@@ -503,6 +505,8 @@ async def test_exposure_population_uses_radius_and_locked_versions(
     assert result.value["resident_population"] == 80
     assert result.value["floating_population"] == 15
     assert result.value["total_population"] == 100
+    assert result.value["population_basis"] == "area_weighted_intersection"
+    assert result.value["regions"][0]["coverage_ratio"] == pytest.approx(1.0)
     assert result.value["precision"] == 0
     assert result.value["unit"] == "人"
     assert result.value["run_revision_id"] == str(
@@ -516,6 +520,8 @@ async def test_exposure_population_uses_radius_and_locked_versions(
             "floating_population": 15,
             "total_population": 100,
             "precision": 0,
+            "population_basis": "area_weighted_intersection",
+            "coverage_ratio": 1.0,
             "unit": "人",
             "quality_grade": "B",
             "value_status": "published",
@@ -558,6 +564,74 @@ async def test_exposure_population_area_code_selects_locked_subset(
         "310115000001",
         "310115000002",
     ]
+
+
+async def test_exposure_population_weights_partial_town_intersection(
+    assessment_tool_fixture,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            revision = await session.get(
+                EarthquakeRevision,
+                assessment_tool_fixture.revision_id,
+            )
+            assert revision is not None
+            revision.longitude = Decimal("121.49")
+            revision.latitude = Decimal("31.2")
+
+        context = context_for(assessment_tool_fixture, session)
+        result = await ExposurePopulationTool().handle(
+            {"radius_km": "1.2"},
+            context,
+        )
+
+    assert result.status == "ok"
+    assert result.value["population_basis"] == "area_weighted_intersection"
+    assert 0 < result.value["total_population"] < 100
+    region = result.value["regions"][0]
+    assert 0.25 < region["coverage_ratio"] < 0.75
+    assert region["total_population"] < 100
+
+
+def test_area_code_tools_reject_empty_string() -> None:
+    with pytest.raises(ValidationError, match="area_code"):
+        ExposurePopulationInput.model_validate({"area_code": ""})
+    with pytest.raises(ValidationError, match="area_code"):
+        LossMetricsInput.model_validate(
+            {
+                "product_type": "casualties",
+                "area_code": "",
+            }
+        )
+
+
+async def test_area_code_tool_handlers_reject_empty_string_directly() -> None:
+    context = ToolContext(
+        session=None,  # type: ignore[arg-type]
+        user=AuthUser(username="qa-task9", role="viewer", workgroup=None),
+        event_id=uuid4(),
+        revision_id=None,
+        assessment_run_id=None,
+        snapshot_id=uuid4(),
+        index_version_id=uuid4(),
+    )
+    population = await ExposurePopulationTool().handle(
+        {"area_code": ""},
+        context,
+    )
+    loss = await LossMetricsTool().handle(
+        {
+            "product_type": "casualties",
+            "area_code": "",
+        },
+        context,
+    )
+
+    assert population.status == "invalid"
+    assert population.limitations == ("area_code_required",)
+    assert loss.status == "invalid"
+    assert loss.limitations == ("area_code_required",)
 
 
 async def test_exposure_population_returns_unavailable_without_locked_asset(

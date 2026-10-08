@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ class KnowledgeFileStore:
         self._max_upload_bytes = max_upload_bytes
         self._root.mkdir(parents=True, exist_ok=True)
 
-    def store_upload(
+    async def store_upload(
         self,
         source: BinaryIO,
         *,
@@ -37,12 +39,12 @@ class KnowledgeFileStore:
         temporary = self._root / f".upload-{os.getpid()}-{id(source)}.tmp"
         try:
             with temporary.open("wb") as target:
-                while chunk := source.read(1024 * 1024):
+                while chunk := await _read_upload_chunk(source, 1024 * 1024):
                     size += len(chunk)
                     if size > self._max_upload_bytes:
                         raise ValueError("upload exceeds configured maximum size")
                     digest.update(chunk)
-                    target.write(chunk)
+                    await asyncio.to_thread(target.write, chunk)
 
             checksum = digest.hexdigest()
             relative = (
@@ -54,9 +56,9 @@ class KnowledgeFileStore:
             destination = self._root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
-                temporary.unlink()
+                await asyncio.to_thread(temporary.unlink)
             else:
-                temporary.replace(destination)
+                await asyncio.to_thread(temporary.replace, destination)
             return StoredKnowledgeFile(
                 file_name=safe_name,
                 relative_path=relative.as_posix(),
@@ -66,7 +68,7 @@ class KnowledgeFileStore:
             )
         finally:
             if temporary.exists():
-                temporary.unlink()
+                await asyncio.to_thread(temporary.unlink)
 
     def write_text(self, relative_path: str, text: str) -> StoredKnowledgeFile:
         # The supplied path is only validated; parsed text is always stored by
@@ -106,3 +108,10 @@ class KnowledgeFileStore:
         if any(character in file_name for character in ("\x00", "\r", "\n")):
             raise ValueError("file name contains invalid characters")
         return file_name[:255]
+
+
+async def _read_upload_chunk(source: BinaryIO, size: int) -> bytes:
+    read = source.read
+    if inspect.iscoroutinefunction(read):
+        return await read(size)
+    return await asyncio.to_thread(read, size)

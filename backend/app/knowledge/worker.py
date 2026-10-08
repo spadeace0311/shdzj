@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -10,13 +11,17 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.knowledge.adapters import EmbeddingAdapter
 from app.knowledge.chunker import chunk_document
-from app.knowledge.domain import KnowledgeJobStatus, KnowledgeVersionStatus
+from app.knowledge.domain import (
+    KnowledgeJobStatus,
+    KnowledgeVersionDisabledError,
+    KnowledgeVersionStatus,
+)
 from app.knowledge.fetch import (
     FetchPolicy,
     build_pinned_http_client,
@@ -55,6 +60,9 @@ class KnowledgeWorker:
         fetch_policy: FetchPolicy | None = None,
         http_client: httpx.AsyncClient | None = None,
         lease_seconds: int | None = None,
+        batch_size: int | None = None,
+        refresh_interval_seconds: int | None = None,
+        online_search_enabled: bool | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store or KnowledgeFileStore(
@@ -69,6 +77,17 @@ class KnowledgeWorker:
         self._fetch_policy = fetch_policy or load_fetch_policy()
         self._http_client = http_client
         self._lease_seconds = lease_seconds or settings.knowledge_job_lease_seconds
+        self._batch_size = batch_size or settings.knowledge_worker_batch_size
+        self._refresh_interval_seconds = (
+            refresh_interval_seconds
+            if refresh_interval_seconds is not None
+            else settings.knowledge_online_refresh_interval_seconds
+        )
+        self._online_search_enabled = (
+            settings.online_search_enabled
+            if online_search_enabled is None
+            else online_search_enabled
+        )
         self._now = now or (lambda: datetime.now(UTC))
 
     async def process_one(self, session: AsyncSession) -> bool:
@@ -83,6 +102,13 @@ class KnowledgeWorker:
         force_rebuild = bool(job.request_payload.get("force"))
         try:
             async with session.begin_nested():
+                version = await _version_for_update(session, job.version_id)
+                if version.status == KnowledgeVersionStatus.DISABLED.value and not (
+                    job.job_type == "index" and force_rebuild
+                ):
+                    raise KnowledgeVersionDisabledError(
+                        "disabled knowledge versions cannot run live jobs"
+                    )
                 if (
                     job.job_type in _REPEATABLE_JOB_TYPES
                     and not force_rebuild
@@ -173,7 +199,7 @@ class KnowledgeWorker:
             fetched.final_url,
             fetched.content_type,
         )
-        stored = self._store.store_upload(
+        stored = await self._store.store_upload(
             BytesIO(fetched.body),
             file_name=file_name,
             source_id=str(version.source_id),
@@ -226,7 +252,10 @@ class KnowledgeWorker:
         if source is None:
             raise LookupError("knowledge source not found")
 
-        existing_chunks = await _chunks_for_version(session, version.id)
+        existing_chunk_count = await _chunk_count_for_version(
+            session,
+            version.id,
+        )
         existing_index = await session.scalar(
             select(KnowledgeIndexVersion)
             .where(KnowledgeIndexVersion.source_version_id == version.id)
@@ -234,7 +263,7 @@ class KnowledgeWorker:
         )
         if (
             not force_rebuild
-            and existing_chunks
+            and existing_chunk_count > 0
             and existing_index is not None
             and version.status
             in {
@@ -244,8 +273,8 @@ class KnowledgeWorker:
         ):
             return
 
-        if existing_chunks:
-            chunks = existing_chunks
+        if existing_chunk_count > 0:
+            chunk_count = existing_chunk_count
         else:
             if not version.storage_path:
                 raise ValueError("version has no stored document to ingest")
@@ -263,7 +292,12 @@ class KnowledgeWorker:
             drafts = list(self._chunker(parsed))
             if not drafts:
                 raise ValueError("document produced no indexable chunks")
-            chunks = await _persist_chunks(session, version, drafts)
+            chunk_count = await _persist_chunks(
+                session,
+                version,
+                drafts,
+                batch_size=self._batch_size,
+            )
 
         await _build_index(
             session,
@@ -271,14 +305,16 @@ class KnowledgeWorker:
             self._embeddings,
             version,
             source,
-            chunks,
+            chunk_count,
+            force_rebuild=force_rebuild,
+            batch_size=self._batch_size,
         )
         version.indexed_at = self._now()
         if force_rebuild:
             job.result_payload = {
                 "status": "rebuilt",
                 "version_id": str(version.id),
-                "chunk_count": len(chunks),
+                "chunk_count": chunk_count,
             }
 
     async def _handle_publish(self, session: AsyncSession, job: KnowledgeJob) -> None:
@@ -323,6 +359,90 @@ class KnowledgeWorker:
             "version_id": str(version.id),
         }
 
+    async def enqueue_due_refreshes(self, session: AsyncSession) -> int:
+        if not self._online_search_enabled:
+            return 0
+        now = self._now()
+        interval = self._refresh_interval_seconds
+        bucket_timestamp = int(now.timestamp() // interval * interval)
+        bucket_label = f"auto-refresh-{bucket_timestamp}"
+        sources = list(
+            (
+                await session.scalars(
+                    select(KnowledgeSource)
+                    .where(
+                        KnowledgeSource.allow_online_refresh.is_(True),
+                        KnowledgeSource.is_active.is_(True),
+                    )
+                    .order_by(KnowledgeSource.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        enqueued = 0
+        for source in sources:
+            latest_version = await session.scalar(
+                select(KnowledgeSourceVersion)
+                .where(KnowledgeSourceVersion.source_id == source.id)
+                .order_by(
+                    KnowledgeSourceVersion.created_at.desc(),
+                    KnowledgeSourceVersion.id.desc(),
+                )
+                .limit(1)
+            )
+            latest_fetch = await session.scalar(
+                select(KnowledgeWebSnapshot.fetched_at)
+                .join(
+                    KnowledgeSourceVersion,
+                    KnowledgeWebSnapshot.version_id
+                    == KnowledgeSourceVersion.id,
+                )
+                .where(KnowledgeSourceVersion.source_id == source.id)
+                .order_by(KnowledgeWebSnapshot.fetched_at.desc())
+                .limit(1)
+            )
+            source_uri = source.origin or (
+                latest_version.source_uri if latest_version is not None else None
+            )
+            if not source_uri or latest_fetch is None:
+                continue
+            if latest_fetch + timedelta(seconds=interval) > now:
+                continue
+            existing = await session.scalar(
+                select(KnowledgeSourceVersion).where(
+                    KnowledgeSourceVersion.source_id == source.id,
+                    KnowledgeSourceVersion.version == bucket_label,
+                )
+            )
+            if existing is not None:
+                continue
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version=bucket_label,
+                status=KnowledgeVersionStatus.REGISTERED.value,
+                source_uri=source_uri,
+                version_metadata={
+                    **(latest_version.version_metadata or {}),
+                    "auto_refresh": True,
+                    "refresh_bucket": bucket_timestamp,
+                },
+                created_by="knowledge-refresh",
+            )
+            session.add(version)
+            await session.flush()
+            await _queue_job(
+                session,
+                version.id,
+                "fetch",
+                {
+                    "source_uri": source_uri,
+                    "metadata": dict(version.version_metadata or {}),
+                    "refresh": True,
+                },
+            )
+            enqueued += 1
+        return enqueued
+
 
 async def run_worker() -> None:
     from app.db import SessionFactory
@@ -332,9 +452,20 @@ async def run_worker() -> None:
         processed = False
         async with SessionFactory() as session:
             async with session.begin():
-                processed = await worker.process_one(session)
+                processed = (
+                    await worker.enqueue_due_refreshes(session) > 0
+                ) or processed
+                processed = await worker.process_one(session) or processed
         if not processed:
             await asyncio.sleep(settings.knowledge_worker_poll_seconds)
+
+
+async def run_refresh_scan_once() -> int:
+    from app.db import SessionFactory
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            return await KnowledgeWorker().enqueue_due_refreshes(session)
 
 
 async def _claim_next_job(
@@ -420,9 +551,14 @@ async def _mark_failure(
             in {
                 KnowledgeVersionStatus.INDEXED.value,
                 KnowledgeVersionStatus.PUBLISHED.value,
+                KnowledgeVersionStatus.DISABLED.value,
             }
         )
-        if version is not None and not preserve_healthy_rebuild_target:
+        if (
+            version is not None
+            and not preserve_healthy_rebuild_target
+            and version.status != KnowledgeVersionStatus.DISABLED.value
+        ):
             version.status = KnowledgeVersionStatus.FAILED.value
             version.failure_reason = safe_error
     else:
@@ -432,10 +568,15 @@ async def _mark_failure(
         )
         job.lease_expires_at = None
         job.completed_at = None
-        if version is not None and version.status not in {
-            KnowledgeVersionStatus.INDEXED.value,
-            KnowledgeVersionStatus.PUBLISHED.value,
-        }:
+        if (
+            version is not None
+            and version.status != KnowledgeVersionStatus.DISABLED.value
+            and version.status
+            not in {
+                KnowledgeVersionStatus.INDEXED.value,
+                KnowledgeVersionStatus.PUBLISHED.value,
+            }
+        ):
             version.status = KnowledgeVersionStatus.FAILED.value
             version.failure_reason = safe_error
     await session.flush()
@@ -470,19 +611,17 @@ async def _persist_parse_result(
     }
 
 
-async def _chunks_for_version(
+async def _chunk_count_for_version(
     session: AsyncSession,
     version_id: UUID,
-) -> list[KnowledgeChunk]:
-    return list(
-        (
-            await session.scalars(
-                select(KnowledgeChunk)
-                .where(KnowledgeChunk.version_id == version_id)
-                .order_by(KnowledgeChunk.chunk_no)
-                .with_for_update()
-            )
-        ).all()
+) -> int:
+    return int(
+        await session.scalar(
+            select(func.count())
+            .select_from(KnowledgeChunk)
+            .where(KnowledgeChunk.version_id == version_id)
+        )
+        or 0
     )
 
 
@@ -490,8 +629,24 @@ async def _persist_chunks(
     session: AsyncSession,
     version: KnowledgeSourceVersion,
     drafts: list[Any],
-) -> list[KnowledgeChunk]:
-    chunks: list[KnowledgeChunk] = []
+    *,
+    batch_size: int,
+) -> int:
+    pending: list[KnowledgeChunk] = []
+    chunk_count = 0
+
+    async def flush_batch() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        await session.flush()
+        for chunk in pending:
+            chunk.qdrant_point_id = uuid5(NAMESPACE_URL, str(chunk.id))
+        await session.flush()
+        for chunk in pending:
+            session.expunge(chunk)
+        pending = []
+
     for chunk_no, draft in enumerate(drafts, start=1):
         metadata = dict(getattr(draft, "metadata", {}) or {})
         chunk = KnowledgeChunk(
@@ -511,12 +666,30 @@ async def _persist_chunks(
             text=draft.text,
         )
         session.add(chunk)
-        chunks.append(chunk)
-    await session.flush()
-    for chunk in chunks:
-        chunk.qdrant_point_id = uuid5(NAMESPACE_URL, str(chunk.id))
-    await session.flush()
-    return chunks
+        pending.append(chunk)
+        chunk_count += 1
+        if len(pending) >= batch_size:
+            await flush_batch()
+    await flush_batch()
+    return chunk_count
+
+
+async def _chunk_batches(
+    session: AsyncSession,
+    version_id: UUID,
+    *,
+    batch_size: int,
+):
+    result = await session.stream_scalars(
+        select(KnowledgeChunk)
+        .where(KnowledgeChunk.version_id == version_id)
+        .order_by(KnowledgeChunk.chunk_no, KnowledgeChunk.id)
+        .execution_options(yield_per=batch_size)
+    )
+    async for batch in result.partitions(batch_size):
+        yield batch
+        for chunk in batch:
+            session.expunge(chunk)
 
 
 async def _build_index(
@@ -525,7 +698,10 @@ async def _build_index(
     embeddings: Any,
     version: KnowledgeSourceVersion,
     source: KnowledgeSource,
-    chunks: list[KnowledgeChunk],
+    chunk_count: int,
+    *,
+    force_rebuild: bool,
+    batch_size: int,
 ) -> None:
     index_version = await session.scalar(
         select(KnowledgeIndexVersion)
@@ -556,38 +732,67 @@ async def _build_index(
             collection_name=collection_name,
             embedding_model=settings.embedding_model_name,
             reranker_model=settings.reranker_model_name,
-            chunk_count=len(chunks),
+            chunk_count=chunk_count,
             manifest=manifest,
         )
         session.add(index_version)
     else:
-        index_version.collection_name = collection_name
-        index_version.chunk_count = len(chunks)
+        index_version.chunk_count = chunk_count
         index_version.manifest = manifest
         if not index_was_published:
             index_version.status = KnowledgeVersionStatus.INDEXED.value
     await session.flush()
 
     version.status = KnowledgeVersionStatus.EMBEDDING.value
-    batch = await embeddings.embed([chunk.text for chunk in chunks])
-    await index.ensure_collection(index_version)
-    indexed_chunks = [
-        IndexedChunk(
-            chunk_id=chunk.id,
-            version_id=version.id,
-            source_id=source.id,
-            source_key=source.source_key,
-            layer=source.layer,
-            access_level=source.access_level,
-            text=chunk.text,
-            section_path=tuple(chunk.section_path or ()),
-            page_from=chunk.page_from,
-            page_to=chunk.page_to,
-            checksum=chunk.checksum,
-        )
-        for chunk in chunks
-    ]
-    await index.upsert_chunks(index_version, indexed_chunks, batch)
+    rebuild = None
+    target_collection = None
+    try:
+        await index.ensure_collection(index_version)
+        if force_rebuild:
+            rebuild = await index.prepare_rebuild(index_version)
+            target_collection = rebuild.staging_name
+        async for chunk_batch in _chunk_batches(
+            session,
+            version.id,
+            batch_size=batch_size,
+        ):
+            batch = await embeddings.embed(
+                [chunk.text for chunk in chunk_batch]
+            )
+            indexed_chunks = [
+                IndexedChunk(
+                    chunk_id=chunk.id,
+                    version_id=version.id,
+                    source_id=source.id,
+                    source_key=source.source_key,
+                    layer=source.layer,
+                    access_level=source.access_level,
+                    text=chunk.text,
+                    section_path=tuple(chunk.section_path or ()),
+                    page_from=chunk.page_from,
+                    page_to=chunk.page_to,
+                    checksum=chunk.checksum,
+                )
+                for chunk in chunk_batch
+            ]
+            await index.upsert_chunks(
+                index_version,
+                indexed_chunks,
+                batch,
+                collection_name=target_collection,
+            )
+        manifest["index_batch_size"] = batch_size
+        if rebuild is not None:
+            await index.commit_rebuild(rebuild)
+            manifest["collection_alias"] = rebuild.alias_name
+            manifest["physical_collection_name"] = rebuild.staging_name
+            index_version.collection_name = rebuild.alias_name
+        index_version.manifest = manifest
+        await session.flush()
+    except Exception:
+        if rebuild is not None:
+            await index.abort_rebuild(rebuild)
+        raise
     if version_was_published:
         version.status = KnowledgeVersionStatus.PUBLISHED.value
     else:
@@ -670,4 +875,7 @@ def _safe_error_text(error: Exception) -> str:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_worker())
+    if len(sys.argv) > 1 and sys.argv[1] == "refresh-once":
+        asyncio.run(run_refresh_scan_once())
+    else:
+        asyncio.run(run_worker())

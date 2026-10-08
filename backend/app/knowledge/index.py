@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
+    CreateAlias,
+    CreateAliasOperation,
     DatetimeRange,
+    DeleteAlias,
+    DeleteAliasOperation,
     Distance,
     FieldCondition,
     Filter,
@@ -35,6 +39,15 @@ class KnowledgeIndexNotPublishedError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeIndexRebuild:
+    logical_name: str
+    alias_name: str
+    staging_name: str
+    previous_name: str | None
+    previous_alias_exists: bool
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeFilters:
     source_ids: tuple[UUID, ...] = ()
     source_version_ids: tuple[UUID, ...] = ()
@@ -43,6 +56,7 @@ class KnowledgeFilters:
     event_id: UUID | None = None
     global_only: bool = False
     published_before: datetime | None = None
+    snapshot_locked: bool = False
 
     def __post_init__(self) -> None:
         if self.global_only and self.event_id is not None:
@@ -88,27 +102,93 @@ class KnowledgeIndex:
         url: str | None = None,
     ) -> None:
         self._client = client or AsyncQdrantClient(url=url or settings.qdrant_url)
+        self._owns_client = client is None
 
-    async def ensure_collection(self, index_version: KnowledgeIndexVersion) -> None:
-        collection_name = _collection_name(index_version)
-        if await self._client.collection_exists(collection_name):
-            return
-        await self._client.create_collection(
-            collection_name=collection_name,
-            vectors_config={
-                "dense": VectorParams(
-                    size=DENSE_DIMENSIONS,
-                    distance=Distance.COSINE,
-                )
-            },
-            sparse_vectors_config={"sparse": SparseVectorParams()},
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.close()
+
+    async def ensure_collection(
+        self,
+        index_version: KnowledgeIndexVersion,
+        *,
+        collection_name: str | None = None,
+    ) -> None:
+        collection_name = collection_name or _logical_collection_name(
+            index_version
         )
+        if await self._client.collection_exists(collection_name):
+            await self.validate_collection(
+                index_version,
+                collection_name=collection_name,
+            )
+            return
+        await self._create_collection(collection_name)
+
+    async def validate_collection(
+        self,
+        index_version: KnowledgeIndexVersion,
+        *,
+        collection_name: str | None = None,
+    ) -> None:
+        collection_name = collection_name or _logical_collection_name(
+            index_version
+        )
+        info = await self._client.get_collection(collection_name)
+        config = getattr(info, "config", None)
+        params = getattr(config, "params", None)
+        vectors = getattr(params, "vectors", None)
+        dense = vectors.get("dense") if isinstance(vectors, dict) else vectors
+        if (
+            dense is None
+            or int(getattr(dense, "size", 0)) != DENSE_DIMENSIONS
+            or getattr(dense, "distance", None) != Distance.COSINE
+        ):
+            raise KnowledgeIndexConfigurationError(
+                "Qdrant dense vector configuration is incompatible"
+            )
+        sparse_config = getattr(params, "sparse_vectors", None) or {}
+        if sparse_config.get("sparse") is None:
+            raise KnowledgeIndexConfigurationError(
+                "Qdrant sparse vector configuration is incompatible"
+            )
+        payload_schema = getattr(info, "payload_schema", None) or {}
+        required_payload_fields = {
+            "chunk_id",
+            "version_id",
+            "source_id",
+            "source_key",
+            "source_title",
+            "layer",
+            "access_level",
+            "section_path",
+            "checksum",
+            "text",
+        }
+        if payload_schema and not required_payload_fields <= set(payload_schema):
+            raise KnowledgeIndexConfigurationError(
+                "Qdrant payload schema is incompatible"
+            )
+        points, _offset = await self._client.scroll(
+            collection_name=collection_name,
+            limit=1,
+            with_payload=True,
+        )
+        if points:
+            payload = dict(getattr(points[0], "payload", None) or {})
+            if not required_payload_fields <= set(payload):
+                raise KnowledgeIndexConfigurationError(
+                    "Qdrant point payload schema is incompatible"
+                )
+            _validate_payload_types(payload)
 
     async def upsert_chunks(
         self,
         index_version: KnowledgeIndexVersion,
         chunks: list[IndexedChunk],
         embeddings: EmbeddingBatch,
+        *,
+        collection_name: str | None = None,
     ) -> None:
         if not chunks:
             return
@@ -168,8 +248,77 @@ class KnowledgeIndex:
             points.append(point)
 
         await self._client.upsert(
-            collection_name=_collection_name(index_version),
+            collection_name=collection_name
+            or _logical_collection_name(index_version),
             points=points,
+        )
+
+    async def prepare_rebuild(
+        self,
+        index_version: KnowledgeIndexVersion,
+    ) -> KnowledgeIndexRebuild:
+        logical_name = _logical_collection_name(index_version)
+        await self.validate_collection(index_version)
+        alias_name = _rebuild_alias_name(logical_name)
+        previous_name = await self._alias_target(alias_name)
+        previous_alias_exists = previous_name is not None
+        if previous_name is None and await self._client.collection_exists(
+            logical_name
+        ):
+            previous_name = logical_name
+        staging_name = (
+            f"{logical_name[:255 - 13]}-{uuid4().hex[:12]}"
+        )
+        await self._create_collection(staging_name)
+        return KnowledgeIndexRebuild(
+            logical_name=logical_name,
+            alias_name=alias_name,
+            staging_name=staging_name,
+            previous_name=previous_name,
+            previous_alias_exists=previous_alias_exists,
+        )
+
+    async def commit_rebuild(self, rebuild: KnowledgeIndexRebuild) -> None:
+        operations = []
+        if rebuild.previous_alias_exists:
+            operations.append(
+                DeleteAliasOperation(
+                    delete_alias=DeleteAlias(
+                        alias_name=rebuild.alias_name,
+                    )
+                )
+            )
+        operations.append(
+            CreateAliasOperation(
+                create_alias=CreateAlias(
+                    alias_name=rebuild.alias_name,
+                    collection_name=rebuild.staging_name,
+                )
+            )
+        )
+        await self._client.update_collection_aliases(operations)
+
+    async def abort_rebuild(self, rebuild: KnowledgeIndexRebuild) -> None:
+        if await self._client.collection_exists(rebuild.staging_name):
+            await self._client.delete_collection(rebuild.staging_name)
+
+    async def _alias_target(self, alias_name: str) -> str | None:
+        response = await self._client.get_aliases()
+        for alias in getattr(response, "aliases", ()):
+            if getattr(alias, "alias_name", None) == alias_name:
+                return str(getattr(alias, "collection_name", "")) or None
+        return None
+
+    async def _create_collection(self, collection_name: str) -> None:
+        await self._client.create_collection(
+            collection_name=collection_name,
+            vectors_config={
+                "dense": VectorParams(
+                    size=DENSE_DIMENSIONS,
+                    distance=Distance.COSINE,
+                )
+            },
+            sparse_vectors_config={"sparse": SparseVectorParams()},
         )
 
     async def delete_version(
@@ -249,6 +398,52 @@ def _collection_name(index_version: KnowledgeIndexVersion) -> str:
             "knowledge index version is missing a collection name"
         )
     return collection_name
+
+
+def _logical_collection_name(index_version: KnowledgeIndexVersion) -> str:
+    manifest_alias = (index_version.manifest or {}).get("collection_alias")
+    if manifest_alias:
+        return str(manifest_alias).strip()
+    return _collection_name(index_version)
+
+
+def _rebuild_alias_name(logical_name: str) -> str:
+    suffix = "-active"
+    return f"{logical_name[:255 - len(suffix)]}{suffix}"
+
+
+def _validate_payload_types(payload: dict[str, object]) -> None:
+    string_fields = {
+        "chunk_id",
+        "version_id",
+        "source_id",
+        "source_key",
+        "source_title",
+        "layer",
+        "access_level",
+        "checksum",
+        "text",
+    }
+    if any(not isinstance(payload.get(field), str) for field in string_fields):
+        raise KnowledgeIndexConfigurationError(
+            "Qdrant point payload field types are incompatible"
+        )
+    if not isinstance(payload.get("section_path"), list):
+        raise KnowledgeIndexConfigurationError(
+            "Qdrant point section_path type is incompatible"
+        )
+    for field_name in ("event_id", "source_uri"):
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise KnowledgeIndexConfigurationError(
+                "Qdrant point nullable field types are incompatible"
+            )
+    for field_name in ("page_from", "page_to"):
+        value = payload.get(field_name)
+        if value is not None and isinstance(value, bool):
+            raise KnowledgeIndexConfigurationError(
+                "Qdrant point page fields are incompatible"
+            )
 
 
 def _qdrant_filter(

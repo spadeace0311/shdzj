@@ -9,6 +9,7 @@ import pytest
 from app.embedding.schemas import EmbeddingBatch
 from app.knowledge.index import (
     IndexedChunk,
+    KnowledgeIndexConfigurationError,
     KnowledgeIndex,
     KnowledgeIndexNotPublishedError,
 )
@@ -20,6 +21,8 @@ from qdrant_client.models import (
     IsNullCondition,
     MatchAny,
     MatchValue,
+    SparseVectorParams,
+    VectorParams,
 )
 
 
@@ -72,13 +75,20 @@ class FakeQdrantClient:
     def __init__(self) -> None:
         self.collections: set[str] = set()
         self.created: list[tuple[str, dict]] = []
+        self.collection_infos: dict[str, object] = {}
         self.upserts: list[tuple[str, list, dict]] = []
         self.deletes: list[tuple[str, object, dict]] = []
         self.queries: list[dict] = []
         self.query_responses: list[SimpleNamespace] = []
+        self.scroll_responses: list[tuple[list, object]] = []
+        self.close_count = 0
 
     async def collection_exists(self, collection_name: str) -> bool:
         return collection_name in self.collections
+
+    async def get_collection(self, collection_name: str, **kwargs: object) -> object:
+        del kwargs
+        return self.collection_infos[collection_name]
 
     async def create_collection(
         self,
@@ -128,6 +138,22 @@ class FakeQdrantClient:
             }
         )
         return self.query_responses.pop(0)
+
+    async def scroll(
+        self,
+        collection_name: str,
+        *,
+        limit: int = 10,
+        with_payload: bool = True,
+        **kwargs: object,
+    ) -> tuple[list, object]:
+        del collection_name, limit, with_payload, kwargs
+        if self.scroll_responses:
+            return self.scroll_responses.pop(0)
+        return [], None
+
+    async def close(self) -> None:
+        self.close_count += 1
 
 
 class FilterAwareQdrantClient:
@@ -213,6 +239,67 @@ async def test_ensure_collection_creates_dense_and_sparse_vectors() -> None:
     assert dense.size == 1024
     assert dense.distance == Distance.COSINE
     assert sparse.__class__.__name__ == "SparseVectorParams"
+
+
+@pytest.mark.parametrize(
+    ("dense_size", "sparse_configured"),
+    [
+        (768, True),
+        (1024, False),
+    ],
+)
+async def test_ensure_collection_rejects_incompatible_existing_config(
+    dense_size: int,
+    sparse_configured: bool,
+) -> None:
+    client = FakeQdrantClient()
+    collection_name = "shanghai-knowledge-incompatible"
+    client.collections.add(collection_name)
+    sparse = (
+        {"sparse": SparseVectorParams()}
+        if sparse_configured
+        else {}
+    )
+    client.collection_infos[collection_name] = _collection_info(
+        dense_size=dense_size,
+        sparse=sparse,
+    )
+    index_version = _index_version(
+        version="incompatible",
+        collection_name=collection_name,
+    )
+
+    with pytest.raises(KnowledgeIndexConfigurationError):
+        await KnowledgeIndex(client=client).ensure_collection(index_version)
+
+
+async def test_ensure_collection_rejects_incompatible_point_payload() -> None:
+    client = FakeQdrantClient()
+    collection_name = "shanghai-knowledge-bad-payload"
+    client.collections.add(collection_name)
+    client.collection_infos[collection_name] = _collection_info(
+        dense_size=1024,
+        sparse={"sparse": SparseVectorParams()},
+    )
+    client.scroll_responses.append(
+        (
+            [
+                SimpleNamespace(
+                    id="point-1",
+                    payload={"text": "missing required fields"},
+                )
+            ],
+            None,
+        )
+    )
+
+    with pytest.raises(KnowledgeIndexConfigurationError, match="payload"):
+        await KnowledgeIndex(client=client).ensure_collection(
+            _index_version(
+                version="bad-payload",
+                collection_name=collection_name,
+            )
+        )
 
 
 async def test_upsert_chunks_uses_stable_uuid5_and_idempotent_payload() -> None:
@@ -430,6 +517,39 @@ async def test_delete_version_filters_by_version_payload() -> None:
     condition = selector.filter.must[0]
     assert condition.key == "version_id"
     assert condition.match.value == str(version_id)
+
+
+async def test_default_qdrant_client_can_be_closed(monkeypatch) -> None:
+    client = FakeQdrantClient()
+    monkeypatch.setattr(
+        "app.knowledge.index.AsyncQdrantClient",
+        lambda url: client,
+    )
+
+    await KnowledgeIndex().close()
+
+    assert client.close_count == 1
+
+
+def _collection_info(
+    *,
+    dense_size: int,
+    sparse: dict[str, object],
+) -> object:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            params=SimpleNamespace(
+                vectors={
+                    "dense": VectorParams(
+                        size=dense_size,
+                        distance=Distance.COSINE,
+                    )
+                },
+                sparse_vectors=sparse,
+            )
+        ),
+        payload_schema={},
+    )
 
 
 def _mandatory_version_filter(query_filter: object) -> str:

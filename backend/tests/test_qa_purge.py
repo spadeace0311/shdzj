@@ -64,6 +64,17 @@ class RecordingKnowledgeIndex:
         self.deletes.append((index_version.collection_name, version_id))
 
 
+class ClosingKnowledgeIndex:
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    async def delete_version(self, index_version, version_id) -> None:
+        del index_version, version_id
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
 class FakeQaRepository:
     def __init__(self) -> None:
         self.deleted: list[object] = []
@@ -356,6 +367,31 @@ async def test_delete_knowledge_version_rejects_snapshot_reference(
     finally:
         await _cleanup_version_fixture(session_factory, ids)
         await _delete_qa_audit_rows(session_factory, QA_PURGE_ACTOR)
+
+
+async def test_knowledge_version_purge_closes_default_qdrant_client(
+    session_factory,
+    monkeypatch,
+) -> None:
+    ids = await _seed_version_fixture(session_factory)
+    default_index = ClosingKnowledgeIndex()
+    monkeypatch.setattr(
+        "app.qa.repository.KnowledgeIndex",
+        lambda: default_index,
+    )
+    try:
+        async with SessionFactory() as session:
+            async with session.begin():
+                await KnowledgeVersionPurgeService().delete_version(
+                    session,
+                    ids["version_id"],
+                    QA_PURGE_ACTOR,
+                )
+    finally:
+        await _cleanup_source_fixture(session_factory, ids["source_id"])
+        await _delete_qa_audit_rows(session_factory, QA_PURGE_ACTOR)
+
+    assert default_index.close_count == 1
 
 
 async def _seed_answer_fixture(session_factory) -> dict[str, object]:

@@ -297,8 +297,21 @@ class QaAdminPurgeService:
 class KnowledgeVersionPurgeService:
     def __init__(self, *, index: KnowledgeIndex | None = None) -> None:
         self._index = index or KnowledgeIndex()
+        self._owns_index = index is None
 
     async def delete_version(
+        self,
+        session: AsyncSession,
+        version_id: UUID,
+        actor: str,
+    ) -> None:
+        try:
+            await self._delete_version(session, version_id, actor)
+        finally:
+            if self._owns_index:
+                await self._index.close()
+
+    async def _delete_version(
         self,
         session: AsyncSession,
         version_id: UUID,

@@ -66,13 +66,18 @@ class PostgresLexicalIndex:
             "lexical_score"
         )
         conditions = [
-            KnowledgeSourceVersion.status == "published",
-            KnowledgeSource.is_active.is_(True),
             KnowledgeChunk.search_text.ilike(
                 _trigram_pattern(query),
                 escape="\\",
             ),
         ]
+        if not filters.snapshot_locked:
+            conditions.extend(
+                [
+                    KnowledgeSourceVersion.status == "published",
+                    KnowledgeSource.is_active.is_(True),
+                ]
+            )
         if filters.source_ids:
             conditions.append(KnowledgeSource.id.in_(filters.source_ids))
         if filters.source_version_ids:
@@ -167,6 +172,7 @@ class HybridRetriever:
                 )
         filters = replace(
             filters,
+            snapshot_locked=True,
             source_version_ids=tuple(
                 dict.fromkeys(
                     stored_index_version.source_version_id

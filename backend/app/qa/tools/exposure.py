@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 
 from app.assessment.models import AssessmentRun
@@ -24,7 +25,20 @@ _POPULATION_SQL = text(
     """
     SELECT
       population.business_key,
-      population.properties
+      population.properties,
+      ST_Area(
+        ST_Intersection(
+          town.geom::geography,
+          ST_Buffer(
+            ST_SetSRID(
+              ST_MakePoint(:longitude, :latitude),
+              4326
+            )::geography,
+            :radius_m
+          )::geography
+        )::geography
+      ) AS intersection_area,
+      ST_Area(town.geom::geography) AS town_area
     FROM data_asset_records AS population
     JOIN data_asset_records AS town
       ON town.version_id = :admin_version_id
@@ -57,6 +71,13 @@ class ExposurePopulationInput(BaseModel):
     radius_km: Decimal = Field(default=Decimal("50"), gt=0, le=500)
     area_code: str | None = Field(default=None, max_length=64)
 
+    @field_validator("area_code")
+    @classmethod
+    def validate_area_code(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("area_code must not be empty")
+        return value.strip() if value is not None else None
+
 
 class ExposurePopulationTool:
     def __init__(
@@ -70,6 +91,14 @@ class ExposurePopulationTool:
         arguments: dict[str, Any],
         context: ToolContext,
     ) -> ToolResult:
+        if (
+            arguments.get("area_code") is not None
+            and not str(arguments["area_code"]).strip()
+        ):
+            return ToolResult.invalid(
+                limitations=("area_code_required",),
+                parameters={"area_code": arguments["area_code"]},
+            )
         requested_event_id = arguments.get("event_id")
         if (
             requested_event_id is not None
@@ -155,6 +184,7 @@ class ExposurePopulationTool:
         ).mappings().all()
 
         regions: list[dict[str, Any]] = []
+        fallback_regions: list[str] = []
         for row in rows:
             properties = dict(row["properties"] or {})
             try:
@@ -185,11 +215,36 @@ class ExposurePopulationTool:
                     "floating_population": _json_number(floating),
                     "total_population": _json_number(total),
                     "precision": precision,
+                    "population_basis": (
+                        "area_weighted_intersection"
+                        if _coverage_ratio(row) is not None
+                        else "full_town_intersecting"
+                    ),
+                    "coverage_ratio": _coverage_ratio(row),
                     "unit": "人",
                     "quality_grade": population_version.quality_grade,
                     "value_status": population_version.status,
                 }
             )
+            coverage_ratio = _coverage_ratio(row)
+            population_basis = (
+                "area_weighted_intersection"
+                if coverage_ratio is not None
+                else "full_town_intersecting"
+            )
+            if coverage_ratio is None:
+                fallback_regions.append(row["business_key"])
+            else:
+                weight = Decimal(str(coverage_ratio))
+                regions[-1]["resident_population"] = _json_number(
+                    resident * weight
+                )
+                regions[-1]["floating_population"] = _json_number(
+                    floating * weight
+                )
+                regions[-1]["total_population"] = _json_number(total * weight)
+            regions[-1]["population_basis"] = population_basis
+            regions[-1]["coverage_ratio"] = coverage_ratio
 
         if not regions:
             return ToolResult.not_found(
@@ -210,6 +265,11 @@ class ExposurePopulationTool:
                 "run_revision_id": str(assessment_run.revision_id),
                 "radius_km": float(radius_km),
                 "area_code": area_code,
+                "population_basis": (
+                    "full_town_intersecting"
+                    if fallback_regions
+                    else "area_weighted_intersection"
+                ),
                 "resident_population": _json_number(
                     sum(_population_decimal(region, "resident_population") for region in regions)
                 ),
@@ -242,6 +302,11 @@ class ExposurePopulationTool:
             unit="人",
             source=POPULATION_TOWN_ASSET_KEY,
             version=population_version.version,
+            limitations=(
+                ("population_full_town_estimate",)
+                if fallback_regions
+                else ()
+            ),
             parameters={
                 "event_id": str(event.id),
                 "run_id": str(assessment_run.id),
@@ -303,6 +368,26 @@ def _city_prefix(area_code: str | None) -> str | None:
     ):
         return f"{area_code[:2]}%"
     return None
+
+
+def _coverage_ratio(row: Any) -> float | None:
+    intersection_area = row.get("intersection_area")
+    town_area = row.get("town_area")
+    try:
+        intersection_value = float(intersection_area)
+        town_value = float(town_area)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(intersection_value) or not math.isfinite(town_value):
+        return None
+    if town_value <= 0 or intersection_value < 0:
+        return None
+    ratio = intersection_value / town_value
+    if ratio >= 0.999999:
+        return 1.0
+    if ratio <= 0 or ratio > 1.0:
+        return None
+    return ratio
 
 
 def _assessment_revision_mismatch_result(

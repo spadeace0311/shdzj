@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -19,6 +20,7 @@ from app.knowledge.models import (
     KnowledgeJob,
     KnowledgeSource,
     KnowledgeSourceVersion,
+    KnowledgeWebSnapshot,
 )
 from app.knowledge.publication import KnowledgePublicationService
 from app.knowledge.storage import KnowledgeFileStore
@@ -40,7 +42,7 @@ async def _dispose_engine_between_tests():
 async def test_ingest_job_parses_chunks_and_indexes(session_factory, tmp_path: Path):
     try:
         store = KnowledgeFileStore(tmp_path, max_upload_bytes=1024 * 1024)
-        stored = store.store_upload(
+        stored = await store.store_upload(
             BytesIO(b"Earthquake response plan\n\nEvacuation procedures."),
             file_name="preplan.txt",
             source_id="source",
@@ -90,7 +92,7 @@ async def test_duplicate_successful_job_is_idempotent(
 ):
     try:
         store = KnowledgeFileStore(tmp_path, max_upload_bytes=1024 * 1024)
-        stored = store.store_upload(
+        stored = await store.store_upload(
             BytesIO(b"Earthquake response plan\n\nEvacuation procedures."),
             file_name="preplan.txt",
             source_id="source",
@@ -293,6 +295,93 @@ async def test_force_rebuild_exhaustion_keeps_published_version_healthy(
         await _delete_actor_data(session_factory)
 
 
+async def test_force_rebuild_embeds_and_upserts_in_bounded_batches(
+    session_factory,
+) -> None:
+    try:
+        version_id, chunk_ids = await _seed_chunked_published_version(
+            session_factory,
+            chunk_count=25,
+        )
+        index = _BatchingIndex(
+            points={
+                uuid5(NAMESPACE_URL, str(chunk_id)): version_id
+                for chunk_id in chunk_ids
+            }
+        )
+        embeddings = _BatchingEmbeddings()
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "bounded rebuild"},
+        )
+        worker = KnowledgeWorker(
+            index=index,
+            embeddings=embeddings,
+            batch_size=10,
+        )
+
+        assert await _process_one(session_factory, worker) is True
+
+        assert embeddings.sizes == [10, 10, 5]
+        assert index.upsert_sizes == [10, 10, 5]
+        assert index.commit_count == 1
+        assert len(index.retrieve(version_id)) == 25
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_late_batch_upsert_failure_preserves_old_points(
+    session_factory,
+) -> None:
+    try:
+        version_id, chunk_ids = await _seed_chunked_published_version(
+            session_factory,
+            chunk_count=25,
+        )
+        old_points = {
+            uuid5(NAMESPACE_URL, str(chunk_id)): version_id
+            for chunk_id in chunk_ids
+        }
+        index = _BatchingIndex(
+            points=old_points,
+            fail_upsert_call=2,
+        )
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "late batch failure"},
+            max_attempts=2,
+        )
+        worker = KnowledgeWorker(
+            index=index,
+            embeddings=_BatchingEmbeddings(),
+            batch_size=10,
+        )
+
+        assert await _process_one(session_factory, worker) is True
+
+        async with session_factory() as session:
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            index_version = await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == version_id
+                )
+            )
+            assert version is not None
+            assert index_version is not None
+            assert version.status == KnowledgeVersionStatus.PUBLISHED.value
+            assert index_version.status == KnowledgeVersionStatus.PUBLISHED.value
+        assert index.upsert_sizes == [10, 10]
+        assert index.commit_count == 0
+        assert index.abort_count == 1
+        assert index.points == old_points
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 @pytest.mark.parametrize("job_type", ["ingest", "index"])
 async def test_worker_dead_letters_after_attempt_budget(
     session_factory,
@@ -357,6 +446,42 @@ async def test_worker_requeues_failed_job_with_backoff(
             assert job.attempt_count == 1
             assert job.lease_expires_at is None
             assert job.last_error is not None
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_disabled_version_worker_job_does_not_change_status(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    try:
+        version_id = await _seed_version_and_job(
+            session_factory,
+            status=KnowledgeVersionStatus.DISABLED.value,
+            job_type="ingest",
+            attempt_count=0,
+            max_attempts=1,
+        )
+        worker = KnowledgeWorker(
+            store=KnowledgeFileStore(tmp_path, max_upload_bytes=1024),
+            index=_FakeIndex(),
+            embeddings=_FakeEmbeddings(),
+        )
+
+        assert await _process_one(session_factory, worker) is True
+
+        async with session_factory() as session:
+            job = await session.scalar(
+                select(KnowledgeJob).where(
+                    KnowledgeJob.version_id == version_id
+                )
+            )
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            assert job is not None
+            assert job.status == KnowledgeJobStatus.DEAD_LETTER.value
+            assert version is not None
+            assert version.status == KnowledgeVersionStatus.DISABLED.value
+            assert version.failure_reason is None
     finally:
         await _delete_actor_data(session_factory)
 
@@ -453,6 +578,100 @@ async def test_lifecycle_jobs_execute_even_after_prior_success(
         await _delete_actor_data(session_factory)
 
 
+async def test_online_refresh_scan_enqueues_one_due_version_per_interval(
+    session_factory,
+) -> None:
+    source_key = f"worker.refresh.{uuid4()}"
+    now = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+    source_id = await _seed_refresh_source(
+        session_factory,
+        source_key=source_key,
+        fetched_at=now - timedelta(days=2),
+    )
+    worker = KnowledgeWorker(
+        index=_FakeIndex(),
+        embeddings=_FakeEmbeddings(),
+        now=lambda: now,
+        refresh_interval_seconds=86_400,
+        online_search_enabled=True,
+    )
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                first = await worker.enqueue_due_refreshes(session)
+                second = await worker.enqueue_due_refreshes(session)
+
+        assert first == 1
+        assert second == 0
+        async with session_factory() as session:
+            versions = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeSourceVersion)
+                        .where(KnowledgeSourceVersion.source_id == source_id)
+                        .order_by(KnowledgeSourceVersion.created_at)
+                    )
+                ).all()
+            )
+            refresh_jobs = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeJob).where(
+                            KnowledgeJob.version_id.in_(
+                                version.id for version in versions
+                            ),
+                            KnowledgeJob.job_type == "fetch",
+                            KnowledgeJob.request_payload["refresh"].as_boolean(),
+                        )
+                    )
+                ).all()
+            )
+        assert len(versions) == 2
+        assert versions[1].version.startswith("auto-refresh-")
+        assert versions[1].status == KnowledgeVersionStatus.REGISTERED.value
+        assert len(refresh_jobs) == 1
+    finally:
+        await _delete_refresh_source(session_factory, source_id)
+
+
+async def test_online_refresh_scan_is_disabled_when_online_search_is_off(
+    session_factory,
+) -> None:
+    source_key = f"worker.refresh-offline.{uuid4()}"
+    now = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+    source_id = await _seed_refresh_source(
+        session_factory,
+        source_key=source_key,
+        fetched_at=now - timedelta(days=2),
+    )
+    worker = KnowledgeWorker(
+        index=_FakeIndex(),
+        embeddings=_FakeEmbeddings(),
+        now=lambda: now,
+        refresh_interval_seconds=86_400,
+        online_search_enabled=False,
+    )
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                count = await worker.enqueue_due_refreshes(session)
+
+        assert count == 0
+        async with session_factory() as session:
+            versions = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeSourceVersion).where(
+                            KnowledgeSourceVersion.source_id == source_id
+                        )
+                    )
+                ).all()
+            )
+        assert len(versions) == 1
+    finally:
+        await _delete_refresh_source(session_factory, source_id)
+
+
 async def _process_one(session_factory, worker: KnowledgeWorker) -> bool:
     async with session_factory() as session:
         async with session.begin():
@@ -471,9 +690,36 @@ class _FakeIndex:
         self.upserted_point_ids: list[UUID] = []
         self.points = dict(points or {})
         self.fail_upsert = fail_upsert
+        self._staging_points: dict[UUID, UUID] = {}
+        self._build: SimpleNamespace | None = None
 
     async def ensure_collection(self, index_version: KnowledgeIndexVersion) -> None:
         del index_version
+
+    async def prepare_rebuild(
+        self,
+        index_version: KnowledgeIndexVersion,
+    ) -> SimpleNamespace:
+        self._build = SimpleNamespace(
+            logical_name=index_version.collection_name,
+            alias_name=f"{index_version.collection_name}-active",
+            staging_name=f"{index_version.collection_name}-staging",
+            previous_name=index_version.collection_name,
+            previous_alias_exists=False,
+        )
+        self._staging_points = {}
+        return self._build
+
+    async def commit_rebuild(self, build: SimpleNamespace) -> None:
+        del build
+        self.points = dict(self._staging_points)
+        self._staging_points = {}
+        self._build = None
+
+    async def abort_rebuild(self, build: SimpleNamespace) -> None:
+        del build
+        self._staging_points = {}
+        self._build = None
 
     async def delete_version(
         self,
@@ -493,6 +739,8 @@ class _FakeIndex:
         index_version: KnowledgeIndexVersion,
         chunks: list[IndexedChunk],
         embeddings: EmbeddingBatch,
+        *,
+        collection_name: str | None = None,
     ) -> None:
         del index_version, embeddings
         self.upsert_count += 1
@@ -501,12 +749,18 @@ class _FakeIndex:
         ]
         if self.fail_upsert:
             raise RuntimeError("qdrant upsert failed")
+        target = self.points
+        if (
+            self._build is not None
+            and collection_name == self._build.staging_name
+        ):
+            target = self._staging_points
         for point_id, chunk in zip(
             self.upserted_point_ids,
             chunks,
             strict=True,
         ):
-            self.points[point_id] = chunk.version_id
+            target[point_id] = chunk.version_id
 
     def retrieve(self, version_id: UUID) -> set[UUID]:
         return {
@@ -526,6 +780,91 @@ class _FakeEmbeddings:
             dense=[[0.1] * DENSE_DIMENSIONS for _ in texts],
             sparse=[{} for _ in texts],
         )
+
+
+class _BatchingEmbeddings:
+    def __init__(self) -> None:
+        self.sizes: list[int] = []
+
+    async def embed(self, texts: list[str]) -> EmbeddingBatch:
+        self.sizes.append(len(texts))
+        return EmbeddingBatch(
+            dense=[[0.1] * DENSE_DIMENSIONS for _ in texts],
+            sparse=[{} for _ in texts],
+        )
+
+
+class _BatchingIndex:
+    def __init__(
+        self,
+        *,
+        points: dict[UUID, UUID] | None = None,
+        fail_upsert_call: int | None = None,
+    ) -> None:
+        self.points = dict(points or {})
+        self.fail_upsert_call = fail_upsert_call
+        self.upsert_sizes: list[int] = []
+        self.commit_count = 0
+        self.abort_count = 0
+        self._staging: dict[UUID, UUID] = {}
+        self._build: SimpleNamespace | None = None
+
+    async def ensure_collection(
+        self,
+        index_version: KnowledgeIndexVersion,
+    ) -> None:
+        del index_version
+
+    async def prepare_rebuild(
+        self,
+        index_version: KnowledgeIndexVersion,
+    ) -> SimpleNamespace:
+        self._build = SimpleNamespace(
+            logical_name=index_version.collection_name,
+            alias_name=f"{index_version.collection_name}-active",
+            staging_name=f"{index_version.collection_name}-staging",
+            previous_name=index_version.collection_name,
+            previous_alias_exists=False,
+        )
+        self._staging = {}
+        return self._build
+
+    async def upsert_chunks(
+        self,
+        index_version: KnowledgeIndexVersion,
+        chunks: list[IndexedChunk],
+        embeddings: EmbeddingBatch,
+        *,
+        collection_name: str | None = None,
+    ) -> None:
+        del index_version, embeddings
+        self.upsert_sizes.append(len(chunks))
+        if (
+            self.fail_upsert_call is not None
+            and len(self.upsert_sizes) == self.fail_upsert_call
+        ):
+            raise RuntimeError("qdrant late batch upsert failed")
+        target = self._staging if self._build is not None else self.points
+        del collection_name
+        for chunk in chunks:
+            target[uuid5(NAMESPACE_URL, str(chunk.chunk_id))] = chunk.version_id
+
+    async def commit_rebuild(self, build: SimpleNamespace) -> None:
+        del build
+        self.commit_count += 1
+        self.points = dict(self._staging)
+
+    async def abort_rebuild(self, build: SimpleNamespace) -> None:
+        del build
+        self.abort_count += 1
+        self._staging = {}
+
+    def retrieve(self, version_id: UUID) -> set[UUID]:
+        return {
+            point_id
+            for point_id, stored_version_id in self.points.items()
+            if stored_version_id == version_id
+        }
 
 
 class _FailingEmbeddings:
@@ -686,6 +1025,75 @@ async def _seed_published_indexed_version(
             return version.id, chunk_ids
 
 
+async def _seed_chunked_published_version(
+    session_factory,
+    *,
+    chunk_count: int,
+) -> tuple[UUID, list[UUID]]:
+    async with session_factory() as session:
+        async with session.begin():
+            source = KnowledgeSource(
+                source_key=f"worker.batch.{uuid4()}",
+                title="Worker Batch Source",
+                layer="local_authority",
+                source_type="preplan",
+                access_level="internal",
+                created_by=WORKER_ACTOR,
+            )
+            session.add(source)
+            await session.flush()
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version="v1",
+                status=KnowledgeVersionStatus.PUBLISHED.value,
+                created_by=WORKER_ACTOR,
+            )
+            session.add(version)
+            await session.flush()
+            chunk_ids = [uuid4() for _ in range(chunk_count)]
+            index_version = KnowledgeIndexVersion(
+                source_version_id=version.id,
+                version="v1",
+                status=KnowledgeVersionStatus.PUBLISHED.value,
+                collection_name=(
+                    f"{settings.qdrant_collection_prefix}-{source.source_key}"
+                ),
+                embedding_model=settings.embedding_model_name,
+                reranker_model=settings.reranker_model_name,
+                chunk_count=chunk_count,
+            )
+            session.add(index_version)
+            await session.flush()
+            session.add_all(
+                [
+                    KnowledgeChunk(
+                        id=chunk_id,
+                        version_id=version.id,
+                        chunk_no=chunk_no,
+                        section_path=["批量"],
+                        checksum=str(chunk_no).zfill(64),
+                        search_text=f"batch chunk {chunk_no}",
+                        text=f"batch chunk {chunk_no}",
+                    )
+                    for chunk_no, chunk_id in enumerate(
+                        chunk_ids,
+                        start=1,
+                    )
+                ]
+            )
+            session.add(
+                KnowledgeJob(
+                    version_id=version.id,
+                    job_type="index",
+                    status=KnowledgeJobStatus.SUCCEEDED.value,
+                    max_attempts=settings.knowledge_job_max_attempts,
+                    request_payload={},
+                )
+            )
+            await session.flush()
+            return version.id, chunk_ids
+
+
 async def _seed_publishable_versions(session_factory):
     async with session_factory() as session:
         async with session.begin():
@@ -766,6 +1174,66 @@ async def _seed_job(
             )
             session.add(job)
             await session.flush()
+
+
+async def _seed_refresh_source(
+    session_factory,
+    *,
+    source_key: str,
+    fetched_at: datetime,
+) -> UUID:
+    async with session_factory() as session:
+        async with session.begin():
+            source = KnowledgeSource(
+                source_key=source_key,
+                title="Refresh Source",
+                layer="public_reference",
+                source_type="web",
+                access_level="public",
+                origin="https://example.invalid/refresh",
+                allow_online_refresh=True,
+                created_by=WORKER_ACTOR,
+            )
+            session.add(source)
+            await session.flush()
+            version = KnowledgeSourceVersion(
+                source_id=source.id,
+                version="manual-v1",
+                status=KnowledgeVersionStatus.PUBLISHED.value,
+                source_uri="https://example.invalid/refresh",
+                created_by=WORKER_ACTOR,
+            )
+            session.add(version)
+            await session.flush()
+            session.add(
+                KnowledgeWebSnapshot(
+                    version_id=version.id,
+                    requested_url="https://example.invalid/refresh",
+                    final_url="https://example.invalid/refresh",
+                    http_status=200,
+                    fetched_at=fetched_at,
+                )
+            )
+            await session.flush()
+            return source.id
+
+
+async def _delete_refresh_source(
+    session_factory: async_sessionmaker[AsyncSession],
+    source_id: UUID,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(KnowledgeSourceVersion).where(
+                    KnowledgeSourceVersion.source_id == source_id
+                )
+            )
+            await session.execute(
+                delete(KnowledgeSource).where(
+                    KnowledgeSource.id == source_id
+                )
+            )
 
 
 async def _delete_actor_data(

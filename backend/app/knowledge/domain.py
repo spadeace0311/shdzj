@@ -31,6 +31,10 @@ class KnowledgeJobStatus(StrEnum):
     DEAD_LETTER = "dead_letter"
 
 
+class KnowledgeVersionDisabledError(ValueError):
+    """Raised when a disabled knowledge version is used for live operations."""
+
+
 @dataclass(frozen=True, slots=True)
 class ChunkDraft:
     text: str

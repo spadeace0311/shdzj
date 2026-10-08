@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.models import ProductionRun
@@ -35,6 +35,18 @@ class KnowledgeSnapshotService:
         created_by: str | None = None,
     ) -> KnowledgeSnapshot:
         del created_by
+        await session.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtext(:scope_key))"
+            ),
+            {
+                "scope_key": (
+                    "knowledge-snapshot:global"
+                    if event_id is None
+                    else f"knowledge-snapshot:event:{event_id}"
+                )
+            },
+        )
         revision_id: UUID | None = None
         assessment_run_id: UUID | None = None
         artifact_production_run_id: UUID | None = None
@@ -257,6 +269,15 @@ def _knowledge_index_versions(
                 str(event_id) if event_id is not None else None
             ),
             "chunk_count": int(index_version.chunk_count),
+            "collection_name": index_version.collection_name,
+            "embedding_model": index_version.embedding_model,
+            "reranker_model": index_version.reranker_model,
+            "status": index_version.status,
+            "published_at": (
+                index_version.activated_at.isoformat()
+                if index_version.activated_at is not None
+                else None
+            ),
         }
         for index_version, _source_version, source in index_versions
         for event_id in [

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 from geoalchemy2.shape import WKTElement
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.artifacts.models import ProductionRun
@@ -29,8 +30,11 @@ from app.knowledge.models import (
     KnowledgeSource,
     KnowledgeSourceVersion,
 )
+from app.knowledge.service import KnowledgeService
 from app.knowledge.snapshot import KnowledgeSnapshotService
 from app.loss.region import load_region_loss_profile
+from app.qa.dependencies import LockedKnowledgeRetrieverFactory
+from app.qa.service import StoredQaSession
 
 
 SNAPSHOT_ACTOR = "knowledge-snapshot-test"
@@ -145,6 +149,44 @@ async def test_event_snapshot_locks_context_and_is_idempotent(
         await _delete_actor_data(session_factory)
 
 
+async def test_concurrent_global_snapshot_creation_is_lock_safe(
+    session_factory,
+    monkeypatch,
+) -> None:
+    try:
+        await _seed_index(session_factory)
+        from app.knowledge import snapshot as snapshot_module
+
+        release = asyncio.Event()
+        original = snapshot_module._active_index_versions
+
+        async def delayed_active_index_versions(*args, **kwargs):
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            snapshot_module,
+            "_active_index_versions",
+            delayed_active_index_versions,
+        )
+        tasks = [
+            asyncio.create_task(_create_snapshot(session_factory))
+            for _ in range(4)
+        ]
+        await asyncio.sleep(0.05)
+        release.set()
+        snapshots = await asyncio.gather(*tasks)
+
+        assert len({snapshot.id for snapshot in snapshots}) == 1
+        async with session_factory() as session:
+            count = await session.scalar(
+                select(func.count()).select_from(KnowledgeSnapshot)
+            )
+        assert count == 1
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_event_snapshot_locks_event_and_global_knowledge_versions(
     session_factory,
 ) -> None:
@@ -184,7 +226,11 @@ async def test_event_snapshot_locks_event_and_global_knowledge_versions(
         ]
         assert str(other_event_index) not in locked
         assert str(global_restricted) not in locked
-        assert snapshot.manifest["knowledge_index_versions"] == [
+        index_versions = snapshot.manifest["knowledge_index_versions"]
+        assert [
+            {key: value for key, value in item.items() if key != "published_at"}
+            for item in index_versions
+        ] == [
             {
                 "index_version_id": str(event_a_index),
                 "source_version_id": await _source_version_id(
@@ -195,6 +241,12 @@ async def test_event_snapshot_locks_event_and_global_knowledge_versions(
                 "version": "v1",
                 "event_id": str(event_a),
                 "chunk_count": 1,
+                "collection_name": (
+                    f"{settings.qdrant_collection_prefix}-00-event-a"
+                ),
+                "embedding_model": settings.embedding_model_name,
+                "reranker_model": settings.reranker_model_name,
+                "status": "published",
             },
             {
                 "index_version_id": str(global_a),
@@ -206,8 +258,15 @@ async def test_event_snapshot_locks_event_and_global_knowledge_versions(
                 "version": "v1",
                 "event_id": None,
                 "chunk_count": 1,
+                "collection_name": (
+                    f"{settings.qdrant_collection_prefix}-01-global-a"
+                ),
+                "embedding_model": settings.embedding_model_name,
+                "reranker_model": settings.reranker_model_name,
+                "status": "published",
             },
         ]
+        assert all(item["published_at"] for item in index_versions)
         assert snapshot.index_version_id == event_a_index
     finally:
         await _delete_actor_data(session_factory)
@@ -253,6 +312,58 @@ async def test_global_snapshot_ignores_newer_event_specific_index(
 
         assert event_index_id != global_index_id
         assert snapshot.index_version_id == global_index_id
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_disabled_version_leaves_old_snapshot_but_is_not_in_new_one(
+    session_factory,
+) -> None:
+    try:
+        index_version_id = await _seed_index(session_factory)
+        locked = await _create_snapshot(session_factory)
+        source_version_id = UUID(
+            await _source_version_id(session_factory, index_version_id)
+        )
+
+        async with session_factory() as session:
+            async with session.begin():
+                await KnowledgeService().disable_version(
+                    session,
+                    SNAPSHOT_ACTOR,
+                    source_version_id,
+                    "incident review",
+                )
+
+        stored = await _get_snapshot(session_factory, locked.id)
+        assert stored.id == locked.id
+        assert stored.index_version_id == index_version_id
+        stored_session = StoredQaSession(
+            id=uuid4(),
+            snapshot_id=locked.id,
+            index_version_id=locked.index_version_id,
+            index_version_ids=(locked.index_version_id,),
+            event_id=None,
+            revision_id=None,
+            assessment_run_id=None,
+            artifact_production_run_id=None,
+            created_by=SNAPSHOT_ACTOR,
+            title="locked",
+            manifest=dict(stored.manifest or {}),
+        )
+        retriever = await LockedKnowledgeRetrieverFactory(
+            embedding=object(),
+            qdrant=object(),
+            postgres=object(),
+            reranker=object(),
+            session_factory=session_factory,
+        )(stored_session)
+        assert all(
+            index_version.status == "published"
+            for index_version in retriever._index_versions
+        )
+        with pytest.raises(LookupError, match="index"):
+            await _create_snapshot(session_factory)
     finally:
         await _delete_actor_data(session_factory)
 

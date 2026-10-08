@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.assessment.models import AssessmentRun
 from app.auth.service import AuthUser
@@ -25,7 +25,7 @@ from app.events.models import (
 from app.qa.tools.event import GetEventContextTool, GetEventRevisionTool
 from app.qa.tools.fault import FaultNearestTool
 from app.qa.tools.region import RegionLookupTool
-from app.qa.tools.registry import ToolContext
+from app.qa.tools.registry import ToolContext, resolve_locked_asset_version
 from app.qa.tools.seismicity import SeismicityDistanceTool, SeismicityWithinRadiusTool
 
 
@@ -438,3 +438,187 @@ async def test_fault_history_distance_and_region_tools_use_postgis(
         "county",
         "city",
     ]
+
+
+async def test_history_radius_exactly_100_rows_is_not_truncated(
+    session_factory,
+    spatial_context,
+) -> None:
+    context, _ = spatial_context
+    async with session_factory() as session:
+        async with session.begin():
+            version = await resolve_locked_asset_version(
+                ToolContext(
+                    session=session,
+                    user=context.user,
+                    event_id=context.event_id,
+                    revision_id=context.revision_id,
+                    assessment_run_id=context.assessment_run_id,
+                    snapshot_id=context.snapshot_id,
+                    index_version_id=context.index_version_id,
+                ),
+                "shanghai.historical.earthquakes",
+            )
+            assert version is not None
+            await _replace_historical_version_with_bulk(
+                session,
+                context=context,
+                count=100,
+            )
+            tool_context = ToolContext(
+                session=session,
+                user=context.user,
+                event_id=context.event_id,
+                revision_id=context.revision_id,
+                assessment_run_id=context.assessment_run_id,
+                snapshot_id=context.snapshot_id,
+                index_version_id=context.index_version_id,
+            )
+            result = await SeismicityWithinRadiusTool().handle(
+                {"radius_km": "50"},
+                tool_context,
+            )
+
+    assert result.status == "ok"
+    assert result.value["count"] == 100
+    assert result.value["truncated"] is False
+    assert result.limitations == ()
+
+
+async def test_history_radius_101_rows_marks_first_100_truncated(
+    session_factory,
+    spatial_context,
+) -> None:
+    context, _ = spatial_context
+    async with session_factory() as session:
+        async with session.begin():
+            version = await resolve_locked_asset_version(
+                ToolContext(
+                    session=session,
+                    user=context.user,
+                    event_id=context.event_id,
+                    revision_id=context.revision_id,
+                    assessment_run_id=context.assessment_run_id,
+                    snapshot_id=context.snapshot_id,
+                    index_version_id=context.index_version_id,
+                ),
+                "shanghai.historical.earthquakes",
+            )
+            assert version is not None
+            await _replace_historical_version_with_bulk(
+                session,
+                context=context,
+                count=101,
+            )
+            tool_context = ToolContext(
+                session=session,
+                user=context.user,
+                event_id=context.event_id,
+                revision_id=context.revision_id,
+                assessment_run_id=context.assessment_run_id,
+                snapshot_id=context.snapshot_id,
+                index_version_id=context.index_version_id,
+            )
+            result = await SeismicityWithinRadiusTool().handle(
+                {"radius_km": "50"},
+                tool_context,
+            )
+
+    assert result.status == "ok"
+    assert result.value["count"] == 100
+    assert len(result.value["events"]) == 100
+    assert result.value["truncated"] is True
+    assert result.limitations == ("truncated_to_100",)
+
+
+async def _replace_historical_version_with_bulk(
+    session,
+    *,
+    context: ToolContext,
+    count: int,
+) -> None:
+    snapshot = await session.scalar(
+        select(DataAssetSnapshot).where(
+            DataAssetSnapshot.run_id == context.assessment_run_id,
+            DataAssetSnapshot.asset_key == "shanghai.historical.earthquakes",
+        )
+    )
+    assert snapshot is not None
+    current = await session.get(DataAssetVersion, snapshot.asset_version_id)
+    assert current is not None
+    now = datetime.now(UTC)
+    current.status = "retired"
+    current.retired_at = now
+    await session.flush()
+    replacement = DataAssetVersion(
+        asset_id=current.asset_id,
+        version=f"qa-historical-bulk-{uuid4()}",
+        status="imported",
+        source_uri="test://qa-historical-bulk",
+        schema_summary={},
+        record_count=count,
+        source_crs="EPSG:4326",
+        checksum=uuid4().hex + uuid4().hex,
+        quality_grade="A",
+        imported_by=FIXTURE_ACTOR,
+        imported_at=now,
+    )
+    session.add(replacement)
+    await session.flush()
+    for index in range(count):
+        session.add(
+            DataAssetRecord(
+                version_id=replacement.id,
+                row_number=index + 1,
+                business_key=f"bulk-{index}",
+                properties={
+                    "event_id": f"bulk-{index}",
+                    "origin_time": f"19{80 + index % 20}-01-01T00:00:00+00:00",
+                    "longitude": 121.5 + index * 0.00001,
+                    "latitude": 31.25,
+                    "magnitude": 3.0 + index / 1000.0,
+                    "depth_km": 10.0,
+                    "place": "bulk historical fixture",
+                    "source": "fixture",
+                    "disaster_flag": False,
+                },
+                geom=WKTElement(
+                    f"POINT ({121.5 + index * 0.00001} 31.25)",
+                    srid=4326,
+                ),
+            )
+        )
+    await session.flush()
+    replacement.status = "validated"
+    await session.flush()
+    replacement.status = "published"
+    replacement.published_at = now
+    await session.flush()
+    snapshot = await session.scalar(
+        select(DataAssetSnapshot).where(
+            DataAssetSnapshot.run_id == context.assessment_run_id,
+            DataAssetSnapshot.asset_key == "shanghai.historical.earthquakes",
+        )
+    )
+    assert snapshot is not None
+    run_id = snapshot.run_id
+    asset_id = current.asset_id
+    region_id = snapshot.region_id
+    role = snapshot.role
+    required = snapshot.required
+    await session.delete(snapshot)
+    await session.flush()
+    session.add(
+        DataAssetSnapshot(
+            run_id=run_id,
+            asset_id=asset_id,
+            asset_version_id=replacement.id,
+            region_id=region_id,
+            asset_key="shanghai.historical.earthquakes",
+            version=replacement.version,
+            checksum=replacement.checksum or "",
+            role=role,
+            required=required,
+        )
+    )
+    await session.flush()

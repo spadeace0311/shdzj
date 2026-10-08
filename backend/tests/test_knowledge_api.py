@@ -6,6 +6,7 @@ from sqlalchemy import delete, select
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
+from app.knowledge.domain import KnowledgeVersionStatus
 from app.knowledge.models import (
     KnowledgeIndexVersion,
     KnowledgeJob,
@@ -247,6 +248,43 @@ async def test_rebuild_version_route_reuses_pending_forced_job(
             )
         assert len(jobs) == 1
         assert jobs[0].request_payload["force"] is True
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_disable_publish_enable_lifecycle(
+    knowledge_client,
+    session_factory,
+) -> None:
+    try:
+        _previous_id, version_id = await _seed_indexed_versions(session_factory)
+
+        disabled = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/disable",
+            json={"reason": "incident review"},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["status"] == KnowledgeVersionStatus.DISABLED.value
+
+        publish_disabled = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/publish",
+            json={"reason": "must be rejected"},
+        )
+        assert publish_disabled.status_code == 409
+
+        enabled = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/enable",
+            json={"reason": "review completed"},
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["status"] == KnowledgeVersionStatus.INDEXED.value
+
+        published = await knowledge_client.post(
+            f"/api/v1/knowledge/versions/{version_id}/publish",
+            json={"reason": "release again"},
+        )
+        assert published.status_code == 200
+        assert published.json()["status"] == KnowledgeVersionStatus.PUBLISHED.value
     finally:
         await _delete_actor_data(session_factory)
 

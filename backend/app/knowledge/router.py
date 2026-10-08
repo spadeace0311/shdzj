@@ -172,6 +172,52 @@ async def rebuild_knowledge_version(
 
 
 @router.post(
+    "/versions/{version_id}/disable",
+    response_model=KnowledgeVersionResponse,
+)
+async def disable_knowledge_version(
+    version_id: UUID,
+    request: KnowledgeLifecycleRequest,
+    session: AsyncSession = Depends(get_session),
+    service: KnowledgeService = Depends(get_knowledge_service),
+    current_user: AuthUser = Depends(require_role(*_PUBLISH_ROLES)),
+) -> KnowledgeVersionResponse:
+    try:
+        async with session.begin():
+            return await service.disable_version(
+                session,
+                current_user.username,
+                version_id,
+                request.reason,
+            )
+    except (LookupError, ValueError, IntegrityError, SQLAlchemyError) as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/versions/{version_id}/enable",
+    response_model=KnowledgeVersionResponse,
+)
+async def enable_knowledge_version(
+    version_id: UUID,
+    request: KnowledgeLifecycleRequest,
+    session: AsyncSession = Depends(get_session),
+    service: KnowledgeService = Depends(get_knowledge_service),
+    current_user: AuthUser = Depends(require_role(*_PUBLISH_ROLES)),
+) -> KnowledgeVersionResponse:
+    try:
+        async with session.begin():
+            return await service.enable_version(
+                session,
+                current_user.username,
+                version_id,
+                request.reason,
+            )
+    except (LookupError, ValueError, IntegrityError, SQLAlchemyError) as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
     "/versions/{version_id}/publish",
     response_model=KnowledgeVersionResponse,
 )

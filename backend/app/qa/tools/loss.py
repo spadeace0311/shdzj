@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from app.assessment.models import AssessmentRun
@@ -35,6 +35,13 @@ class LossMetricsInput(BaseModel):
     metric_keys: list[str] = Field(default_factory=list, max_length=50)
     value_type: Literal["low", "central", "high"] = "central"
 
+    @field_validator("area_code")
+    @classmethod
+    def validate_area_code(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("area_code must not be empty")
+        return value.strip() if value is not None else None
+
 
 class LossMetricsTool:
     def __init__(
@@ -50,6 +57,14 @@ class LossMetricsTool:
         arguments: dict[str, Any],
         context: ToolContext,
     ) -> ToolResult:
+        if (
+            arguments.get("area_code") is not None
+            and not str(arguments["area_code"]).strip()
+        ):
+            return ToolResult.invalid(
+                limitations=("area_code_required",),
+                parameters={"area_code": arguments["area_code"]},
+            )
         requested_event_id = arguments.get("event_id")
         if (
             requested_event_id is not None

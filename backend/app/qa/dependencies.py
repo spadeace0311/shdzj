@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import httpx
 from qdrant_client import AsyncQdrantClient
@@ -54,19 +55,67 @@ class LockedKnowledgeRetrieverFactory:
                 ).all()
             )
         by_id = {row.id: row for row in rows}
+        snapshot_details = {
+            UUID(str(item["index_version_id"])): item
+            for item in (stored.manifest or {}).get(
+                "knowledge_index_versions",
+                [],
+            )
+            if isinstance(item, dict) and item.get("index_version_id")
+        }
+        locked_versions = []
         missing = [
             index_version_id
             for index_version_id in index_version_ids
             if index_version_id not in by_id
+            and snapshot_details.get(index_version_id) is None
         ]
         if missing:
             raise LookupError("knowledge snapshot index versions are unavailable")
+        for index_version_id in index_version_ids:
+            row = by_id.get(index_version_id)
+            detail = snapshot_details.get(index_version_id) or {}
+            if row is None:
+                if detail.get("status") != "published":
+                    raise LookupError(
+                        "knowledge snapshot index versions are unavailable"
+                    )
+                row = KnowledgeIndexVersion(
+                    id=index_version_id,
+                    source_version_id=UUID(
+                        str(detail["source_version_id"])
+                    ),
+                    version=str(detail.get("version") or "locked"),
+                    status="published",
+                    collection_name=str(
+                        detail.get("collection_name")
+                        or detail.get("source_key")
+                        or ""
+                    ),
+                    embedding_model=str(
+                        detail.get("embedding_model") or "locked"
+                    ),
+                    reranker_model=str(
+                        detail.get("reranker_model") or "locked"
+                    ),
+                    chunk_count=int(detail.get("chunk_count") or 0),
+                    manifest={
+                        key: value
+                        for key, value in detail.items()
+                        if key not in {"index_version_id", "source_version_id"}
+                    },
+                )
+            elif detail.get("status") == "published":
+                row.status = "published"
+                if detail.get("collection_name"):
+                    row.collection_name = str(detail["collection_name"])
+            locked_versions.append(row)
         return HybridRetriever(
             embedding=self._embedding,
             qdrant=self._qdrant,
             postgres=self._postgres,
             reranker=self._reranker,
-            index_versions=tuple(by_id[item] for item in index_version_ids),
+            index_versions=tuple(locked_versions),
         )
 
 

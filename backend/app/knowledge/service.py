@@ -8,7 +8,11 @@ from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.knowledge.domain import KnowledgeJobStatus, KnowledgeVersionStatus
+from app.knowledge.domain import (
+    KnowledgeJobStatus,
+    KnowledgeVersionDisabledError,
+    KnowledgeVersionStatus,
+)
 from app.knowledge.models import (
     KnowledgeJob,
     KnowledgeSource,
@@ -24,6 +28,7 @@ from app.knowledge.schemas import (
     KnowledgeVersionResponse,
 )
 from app.knowledge.storage import KnowledgeFileStore
+from app.qa.models import QaAdminAuditLog
 
 
 class KnowledgeService:
@@ -91,7 +96,7 @@ class KnowledgeService:
             "application/octet-stream"
         )
         source_stream = upload.file if hasattr(upload, "filename") else upload
-        stored = self._store.store_upload(
+        stored = await self._store.store_upload(
             source_stream,
             file_name=file_name,
             source_id=str(source_id),
@@ -216,6 +221,88 @@ class KnowledgeService:
         )
         return _version_response(version)
 
+    async def disable_version(
+        self,
+        session: AsyncSession,
+        actor: str,
+        version_id: UUID,
+        reason: str,
+    ) -> KnowledgeVersionResponse:
+        version = await self._repository.get_version(
+            session,
+            version_id,
+            for_update=True,
+        )
+        if version is None:
+            raise LookupError("knowledge source version not found")
+        if version.status not in {
+            KnowledgeVersionStatus.INDEXED.value,
+            KnowledgeVersionStatus.PUBLISHED.value,
+        }:
+            raise ValueError(
+                "only indexed or published knowledge versions can be disabled"
+            )
+        index_version = await self._repository.get_index_version(
+            session,
+            version.id,
+            for_update=True,
+        )
+        version.status = KnowledgeVersionStatus.DISABLED.value
+        if index_version is not None:
+            index_version.status = KnowledgeVersionStatus.DISABLED.value
+        session.add(
+            QaAdminAuditLog(
+                resource_type="knowledge_version",
+                resource_id=str(version.id),
+                action="disable",
+                actor=actor,
+                details={"reason": reason, "version": version.version},
+            )
+        )
+        await session.flush()
+        return _version_response(version)
+
+    async def enable_version(
+        self,
+        session: AsyncSession,
+        actor: str,
+        version_id: UUID,
+        reason: str,
+    ) -> KnowledgeVersionResponse:
+        version = await self._repository.get_version(
+            session,
+            version_id,
+            for_update=True,
+        )
+        if version is None:
+            raise LookupError("knowledge source version not found")
+        if version.status != KnowledgeVersionStatus.DISABLED.value:
+            raise KnowledgeVersionDisabledError(
+                "only disabled knowledge versions can be re-enabled"
+            )
+        index_version = await self._repository.get_index_version(
+            session,
+            version.id,
+            for_update=True,
+        )
+        if index_version is None or index_version.chunk_count <= 0:
+            raise ValueError(
+                "disabled knowledge version must be rebuilt before re-enabling"
+            )
+        version.status = KnowledgeVersionStatus.INDEXED.value
+        index_version.status = KnowledgeVersionStatus.INDEXED.value
+        session.add(
+            QaAdminAuditLog(
+                resource_type="knowledge_version",
+                resource_id=str(version.id),
+                action="enable",
+                actor=actor,
+                details={"reason": reason, "version": version.version},
+            )
+        )
+        await session.flush()
+        return _version_response(version)
+
     async def retry_job(
         self,
         session: AsyncSession,
@@ -261,9 +348,10 @@ class KnowledgeService:
         if version.status not in {
             KnowledgeVersionStatus.INDEXED.value,
             KnowledgeVersionStatus.PUBLISHED.value,
+            KnowledgeVersionStatus.DISABLED.value,
         }:
             raise ValueError(
-                "only indexed or published knowledge versions can be rebuilt"
+                "only indexed, published or disabled knowledge versions can be rebuilt"
             )
         pending_jobs = await self._repository.list_pending_jobs(
             session,
