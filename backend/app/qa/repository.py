@@ -13,7 +13,10 @@ from app.knowledge.models import (
     KnowledgeSnapshot,
     KnowledgeSourceVersion,
 )
-from app.knowledge.snapshot import KnowledgeSnapshotService
+from app.knowledge.snapshot import (
+    KnowledgeSnapshotService,
+    locked_index_version_ids,
+)
 from app.qa.access import AccessPolicy
 from app.qa.models import (
     QaAdminAuditLog,
@@ -320,6 +323,22 @@ class KnowledgeVersionPurgeService:
             )
             .limit(1)
         )
+        if referenced is None:
+            snapshots = list(
+                (
+                    await session.scalars(select(KnowledgeSnapshot))
+                ).all()
+            )
+            for snapshot in snapshots:
+                if str(version_id) in {
+                    str(index_version_id)
+                    for index_version_id in locked_index_version_ids(
+                        snapshot.manifest,
+                        snapshot.index_version_id,
+                    )
+                }:
+                    referenced = snapshot.id
+                    break
         if referenced is not None:
             raise ValueError(
                 "knowledge version is referenced by a historical snapshot"

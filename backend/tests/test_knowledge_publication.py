@@ -57,6 +57,17 @@ async def test_publish_promotes_indexed_version_and_audits(
                         reranker_model="BAAI/bge-reranker-v2-m3",
                     )
                 )
+                session.add(
+                    KnowledgeIndexVersion(
+                        source_version_id=target.id,
+                        version="v2",
+                        status="indexed",
+                        collection_name="shanghai-knowledge-source",
+                        embedding_model="BAAI/bge-m3",
+                        reranker_model="BAAI/bge-reranker-v2-m3",
+                        chunk_count=1,
+                    )
+                )
                 await session.flush()
 
         async with session_factory() as session:
@@ -111,6 +122,20 @@ async def test_publish_populates_index_manifest_and_global_collection_name(
                     source_uri="https://example.invalid/preplan",
                     metadata={"event_id": str(event_id)},
                 )
+                session.add(
+                    KnowledgeIndexVersion(
+                        source_version_id=target.id,
+                        version="v1",
+                        status="indexed",
+                        collection_name=(
+                            f"{settings.qdrant_collection_prefix}-{source.source_key}"
+                        ),
+                        embedding_model=settings.embedding_model_name,
+                        reranker_model=settings.reranker_model_name,
+                        chunk_count=1,
+                    )
+                )
+                await session.flush()
 
         async with session_factory() as session:
             async with session.begin():
@@ -137,6 +162,89 @@ async def test_publish_populates_index_manifest_and_global_collection_name(
                 "event_id": str(event_id),
                 "published_at": published.published_at.isoformat(),
             }
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_publish_rejects_missing_index_pointer(session_factory) -> None:
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                source = await _create_source(session)
+                target = await _create_version(
+                    session,
+                    source.id,
+                    "v1",
+                    "indexed",
+                )
+
+        with pytest.raises(ValueError, match="index pointer"):
+            async with session.begin():
+                await KnowledgePublicationService().publish(
+                    session,
+                    target.id,
+                    PUBLICATION_ACTOR,
+                    "missing pointer",
+                )
+
+        async with session_factory() as session:
+            stored = await session.get(KnowledgeSourceVersion, target.id)
+            assert stored is not None
+            assert stored.status == "indexed"
+            assert await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == target.id
+                )
+            ) is None
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_publish_rejects_empty_index_pointer(session_factory) -> None:
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                source = await _create_source(session)
+                target = await _create_version(
+                    session,
+                    source.id,
+                    "v1",
+                    "indexed",
+                )
+                session.add(
+                    KnowledgeIndexVersion(
+                        source_version_id=target.id,
+                        version="v1",
+                        status="indexed",
+                        collection_name="shanghai-knowledge-empty",
+                        embedding_model="BAAI/bge-m3",
+                        reranker_model="BAAI/bge-reranker-v2-m3",
+                        chunk_count=0,
+                    )
+                )
+                await session.flush()
+
+        with pytest.raises(ValueError, match="chunk_count|chunks"):
+            async with session.begin():
+                await KnowledgePublicationService().publish(
+                    session,
+                    target.id,
+                    PUBLICATION_ACTOR,
+                    "empty pointer",
+                )
+
+        async with session_factory() as session:
+            stored = await session.get(KnowledgeSourceVersion, target.id)
+            pointer = await session.scalar(
+                select(KnowledgeIndexVersion).where(
+                    KnowledgeIndexVersion.source_version_id == target.id
+                )
+            )
+            assert stored is not None
+            assert stored.status == "indexed"
+            assert pointer is not None
+            assert pointer.status == "indexed"
+            assert pointer.chunk_count == 0
     finally:
         await _delete_actor_data(session_factory)
 

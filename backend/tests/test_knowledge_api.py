@@ -327,6 +327,7 @@ async def _seed_indexed_versions(session_factory):
                         collection_name="shanghai-knowledge-source",
                         embedding_model="BAAI/bge-m3",
                         reranker_model="BAAI/bge-reranker-v2-m3",
+                        chunk_count=1,
                     ),
                     KnowledgeIndexVersion(
                         source_version_id=current.id,
@@ -335,6 +336,7 @@ async def _seed_indexed_versions(session_factory):
                         collection_name="shanghai-knowledge-source",
                         embedding_model="BAAI/bge-m3",
                         reranker_model="BAAI/bge-reranker-v2-m3",
+                        chunk_count=1,
                     ),
                 ]
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from datetime import datetime
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.auth.router import get_current_user, require_role
 from app.auth.service import AuthUser
 from app.db import get_session
@@ -18,6 +20,7 @@ from app.qa.repository import (
     QaRepository,
     _session_response,
 )
+from app.qa.dependencies import QuestionOrchestratorRuntime
 from app.qa.schemas import (
     OperationLogPurgeFilters,
     OperationLogPurgeResponse,
@@ -28,6 +31,7 @@ from app.qa.schemas import (
     QaSessionCreate,
     QaSessionResponse,
 )
+from app.qa.deepseek import DeepSeekAdapter
 from app.qa.service import AnswerEvent, QuestionOrchestrator
 
 router = APIRouter(prefix="/api/v1", tags=["qa"])
@@ -37,8 +41,18 @@ def get_qa_repository() -> QaRepository:
     return QaRepository()
 
 
-def get_question_orchestrator() -> QuestionOrchestrator:
-    return QuestionOrchestrator()
+def get_deepseek_adapter() -> DeepSeekAdapter:
+    return DeepSeekAdapter(settings)
+
+
+async def get_question_orchestrator(
+    deepseek: DeepSeekAdapter = Depends(get_deepseek_adapter),
+) -> AsyncIterator[QuestionOrchestrator]:
+    runtime = QuestionOrchestratorRuntime(deepseek=deepseek)
+    try:
+        yield runtime.orchestrator
+    finally:
+        await runtime.close()
 
 
 def get_qa_admin_purge_service() -> QaAdminPurgeService:

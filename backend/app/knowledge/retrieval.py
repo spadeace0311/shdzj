@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from typing import Any
@@ -133,12 +133,18 @@ class HybridRetriever:
         postgres: PostgresLexicalIndex,
         reranker: RerankerAdapter | None = None,
         index_version: KnowledgeIndexVersion | None = None,
+        index_versions: Sequence[KnowledgeIndexVersion] | None = None,
     ) -> None:
         self._embedding = embedding
         self._qdrant = qdrant
         self._postgres = postgres
         self._reranker = reranker
-        self._index_version = index_version
+        if index_versions is not None:
+            self._index_versions = tuple(index_versions)
+        elif index_version is not None:
+            self._index_versions = (index_version,)
+        else:
+            self._index_versions = ()
 
     async def search(
         self,
@@ -150,17 +156,23 @@ class HybridRetriever:
             raise ValueError("query must not be blank")
         if limit < 1:
             raise ValueError("limit must be positive")
-        if self._index_version is None:
+        if not self._index_versions:
             raise KnowledgeIndexConfigurationError(
                 "an active knowledge index version is required for retrieval"
             )
-        if self._index_version.status != "published":
-            raise KnowledgeIndexNotPublishedError(
-                "only published knowledge index versions can be retrieved"
-            )
+        for stored_index_version in self._index_versions:
+            if stored_index_version.status != "published":
+                raise KnowledgeIndexNotPublishedError(
+                    "only published knowledge index versions can be retrieved"
+                )
         filters = replace(
             filters,
-            source_version_ids=(self._index_version.source_version_id,),
+            source_version_ids=tuple(
+                dict.fromkeys(
+                    stored_index_version.source_version_id
+                    for stored_index_version in self._index_versions
+                )
+            ),
         )
 
         reasons: list[str] = []
@@ -180,36 +192,42 @@ class HybridRetriever:
         async def _skip() -> list[RetrievedEvidence]:
             return []
 
+        dense_tasks: list[Any] = []
+        sparse_tasks: list[Any] = []
         if dense_vector is not None and sparse_vector is not None:
-            dense_task = self._qdrant.search_dense(
-                self._index_version,
-                dense_vector,
-                filters,
-                candidate_limit,
-            )
-            sparse_task = self._qdrant.search_sparse(
-                self._index_version,
-                sparse_vector,
-                filters,
-                candidate_limit,
-            )
-        else:
-            dense_task = _skip()
-            sparse_task = _skip()
+            for stored_index_version in self._index_versions:
+                dense_tasks.append(
+                    self._qdrant.search_dense(
+                        stored_index_version,
+                        dense_vector,
+                        filters,
+                        candidate_limit,
+                    )
+                )
+                sparse_tasks.append(
+                    self._qdrant.search_sparse(
+                        stored_index_version,
+                        sparse_vector,
+                        filters,
+                        candidate_limit,
+                    )
+                )
         lexical_task = self._postgres.search(query, filters, candidate_limit)
 
-        dense_result, sparse_result, lexical_result = await asyncio.gather(
-            dense_task,
-            sparse_task,
+        route_results = await asyncio.gather(
+            *dense_tasks,
+            *sparse_tasks,
             lexical_task,
             return_exceptions=True,
         )
 
         qdrant_available = True
-        if isinstance(dense_result, Exception) or isinstance(
-            sparse_result,
-            Exception,
-        ):
+        vector_result_count = len(dense_tasks) + len(sparse_tasks)
+        vector_results = route_results[:vector_result_count]
+        lexical_result = (
+            route_results[-1] if route_results else _skip()
+        )
+        if any(isinstance(result, Exception) for result in vector_results):
             qdrant_available = False
             dense_result = []
             sparse_result = []
@@ -218,6 +236,13 @@ class HybridRetriever:
             qdrant_available = False
             dense_result = []
             sparse_result = []
+        else:
+            dense_result = _flatten_route_results(
+                vector_results[: len(dense_tasks)]
+            )
+            sparse_result = _flatten_route_results(
+                vector_results[len(dense_tasks) :]
+            )
 
         postgres_available = True
         if isinstance(lexical_result, Exception):
@@ -259,6 +284,14 @@ class HybridRetriever:
             degraded=bool(reasons),
             degradation_reason=tuple(reasons),
         )
+
+
+def _flatten_route_results(results: Sequence[Any]) -> list[RetrievedEvidence]:
+    flattened: list[RetrievedEvidence] = []
+    for result in results:
+        if isinstance(result, list):
+            flattened.extend(result)
+    return flattened
 
 
 def _trigram_pattern(query: str) -> str:

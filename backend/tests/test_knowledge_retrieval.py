@@ -232,6 +232,29 @@ async def test_hybrid_retriever_locks_postgres_to_index_source_version() -> None
     )
 
 
+async def test_hybrid_retriever_locks_all_snapshot_index_source_versions() -> None:
+    postgres = FakePostgresIndex()
+    first = _published_index_version()
+    second = _published_index_version()
+    retriever = HybridRetriever(
+        embedding=FakeEmbeddingAdapter(),
+        qdrant=FakeQdrantIndex(dense=[], sparse=[]),
+        postgres=postgres,
+        reranker=None,
+        index_versions=(first, second),
+    )
+
+    await retriever.search(
+        "联合检索",
+        KnowledgeFilters(access_levels=("public", "internal")),
+    )
+
+    assert postgres.calls[0][1].source_version_ids == (
+        first.source_version_id,
+        second.source_version_id,
+    )
+
+
 async def test_rrf_promotes_chunks_present_in_dense_and_sparse() -> None:
     shared = uuid4()
     dense_only = uuid4()
@@ -457,9 +480,21 @@ async def test_postgres_retrieval_isolated_by_locked_version_and_global_scope(
             ),
             limit=10,
         )
+        combined_result = await index.search(
+            token,
+            KnowledgeFilters(
+                access_levels=("public", "internal"),
+                source_version_ids=(global_v1.id, event_a_v1.id),
+            ),
+            limit=10,
+        )
 
         assert [item.text for item in event_result] == ["event-a-v1"]
         assert [item.text for item in global_result] == ["global-v1"]
+        assert {item.text for item in combined_result} == {
+            "global-v1",
+            "event-a-v1",
+        }
     finally:
         async with session_factory() as session:
             async with session.begin():

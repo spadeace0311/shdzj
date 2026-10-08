@@ -16,6 +16,7 @@ from app.config import settings
 from app.db import SessionFactory
 from app.knowledge.index import RetrievedEvidence
 from app.knowledge.models import (
+    KnowledgeChunk,
     KnowledgeIndexVersion,
     KnowledgeSnapshot,
     KnowledgeSource,
@@ -26,7 +27,7 @@ from app.main import app
 from app.qa.domain import ExecutionPlan, KnowledgeQuery, ToolCallPlan
 from app.qa.models import QaAnswer, QaCitation, QaQuestion, QaSession, QaToolCall
 from app.qa.repository import QaRepository
-from app.qa.router import get_question_orchestrator
+from app.qa.router import get_deepseek_adapter, get_question_orchestrator
 from app.qa.schemas import QaSessionCreate
 from app.qa.service import AnswerEvent, QuestionOrchestrator
 from app.qa.tools.registry import (
@@ -135,6 +136,30 @@ async def qa_client(qa_db):
         _restore_override(app, get_question_orchestrator, previous_orchestrator)
 
 
+@pytest.fixture
+async def default_dependency_qa_client(qa_db):
+    previous_user = app.dependency_overrides.get(get_current_user)
+    previous_deepseek = app.dependency_overrides.get(get_deepseek_adapter)
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        username=QA_API_ACTOR,
+        role="viewer",
+        workgroup=None,
+    )
+    app.dependency_overrides[get_deepseek_adapter] = lambda: FakeDeepSeek(
+        _plan(query="检索已发布预案依据"),
+        chunks=["默认依赖检索到预案依据。 [C1]"],
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            yield client
+    finally:
+        _restore_override(app, get_deepseek_adapter, previous_deepseek)
+        _restore_override(app, get_current_user, previous_user)
+
+
 async def test_question_stream_has_ordered_events(qa_client) -> None:
     session = await qa_client.post(
         "/api/v1/qa/sessions",
@@ -159,6 +184,27 @@ async def test_question_stream_has_ordered_events(qa_client) -> None:
         assert answer.status == "completed"
         assert answer.text is not None
         assert answer.citation_keys == ["C1"]
+
+
+async def test_question_uses_default_retriever_dependencies_without_orchestrator_override(
+    default_dependency_qa_client,
+) -> None:
+    session = await default_dependency_qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "默认检索依赖", "event_id": None},
+    )
+    assert session.status_code == 201
+
+    response = await default_dependency_qa_client.post(
+        f"/api/v1/qa/sessions/{session.json()['id']}/questions",
+        json={"question": "检索已发布预案依据"},
+    )
+
+    assert response.status_code == 200
+    assert '"count":1' in response.text
+    assert "retrieval_unavailable" not in response.text
+    assert '"citation_key":"C1"' in response.text
+    assert "默认依赖检索到预案依据" in response.text
 
 
 async def test_question_requires_authentication() -> None:
@@ -364,7 +410,11 @@ def _viewer() -> AuthUser:
     return AuthUser(username=QA_API_ACTOR, role="viewer", workgroup=None)
 
 
-def _plan(*, with_tool: bool = False) -> ExecutionPlan:
+def _plan(
+    *,
+    with_tool: bool = False,
+    query: str = "断层距离",
+) -> ExecutionPlan:
     return ExecutionPlan(
         intent="knowledge_query",
         tool_calls=(
@@ -372,7 +422,7 @@ def _plan(*, with_tool: bool = False) -> ExecutionPlan:
             if with_tool
             else []
         ),
-        knowledge_queries=[KnowledgeQuery(text="断层距离", top_k=5)],
+        knowledge_queries=[KnowledgeQuery(text=query, top_k=5)],
         map_intents=[],
         clarification=None,
     )
@@ -454,7 +504,7 @@ async def _seed_knowledge_index() -> dict[str, object]:
             version = KnowledgeSourceVersion(
                 source_id=source.id,
                 version="v1",
-                status="indexed",
+                status="published",
                 checksum="a" * 64,
                 created_by=QA_API_ACTOR,
             )
@@ -467,11 +517,22 @@ async def _seed_knowledge_index() -> dict[str, object]:
                 collection_name=f"shanghai-knowledge-{uuid4()}",
                 embedding_model=settings.embedding_model_name,
                 reranker_model=settings.reranker_model_name,
+                chunk_count=1,
                 manifest={},
                 activated_at=now,
             )
             session.add(index_version)
             await session.flush()
+            session.add(
+                KnowledgeChunk(
+                    version_id=version.id,
+                    chunk_no=1,
+                    section_path=["第一章"],
+                    checksum="b" * 64,
+                    search_text="检索已发布预案依据 应急响应",
+                    text="已发布预案依据：应急响应。",
+                )
+            )
             return {
                 "source_id": source.id,
                 "version_id": version.id,

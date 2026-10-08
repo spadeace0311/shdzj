@@ -21,7 +21,10 @@ from app.db import SessionFactory
 from app.knowledge.index import KnowledgeFilters
 from app.knowledge.models import KnowledgeSnapshot
 from app.knowledge.retrieval import RetrievalResult
-from app.knowledge.snapshot import KnowledgeSnapshotService
+from app.knowledge.snapshot import (
+    KnowledgeSnapshotService,
+    locked_index_version_ids,
+)
 from app.qa.access import AccessPolicy
 from app.qa.deepseek import DeepSeekAdapter
 from app.qa.domain import ExecutionPlan
@@ -62,6 +65,7 @@ class StoredQaSession:
     id: UUID
     snapshot_id: UUID
     index_version_id: UUID
+    index_version_ids: tuple[UUID, ...]
     event_id: UUID | None
     revision_id: UUID | None
     assessment_run_id: UUID | None
@@ -266,7 +270,7 @@ class QuestionOrchestrator:
         *,
         deepseek: DeepSeekAdapter | Any | None = None,
         retriever: Any | None = None,
-        retriever_factory: Callable[[UUID], Any] | None = None,
+        retriever_factory: Callable[[StoredQaSession], Any] | None = None,
         registry: ToolRegistry | Any | None = None,
         plan_validator: PlanValidator | None = None,
         store: QaStateStore | None = None,
@@ -567,7 +571,7 @@ class QuestionOrchestrator:
             return RetrievalResult((), False, ())
         retriever = self._retriever
         if self._retriever_factory is not None:
-            retriever = self._retriever_factory(stored.index_version_id)
+            retriever = self._retriever_factory(stored)
             if inspect.isawaitable(retriever):
                 retriever = await retriever
         if retriever is None:
@@ -577,11 +581,16 @@ class QuestionOrchestrator:
                 ("retrieval_unavailable",),
             )
 
-        filters = KnowledgeFilters(
-            access_levels=("public", "internal", "restricted"),
-            event_id=stored.event_id,
-            global_only=stored.event_id is None,
-        )
+        if len(stored.index_version_ids) > 1:
+            filters = KnowledgeFilters(
+                access_levels=("public", "internal", "restricted"),
+            )
+        else:
+            filters = KnowledgeFilters(
+                access_levels=("public", "internal", "restricted"),
+                event_id=stored.event_id,
+                global_only=stored.event_id is None,
+            )
 
         async def search(query: Any) -> RetrievalResult:
             try:
@@ -723,6 +732,10 @@ def _stored_session(
         id=qa_session.id,
         snapshot_id=qa_session.snapshot_id,
         index_version_id=snapshot.index_version_id,
+        index_version_ids=locked_index_version_ids(
+            snapshot.manifest,
+            snapshot.index_version_id,
+        ),
         event_id=snapshot.event_id,
         revision_id=snapshot.revision_id,
         assessment_run_id=snapshot.assessment_run_id,
@@ -754,6 +767,10 @@ def _planning_context(
             "assessment_run_id": _str_or_none(stored.assessment_run_id),
             "artifact_production_run_id": _str_or_none(stored.artifact_production_run_id),
             "index_version_id": str(stored.index_version_id),
+            "index_version_ids": [
+                str(index_version_id)
+                for index_version_id in stored.index_version_ids
+            ],
             "manifest": stored.manifest,
         },
     }
@@ -768,6 +785,10 @@ def _answer_context(stored: StoredQaSession) -> dict[str, Any]:
         "assessment_run_id": _str_or_none(stored.assessment_run_id),
         "artifact_production_run_id": _str_or_none(stored.artifact_production_run_id),
         "index_version_id": str(stored.index_version_id),
+        "index_version_ids": [
+            str(index_version_id)
+            for index_version_id in stored.index_version_ids
+        ],
     }
 
 

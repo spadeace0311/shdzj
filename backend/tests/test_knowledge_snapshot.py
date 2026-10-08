@@ -60,7 +60,16 @@ async def test_global_snapshot_uses_active_index_and_empty_event_context(
         assert stored.assessment_run_id is None
         assert stored.artifact_production_run_id is None
         assert stored.index_version_id == index_version_id
-        assert stored.manifest == {
+        legacy_manifest = {
+            key: value
+            for key, value in stored.manifest.items()
+            if key
+            not in {
+                "index_version_ids",
+                "knowledge_index_versions",
+            }
+        }
+        assert legacy_manifest == {
             "event_revision_id": None,
             "assessment_run_id": None,
             "artifact_production_run_id": None,
@@ -68,6 +77,12 @@ async def test_global_snapshot_uses_active_index_and_empty_event_context(
             "model_versions": {},
             "index_version_id": str(index_version_id),
         }
+        assert stored.manifest["index_version_ids"] == [
+            str(index_version_id)
+        ]
+        assert stored.manifest["knowledge_index_versions"][0][
+            "index_version_id"
+        ] == str(index_version_id)
         assert len(stored.fingerprint) == 64
     finally:
         await _delete_actor_data(session_factory)
@@ -122,8 +137,100 @@ async def test_event_snapshot_locks_context_and_is_idempotent(
             seeded["production_run_id"]
         )
         assert first.manifest["index_version_id"] == str(index_version_id)
+        assert first.manifest["index_version_ids"] == [str(index_version_id)]
+        assert first.manifest["knowledge_index_versions"][0][
+            "index_version_id"
+        ] == str(index_version_id)
     finally:
         await _delete_actor_data(session_factory)
+
+
+async def test_event_snapshot_locks_event_and_global_knowledge_versions(
+    session_factory,
+) -> None:
+    try:
+        seeded = await _seed_event_graph(session_factory)
+        event_a = seeded["event_id"]
+        global_a = await _seed_index(
+            session_factory,
+            source_key="01-global-a",
+        )
+        global_restricted = await _seed_index(
+            session_factory,
+            source_key="03-global-restricted",
+            access_level="restricted",
+        )
+        event_a_index = await _seed_index(
+            session_factory,
+            source_key="00-event-a",
+            event_id=event_a,
+        )
+        other_event_index = await _seed_index(
+            session_factory,
+            source_key="02-event-other",
+            event_id=uuid4(),
+        )
+
+        snapshot = await _create_snapshot(
+            session_factory,
+            event_id=event_a,
+            created_by=SNAPSHOT_ACTOR,
+        )
+
+        locked = snapshot.manifest["index_version_ids"]
+        assert locked == [
+            str(event_a_index),
+            str(global_a),
+        ]
+        assert str(other_event_index) not in locked
+        assert str(global_restricted) not in locked
+        assert snapshot.manifest["knowledge_index_versions"] == [
+            {
+                "index_version_id": str(event_a_index),
+                "source_version_id": await _source_version_id(
+                    session_factory,
+                    event_a_index,
+                ),
+                "source_key": "00-event-a",
+                "version": "v1",
+                "event_id": str(event_a),
+                "chunk_count": 1,
+            },
+            {
+                "index_version_id": str(global_a),
+                "source_version_id": await _source_version_id(
+                    session_factory,
+                    global_a,
+                ),
+                "source_key": "01-global-a",
+                "version": "v1",
+                "event_id": None,
+                "chunk_count": 1,
+            },
+        ]
+        assert snapshot.index_version_id == event_a_index
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_legacy_snapshot_manifest_keeps_single_locked_index(
+    session_factory,
+) -> None:
+    from app.knowledge.snapshot import locked_index_version_ids
+
+    index_version_id = uuid4()
+    manifest = {"index_version_id": str(index_version_id)}
+    detail_manifest = {
+        "knowledge_index_versions": [
+            {"index_version_id": str(index_version_id)}
+        ]
+    }
+
+    assert locked_index_version_ids(manifest, None) == (index_version_id,)
+    assert locked_index_version_ids(detail_manifest, None) == (
+        index_version_id,
+    )
+    assert locked_index_version_ids({}, index_version_id) == (index_version_id,)
 
 
 async def test_global_snapshot_ignores_newer_event_specific_index(
@@ -172,6 +279,7 @@ async def _seed_index(
     source_key: str | None = None,
     event_id: UUID | None = None,
     activated_at: datetime | None = None,
+    access_level: str = "internal",
 ) -> UUID:
     async with session_factory() as session:
         async with session.begin():
@@ -180,7 +288,7 @@ async def _seed_index(
                 title="Snapshot Source",
                 layer="local_authority",
                 source_type="preplan",
-                access_level="internal",
+                access_level=access_level,
                 created_by=SNAPSHOT_ACTOR,
             )
             session.add(source)
@@ -188,7 +296,7 @@ async def _seed_index(
             version = KnowledgeSourceVersion(
                 source_id=source.id,
                 version="v1",
-                status="indexed",
+                status="published",
                 checksum="a" * 64,
                 created_by=SNAPSHOT_ACTOR,
                 version_metadata={"event_id": str(event_id)} if event_id else {},
@@ -217,6 +325,19 @@ async def _seed_index(
             session.add(index_version)
             await session.flush()
             return index_version.id
+
+
+async def _source_version_id(
+    session_factory,
+    index_version_id: UUID,
+) -> str:
+    async with session_factory() as session:
+        index_version = await session.get(
+            KnowledgeIndexVersion,
+            index_version_id,
+        )
+        assert index_version is not None
+        return str(index_version.source_version_id)
 
 
 async def _seed_event_graph(session_factory) -> dict[str, UUID]:

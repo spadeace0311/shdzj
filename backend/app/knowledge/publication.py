@@ -5,9 +5,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.knowledge.models import (
-    KnowledgeIndexVersion,
     KnowledgeSource,
     KnowledgeSourceVersion,
 )
@@ -24,7 +22,11 @@ class KnowledgeVersionNotIndexedError(KnowledgePublicationError):
 
 
 class KnowledgeIndexPointerMissingError(KnowledgePublicationError):
-    """Raised when rollback has no active index pointer to restore."""
+    """Raised when a publication target has no active index pointer."""
+
+
+class KnowledgeEmptyIndexError(KnowledgePublicationError):
+    """Raised when an index pointer does not contain retrievable chunks."""
 
 
 class KnowledgePublicationService:
@@ -71,7 +73,7 @@ class KnowledgePublicationService:
             source,
             target,
             now,
-            create_if_missing=True,
+            require_chunks=True,
         )
         target.status = "published"
         target.published_at = now
@@ -129,7 +131,7 @@ class KnowledgePublicationService:
             source,
             target,
             now,
-            create_if_missing=False,
+            require_chunks=False,
         )
         for published_version in previous:
             published_version.status = "indexed"
@@ -183,7 +185,7 @@ class KnowledgePublicationService:
         target: KnowledgeSourceVersion,
         now: datetime,
         *,
-        create_if_missing: bool,
+        require_chunks: bool,
     ) -> None:
         existing = await self._repository.get_index_version(
             session,
@@ -191,29 +193,16 @@ class KnowledgePublicationService:
             for_update=True,
         )
         if existing is None:
-            if not create_if_missing:
-                raise KnowledgeIndexPointerMissingError(
-                    "rollback target has no active index pointer"
-                )
-            session.add(
-                KnowledgeIndexVersion(
-                    source_version_id=target.id,
-                    version=target.version,
-                    status="published",
-                    collection_name=(
-                        f"{settings.qdrant_collection_prefix}-{source.source_key}"
-                    ),
-                    embedding_model=settings.embedding_model_name,
-                    reranker_model=settings.reranker_model_name,
-                    chunk_count=0,
-                    manifest=_build_index_manifest(source, target, now),
-                    activated_at=now,
-                )
+            raise KnowledgeIndexPointerMissingError(
+                "target has no active index pointer"
             )
-        else:
-            existing.status = "published"
-            existing.activated_at = now
-            existing.manifest = _build_index_manifest(source, target, now)
+        if require_chunks and existing.chunk_count <= 0:
+            raise KnowledgeEmptyIndexError(
+                "target index pointer has no retrievable chunks"
+            )
+        existing.status = "published"
+        existing.activated_at = now
+        existing.manifest = _build_index_manifest(source, target, now)
         await session.flush()
 
     async def _mark_index_version_indexed(

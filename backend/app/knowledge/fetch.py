@@ -326,6 +326,8 @@ def _ensure_global_unicast(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
         raise UnsafeUrlError("reserved address is blocked")
     if ip.is_unspecified:
         raise UnsafeUrlError("unspecified address is blocked")
+    if not ip.is_global:
+        raise UnsafeUrlError("non-global unicast address is blocked")
 
 
 @asynccontextmanager

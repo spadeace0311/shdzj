@@ -16,6 +16,26 @@ from app.knowledge.fetch import (
 )
 
 
+@pytest.mark.parametrize(
+    "address",
+    (
+        "100.100.100.200",
+        "100.64.0.0",
+        "100.64.255.255",
+    ),
+)
+def test_fetch_policy_blocks_non_global_unicast_addresses(address: str) -> None:
+    policy = FetchPolicy.from_yaml(
+        {
+            "allowed_domains": ["cea.gov.cn"],
+            "allowed_content_types": ["text/html"],
+        }
+    )
+
+    with pytest.raises(UnsafeUrlError, match="non-global"):
+        validate_fetch_url(f"http://{address}/report", policy)
+
+
 def test_fetch_policy_blocks_private_and_redirect_targets() -> None:
     policy = FetchPolicy.from_yaml(
         {

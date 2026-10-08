@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from uuid import UUID
 
 from sqlalchemy import select
@@ -12,8 +13,17 @@ from app.config import settings
 from app.data_assets.models import DataAssetSnapshot
 from app.data_assets.locks import lock_data_asset_catalog
 from app.events.models import EarthquakeEvent
-from app.knowledge.models import KnowledgeIndexVersion, KnowledgeSnapshot
+from app.knowledge.models import (
+    KnowledgeIndexVersion,
+    KnowledgeSnapshot,
+    KnowledgeSource,
+    KnowledgeSourceVersion,
+)
 from app.loss.region import load_region_loss_profile
+
+_INDEX_VERSION_IDS_KEY = "index_version_ids"
+_LEGACY_INDEX_VERSION_ID_KEY = "index_version_id"
+_KNOWLEDGE_INDEX_VERSIONS_KEY = "knowledge_index_versions"
 
 
 class KnowledgeSnapshotService:
@@ -56,7 +66,8 @@ class KnowledgeSnapshotService:
             )
             model_versions = _model_versions()
 
-        index_version = await _active_index_version(session, event_id)
+        index_versions = await _active_index_versions(session, event_id)
+        index_version = index_versions[0][0]
         manifest = {
             "event_revision_id": (
                 str(revision_id) if revision_id is not None else None
@@ -74,6 +85,14 @@ class KnowledgeSnapshotService:
             "data_asset_versions": data_asset_versions,
             "model_versions": model_versions,
             "index_version_id": str(index_version.id),
+            "index_version_ids": [
+                str(stored_index.id)
+                for stored_index, _stored_version, _stored_source
+                in index_versions
+            ],
+            "knowledge_index_versions": _knowledge_index_versions(
+                index_versions,
+            ),
         }
         fingerprint = _fingerprint(manifest)
         existing = await session.scalar(
@@ -108,18 +127,76 @@ class KnowledgeSnapshotService:
         return snapshot
 
 
-async def _active_index_version(
+def locked_index_version_ids(
+    manifest: dict[str, object] | None,
+    legacy_index_version_id: UUID | None,
+) -> tuple[UUID, ...]:
+    values: list[object] = []
+    stored_manifest = manifest or {}
+    candidate = stored_manifest.get(_INDEX_VERSION_IDS_KEY)
+    if isinstance(candidate, list):
+        values = list(candidate)
+    else:
+        details = stored_manifest.get(_KNOWLEDGE_INDEX_VERSIONS_KEY)
+        if isinstance(details, list):
+            values = [
+                item.get("index_version_id")
+                for item in details
+                if isinstance(item, Mapping)
+            ]
+    if not values:
+        values = [stored_manifest.get(_LEGACY_INDEX_VERSION_ID_KEY)]
+
+    parsed: list[UUID] = []
+    for value in values:
+        try:
+            parsed_value = value if isinstance(value, UUID) else UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+        if parsed_value not in parsed:
+            parsed.append(parsed_value)
+
+    if not parsed and legacy_index_version_id is not None:
+        parsed.append(legacy_index_version_id)
+    return tuple(parsed)
+
+
+async def _active_index_versions(
     session: AsyncSession,
     event_id: UUID | None,
-) -> KnowledgeIndexVersion:
+) -> list[
+    tuple[
+        KnowledgeIndexVersion,
+        KnowledgeSourceVersion,
+        KnowledgeSource,
+    ]
+]:
     rows = list(
         (
-            await session.scalars(
-                select(KnowledgeIndexVersion)
-                .where(KnowledgeIndexVersion.status == "published")
+            await session.execute(
+                select(
+                    KnowledgeIndexVersion,
+                    KnowledgeSourceVersion,
+                    KnowledgeSource,
+                )
+                .join(
+                    KnowledgeSourceVersion,
+                    KnowledgeIndexVersion.source_version_id
+                    == KnowledgeSourceVersion.id,
+                )
+                .join(
+                    KnowledgeSource,
+                    KnowledgeSourceVersion.source_id == KnowledgeSource.id,
+                )
+                .where(
+                    KnowledgeIndexVersion.status == "published",
+                    KnowledgeSourceVersion.status == "published",
+                    KnowledgeSource.is_active.is_(True),
+                )
                 .order_by(
-                    KnowledgeIndexVersion.activated_at.desc(),
-                    KnowledgeIndexVersion.id.desc(),
+                    KnowledgeSource.source_key,
+                    KnowledgeSourceVersion.version,
+                    KnowledgeIndexVersion.id,
                 )
                 .with_for_update()
             )
@@ -127,24 +204,85 @@ async def _active_index_version(
     )
     if not rows:
         raise LookupError("no active knowledge index version")
-    if event_id is not None:
-        matching = [
-            row
-            for row in rows
-            if _manifest_event_id(row) == str(event_id)
+
+    matching: list[
+        tuple[
+            KnowledgeIndexVersion,
+            KnowledgeSourceVersion,
+            KnowledgeSource,
         ]
-    else:
-        matching = [row for row in rows if _manifest_event_id(row) is None]
+    ] = []
+    for index_version, source_version, source in rows:
+        index_event_id = _index_event_id(index_version, source_version)
+        if event_id is not None:
+            if index_event_id is not None and index_event_id != event_id:
+                continue
+            if index_event_id is None:
+                if source.access_level not in {
+                    "public",
+                    "internal",
+                }:
+                    continue
+        else:
+            if index_event_id is not None:
+                continue
+            if source.access_level not in {
+                "public",
+                "internal",
+            }:
+                continue
+        matching.append((index_version, source_version, source))
+
     if not matching:
         raise LookupError("no active knowledge index version for snapshot scope")
-    return matching[0]
+    return matching
 
 
-def _manifest_event_id(index_version: KnowledgeIndexVersion) -> str | None:
-    value = (index_version.manifest or {}).get("event_id")
-    if value is None or value == "":
+def _knowledge_index_versions(
+    index_versions: list[
+        tuple[
+            KnowledgeIndexVersion,
+            KnowledgeSourceVersion,
+            KnowledgeSource,
+        ]
+    ],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "index_version_id": str(index_version.id),
+            "source_version_id": str(index_version.source_version_id),
+            "source_key": source.source_key,
+            "version": index_version.version,
+            "event_id": (
+                str(event_id) if event_id is not None else None
+            ),
+            "chunk_count": int(index_version.chunk_count),
+        }
+        for index_version, _source_version, source in index_versions
+        for event_id in [
+            _index_event_id(index_version, _source_version),
+        ]
+    ]
+
+
+def _index_event_id(
+    index_version: KnowledgeIndexVersion,
+    source_version: KnowledgeSourceVersion,
+) -> UUID | None:
+    manifest_value = (index_version.manifest or {}).get("event_id")
+    if manifest_value not in {None, ""}:
+        try:
+            return UUID(str(manifest_value))
+        except (TypeError, ValueError):
+            pass
+
+    metadata_value = (source_version.version_metadata or {}).get("event_id")
+    if metadata_value in {None, ""}:
         return None
-    return str(value)
+    try:
+        return UUID(str(metadata_value))
+    except (TypeError, ValueError):
+        return None
 
 
 async def _active_production_run_id(

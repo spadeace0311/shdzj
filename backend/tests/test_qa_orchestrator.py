@@ -35,6 +35,7 @@ class StoredSession:
     id: UUID
     snapshot_id: UUID
     index_version_id: UUID
+    index_version_ids: tuple[UUID, ...]
     event_id: UUID | None
     revision_id: UUID | None
     assessment_run_id: UUID | None
@@ -204,6 +205,7 @@ def _stored_session(*, event_id: UUID | None = None) -> StoredSession:
         id=uuid4(),
         snapshot_id=uuid4(),
         index_version_id=uuid4(),
+        index_version_ids=(),
         event_id=event_id,
         revision_id=uuid4() if event_id is not None else None,
         assessment_run_id=uuid4() if event_id is not None else None,
@@ -833,10 +835,10 @@ async def test_retriever_factory_receives_snapshot_locked_index_version() -> Non
     store = FakeStore(stored_session)
     deepseek = FakeDeepSeek(_plan(queries=True), chunks=["回答"])
     retriever = FakeRetriever([_evidence()])
-    captured: list[UUID] = []
+    captured: list[StoredSession] = []
 
-    def retriever_factory(index_version_id: UUID):
-        captured.append(index_version_id)
+    def retriever_factory(stored: StoredSession):
+        captured.append(stored)
         return retriever
 
     orchestrator = QuestionOrchestrator(
@@ -853,4 +855,30 @@ async def test_retriever_factory_receives_snapshot_locked_index_version() -> Non
     ):
         pass
 
-    assert captured == [stored_session.index_version_id]
+    assert captured == [stored_session]
+
+
+async def test_multi_index_event_retrieval_uses_locked_ids_without_event_filter() -> None:
+    stored_session = replace(
+        _stored_session(event_id=uuid4()),
+        index_version_ids=(uuid4(), uuid4()),
+    )
+    store = FakeStore(stored_session)
+    deepseek = FakeDeepSeek(_plan(queries=True), chunks=["回答"])
+    retriever = FakeRetriever([_evidence()])
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=retriever,
+        registry=ToolRegistry(),
+        store=store,
+    )
+
+    async for _event in orchestrator.ask(
+        "联合锁定哪些版本？",
+        session_id=stored_session.id,
+        user=_user(),
+    ):
+        pass
+
+    assert retriever.calls[0][1].event_id is None
+    assert retriever.calls[0][1].global_only is False
