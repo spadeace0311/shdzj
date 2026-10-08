@@ -357,6 +357,15 @@ export type QaMapAction =
   | { action_type: "highlight"; target_ref: string; layer_id: string; reason: string; valid_until: string }
   | { action_type: "set_layers"; layers: string[]; reason: string; valid_until: string };
 
+export interface QaMapActionRecord {
+  id: string;
+  answer_id: string;
+  action_type: string;
+  payload: Record<string, unknown>;
+  valid_until: string | null;
+  created_at: string;
+}
+
 export interface QaAnswer {
   id: string;
   question_id: string;
@@ -372,7 +381,7 @@ export interface QaAnswer {
   completed_at: string | null;
   citations: QaCitation[];
   tool_calls: QaToolCall[];
-  map_actions: QaMapAction[];
+  map_actions: QaMapActionRecord[];
 }
 
 export interface QaStreamEvent {

@@ -2,9 +2,11 @@ import { afterEach, expect, test, vi } from "vitest";
 
 import {
   clearAccessToken,
+  getQaAnswer,
   setAccessToken,
   streamQaQuestion,
 } from "../src/api/client";
+import type { QaMapActionRecord } from "../src/types";
 
 
 afterEach(() => {
@@ -144,6 +146,61 @@ test("sends bearer token and reports stream errors", async () => {
     streamQaQuestion("s1", "问题", () => undefined),
   ).rejects.toThrow("qa unavailable");
 
+  expect(vi.mocked(globalThis.fetch).mock.calls[0][1]?.headers).toMatchObject({
+    Authorization: "Bearer test-token",
+  });
+});
+
+
+test("getQaAnswer returns persisted map action records", async () => {
+  setAccessToken("test-token");
+  const persistedAction = {
+    id: "ma1",
+    answer_id: "a1",
+    action_type: "locate",
+    payload: {
+      target_ref: "event:epicenter",
+      reason: "定位震中",
+    },
+    valid_until: null,
+    created_at: "2026-10-08T00:00:00Z",
+  };
+  const answer = {
+    id: "a1",
+    question_id: "q1",
+    session_id: "s1",
+    status: "completed",
+    text: "回答",
+    structured: null,
+    citation_keys: [],
+    degraded_reasons: [],
+    duration_ms: 120,
+    created_at: "2026-10-08T00:00:00Z",
+    updated_at: "2026-10-08T00:00:01Z",
+    completed_at: "2026-10-08T00:00:01Z",
+    citations: [],
+    tool_calls: [],
+    map_actions: [persistedAction],
+  };
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(JSON.stringify(answer), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+
+  const result = await getQaAnswer("a1");
+  const action: QaMapActionRecord = result.map_actions[0]!;
+
+  expect(action).toEqual(persistedAction);
+  expect(action.valid_until).toBeNull();
+  expect(action.payload).toEqual({
+    target_ref: "event:epicenter",
+    reason: "定位震中",
+  });
+  expect(vi.mocked(globalThis.fetch).mock.calls[0][0]).toBe(
+    "/api/v1/qa/answers/a1",
+  );
   expect(vi.mocked(globalThis.fetch).mock.calls[0][1]?.headers).toMatchObject({
     Authorization: "Bearer test-token",
   });
