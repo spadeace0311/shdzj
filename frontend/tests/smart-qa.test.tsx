@@ -1,9 +1,18 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import * as maplibregl from "maplibre-gl";
 import { beforeEach, expect, test, vi } from "vitest";
+import stylesCss from "../src/styles.css?raw";
 
 import {
   createQaSession,
+  getEvent,
   getQaAnswer,
   listQaSessions,
   streamQaQuestion,
@@ -11,23 +20,49 @@ import {
 import type {
   QaAnswer,
   QaCitation,
+  EventDetail,
   QaMapAction,
+  QaMapActionRecord,
   QaSession,
   QaStreamEvent,
   QaToolCall,
 } from "../src/types";
 import { QaConversation } from "../src/components/QaConversation";
+import { QaMap } from "../src/components/QaMap";
 import { applyQaMapAction } from "../src/qa/mapActions";
 import type { QaActionMap, QaLayerCatalog } from "../src/qa/mapActions";
 import { SmartQaPage } from "../src/pages/SmartQaPage";
 
+interface MockQaMap {
+  options: {
+    center?: [number, number];
+    [key: string]: unknown;
+  };
+  getZoom: ReturnType<typeof vi.fn>;
+  flyTo: ReturnType<typeof vi.fn>;
+  fitBounds: ReturnType<typeof vi.fn>;
+  getSource: ReturnType<typeof vi.fn>;
+  addSource: ReturnType<typeof vi.fn>;
+  getLayer: ReturnType<typeof vi.fn>;
+  addLayer: ReturnType<typeof vi.fn>;
+  setFilter: ReturnType<typeof vi.fn>;
+  setLayoutProperty: ReturnType<typeof vi.fn>;
+  once: ReturnType<typeof vi.fn>;
+  off: ReturnType<typeof vi.fn>;
+  loaded: ReturnType<typeof vi.fn>;
+  on: ReturnType<typeof vi.fn>;
+  remove: ReturnType<typeof vi.fn>;
+}
+
 vi.mock("maplibre-gl", () => {
-  const maps: unknown[] = [];
+  const maps: MockQaMap[] = [];
   return {
-    Map: vi.fn(() => {
+    Map: vi.fn((options: Record<string, unknown>) => {
       const sources = new Map<string, unknown>();
       const layers = new Map<string, unknown>();
-      const map = {
+      const eventHandlers = new Map<string, (...args: unknown[]) => void>();
+      const map: MockQaMap = {
+        options,
         getZoom: vi.fn(() => 9),
         flyTo: vi.fn(),
         fitBounds: vi.fn(),
@@ -41,6 +76,19 @@ vi.mock("maplibre-gl", () => {
         }),
         setFilter: vi.fn(),
         setLayoutProperty: vi.fn(),
+        once: vi.fn(
+          (type: string, handler: (...args: unknown[]) => void) => {
+            eventHandlers.set(type, handler);
+          },
+        ),
+        off: vi.fn(
+          (type: string, handler: (...args: unknown[]) => void) => {
+            if (eventHandlers.get(type) === handler) {
+              eventHandlers.delete(type);
+            }
+          },
+        ),
+        loaded: vi.fn(() => true),
         on: vi.fn(),
         remove: vi.fn(),
       };
@@ -56,6 +104,7 @@ vi.mock("../src/api/client", async (importOriginal) => {
   return {
     ...actual,
     createQaSession: vi.fn(),
+    getEvent: vi.fn(),
     listQaSessions: vi.fn(),
     getQaSession: vi.fn(),
     streamQaQuestion: vi.fn(),
@@ -68,6 +117,7 @@ const createQaSessionMock = vi.mocked(createQaSession);
 const listQaSessionsMock = vi.mocked(listQaSessions);
 const streamQaQuestionMock = vi.mocked(streamQaQuestion);
 const getQaAnswerMock = vi.mocked(getQaAnswer);
+const getEventMock = vi.mocked(getEvent);
 
 const session: QaSession = {
   id: "s1",
@@ -83,6 +133,32 @@ const secondSession: QaSession = {
   ...session,
   id: "s2",
   title: "历史问答 2",
+};
+
+const eventSession: QaSession = {
+  ...session,
+  id: "event-session",
+  event_id: "event-1",
+  title: "事件问答",
+};
+
+const eventDetail: EventDetail = {
+  id: "event-1",
+  source: "test",
+  place: "测试事件",
+  magnitude: 5.2,
+  depth_km: 10,
+  origin_time: "2026-10-08T00:00:00Z",
+  longitude: 121.5,
+  latitude: 31.2,
+  institutional_level: null,
+  service_level: null,
+  response_suggestion: null,
+  response_rule_version: null,
+  revision_no: 1,
+  event_kind: "auto",
+  lifecycle_state: "formal_triggered",
+  t1_at: null,
 };
 
 const citation: QaCitation = {
@@ -125,6 +201,28 @@ const persistedAnswer: QaAnswer = {
   map_actions: [],
 };
 
+const mapActionRecord: QaMapActionRecord = {
+  id: "ma1",
+  answer_id: "a1",
+  action_type: "buffer",
+  payload: {
+    target_ref: "event:epicenter",
+    radius_km: 50,
+    reason: "展示影响范围",
+  },
+  valid_until: "2026-10-08T00:10:00Z",
+  created_at: "2026-10-08T00:00:01Z",
+};
+
+const persistedStructuredAnswer: QaAnswer = {
+  ...persistedAnswer,
+  structured: {
+    nearest_fault_km: 18.2,
+    notes: ["需复核断裂带参数"],
+  },
+  map_actions: [mapActionRecord],
+};
+
 const workflowEvents: QaStreamEvent[] = [
   {
     type: "retrieval",
@@ -165,11 +263,24 @@ function mockQaApi(events: QaStreamEvent[], answer = persistedAnswer) {
   getQaAnswerMock.mockResolvedValue(answer);
 }
 
+function mapModule(): { __maps: MockQaMap[] } {
+  return maplibregl as unknown as { __maps: MockQaMap[] };
+}
+
+function triggerMapLoad(map: MockQaMap) {
+  const loadCall = map.once.mock.calls.find(
+    ([type]: unknown[]) => type === "load",
+  );
+  (loadCall?.[1] as (() => void) | undefined)?.();
+}
+
 beforeEach(() => {
   createQaSessionMock.mockReset();
   listQaSessionsMock.mockReset();
   streamQaQuestionMock.mockReset();
   getQaAnswerMock.mockReset();
+  getEventMock.mockReset();
+  mapModule().__maps.length = 0;
 });
 
 test("streams an answer and shows citation, tool and map action", async () => {
@@ -348,6 +459,139 @@ test("aborts the active stream on unmount", async () => {
   unmount();
 
   expect(capturedSignal?.aborted).toBe(true);
+});
+
+test("renders structured results without opening links", async () => {
+  mockQaApi(workflowEvents, persistedStructuredAnswer);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: "给出结构化结论" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+  expect(await screen.findByTestId("qa-structured")).toBeInTheDocument();
+  expect(screen.getByText("18.2")).toBeInTheDocument();
+  expect(screen.getByText("需复核断裂带参数")).toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+});
+
+test("recovers persisted map actions when the stream stops early", async () => {
+  mockQaApi(
+    workflowEvents.filter((event) => event.type !== "map_action"),
+    persistedStructuredAnswer,
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  fireEvent.change(screen.getByLabelText("问题"), {
+    target: { value: "断流后恢复地图动作" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+  expect(await screen.findByText("缓冲区")).toBeInTheDocument();
+});
+
+test("passes the current event epicenter into QaMap", async () => {
+  listQaSessionsMock.mockResolvedValue([eventSession]);
+  getEventMock.mockResolvedValue(eventDetail);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  await screen.findByRole("button", { name: "事件问答" });
+  await waitFor(() =>
+    expect(
+      mapModule().__maps.some(
+        (map) => map.options.center?.[0] === 121.5,
+      ),
+    ).toBe(true),
+  );
+  const map = mapModule().__maps.find(
+    (candidate) => candidate.options.center?.[0] === 121.5,
+  );
+  expect(map?.options.center).toEqual([121.5, 31.2]);
+});
+
+test("degrades to the neutral map center without an event", async () => {
+  listQaSessionsMock.mockResolvedValue([session]);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  await screen.findByRole("button", { name: "当前问答" });
+  await waitFor(() => expect(mapModule().__maps.length).toBeGreaterThan(0));
+  expect(mapModule().__maps[0]?.options.center).toEqual([121.47, 31.23]);
+});
+
+test("ignores a stale list response after a new session is created", async () => {
+  let resolveList!: (sessions: QaSession[]) => void;
+  listQaSessionsMock.mockImplementation(
+    () =>
+      new Promise<QaSession[]>((resolveSession) => {
+        resolveList = resolveSession;
+      }),
+  );
+  createQaSessionMock.mockResolvedValue(secondSession);
+
+  render(
+    <MemoryRouter initialEntries={["/qa"]}>
+      <SmartQaPage />
+    </MemoryRouter>,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "新建问题" }));
+  await screen.findByRole("button", { name: "历史问答 2" });
+
+  act(() => {
+    resolveList([session]);
+  });
+
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "历史问答 2" }),
+    ).toHaveClass("smart-qa-session--active"),
+  );
+});
+
+test("waits for MapLibre load before applying sources, layers and actions", async () => {
+  render(
+    <QaMap
+      actions={[validAction("buffer")]}
+      epicenter={[121.47, 31.23]}
+    />,
+  );
+
+  await waitFor(() => expect(mapModule().__maps.length).toBeGreaterThan(0));
+  const map = mapModule().__maps.at(-1) as MockQaMap;
+  expect(map.addSource).not.toHaveBeenCalled();
+  expect(map.addLayer).not.toHaveBeenCalled();
+
+  await act(async () => {
+    triggerMapLoad(map);
+  });
+
+  await waitFor(() =>
+    expect(map.addSource).toHaveBeenCalledWith(
+      "qa-buffer",
+      expect.objectContaining({ type: "geojson" }),
+    ),
+  );
 });
 
 const testCatalog: QaLayerCatalog = {
@@ -549,4 +793,13 @@ test("locate uses a zoom no lower than eight when the map is already zoomed in",
     center: [121.47, 31.23],
     zoom: 12,
   });
+});
+
+test("keeps the left and right smart QA columns fixed at 300px and 460px", () => {
+  expect(stylesCss).toContain(
+    "grid-template-columns: 300px minmax(0, 1fr) 460px;",
+  );
+  expect(stylesCss).not.toContain(
+    "grid-template-columns: 280px minmax(0, 1fr) 430px;",
+  );
 });

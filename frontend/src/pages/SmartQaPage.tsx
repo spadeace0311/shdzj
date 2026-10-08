@@ -2,15 +2,18 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   createQaSession,
+  getEvent,
   getQaAnswer,
   listQaSessions,
   sendQaFeedback,
   streamQaQuestion,
 } from "../api/client";
 import type {
+  EventDetail,
   QaAnswer,
   QaCitation,
   QaMapAction,
+  QaMapActionRecord,
   QaSession,
   QaStreamEvent,
   QaToolCall,
@@ -171,6 +174,118 @@ function answerIdFromEvents(events: QaStreamEvent[]): string | null {
   return null;
 }
 
+function eventEpicenter(detail: EventDetail): [number, number] | undefined {
+  const longitude = Number(detail.longitude);
+  const latitude = Number(detail.latitude);
+  if (
+    !Number.isFinite(longitude) ||
+    !Number.isFinite(latitude) ||
+    longitude < -180 ||
+    longitude > 180 ||
+    latitude < -90 ||
+    latitude > 90
+  ) {
+    return undefined;
+  }
+  return [longitude, latitude];
+}
+
+function mapActionRecordToAction(
+  record: QaMapActionRecord,
+): QaMapAction | null {
+  const payload = isRecord(record.payload) ? record.payload : {};
+  const validUntil =
+    record.valid_until ?? stringValue(payload.valid_until) ?? "";
+  return streamMapAction({
+    ...payload,
+    action_type: record.action_type,
+    valid_until: validUntil,
+  });
+}
+
+function mapActionKey(action: QaMapAction): string {
+  return JSON.stringify(action);
+}
+
+function mergeMapActions(
+  current: QaMapAction[],
+  recovered: QaMapAction[],
+): QaMapAction[] {
+  const existing = new Set(current.map(mapActionKey));
+  return [
+    ...current,
+    ...recovered.filter((action) => !existing.has(mapActionKey(action))),
+  ];
+}
+
+function StructuredValue({
+  value,
+  depth = 0,
+}: {
+  value: unknown;
+  depth?: number;
+}) {
+  if (value === null || value === undefined) {
+    return <span>-</span>;
+  }
+  if (Array.isArray(value)) {
+    if (depth >= 4) {
+      return <span>[...]</span>;
+    }
+    return (
+      <ul className="qa-structured-list">
+        {value.map((item, index) => (
+          <li key={index}>
+            <StructuredValue value={item} depth={depth + 1} />
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      return <span>-</span>;
+    }
+    if (depth >= 4) {
+      return <span>{"{...}"}</span>;
+    }
+    return (
+      <dl className="qa-structured-object">
+        {entries.map(([key, item]) => (
+          <div key={key}>
+            <dt>{key}</dt>
+            <dd>
+              <StructuredValue value={item} depth={depth + 1} />
+            </dd>
+          </div>
+        ))}
+      </dl>
+    );
+  }
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return <span>{String(value)}</span>;
+  }
+  return <span>{String(value)}</span>;
+}
+
+function StructuredResult({ value }: { value: Record<string, unknown> }) {
+  return (
+    <section
+      className="qa-structured-result"
+      data-testid="qa-structured"
+      aria-label="结构化结果"
+    >
+      <h2>结构化结果</h2>
+      <StructuredValue value={value} />
+    </section>
+  );
+}
+
 export function SmartQaPage() {
   const [sessions, setSessions] = useState<QaSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -178,14 +293,21 @@ export function SmartQaPage() {
   const [answer, setAnswer] = useState<QaAnswer | null>(null);
   const [mapActions, setMapActions] = useState<QaMapAction[]>([]);
   const [busy, setBusy] = useState(false);
+  const [epicenter, setEpicenter] = useState<[number, number] | undefined>(
+    undefined,
+  );
   const abortRef = useRef<AbortController | null>(null);
+  const sessionIntentRef = useRef(0);
+  const currentSession =
+    sessions.find((session) => session.id === currentSessionId) ?? null;
 
   useEffect(() => {
     let active = true;
+    const requestId = ++sessionIntentRef.current;
 
     void listQaSessions()
       .then((loadedSessions) => {
-        if (!active) {
+        if (!active || requestId !== sessionIntentRef.current) {
           return;
         }
         setSessions(loadedSessions);
@@ -194,7 +316,7 @@ export function SmartQaPage() {
         }
       })
       .catch(() => {
-        if (active) {
+        if (active && requestId === sessionIntentRef.current) {
           setSessions([]);
         }
       });
@@ -205,8 +327,32 @@ export function SmartQaPage() {
     };
   }, []);
 
-  const currentSession =
-    sessions.find((session) => session.id === currentSessionId) ?? null;
+  useEffect(() => {
+    let active = true;
+    const eventId = currentSession?.event_id;
+    if (!eventId) {
+      setEpicenter(undefined);
+      return () => {
+        active = false;
+      };
+    }
+
+    void getEvent(eventId)
+      .then((detail) => {
+        if (active) {
+          setEpicenter(eventEpicenter(detail));
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setEpicenter(undefined);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [currentSession?.event_id]);
 
   function clearConversation() {
     setEvents([]);
@@ -216,10 +362,13 @@ export function SmartQaPage() {
   }
 
   async function createSession(title = NEW_SESSION_TITLE): Promise<string | null> {
+    const requestId = ++sessionIntentRef.current;
     try {
       const created = await createQaSession({ title });
-      setSessions((current) => [created, ...current]);
-      setCurrentSessionId(created.id);
+      if (requestId === sessionIntentRef.current) {
+        setSessions((current) => [created, ...current]);
+        setCurrentSessionId(created.id);
+      }
       return created.id;
     } catch {
       return null;
@@ -227,6 +376,7 @@ export function SmartQaPage() {
   }
 
   function handleNewSession() {
+    sessionIntentRef.current += 1;
     abortRef.current?.abort();
     clearConversation();
     setCurrentSessionId(null);
@@ -237,6 +387,7 @@ export function SmartQaPage() {
     if (sessionId === currentSessionId) {
       return;
     }
+    sessionIntentRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
     clearConversation();
@@ -304,6 +455,12 @@ export function SmartQaPage() {
       const persistedAnswer = await getQaAnswer(answerId);
       if (!controller.signal.aborted) {
         setAnswer(persistedAnswer);
+        const recoveredActions = persistedAnswer.map_actions
+          .map(mapActionRecordToAction)
+          .filter((action): action is QaMapAction => action !== null);
+        setMapActions((current) =>
+          mergeMapActions(current, recoveredActions),
+        );
       }
     } catch {
       // Stream citations and tools remain available even if reloading fails.
@@ -370,6 +527,9 @@ export function SmartQaPage() {
             <p className="smart-qa-event">
               {currentSession?.event_id ?? "未关联事件"}
             </p>
+            {currentSession?.event_id && !epicenter ? (
+              <p className="smart-qa-event-warning">震中坐标不可用</p>
+            ) : null}
           </div>
         </aside>
 
@@ -391,10 +551,12 @@ export function SmartQaPage() {
             toolCalls={toolCalls}
             mapActions={mapActions}
           />
-          <QaMap actions={mapActions} />
+          {answer?.structured ? (
+            <StructuredResult value={answer.structured} />
+          ) : null}
+          <QaMap actions={mapActions} epicenter={epicenter} />
         </aside>
       </div>
     </section>
   );
 }
-

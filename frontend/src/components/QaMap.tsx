@@ -77,6 +77,7 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
 
     let disposed = false;
     let map: MaplibreMap | null = null;
+    let handleLoad: (() => void) | null = null;
     const center: [number, number] = epicenter ?? [121.47, 31.23];
     const options: MapOptions = {
       container: containerRef.current,
@@ -106,12 +107,21 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
       }
       const createdMap = new MapConstructor(options);
       map = createdMap;
-      mapRef.current = createdMap;
-      setMapReady(true);
+      handleLoad = () => {
+        if (disposed) {
+          return;
+        }
+        mapRef.current = createdMap;
+        setMapReady(true);
+      };
+      createdMap.once("load", handleLoad);
     });
 
     return () => {
       disposed = true;
+      if (handleLoad) {
+        map?.off("load", handleLoad);
+      }
       map?.remove();
       mapRef.current = null;
       setMapReady(false);
@@ -123,7 +133,7 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
       return;
     }
     const map = mapRef.current;
-    if (!map) {
+    if (!map || !map.loaded()) {
       return;
     }
 
@@ -153,7 +163,7 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
       return;
     }
     const map = mapRef.current;
-    if (!map) {
+    if (!map || !map.loaded()) {
       return;
     }
 
@@ -186,7 +196,7 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
       return;
     }
     const map = mapRef.current;
-    if (!map) {
+    if (!map || !map.loaded()) {
       return;
     }
     for (const action of actions) {
