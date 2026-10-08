@@ -715,6 +715,79 @@ async def test_stream_sanitizes_invalid_citation_tokens_before_exposure() -> Non
     assert answer.citation_keys == ["C1"]
 
 
+async def test_suppressed_document_key_is_not_valid_stream_citation() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    registry = StaticExecutionRegistry(
+        [
+            ToolExecution(
+                name="fault.nearest",
+                result=ToolResult.ok(
+                    value={"distance_km": 12.5, "fault_key": "f1"},
+                    unit="km",
+                    source="shanghai.fault",
+                    version="v1",
+                    parameters={"event_id": str(stored_session.event_id)},
+                ),
+            )
+        ]
+    )
+    plan = ExecutionPlan(
+        intent="fault_distance",
+        tool_calls=[ToolCallPlan(name="fault.nearest", arguments={})],
+        knowledge_queries=[KnowledgeQuery(text="断层距离", top_k=5)],
+        map_intents=[],
+        clarification=None,
+    )
+    deepseek = FakeDeepSeek(
+        plan,
+        chunks=["预案依据 [C1]，文档估算 [C2]。"],
+    )
+    retriever = FakeRetriever(
+        [
+            _evidence(text="应急预案规定响应分级。"),
+            _evidence(text="文档距离为 13 公里。"),
+        ]
+    )
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=retriever,
+        registry=registry,
+        store=store,
+    )
+
+    events = [
+        event
+        async for event in orchestrator.ask(
+            "断层距离是多少？",
+            session_id=stored_session.id,
+            user=_user(),
+        )
+    ]
+    emitted = "".join(
+        event.data["text"]
+        for event in events
+        if event.type == "answer_delta"
+    )
+    answer_id = next(
+        event.data["answer_id"]
+        for event in events
+        if event.type == "answer_started"
+    )
+    answer = await orchestrator.finalize(answer_id)
+
+    assert [
+        item["citation_key"]
+        for item in deepseek.stream_evidence[0]
+        if item["kind"] == "document"
+    ] == ["C1"]
+    assert "C2" not in emitted
+    assert "C2" not in answer.text
+    assert "[C1]" in emitted
+    assert answer.citation_keys == ["C1"]
+    assert answer.structured["invalid_citation_keys"] == ["C2"]
+
+
 async def test_partial_failure_removes_split_invalid_citation_tokens() -> None:
     stored_session = _stored_session()
     store = FakeStore(stored_session)

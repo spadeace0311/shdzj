@@ -283,6 +283,12 @@ def _qdrant_filter(
                 match=MatchValue(value=str(filters.event_id)),
             )
         )
+    if filters.global_only:
+        conditions.append(
+            IsNullCondition(
+                is_null=PayloadField(key="event_id"),
+            )
+        )
     if filters.published_before is not None:
         conditions.append(
             FieldCondition(
@@ -290,16 +296,7 @@ def _qdrant_filter(
                 range=DatetimeRange(lte=filters.published_before),
             )
         )
-    must_not = (
-        [
-            IsNullCondition(
-                is_null=PayloadField(key="event_id"),
-            )
-        ]
-        if filters.global_only
-        else None
-    )
-    return Filter(must=conditions, must_not=must_not)
+    return Filter(must=conditions)
 
 
 def _match_any(key: str, values: list[str]) -> FieldCondition:

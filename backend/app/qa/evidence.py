@@ -50,6 +50,7 @@ class EvidenceCitation:
     checksum: str
     layer: str
     access_level: str
+    model_exported: bool
 
     def to_model_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +104,14 @@ class EvidencePack:
     def model_evidence(self) -> list[dict[str, Any]]:
         return list(self.primary)
 
+    @property
+    def model_citation_keys(self) -> tuple[str, ...]:
+        return tuple(
+            citation.citation_key
+            for citation in self.citations
+            if citation.model_exported
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _StructuredFact:
@@ -141,6 +150,7 @@ class EvidenceBuilder:
         citations, restricted_count = _document_citations(
             evidence,
             prioritize_nonnumeric=bool(facts),
+            suppress_numeric=bool(facts),
         )
         authority_notes: list[str] = []
         if facts:
@@ -166,10 +176,7 @@ class EvidenceBuilder:
                         "authority": "documentary_nonnumeric",
                     }
                     for citation in citations
-                    if is_model_exportable_access_level(citation.access_level)
-                    and not (
-                        facts and _contains_numeric_claim(citation.excerpt)
-                    )
+                    if citation.model_exported
                 ),
             ]
         )
@@ -193,6 +200,7 @@ def _document_citations(
     evidence: Iterable[RetrievedEvidence],
     *,
     prioritize_nonnumeric: bool = False,
+    suppress_numeric: bool = False,
 ) -> tuple[tuple[EvidenceCitation, ...], int]:
     unique: dict[UUID, RetrievedEvidence] = {}
     for item in evidence:
@@ -231,6 +239,12 @@ def _document_citations(
             checksum=item.checksum,
             layer=item.layer,
             access_level=item.access_level,
+            model_exported=(
+                is_model_exportable_access_level(item.access_level)
+                and not (
+                    suppress_numeric and _contains_numeric_claim(item.text)
+                )
+            ),
         )
         for index, item in enumerate(selected, start=1)
     )

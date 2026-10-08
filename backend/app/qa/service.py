@@ -22,7 +22,7 @@ from app.knowledge.index import KnowledgeFilters
 from app.knowledge.models import KnowledgeSnapshot
 from app.knowledge.retrieval import RetrievalResult
 from app.knowledge.snapshot import KnowledgeSnapshotService
-from app.qa.access import AccessPolicy, is_model_exportable_access_level
+from app.qa.access import AccessPolicy
 from app.qa.deepseek import DeepSeekAdapter
 from app.qa.domain import ExecutionPlan
 from app.qa.evidence import EvidenceBuilder, EvidencePack
@@ -420,9 +420,7 @@ class QuestionOrchestrator:
                         {
                             citation.citation_key
                             for citation in pack.citations
-                            if is_model_exportable_access_level(
-                                citation.access_level
-                            )
+                            if citation.model_exported
                         }
                     )
                     draft_structured: dict[str, Any] = {}
@@ -820,7 +818,7 @@ def _validate_citations(
     available = {
         citation.citation_key
         for citation in citations
-        if is_model_exportable_access_level(citation.access_level)
+        if citation.model_exported
     }
     requested = [
         *requested_keys,

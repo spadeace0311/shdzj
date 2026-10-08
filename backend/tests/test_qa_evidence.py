@@ -116,6 +116,14 @@ def test_structured_facts_suppress_numeric_documents_and_keep_nonnumeric_evidenc
     assert "14.0" in pack.conflict_notes[0]
     assert "C1" in pack.authority_notes[0]
     assert "structured" in pack.authority_notes[0]
+    assert pack.citations[0].model_exported is True
+    assert pack.citations[1].model_exported is False
+    assert pack.model_citation_keys == ("C1",)
+    assert [
+        item["citation_key"]
+        for item in pack.model_evidence
+        if item["kind"] == "document"
+    ] == ["C1"]
 
 
 def test_prompt_injection_text_remains_quoted_evidence_only() -> None:

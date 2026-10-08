@@ -15,6 +15,12 @@ from app.knowledge.index import (
 from app.knowledge.models import KnowledgeIndexVersion
 from app.knowledge.retrieval import KnowledgeFilters
 from qdrant_client.models import Distance
+from qdrant_client.models import (
+    FieldCondition,
+    IsNullCondition,
+    MatchAny,
+    MatchValue,
+)
 
 
 def _index_version(
@@ -122,6 +128,40 @@ class FakeQdrantClient:
             }
         )
         return self.query_responses.pop(0)
+
+
+class FilterAwareQdrantClient:
+    def __init__(self, payloads: list[dict]) -> None:
+        self.payloads = payloads
+
+    async def query_points(
+        self,
+        collection_name: str,
+        *,
+        query: object = None,
+        using: str | None = None,
+        query_filter: object = None,
+        limit: int = 10,
+        with_payload: bool = True,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        del kwargs
+        assert collection_name
+        assert query is not None
+        assert using == "dense"
+        assert with_payload is True
+        points = [
+            SimpleNamespace(
+                id=str(uuid5(NAMESPACE_URL, str(payload["chunk_id"]))),
+                version=1,
+                score=0.9,
+                payload=payload,
+                vector=None,
+            )
+            for payload in self.payloads
+            if _filter_matches(query_filter, payload)
+        ]
+        return SimpleNamespace(points=points[:limit])
 
 
 def _query_response(
@@ -277,27 +317,34 @@ async def test_search_sparse_uses_sorted_bge_token_ids() -> None:
 
 
 async def test_search_global_only_excludes_points_with_event_metadata() -> None:
-    client = FakeQdrantClient()
-    client.query_responses.append(
-        _query_response(
-            chunk_id=uuid4(),
-            source_id=uuid4(),
-            version_id=uuid4(),
-            score=0.42,
-        )
+    index_version = _index_version()
+    global_chunk_id = uuid4()
+    event_chunk_id = uuid4()
+    client = FilterAwareQdrantClient(
+        [
+            _point_payload(
+                chunk_id=global_chunk_id,
+                source_id=uuid4(),
+                version_id=index_version.source_version_id,
+                event_id=None,
+            ),
+            _point_payload(
+                chunk_id=event_chunk_id,
+                source_id=uuid4(),
+                version_id=index_version.source_version_id,
+                event_id=str(uuid4()),
+            ),
+        ]
     )
 
-    await KnowledgeIndex(client=client).search_dense(
-        _index_version(),
+    result = await KnowledgeIndex(client=client).search_dense(
+        index_version,
         [0.25] * 1024,
         KnowledgeFilters(global_only=True),
         limit=3,
     )
 
-    query_filter = client.queries[0]["query_filter"]
-    assert len(query_filter.must_not) == 1
-    condition = query_filter.must_not[0]
-    assert condition.is_null.key == "event_id"
+    assert [item.chunk_id for item in result] == [global_chunk_id]
 
 
 async def test_search_isolates_sources_with_same_version_string() -> None:
@@ -391,3 +438,49 @@ def _mandatory_version_filter(query_filter: object) -> str:
         for condition in query_filter.must
         if condition.key == "version_id"
     )
+
+
+def _point_payload(
+    *,
+    chunk_id: UUID,
+    source_id: UUID,
+    version_id: UUID,
+    event_id: str | None,
+) -> dict:
+    return {
+        "chunk_id": str(chunk_id),
+        "version_id": str(version_id),
+        "source_id": str(source_id),
+        "source_key": "source-key",
+        "source_title": "Source Title",
+        "layer": "local_authority",
+        "access_level": "internal",
+        "event_id": event_id,
+        "section_path": ["第一章"],
+        "page_from": 1,
+        "page_to": 1,
+        "checksum": "b" * 64,
+        "source_uri": None,
+        "published_at": "2026-10-08T00:00:00+00:00",
+        "text": "evidence text",
+    }
+
+
+def _filter_matches(query_filter: object, payload: dict) -> bool:
+    must = getattr(query_filter, "must", None) or []
+    must_not = getattr(query_filter, "must_not", None) or []
+    return all(_condition_matches(condition, payload) for condition in must) and not any(
+        _condition_matches(condition, payload) for condition in must_not
+    )
+
+
+def _condition_matches(condition: object, payload: dict) -> bool:
+    if isinstance(condition, IsNullCondition):
+        return payload.get(condition.is_null.key) is None
+    if isinstance(condition, FieldCondition):
+        value = payload.get(condition.key)
+        if isinstance(condition.match, MatchValue):
+            return value == condition.match.value
+        if isinstance(condition.match, MatchAny):
+            return value in condition.match.any
+    raise AssertionError(f"unsupported Qdrant condition: {condition!r}")
