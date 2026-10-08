@@ -298,6 +298,101 @@ export interface CommandHallStreamEvent {
   data: Record<string, unknown>;
 }
 
+export type QaAnswerStatus =
+  | "running"
+  | "completed"
+  | "partial"
+  | "unavailable"
+  | "failed";
+
+export interface QaSession {
+  id: string;
+  created_by: string;
+  event_id: string | null;
+  snapshot_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QaSessionCreateInput {
+  title: string;
+  event_id?: string;
+}
+
+export interface QaQuestion {
+  id: string;
+  session_id: string;
+  question_text: string;
+  status: QaAnswerStatus;
+  created_at: string;
+}
+
+export interface QaCitation {
+  citation_key: string;
+  source_title: string;
+  version_label: string;
+  locator: string;
+  excerpt: string;
+  source_uri: string | null;
+  checksum: string;
+}
+
+export interface QaToolCall {
+  id: string;
+  answer_id: string;
+  tool_name: string;
+  tool_status: string;
+  arguments: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  limitations: unknown[];
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export type QaMapAction =
+  | { action_type: "locate"; target_ref: string; reason: string; valid_until: string }
+  | { action_type: "fit_bounds"; bounds: [number, number, number, number]; reason: string; valid_until: string }
+  | { action_type: "buffer"; target_ref: string; radius_km: number; reason: string; valid_until: string }
+  | { action_type: "highlight"; target_ref: string; layer_id: string; reason: string; valid_until: string }
+  | { action_type: "set_layers"; layers: string[]; reason: string; valid_until: string };
+
+export interface QaAnswer {
+  id: string;
+  question_id: string;
+  session_id: string;
+  status: QaAnswerStatus;
+  text: string | null;
+  structured: Record<string, unknown> | null;
+  citation_keys: string[];
+  degraded_reasons: string[];
+  duration_ms: number | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  citations: QaCitation[];
+  tool_calls: QaToolCall[];
+  map_actions: QaMapAction[];
+}
+
+export interface QaStreamEvent {
+  type:
+    | "retrieval"
+    | "tool"
+    | "answer_started"
+    | "answer_delta"
+    | "answer_completed"
+    | "map_action"
+    | "error";
+  data: Record<string, unknown>;
+}
+
+export interface QaFeedbackInput {
+  helpful?: boolean | null;
+  rating?: number | null;
+  comment?: string | null;
+}
+
 export interface TokenResponse {
   access_token: string;
   token_type?: string;

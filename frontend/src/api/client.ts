@@ -26,6 +26,11 @@ import type {
   ManualEventInput,
   ProductionFilters,
   ProductionRun,
+  QaAnswer,
+  QaFeedbackInput,
+  QaSession,
+  QaSessionCreateInput,
+  QaStreamEvent,
   TaskSubmitInput,
   TemporaryTaskCreateInput,
   TokenResponse,
@@ -738,6 +743,213 @@ export async function streamCommandHall(
     signal.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
+}
+
+const QA_STREAM_EVENT_TYPES = new Set<QaStreamEvent["type"]>([
+  "retrieval",
+  "tool",
+  "answer_started",
+  "answer_delta",
+  "answer_completed",
+  "map_action",
+  "error",
+]);
+
+function parseQaSseFrame(frame: string): QaStreamEvent | null {
+  let type = "";
+  const dataLines: string[] = [];
+
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) {
+      value = value.slice(1);
+    }
+    if (field === "event") {
+      type = value;
+    } else if (field === "data") {
+      dataLines.push(value);
+    }
+  }
+
+  if (!QA_STREAM_EVENT_TYPES.has(type as QaStreamEvent["type"]) || dataLines.length === 0) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(dataLines.join("\n")) as unknown;
+  } catch {
+    throw new ApiError("事件流数据格式错误", 0);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ApiError("事件流数据格式错误", 0);
+  }
+
+  return {
+    type: type as QaStreamEvent["type"],
+    data: parsed as Record<string, unknown>,
+  };
+}
+
+export async function createQaSession(
+  input: QaSessionCreateInput,
+): Promise<QaSession> {
+  return requestJson<QaSession>("/api/v1/qa/sessions", {
+    method: "POST",
+    headers: {
+      ...authenticatedHeaders("请先登录后使用 AI 知识问答"),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function listQaSessions(): Promise<QaSession[]> {
+  return requestJson<QaSession[]>("/api/v1/qa/sessions", {
+    headers: authenticatedHeaders("请先登录后使用 AI 知识问答"),
+  });
+}
+
+export async function getQaSession(sessionId: string): Promise<QaSession> {
+  return requestJson<QaSession>(
+    `/api/v1/qa/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      headers: authenticatedHeaders("请先登录后使用 AI 知识问答"),
+    },
+  );
+}
+
+export async function streamQaQuestion(
+  sessionId: string,
+  question: string,
+  onEvent: (event: QaStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const headers = {
+    ...authenticatedHeaders("请先登录后使用 AI 知识问答"),
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(
+      `/api/v1/qa/sessions/${encodeURIComponent(sessionId)}/questions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ question }),
+        signal,
+      },
+    );
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) {
+      return;
+    }
+    throw new ApiError("事件流连接失败，请稍后重试", 0);
+  }
+
+  if (!response.ok) {
+    throw new ApiError(await parseError(response), response.status);
+  }
+  if (response.body === null) {
+    throw new ApiError("事件流响应为空", 0);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder(
+    "utf-8",
+    { stream: true } as TextDecoderOptions,
+  );
+  let buffer = "";
+  const cancelReader = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal) {
+    signal.addEventListener("abort", cancelReader, { once: true });
+    if (signal.aborted) {
+      cancelReader();
+    }
+  }
+
+  const emitFrames = (flush = false) => {
+    while (true) {
+      const boundary = nextSseBoundary(buffer);
+      if (boundary === null) {
+        break;
+      }
+      const frame = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      const event = parseQaSseFrame(frame);
+      if (event !== null) {
+        onEvent(event);
+      }
+    }
+    if (flush && buffer.trim()) {
+      const event = parseQaSseFrame(buffer);
+      buffer = "";
+      if (event !== null) {
+        onEvent(event);
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        emitFrames(true);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      emitFrames();
+    }
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) {
+      return;
+    }
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError("事件流连接中断，请稍后重试", 0);
+  } finally {
+    if (signal) {
+      signal.removeEventListener("abort", cancelReader);
+    }
+    reader.releaseLock();
+  }
+}
+
+export async function getQaAnswer(answerId: string): Promise<QaAnswer> {
+  return requestJson<QaAnswer>(
+    `/api/v1/qa/answers/${encodeURIComponent(answerId)}`,
+    {
+      headers: authenticatedHeaders("请先登录后使用 AI 知识问答"),
+    },
+  );
+}
+
+export async function sendQaFeedback(
+  answerId: string,
+  input: QaFeedbackInput,
+): Promise<void> {
+  await requestJson<unknown>(
+    `/api/v1/qa/answers/${encodeURIComponent(answerId)}/feedback`,
+    {
+      method: "POST",
+      headers: {
+        ...authenticatedHeaders("请先登录后使用 AI 知识问答"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 export async function listDataAssets(): Promise<DataAssetSummary[]> {
