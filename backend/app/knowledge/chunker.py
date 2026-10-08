@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from itertools import zip_longest
 from typing import Iterable
@@ -29,19 +30,28 @@ def chunk_document(
         if not buffer:
             return
         text = "\n".join(buffer)
-        for piece in _chunk_text(
+        page_by_offset = _page_by_offset(buffer, page_numbers)
+        pieces = _chunk_text(
             text,
             min_chars=min_chars,
             max_chars=max_chars,
             overlap_chars=overlap_chars,
-        ):
+        )
+        search_from = 0
+        for piece in pieces:
+            start = text.find(piece, search_from)
+            if start < 0:
+                start = 0
+            end = start + len(piece)
+            pages = _pages_for_span(page_by_offset, start, end)
             chunks.append(
                 _draft(
                     text=piece,
                     section_path=section_path or (),
-                    page_numbers=page_numbers,
+                    pages=pages,
                 )
             )
+            search_from = max(start, end - overlap_chars)
         buffer = []
         page_numbers = []
 
@@ -96,17 +106,16 @@ def _chunk_text(
 
     chunks: list[str] = []
     buffer = ""
+    buffer_is_tail_only = False
     for index, sentence in enumerate(sentences):
         if not sentence:
             continue
         remaining_after = remaining_chars[index + 1]
 
         if len(sentence) > max_chars:
-            if buffer:
-                chunks.append(buffer)
-                buffer = ""
-            hard_chunks = _split_long_sentence(
-                sentence,
+            hard_chunks = _split_hard_text(
+                buffer + sentence,
+                min_chars=min_chars,
                 max_chars=max_chars,
                 overlap_chars=overlap_chars,
             )
@@ -116,15 +125,19 @@ def _chunk_text(
                 if overlap_chars and hard_chunks
                 else ""
             )
+            buffer_is_tail_only = True
             continue
 
         if buffer and len(buffer) + len(sentence) > max_chars:
             chunks.append(buffer)
             buffer = buffer[-overlap_chars:] if overlap_chars else ""
+            buffer_is_tail_only = True
             if buffer and len(buffer) + len(sentence) > max_chars:
                 buffer = ""
+                buffer_is_tail_only = False
 
         buffer += sentence
+        buffer_is_tail_only = False
         if len(buffer) >= min_chars and remaining_after:
             projected_final = (
                 len(buffer[-overlap_chars:]) if overlap_chars else 0
@@ -132,8 +145,9 @@ def _chunk_text(
             if projected_final >= min_chars:
                 chunks.append(buffer)
                 buffer = buffer[-overlap_chars:] if overlap_chars else ""
+                buffer_is_tail_only = True
 
-    if buffer.strip():
+    if buffer.strip() and not buffer_is_tail_only:
         chunks.append(buffer)
     return [chunk for chunk in chunks if chunk.strip()]
 
@@ -146,22 +160,48 @@ def _split_sentences(text: str) -> list[str]:
     ]
 
 
-def _split_long_sentence(
+def _split_hard_text(
     text: str,
     *,
+    min_chars: int,
     max_chars: int,
     overlap_chars: int,
 ) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunk_count = _hard_chunk_count(
+        len(text),
+        min_chars=min_chars,
+        overlap_chars=overlap_chars,
+    )
+    total_output_length = len(text) + (chunk_count - 1) * overlap_chars
+    window_size = math.ceil(total_output_length / chunk_count)
     chunks: list[str] = []
     start = 0
-    while start < len(text):
-        end = min(start + max_chars, len(text))
+    for index in range(chunk_count):
+        end = min(start + window_size, len(text))
+        if index == chunk_count - 1:
+            end = len(text)
         chunks.append(text[start:end])
         if end == len(text):
             break
-        next_start = end - overlap_chars
-        start = max(next_start, start + 1)
+        start = max(end - overlap_chars, start + 1)
     return chunks
+
+
+def _hard_chunk_count(
+    length: int,
+    *,
+    min_chars: int,
+    overlap_chars: int,
+) -> int:
+    count = math.ceil(length / min_chars)
+    while count > 1 and length < count * min_chars - (
+        count - 1
+    ) * overlap_chars:
+        count -= 1
+    return count
 
 
 def _chunk_table(
@@ -247,9 +287,9 @@ def _draft(
     *,
     text: str,
     section_path: tuple[str, ...],
-    page_numbers: list[int | None],
+    pages: list[int | None],
 ) -> ChunkDraft:
-    present_pages = [page for page in page_numbers if page is not None]
+    present_pages = [page for page in pages if page is not None]
     metadata = {
         "checksum": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "kind": "paragraph",
@@ -262,6 +302,28 @@ def _draft(
         table_range=None,
         metadata=metadata,
     )
+
+
+def _page_by_offset(
+    paragraphs: list[str],
+    page_numbers: list[int | None],
+) -> list[int | None]:
+    page_by_offset: list[int | None] = []
+    for index, paragraph in enumerate(paragraphs):
+        page_by_offset.extend([page_numbers[index]] * len(paragraph))
+        if index < len(paragraphs) - 1:
+            page_by_offset.append(page_numbers[index])
+    return page_by_offset
+
+
+def _pages_for_span(
+    page_by_offset: list[int | None],
+    start: int,
+    end: int,
+) -> list[int | None]:
+    if not page_by_offset:
+        return []
+    return page_by_offset[start:end]
 
 
 def _format_table_row(headers: list[str], row: list[str]) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -181,7 +182,9 @@ def _parse_html(
     title = soup.title.get_text("", strip=True) if soup.title else None
     blocks: list[ParsedBlock] = []
     section_path: tuple[str, ...] = ()
-    _walk_html(soup.body or soup, section_path, blocks)
+    pending_text: list[str] = []
+    _walk_html(soup.body or soup, section_path, blocks, pending_text)
+    _flush_html_text(pending_text, section_path, blocks)
     return title or Path(file_name).stem, blocks
 
 
@@ -189,9 +192,13 @@ def _walk_html(
     element: Tag,
     section_path: tuple[str, ...],
     blocks: list[ParsedBlock],
+    pending_text: list[str],
 ) -> None:
     for child in element.children:
         if isinstance(child, NavigableString):
+            direct_text = str(child)
+            if direct_text.strip():
+                pending_text.append(direct_text)
             continue
         if not isinstance(child, Tag):
             continue
@@ -199,6 +206,7 @@ def _walk_html(
         if name in _EXCLUDED_HTML_TAGS:
             continue
         if name in _HEADING_TAGS:
+            _flush_html_text(pending_text, section_path, blocks)
             heading_text = child.get_text("", strip=True)
             if not heading_text:
                 continue
@@ -216,11 +224,13 @@ def _walk_html(
             )
             continue
         if name == "table":
+            _flush_html_text(pending_text, section_path, blocks)
             table_block = _html_table_block(child, section_path)
             if table_block is not None:
                 blocks.append(table_block)
             continue
         if name in _HTML_BLOCK_TAGS:
+            _flush_html_text(pending_text, section_path, blocks)
             block_text = child.get_text("", strip=True)
             if block_text:
                 blocks.append(
@@ -235,7 +245,29 @@ def _walk_html(
                 )
             continue
         if name in _HTML_CONTAINER_TAGS:
-            _walk_html(child, section_path, blocks)
+            _walk_html(child, section_path, blocks, pending_text)
+
+
+def _flush_html_text(
+    pending_text: list[str],
+    section_path: tuple[str, ...],
+    blocks: list[ParsedBlock],
+) -> None:
+    if not pending_text:
+        return
+    text = re.sub(r"\s+", " ", "".join(pending_text)).strip()
+    pending_text.clear()
+    if text:
+        blocks.append(
+            ParsedBlock(
+                kind="paragraph",
+                text=text,
+                page=None,
+                section_path=section_path,
+                row_range=None,
+                metadata={},
+            )
+        )
 
 
 def _html_table_block(
@@ -362,29 +394,139 @@ def _parse_pdf(
     reader = PdfReader(str(path))
     blocks: list[ParsedBlock] = []
     text_characters = 0
+    section_path: tuple[str, ...] = ()
 
     for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+        font_runs: list[tuple[str, float]] = []
+        page_text = page.extract_text(
+            visitor_text=lambda text, _cm, _tm, _font_dict, font_size,
+            runs=font_runs: _record_pdf_font_run(runs, text, font_size)
+        ) or ""
         text_characters += len(re.sub(r"\s+", "", page_text))
-        for line in page_text.splitlines():
-            line_text = line.strip()
-            if line_text:
-                blocks.append(
-                    ParsedBlock(
-                        kind="paragraph",
-                        text=line_text,
-                        page=page_number,
-                        section_path=(),
-                        row_range=None,
-                        metadata={"page": page_number},
-                    )
-                )
+        page_blocks, section_path = _pdf_blocks_from_text(
+            page_text,
+            page_number=page_number,
+            font_runs=font_runs,
+            section_path=section_path,
+        )
+        blocks.extend(page_blocks)
 
     if text_characters < 20:
         raise UnreadableDocumentError(
             "PDF contains no extractable text; OCR is not supported"
         )
     return Path(file_name).stem, blocks
+
+
+def _record_pdf_font_run(
+    runs: list[tuple[str, float]],
+    text: object,
+    font_size: object,
+) -> None:
+    raw_text = "" if text is None else str(text)
+    size = 0.0 if font_size is None else float(font_size)
+    if raw_text.strip():
+        runs.append((raw_text, size))
+
+
+def _pdf_blocks_from_text(
+    page_text: str,
+    *,
+    page_number: int,
+    font_runs: list[tuple[str, float]],
+    section_path: tuple[str, ...],
+) -> tuple[list[ParsedBlock], tuple[str, ...]]:
+    heading_model = _pdf_heading_model(font_runs)
+    blocks: list[ParsedBlock] = []
+
+    for raw_line in page_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        level = _pdf_heading_level(line, heading_model)
+        if level is None:
+            blocks.append(
+                ParsedBlock(
+                    kind="paragraph",
+                    text=line,
+                    page=page_number,
+                    section_path=section_path,
+                    row_range=None,
+                    metadata={"page": page_number},
+                )
+            )
+            continue
+        section_path = section_path[: level - 1] + (line,)
+        blocks.append(
+            ParsedBlock(
+                kind="heading",
+                text=line,
+                page=page_number,
+                section_path=section_path,
+                row_range=None,
+                metadata={"page": page_number},
+            )
+        )
+    return blocks, section_path
+
+
+def _pdf_heading_model(
+    runs: list[tuple[str, float]],
+) -> dict[str, object]:
+    fragments: dict[str, float] = {}
+    size_counts: Counter[float] = Counter()
+    for raw_text, size in runs:
+        normalized = _normalize_pdf_text(raw_text)
+        if not normalized or size <= 0:
+            continue
+        size_counts[size] += 1
+        fragments[normalized] = max(fragments.get(normalized, 0.0), size)
+
+    if not size_counts:
+        return {}
+    body_size = min(size_counts)
+    threshold = max(body_size * 1.3, body_size + 2.0)
+    heading_sizes = sorted(
+        {size for size in size_counts if size >= threshold},
+        reverse=True,
+    )
+    return {
+        "fragments": fragments,
+        "threshold": threshold,
+        "level_by_size": {
+            size: min(index + 1, 6)
+            for index, size in enumerate(heading_sizes)
+        },
+    }
+
+
+def _pdf_heading_level(
+    line: str,
+    model: dict[str, object],
+) -> int | None:
+    if not model or len(line) > 160:
+        return None
+    fragments = model["fragments"]
+    level_by_size = model["level_by_size"]
+    threshold = model["threshold"]
+    if not isinstance(fragments, dict) or not isinstance(level_by_size, dict):
+        return None
+    normalized_line = _normalize_pdf_text(line)
+    candidate_sizes: list[float] = []
+    for fragment, size in fragments.items():
+        if (
+            size >= float(threshold)
+            and size in level_by_size
+            and (fragment == normalized_line or fragment in normalized_line)
+        ):
+            candidate_sizes.append(float(size))
+    if not candidate_sizes:
+        return None
+    return int(level_by_size[max(candidate_sizes)])
+
+
+def _normalize_pdf_text(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _parse_xlsx(

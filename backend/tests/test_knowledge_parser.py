@@ -2,12 +2,15 @@ from pathlib import Path
 
 import pytest
 
+from app.knowledge.chunker import chunk_document
 from app.knowledge.parser import (
     DocumentParser,
     UnreadableDocumentError,
     UnsupportedDocumentError,
 )
 from docx import Document as DocxDocument
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
 from openpyxl import Workbook
 from pypdf import PdfWriter
 
@@ -58,6 +61,35 @@ def test_html_parser_removes_scripts_styles_and_links(tmp_path: Path) -> None:
     assert "body { color" not in body_text
     assert parsed.blocks[-1].text == "震后立即报告。外部"
     assert parsed.blocks[-1].section_path == ("第一章",)
+
+
+def test_html_parser_preserves_direct_container_text(tmp_path: Path) -> None:
+    path = tmp_path / "direct.html"
+    path.write_text(
+        """
+        <section>
+          <h2>第二章</h2>
+          直接正文。
+          <div><span>补充一</span><span>补充二</span></div>
+          <p>嵌套段落。</p>
+        </section>
+        """,
+        encoding="utf-8",
+    )
+
+    parsed = DocumentParser().parse(path, file_name="direct.html")
+    paragraph_texts = {
+        block.text
+        for block in parsed.blocks
+        if block.kind == "paragraph"
+    }
+
+    assert "直接正文。 补充一补充二" in paragraph_texts
+    assert "嵌套段落。" in paragraph_texts
+    assert any(
+        "直接正文。" in block.text and block.section_path == ("第二章",)
+        for block in parsed.blocks
+    )
 
 
 def test_csv_parser_uses_first_row_as_header(tmp_path: Path) -> None:
@@ -114,6 +146,33 @@ def test_docx_parser_keeps_heading_and_table(tmp_path: Path) -> None:
     assert paragraph.section_path == ("第一章",)
     assert table_block.metadata["headers"] == ["区域", "等级"]
     assert table_block.metadata["rows"] == [["浦东", "一级"]]
+
+
+def test_pdf_parser_uses_font_size_sections_and_propagates_to_chunks(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sections.pdf"
+    figure = Figure()
+    figure.text(0.1, 0.8, "Chapter One", fontsize=24)
+    figure.text(0.1, 0.6, "Emergency response.", fontsize=10)
+    with PdfPages(path) as pdf:
+        pdf.savefig(figure)
+
+    parsed = DocumentParser().parse(path, file_name="sections.pdf")
+    heading = next(block for block in parsed.blocks if block.kind == "heading")
+    paragraph = next(block for block in parsed.blocks if block.kind == "paragraph")
+
+    assert heading.text == "Chapter One"
+    assert paragraph.section_path == ("Chapter One",)
+
+    chunks = chunk_document(
+        parsed,
+        min_chars=5,
+        max_chars=100,
+        overlap_chars=2,
+    )
+    assert chunks
+    assert all(chunk.section_path == ("Chapter One",) for chunk in chunks)
 
 
 def test_image_only_pdf_fails_without_ocr(tmp_path: Path) -> None:

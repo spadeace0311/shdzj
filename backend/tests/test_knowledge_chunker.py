@@ -80,6 +80,65 @@ def test_chunker_starts_new_segment_on_heading_change() -> None:
     assert all(chunk.section_path in {("第一章",), ("第二章",)} for chunk in chunks)
 
 
+def test_chunker_preserves_overlap_after_a_long_sentence() -> None:
+    text = "前置。" * 50 + "长" * 1200 + "。"
+    document = ParsedDocument(
+        title="长句预案",
+        blocks=[
+            ParsedBlock(
+                kind="paragraph",
+                text=text,
+                page=1,
+                section_path=("第三章", "处置要求"),
+                row_range=None,
+                metadata={},
+            )
+        ],
+        metadata={},
+    )
+
+    chunks = chunk_document(document, min_chars=500, max_chars=1000, overlap_chars=100)
+
+    assert chunks
+    assert all(500 <= len(chunk.text) <= 1000 for chunk in chunks)
+    assert all(
+        first.text[-100:] == second.text[:100]
+        for first, second in zip(chunks, chunks[1:])
+    )
+
+
+def test_chunker_tracks_pages_per_cross_page_chunk() -> None:
+    document = ParsedDocument(
+        title="跨页正文",
+        blocks=[
+            ParsedBlock(
+                kind="paragraph",
+                text="第一页。" * 30,
+                page=1,
+                section_path=("总则",),
+                row_range=None,
+                metadata={},
+            ),
+            ParsedBlock(
+                kind="paragraph",
+                text="第二页。" * 30,
+                page=2,
+                section_path=("总则",),
+                row_range=None,
+                metadata={},
+            ),
+        ],
+        metadata={},
+    )
+
+    chunks = chunk_document(document, min_chars=50, max_chars=80, overlap_chars=10)
+    page_ranges = {(chunk.page_from, chunk.page_to) for chunk in chunks}
+
+    assert (1, 1) in page_ranges
+    assert (1, 2) in page_ranges
+    assert (2, 2) in page_ranges
+
+
 def test_chunker_keeps_table_rows_and_repeats_header() -> None:
     document = ParsedDocument(
         title="表格",
