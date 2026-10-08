@@ -69,5 +69,17 @@ class KnowledgeJobResponse(BaseModel):
     completed_at: datetime | None
 
 
+class KnowledgeSnapshotResponse(BaseModel):
+    id: UUID
+    event_id: UUID | None
+    revision_id: UUID | None
+    assessment_run_id: UUID | None
+    artifact_production_run_id: UUID | None
+    index_version_id: UUID
+    manifest: dict[str, Any]
+    fingerprint: str
+    created_at: datetime
+
+
 class KnowledgeLifecycleRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)

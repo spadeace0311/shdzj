@@ -244,6 +244,21 @@ class KnowledgeService:
         await session.flush()
         return _job_response(job)
 
+    async def enqueue_job(
+        self,
+        session: AsyncSession,
+        version_id: UUID,
+        *,
+        job_type: str,
+        payload: dict,
+    ) -> KnowledgeJob:
+        return await self._queue_job(
+            session,
+            version_id,
+            job_type=job_type,
+            payload=payload,
+        )
+
     async def _ensure_unique_version(
         self,
         session: AsyncSession,
