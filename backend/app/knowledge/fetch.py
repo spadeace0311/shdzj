@@ -74,6 +74,9 @@ class PinnedAddressTransport(httpx.AsyncBaseTransport):
         )
         return await self._transport.handle_async_request(pinned_request)
 
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
 
 def build_pinned_http_client(
     *,
@@ -350,9 +353,16 @@ async def _stream_request(
 
 
 def _host_header(url: httpx.URL) -> str:
-    if url.port in {None, 80, 443}:
-        return str(url.host)
-    return f"{url.host}:{url.port}"
+    host = str(url.host)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        formatted_host = host
+    else:
+        formatted_host = f"[{host}]" if address.version == 6 else host
+    if url.port is None:
+        return formatted_host
+    return f"{formatted_host}:{url.port}"
 
 
 def _validate_content_type(

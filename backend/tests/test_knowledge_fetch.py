@@ -10,6 +10,7 @@ from app.knowledge.fetch import (
     OnlineSearchDisabledError,
     PinnedAddressTransport,
     UnsafeUrlError,
+    _host_header,
     fetch_web_document,
     validate_fetch_url,
 )
@@ -299,10 +300,39 @@ async def test_pinned_transport_rejects_unvalidated_request() -> None:
     assert recording.requests == []
 
 
+@pytest.mark.asyncio
+async def test_pinned_transport_closes_wrapped_transport() -> None:
+    recording = _RecordingTransport([])
+    transport = PinnedAddressTransport(transport=recording)
+
+    async with httpx.AsyncClient(transport=transport):
+        pass
+
+    assert recording.aclose_count == 1
+
+
+def test_host_header_preserves_ipv6_and_explicit_ports() -> None:
+    assert _host_header(httpx.URL("https://cea.gov.cn/report")) == "cea.gov.cn"
+    assert _host_header(httpx.URL("http://cea.gov.cn/report")) == "cea.gov.cn"
+    assert _host_header(httpx.URL("https://cea.gov.cn:80/report")) == (
+        "cea.gov.cn:80"
+    )
+    assert _host_header(httpx.URL("http://cea.gov.cn:443/report")) == (
+        "cea.gov.cn:443"
+    )
+    assert _host_header(httpx.URL("https://[2001:db8::1]/report")) == (
+        "[2001:db8::1]"
+    )
+    assert _host_header(httpx.URL("https://[2001:db8::1]:80/report")) == (
+        "[2001:db8::1]:80"
+    )
+
+
 class _RecordingTransport(httpx.AsyncBaseTransport):
     def __init__(self, responses: list[httpx.Response]) -> None:
         self.responses = responses
         self.requests: list[httpx.Request] = []
+        self.aclose_count = 0
 
     async def handle_async_request(
         self,
@@ -310,3 +340,6 @@ class _RecordingTransport(httpx.AsyncBaseTransport):
     ) -> httpx.Response:
         self.requests.append(request)
         return self.responses[len(self.requests) - 1]
+
+    async def aclose(self) -> None:
+        self.aclose_count += 1
