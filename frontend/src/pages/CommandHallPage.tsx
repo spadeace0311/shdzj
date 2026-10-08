@@ -9,6 +9,8 @@ import {
 } from "../api/client";
 import { CommandHallDetailDrawer } from "../components/CommandHallDetailDrawer";
 import { CommandHallGroupBoard } from "../components/CommandHallGroupBoard";
+import { QaPanel } from "../components/QaPanel";
+import { MapActionProvider } from "../qa/MapActionContext";
 import {
   formatDateTime,
   formatEventKind,
@@ -210,6 +212,7 @@ export function CommandHallPage() {
   const [selectedGroup, setSelectedGroup] = useState<CommandHallGroup | null>(
     null,
   );
+  const [qaOpen, setQaOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const generationRef = useRef(0);
   const overviewRequestRef = useRef(0);
@@ -505,8 +508,9 @@ export function CommandHallPage() {
   const projectionSyncing = overview.sync_status === "syncing";
 
   return (
-    <div className="command-hall-shell">
-      <main className="command-hall" aria-labelledby="command-hall-title">
+    <MapActionProvider eventId={overview.event_id}>
+      <div className="command-hall-shell">
+        <main className="command-hall" aria-labelledby="command-hall-title">
         <header className="command-hall__header">
           <div className="command-hall__identity">
             <p className="eyebrow">上海市地震应急辅助决策系统</p>
@@ -554,6 +558,13 @@ export function CommandHallPage() {
             </span>
             <span>投影版本 {overview.projection_version}</span>
             <span>更新于 {formatDateTime(overview.updated_at)}</span>
+            <button
+              className="command-hall__qa-button"
+              type="button"
+              onClick={() => setQaOpen(true)}
+            >
+              智能问策
+            </button>
             <Link className="command-hall__exit" to="/">
               退出大屏
             </Link>
@@ -740,7 +751,7 @@ export function CommandHallPage() {
             onOpenGroup={setSelectedGroup}
           />
         </section>
-      </main>
+        </main>
 
       {selectedGroup ? (
         <CommandHallDetailDrawer
@@ -752,6 +763,14 @@ export function CommandHallPage() {
           onClose={() => setSelectedGroup(null)}
         />
       ) : null}
-    </div>
+      {qaOpen ? (
+        <QaPanel
+          eventId={overview.event_id}
+          mode="hall"
+          onClose={() => setQaOpen(false)}
+        />
+      ) : null}
+      </div>
+    </MapActionProvider>
   );
 }

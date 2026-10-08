@@ -12,6 +12,16 @@ import type {
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import { getAccessToken } from "../api/client";
+import {
+  applyQaMapAction,
+  QA_LAYER_CATALOG,
+  type QaActionMap,
+} from "../qa/mapActions";
+import {
+  isQaMapActionExpired,
+  useMapActionConsumer,
+  useMapActionEventId,
+} from "../qa/MapActionContext";
 import type {
   IntensityGridArtifact,
   LossAreaFeature,
@@ -132,7 +142,30 @@ export function LossMap({
   const [fusedBand, setFusedBand] = useState(
     fusedIntensityArtifact?.bands[0]?.name ?? "",
   );
+  const [lastActionType, setLastActionType] = useState("");
+  const currentEventId = useMapActionEventId();
+  const { eventId: actionEventId, action: latestAction } =
+    useMapActionConsumer();
   const centerKey = center.join("|");
+
+  useEffect(() => {
+    if (
+      !latestAction ||
+      actionEventId !== currentEventId ||
+      isQaMapActionExpired(latestAction)
+    ) {
+      return;
+    }
+
+    setLastActionType(latestAction.action_type);
+    if (mapRef.current && mapReady) {
+      applyQaMapAction(
+        mapRef.current as unknown as QaActionMap,
+        latestAction,
+        QA_LAYER_CATALOG,
+      );
+    }
+  }, [actionEventId, currentEventId, latestAction, mapReady]);
 
   useEffect(() => {
     if (
@@ -542,6 +575,12 @@ export function LossMap({
         <div className="loss-map__selection" aria-live="polite">
           {selectedProductLabel ? <span>产品：{selectedProductLabel}</span> : null}
           <span>街镇：{selectedTown || "未选择"}</span>
+          <span
+            className="loss-map__last-action"
+            data-testid="loss-map-last-action"
+          >
+            {lastActionType}
+          </span>
         </div>
       </div>
       <div className="loss-map__canvas" ref={containerRef} />

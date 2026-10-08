@@ -380,6 +380,15 @@ for (const viewport of VIEWPORTS) {
     ).toHaveText("测试");
     await expect(page.getByText("数据已同步")).toBeVisible();
     await assertCommandHallReady(page);
+
+    await page.getByRole("button", { name: "智能问策" }).click();
+    await expect(page.getByLabel("事件上下文问答")).toBeVisible();
+    const qaBounds = await page.getByLabel("事件上下文问答").boundingBox();
+    expect(qaBounds!.x).toBeGreaterThanOrEqual(0);
+    expect(qaBounds!.x + qaBounds!.width).toBeLessThanOrEqual(
+      viewport.width + 1,
+    );
+    await page.getByRole("button", { name: "关闭智能问策" }).click();
   });
 }
 

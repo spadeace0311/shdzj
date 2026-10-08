@@ -8,6 +8,8 @@ import {
   getEvent,
   getLossAssessment,
 } from "../api/client";
+import { QaPanel } from "../components/QaPanel";
+import { MapActionProvider } from "../qa/MapActionContext";
 import { AssessmentProgressCard } from "../components/AssessmentProgressCard";
 import {
   ArtifactProgressCard,
@@ -45,7 +47,9 @@ export function EventDetailPage() {
   const [production, setProduction] = useState<ProductionRun | null>(null);
   const [status, setStatus] = useState<DetailStatus>("loading");
   const [lossState, setLossState] = useState<LossLoadState>({ status: "idle" });
+  const [qaOpen, setQaOpen] = useState(false);
   const lossRequestRef = useRef(0);
+  const scrollBeforeQaRef = useRef({ x: 0, y: 0 });
 
   const loadDetail = useCallback(async () => {
     setStatus("loading");
@@ -60,6 +64,32 @@ export function EventDetailPage() {
   useEffect(() => {
     void loadDetail();
   }, [loadDetail]);
+
+  useEffect(() => {
+    if (!qaOpen) {
+      return;
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [qaOpen]);
+
+  function openQa() {
+    scrollBeforeQaRef.current = {
+      x: window.scrollX,
+      y: window.scrollY,
+    };
+    setQaOpen(true);
+  }
+
+  function closeQa() {
+    setQaOpen(false);
+    globalThis.setTimeout(() => {
+      window.scrollTo(scrollBeforeQaRef.current.x, scrollBeforeQaRef.current.y);
+    }, 0);
+  }
 
   useEffect(() => {
     let active = true;
@@ -147,12 +177,16 @@ export function EventDetailPage() {
   const artifactProgress = buildArtifactProgressSummary(production);
 
   return (
-    <section className="page-section" aria-labelledby="detail-title">
+    <MapActionProvider eventId={eventId}>
+      <section className="page-section" aria-labelledby="detail-title">
       <header className="page-heading">
         <div>
           <p className="eyebrow">事件详情</p>
           <h1 id="detail-title">{event?.place ?? "事件详情"}</h1>
         </div>
+        <button className="secondary-button" type="button" onClick={openQa}>
+          智能问策
+        </button>
         <Link className="text-button" to="/">
           返回事件列表
         </Link>
@@ -357,6 +391,14 @@ export function EventDetailPage() {
           </section>
         </div>
       ) : null}
-    </section>
+      </section>
+      {qaOpen ? (
+        <QaPanel
+          eventId={eventId}
+          mode="event"
+          onClose={closeQa}
+        />
+      ) : null}
+    </MapActionProvider>
   );
 }

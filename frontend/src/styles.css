@@ -4056,3 +4056,131 @@ a:hover {
     height: 620px;
   }
 }
+
+.command-hall__qa-button {
+  min-height: 34px;
+  border: 1px solid #176b9b;
+  border-radius: 5px;
+  background: #e6f2f8;
+  color: #176b9b;
+  padding: 0 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.command-hall__qa-button:hover {
+  background: #d5eaf5;
+}
+
+.loss-map__last-action {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.qa-panel-layer {
+  position: fixed;
+  z-index: 130;
+  inset: 0;
+  pointer-events: none;
+}
+
+.qa-panel-layer--hall {
+  --qa-hall-top: 126px;
+}
+
+.qa-panel__scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgb(11 28 40 / 38%);
+  pointer-events: auto;
+}
+
+.qa-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+  border-left: 1px solid #aebdc8;
+  background: #f4f7f9;
+  box-shadow: -8px 0 24px rgb(10 30 45 / 24%);
+  pointer-events: auto;
+}
+
+.qa-panel--event {
+  width: 520px;
+}
+
+.qa-panel--hall {
+  top: var(--qa-hall-top, 0);
+  width: min(40vw, 1600px);
+  height: calc(100% - var(--qa-hall-top, 0px));
+}
+
+.qa-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 4px solid #176b9b;
+  background: #ffffff;
+  padding: 16px 18px;
+}
+
+.qa-panel__header h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.qa-panel__header .eyebrow {
+  margin: 0 0 4px;
+}
+
+.qa-panel__content {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 18px 30px;
+}
+
+.qa-panel__content .qa-conversation {
+  min-height: 0;
+}
+
+@media (max-height: 1200px) {
+  .qa-panel-layer--hall {
+    --qa-hall-top: 100px;
+  }
+
+  .qa-panel__header {
+    padding: 12px 14px;
+  }
+
+  .qa-panel__content {
+    padding: 12px 14px 24px;
+  }
+}
+
+@media (min-width: 5000px) and (min-height: 1800px) {
+  .qa-panel-layer--hall {
+    --qa-hall-top: 220px;
+  }
+
+  .qa-panel__header {
+    padding: 22px 26px;
+  }
+
+  .qa-panel__header h2 {
+    font-size: 28px;
+  }
+
+  .qa-panel__content {
+    gap: 22px;
+    padding: 22px 26px 38px;
+  }
+}
