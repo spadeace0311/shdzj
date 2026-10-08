@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 
 class QaAnswerStatus(StrEnum):
@@ -7,3 +11,39 @@ class QaAnswerStatus(StrEnum):
     PARTIAL = "partial"
     UNAVAILABLE = "unavailable"
     FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallPlan:
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeQuery:
+    text: str
+    top_k: int
+
+
+@dataclass(frozen=True, slots=True)
+class MapIntent:
+    action_type: str
+    target_ref: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlan:
+    intent: str
+    tool_calls: list[ToolCallPlan]
+    knowledge_queries: list[KnowledgeQuery]
+    map_intents: list[MapIntent]
+    clarification: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerDraft:
+    text: str
+    structured: dict[str, Any]
+    citation_keys: list[str]
+    degraded_reasons: list[str]
