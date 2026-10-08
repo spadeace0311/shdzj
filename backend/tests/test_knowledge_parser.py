@@ -175,6 +175,23 @@ def test_pdf_parser_uses_font_size_sections_and_propagates_to_chunks(
     assert all(chunk.section_path == ("Chapter One",) for chunk in chunks)
 
 
+def test_pdf_body_repeating_heading_term_stays_body(tmp_path: Path) -> None:
+    path = tmp_path / "repeated-term.pdf"
+    figure = Figure()
+    figure.text(0.1, 0.8, "Emergency", fontsize=24)
+    figure.text(0.1, 0.6, "Emergency response.", fontsize=10)
+    with PdfPages(path) as pdf:
+        pdf.savefig(figure)
+
+    parsed = DocumentParser().parse(path, file_name="repeated-term.pdf")
+    heading = next(block for block in parsed.blocks if block.kind == "heading")
+    body = next(block for block in parsed.blocks if block.kind == "paragraph")
+
+    assert heading.text == "Emergency"
+    assert body.text == "Emergency response."
+    assert body.section_path == ("Emergency",)
+
+
 def test_image_only_pdf_fails_without_ocr(tmp_path: Path) -> None:
     path = tmp_path / "image-only.pdf"
     writer = PdfWriter()

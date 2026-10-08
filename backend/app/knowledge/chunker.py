@@ -115,7 +115,6 @@ def _chunk_text(
         if len(sentence) > max_chars:
             hard_chunks = _split_hard_text(
                 buffer + sentence,
-                min_chars=min_chars,
                 max_chars=max_chars,
                 overlap_chars=overlap_chars,
             )
@@ -163,45 +162,35 @@ def _split_sentences(text: str) -> list[str]:
 def _split_hard_text(
     text: str,
     *,
-    min_chars: int,
     max_chars: int,
     overlap_chars: int,
 ) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
-    chunk_count = _hard_chunk_count(
-        len(text),
-        min_chars=min_chars,
-        overlap_chars=overlap_chars,
+    chunk_count = max(
+        1,
+        math.ceil(
+            (len(text) - overlap_chars) / (max_chars - overlap_chars)
+        ),
     )
     total_output_length = len(text) + (chunk_count - 1) * overlap_chars
-    window_size = math.ceil(total_output_length / chunk_count)
+    base_length, remainder = divmod(total_output_length, chunk_count)
+    lengths = [
+        base_length + (1 if index < remainder else 0)
+        for index in range(chunk_count)
+    ]
     chunks: list[str] = []
     start = 0
-    for index in range(chunk_count):
-        end = min(start + window_size, len(text))
+    for index, length in enumerate(lengths):
+        end = min(start + length, len(text))
         if index == chunk_count - 1:
             end = len(text)
         chunks.append(text[start:end])
         if end == len(text):
             break
-        start = max(end - overlap_chars, start + 1)
+        start = max(end - overlap_chars, 0)
     return chunks
-
-
-def _hard_chunk_count(
-    length: int,
-    *,
-    min_chars: int,
-    overlap_chars: int,
-) -> int:
-    count = math.ceil(length / min_chars)
-    while count > 1 and length < count * min_chars - (
-        count - 1
-    ) * overlap_chars:
-        count -= 1
-    return count
 
 
 def _chunk_table(

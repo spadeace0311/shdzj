@@ -517,7 +517,7 @@ def _pdf_heading_level(
         if (
             size >= float(threshold)
             and size in level_by_size
-            and (fragment == normalized_line or fragment in normalized_line)
+            and fragment == normalized_line
         ):
             candidate_sizes.append(float(size))
     if not candidate_sizes:

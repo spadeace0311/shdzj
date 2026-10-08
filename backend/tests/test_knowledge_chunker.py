@@ -107,6 +107,59 @@ def test_chunker_preserves_overlap_after_a_long_sentence() -> None:
     )
 
 
+def test_chunker_hard_split_default_1301_respects_limits() -> None:
+    text = "长" * 1301
+    document = ParsedDocument(
+        title="默认硬切片",
+        blocks=[
+            ParsedBlock(
+                kind="paragraph",
+                text=text,
+                page=1,
+                section_path=(),
+                row_range=None,
+                metadata={},
+            )
+        ],
+        metadata={},
+    )
+
+    chunks = chunk_document(document)
+
+    assert [len(chunk.text) for chunk in chunks] == [701, 700]
+    assert all(500 <= len(chunk.text) <= 1000 for chunk in chunks)
+    assert chunks[0].text[-100:] == chunks[1].text[:100]
+
+
+def test_chunker_hard_split_custom_81_respects_max() -> None:
+    text = "长" * 81
+    document = ParsedDocument(
+        title="自定义硬切片",
+        blocks=[
+            ParsedBlock(
+                kind="paragraph",
+                text=text,
+                page=1,
+                section_path=(),
+                row_range=None,
+                metadata={},
+            )
+        ],
+        metadata={},
+    )
+
+    chunks = chunk_document(
+        document,
+        min_chars=50,
+        max_chars=80,
+        overlap_chars=10,
+    )
+
+    assert [len(chunk.text) for chunk in chunks] == [46, 45]
+    assert all(len(chunk.text) <= 80 for chunk in chunks)
+    assert chunks[0].text[-10:] == chunks[1].text[:10]
+
+
 def test_chunker_tracks_pages_per_cross_page_chunk() -> None:
     document = ParsedDocument(
         title="跨页正文",
