@@ -73,7 +73,7 @@ def test_evidence_deduplicates_limits_each_version_and_excludes_restricted_from_
     assert all("restricted source text" != item.get("text") for item in pack.primary)
 
 
-def test_evidence_prioritizes_structured_facts_and_notes_same_scope_conflicts() -> None:
+def test_structured_facts_suppress_numeric_documents_and_keep_nonnumeric_evidence() -> None:
     first = ToolExecution(
         name="fault.nearest",
         result=ToolResult.ok(
@@ -95,18 +95,27 @@ def test_evidence_prioritizes_structured_facts_and_notes_same_scope_conflicts() 
         ),
     )
 
+    numeric_id = uuid4()
+    nonnumeric_id = uuid4()
     pack = EvidenceBuilder().build(
-        evidence=[_evidence(uuid4(), text="文档距离为 13 公里")],
+        evidence=[
+            _evidence(numeric_id, text="文档距离为 13 公里"),
+            _evidence(nonnumeric_id, text="应急预案规定响应分级。"),
+        ],
         tool_results=[first, second],
     )
 
     assert pack.primary[0]["kind"] == "structured"
     assert pack.primary[1]["kind"] == "structured"
     assert pack.primary[2]["kind"] == "document"
+    assert pack.primary[2]["chunk_id"] == str(nonnumeric_id)
+    assert all("文档距离为 13 公里" not in str(item) for item in pack.primary)
     assert len(pack.conflict_notes) == 1
     assert "distance_km" in pack.conflict_notes[0]
     assert "12.5" in pack.conflict_notes[0]
     assert "14.0" in pack.conflict_notes[0]
+    assert "C1" in pack.authority_notes[0]
+    assert "structured" in pack.authority_notes[0]
 
 
 def test_prompt_injection_text_remains_quoted_evidence_only() -> None:
@@ -145,10 +154,44 @@ def test_access_policy_blocks_inactive_users_and_restricted_model_export() -> No
         access_level="public",
         is_active=True,
     )
+    missing_access = SimpleNamespace(
+        is_active=True,
+    )
+    unknown_access = SimpleNamespace(
+        access_level="mystery",
+        is_active=True,
+    )
 
     assert policy.can_read_event(active_viewer, uuid4())
     assert policy.can_read_source(active_viewer, restricted)
     assert not policy.can_export_to_model(restricted)
     assert policy.can_export_to_model(public)
+    assert not policy.can_export_to_model(missing_access)
+    assert not policy.can_export_to_model(unknown_access)
     assert not policy.can_read_event(inactive_viewer, uuid4())
     assert not policy.can_read_source(inactive_viewer, public)
+
+
+def test_evidence_fails_closed_for_missing_or_unknown_access_metadata() -> None:
+    evidence = [
+        _evidence(uuid4(), access_level="mystery", text="unknown"),
+        RetrievedEvidence(
+            chunk_id=uuid4(),
+            version_id=uuid4(),
+            source_title="missing access",
+            layer="public_reference",
+            access_level="",
+            text="missing",
+            section_path=(),
+            page_from=None,
+            page_to=None,
+            source_uri=None,
+            checksum="c" * 64,
+            scores={},
+        ),
+    ]
+
+    pack = EvidenceBuilder().build(evidence=evidence)
+
+    assert pack.restricted_count == 2
+    assert pack.primary == ()

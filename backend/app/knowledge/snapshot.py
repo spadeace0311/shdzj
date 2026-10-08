@@ -131,11 +131,20 @@ async def _active_index_version(
         matching = [
             row
             for row in rows
-            if str((row.manifest or {}).get("event_id") or "") == str(event_id)
+            if _manifest_event_id(row) == str(event_id)
         ]
-        if matching:
-            return matching[0]
-    return rows[0]
+    else:
+        matching = [row for row in rows if _manifest_event_id(row) is None]
+    if not matching:
+        raise LookupError("no active knowledge index version for snapshot scope")
+    return matching[0]
+
+
+def _manifest_event_id(index_version: KnowledgeIndexVersion) -> str | None:
+    value = (index_version.manifest or {}).get("event_id")
+    if value is None or value == "":
+        return None
+    return str(value)
 
 
 async def _active_production_run_id(

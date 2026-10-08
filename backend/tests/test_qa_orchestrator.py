@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import httpx
+from pydantic import SecretStr
+
 from app.auth.service import AuthUser
+from app.config import Settings
 from app.knowledge.index import RetrievedEvidence
 from app.knowledge.retrieval import RetrievalResult
+from app.qa.deepseek import DeepSeekAdapter
 from app.qa.domain import (
     AnswerDraft,
     ExecutionPlan,
@@ -171,6 +177,7 @@ class StaticExecutionRegistry(ToolRegistry):
     def __init__(self, executions: list[ToolExecution]) -> None:
         super().__init__()
         self.executions = executions
+        self.contexts: list = []
 
     def get(self, name: str):
         if name in {execution.name for execution in self.executions}:
@@ -178,7 +185,8 @@ class StaticExecutionRegistry(ToolRegistry):
         return None
 
     async def execute_plan(self, calls, context):
-        del calls, context
+        del calls
+        self.contexts.append(context)
         return list(self.executions)
 
 
@@ -249,6 +257,36 @@ def test_answer_prompt_treats_evidence_as_untrusted_data() -> None:
     assert "不可信" in system
     assert "URL" in system
     assert "工具" in system
+
+
+def test_stream_prompt_requests_plain_text_with_citation_markers() -> None:
+    from app.qa.prompts import build_stream_answer_messages
+
+    messages = build_stream_answer_messages(
+        "有哪些依据？",
+        {},
+        [{"citation_key": "C1", "text": "依据"}],
+        [],
+    )
+    system = messages[0]["content"]
+
+    assert "JSON" not in system
+    assert "[C#" in system
+    assert "纯文本" in system
+
+
+def _settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://earthquake:earthquake@localhost:5432/earthquake",
+        jwt_secret="test-jwt-secret-at-least-16-characters",
+        superadmin_initial_password="test-superadmin-password-at-least-16-characters",
+        deepseek_api_key=SecretStr("test-deepseek-key"),
+        deepseek_base_url="https://deepseek.test",
+        deepseek_model="deepseek-flash",
+        deepseek_timeout_seconds=1,
+        deepseek_max_retries=0,
+    )
 
 
 async def test_no_evidence_returns_unavailable_without_model_invention() -> None:
@@ -393,6 +431,118 @@ async def test_required_event_carries_validated_citations() -> None:
     assert completed.data["citations"][0]["checksum"] == "b" * 64
 
 
+async def test_snapshot_artifact_run_reaches_tool_context() -> None:
+    stored_session = _stored_session(event_id=uuid4())
+    store = FakeStore(stored_session)
+    registry = StaticExecutionRegistry(
+        [
+            ToolExecution(
+                name="test.echo",
+                result=ToolResult.ok(
+                    value={"ok": True},
+                    source="test",
+                    version="v1",
+                ),
+            )
+        ]
+    )
+    plan = ExecutionPlan(
+        intent="tool_query",
+        tool_calls=[ToolCallPlan(name="test.echo", arguments={})],
+        knowledge_queries=[],
+        map_intents=[],
+        clarification=None,
+    )
+    orchestrator = QuestionOrchestrator(
+        deepseek=FakeDeepSeek(plan, chunks=["确定。"]),
+        retriever=FakeRetriever(),
+        registry=registry,
+        store=store,
+    )
+
+    async for _event in orchestrator.ask(
+        "执行工具",
+        session_id=stored_session.id,
+        user=_user(),
+    ):
+        pass
+
+    assert registry.contexts[0].snapshot_id == stored_session.snapshot_id
+    assert (
+        registry.contexts[0].artifact_production_run_id
+        == stored_session.artifact_production_run_id
+    )
+
+
+async def test_real_adapter_stream_persists_plain_text_not_json() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    retriever = FakeRetriever([_evidence()])
+    captured: dict = {}
+    plan_payload = {
+        "intent": "knowledge_query",
+        "tool_calls": [],
+        "knowledge_queries": [{"text": "地震应急响应分级", "top_k": 5}],
+        "map_intents": [],
+        "clarification": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        captured["payload"] = payload
+        if payload.get("stream"):
+            return httpx.Response(
+                200,
+                content=(
+                    'data: {"choices":[{"delta":{"content":"根据预案，"}}]}\n\n'
+                    'data: {"choices":[{"delta":{"content":"响应分为四级 [C1]。"}}]}\n\n'
+                    "data: [DONE]\n\n"
+                ).encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                plan_payload,
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        adapter = DeepSeekAdapter(_settings(), client=client)
+        orchestrator = QuestionOrchestrator(
+            deepseek=adapter,
+            retriever=retriever,
+            registry=ToolRegistry(),
+            store=store,
+        )
+        answer_id = None
+        async for event in orchestrator.ask(
+            "响应怎么分级？",
+            session_id=stored_session.id,
+            user=_user(),
+        ):
+            if event.type == "retrieval":
+                answer_id = event.data["answer_id"]
+
+    answer = await orchestrator.finalize(answer_id)
+    assert answer.text == "根据预案，响应分为四级 [C1]。"
+    assert not answer.text.startswith("{")
+    assert "只能输出一个 JSON 对象" not in captured["payload"]["messages"][0][
+        "content"
+    ]
+
+
 async def test_non_stream_citation_keys_include_requested_and_inline_valid_keys() -> None:
     stored_session = _stored_session()
     store = FakeStore(stored_session)
@@ -522,6 +672,87 @@ async def test_stream_interruption_persists_partial_text_and_keeps_tools() -> No
         for event in events
     )
     assert not any(event.type == "answer_completed" for event in events)
+
+
+async def test_stream_sanitizes_invalid_citation_tokens_before_exposure() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    deepseek = FakeDeepSeek(
+        _plan(queries=True),
+        chunks=["答案 [C", "9] 继续 [C", "1] 和 C", "9"],
+    )
+    retriever = FakeRetriever([_evidence()])
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=retriever,
+        registry=ToolRegistry(),
+        store=store,
+    )
+
+    events = [
+        event
+        async for event in orchestrator.ask(
+            "响应怎么分级？",
+            session_id=stored_session.id,
+            user=_user(),
+        )
+    ]
+    emitted = "".join(
+        event.data["text"]
+        for event in events
+        if event.type == "answer_delta"
+    )
+    answer_id = next(
+        event.data["answer_id"]
+        for event in events
+        if event.type == "answer_started"
+    )
+    answer = await orchestrator.finalize(answer_id)
+
+    assert "C9" not in emitted
+    assert "C9" not in answer.text
+    assert "[C1]" in emitted
+    assert answer.citation_keys == ["C1"]
+
+
+async def test_partial_failure_removes_split_invalid_citation_tokens() -> None:
+    stored_session = _stored_session()
+    store = FakeStore(stored_session)
+    deepseek = FakeDeepSeek(
+        _plan(queries=True),
+        chunks=["已有 [C", "9] 文本"],
+        stream_error=RuntimeError("connection dropped"),
+    )
+    retriever = FakeRetriever([_evidence()])
+    orchestrator = QuestionOrchestrator(
+        deepseek=deepseek,
+        retriever=retriever,
+        registry=ToolRegistry(),
+        store=store,
+    )
+
+    events = [
+        event
+        async for event in orchestrator.ask(
+            "已有结论是什么？",
+            session_id=stored_session.id,
+            user=_user(),
+        )
+    ]
+    answer_id = next(
+        event.data["answer_id"]
+        for event in events
+        if event.type == "answer_started"
+    )
+    answer = await orchestrator.finalize(answer_id)
+
+    assert answer.status == "partial"
+    assert "C9" not in answer.text
+    assert "C9" not in "".join(
+        event.data["text"]
+        for event in events
+        if event.type == "answer_delta"
+    )
 
 
 async def test_retriever_factory_receives_snapshot_locked_index_version() -> None:

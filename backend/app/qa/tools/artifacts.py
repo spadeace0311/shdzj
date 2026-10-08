@@ -76,11 +76,17 @@ class ArtifactSearchPublishedTool:
                 GeneratedArtifact,
                 GeneratedArtifact.id == ArtifactPublication.artifact_id,
             )
-            .where(
-                ArtifactPublication.event_id == event_id,
-                ArtifactPublication.superseded_at.is_(None),
-            )
+            .where(ArtifactPublication.event_id == event_id)
         )
+        if context.artifact_production_run_id is not None:
+            statement = statement.where(
+                ArtifactPublication.production_run_id
+                == context.artifact_production_run_id
+            )
+        else:
+            statement = statement.where(
+                ArtifactPublication.superseded_at.is_(None)
+            )
         if artifact_key is not None:
             statement = statement.where(
                 ArtifactPublication.artifact_key == artifact_key
@@ -120,6 +126,11 @@ class ArtifactSearchPublishedTool:
                     "output_profile": arguments.get("output_profile"),
                     "production_mode": arguments.get("production_mode"),
                     "status": arguments.get("status"),
+                    "artifact_production_run_id": (
+                        str(context.artifact_production_run_id)
+                        if context.artifact_production_run_id is not None
+                        else None
+                    ),
                 },
                 limitations=("published_artifact_not_found",),
             )
@@ -143,6 +154,11 @@ class ArtifactSearchPublishedTool:
                 "output_profile": arguments.get("output_profile"),
                 "production_mode": arguments.get("production_mode"),
                 "status": arguments.get("status"),
+                "artifact_production_run_id": (
+                    str(context.artifact_production_run_id)
+                    if context.artifact_production_run_id is not None
+                    else None
+                ),
             },
         )
 

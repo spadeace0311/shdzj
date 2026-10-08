@@ -11,8 +11,10 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     FilterSelector,
+    IsNullCondition,
     MatchAny,
     MatchValue,
+    PayloadField,
     PointStruct,
     SparseVector,
     SparseVectorParams,
@@ -35,10 +37,16 @@ class KnowledgeIndexNotPublishedError(ValueError):
 @dataclass(frozen=True, slots=True)
 class KnowledgeFilters:
     source_ids: tuple[UUID, ...] = ()
+    source_version_ids: tuple[UUID, ...] = ()
     layers: tuple[str, ...] = ()
     access_levels: tuple[str, ...] = ()
     event_id: UUID | None = None
+    global_only: bool = False
     published_before: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.global_only and self.event_id is not None:
+            raise ValueError("global_only cannot be combined with event_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +265,13 @@ def _qdrant_filter(
         conditions.append(
             _match_any("source_id", [str(value) for value in filters.source_ids])
         )
+    if filters.source_version_ids:
+        conditions.append(
+            _match_any(
+                "version_id",
+                [str(value) for value in filters.source_version_ids],
+            )
+        )
     if filters.layers:
         conditions.append(_match_any("layer", list(filters.layers)))
     if filters.access_levels:
@@ -275,7 +290,16 @@ def _qdrant_filter(
                 range=DatetimeRange(lte=filters.published_before),
             )
         )
-    return Filter(must=conditions)
+    must_not = (
+        [
+            IsNullCondition(
+                is_null=PayloadField(key="event_id"),
+            )
+        ]
+        if filters.global_only
+        else None
+    )
+    return Filter(must=conditions, must_not=must_not)
 
 
 def _match_any(key: str, values: list[str]) -> FieldCondition:

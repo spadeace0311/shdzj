@@ -126,6 +126,30 @@ async def test_event_snapshot_locks_context_and_is_idempotent(
         await _delete_actor_data(session_factory)
 
 
+async def test_global_snapshot_ignores_newer_event_specific_index(
+    session_factory,
+) -> None:
+    try:
+        global_index_id = await _seed_index(
+            session_factory,
+            source_key=f"global.{uuid4()}",
+            activated_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        event_index_id = await _seed_index(
+            session_factory,
+            source_key=f"event.{uuid4()}",
+            event_id=uuid4(),
+            activated_at=datetime.now(UTC),
+        )
+
+        snapshot = await _create_snapshot(session_factory)
+
+        assert event_index_id != global_index_id
+        assert snapshot.index_version_id == global_index_id
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_snapshot_requires_active_index_version(session_factory) -> None:
     with pytest.raises(LookupError, match="index"):
         await _create_snapshot(session_factory)
@@ -147,6 +171,7 @@ async def _seed_index(
     *,
     source_key: str | None = None,
     event_id: UUID | None = None,
+    activated_at: datetime | None = None,
 ) -> UUID:
     async with session_factory() as session:
         async with session.begin():
@@ -187,7 +212,7 @@ async def _seed_index(
                 reranker_model=settings.reranker_model_name,
                 chunk_count=1,
                 manifest=manifest,
-                activated_at=datetime.now(UTC),
+                activated_at=activated_at or datetime.now(UTC),
             )
             session.add(index_version)
             await session.flush()

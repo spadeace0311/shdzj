@@ -23,7 +23,12 @@ async def dispose_engine_between_tests():
     await engine.dispose()
 
 
-def context_for(seeded_artifact_assessment, session) -> ToolContext:
+def context_for(
+    seeded_artifact_assessment,
+    session,
+    *,
+    artifact_production_run_id: UUID | None = None,
+) -> ToolContext:
     return ToolContext(
         session=session,
         user=AuthUser(username="qa-task9", role="viewer", workgroup=None),
@@ -32,6 +37,7 @@ def context_for(seeded_artifact_assessment, session) -> ToolContext:
         assessment_run_id=seeded_artifact_assessment.assessment_run_id,
         snapshot_id=uuid4(),
         index_version_id=uuid4(),
+        artifact_production_run_id=artifact_production_run_id,
     )
 
 
@@ -104,6 +110,42 @@ async def test_artifact_search_rejects_unknown_catalog_key(
 
     assert result.status == "invalid"
     assert result.limitations == ("unknown_artifact_key",)
+
+
+async def test_artifact_search_uses_snapshot_run_and_preserves_superseded_publication(
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    old = await seeded_artifact_assessment.publish_epicenter_artifact()
+    new = await seeded_artifact_assessment.published_artifact(
+        "map.epicenter",
+        version=2,
+    )
+
+    async with session_factory() as session:
+        locked_context = context_for(
+            seeded_artifact_assessment,
+            session,
+            artifact_production_run_id=old.production_run_id,
+        )
+        locked_result = await ArtifactSearchPublishedTool().handle(
+            {"artifact_key": "map.epicenter"},
+            locked_context,
+        )
+        fallback_context = context_for(seeded_artifact_assessment, session)
+        fallback_result = await ArtifactSearchPublishedTool().handle(
+            {"artifact_key": "map.epicenter"},
+            fallback_context,
+        )
+
+    assert locked_result.status == "ok"
+    assert [
+        item["artifact_id"] for item in locked_result.value["artifacts"]
+    ] == [str(old.id)]
+    assert fallback_result.status == "ok"
+    assert [
+        item["artifact_id"] for item in fallback_result.value["artifacts"]
+    ] == [str(new.id)]
 
 
 async def test_default_registry_registers_assessment_and_artifact_tools() -> None:

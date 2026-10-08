@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from app.knowledge.index import RetrievedEvidence
+from app.qa.access import is_model_exportable_access_level
 
 _LAYER_RANK = {
     "local_authority": 0,
@@ -17,6 +19,7 @@ _LAYER_RANK = {
 }
 _MAX_CITATIONS = 3
 _MAX_PER_VERSION = 3
+_NUMERIC_CLAIM_PATTERN = re.compile(r"[0-9]")
 _METRIC_NAMES = frozenset(
     {
         "count",
@@ -94,6 +97,7 @@ class EvidencePack:
     citations: tuple[EvidenceCitation, ...]
     restricted_count: int
     conflict_notes: tuple[str, ...]
+    authority_notes: tuple[str, ...]
 
     @property
     def model_evidence(self) -> list[dict[str, Any]]:
@@ -115,6 +119,7 @@ class _StructuredFact:
     def to_primary_dict(self) -> dict[str, Any]:
         return {
             "kind": "structured",
+            "authority": "structured",
             "tool_name": self.tool_name,
             "metric_key": self.metric_key,
             "scope": self.scope,
@@ -132,15 +137,39 @@ class EvidenceBuilder:
         evidence: Iterable[RetrievedEvidence] = (),
         tool_results: Iterable[Any] = (),
     ) -> EvidencePack:
-        citations, restricted_count = _document_citations(evidence)
         facts, conflict_notes = _structured_facts(tool_results)
+        citations, restricted_count = _document_citations(
+            evidence,
+            prioritize_nonnumeric=bool(facts),
+        )
+        authority_notes: list[str] = []
+        if facts:
+            suppressed = [
+                citation.citation_key
+                for citation in citations
+                if _contains_numeric_claim(citation.excerpt)
+            ]
+            authority_notes.append(
+                "structured_authority:"
+                f"{','.join(fact.to_primary_dict()['tool_name'] for fact in facts)}; "
+                "documentary_citation_keys:"
+                f"{','.join(citation.citation_key for citation in citations)}; "
+                "numeric_document_citations_suppressed:"
+                f"{','.join(suppressed) if suppressed else 'none'}"
+            )
         primary = tuple(
             [
                 *(fact.to_primary_dict() for fact in facts),
                 *(
-                    citation.to_model_dict()
+                    {
+                        **citation.to_model_dict(),
+                        "authority": "documentary_nonnumeric",
+                    }
                     for citation in citations
-                    if citation.access_level != "restricted"
+                    if is_model_exportable_access_level(citation.access_level)
+                    and not (
+                        facts and _contains_numeric_claim(citation.excerpt)
+                    )
                 ),
             ]
         )
@@ -149,6 +178,7 @@ class EvidenceBuilder:
             citations=citations,
             restricted_count=restricted_count,
             conflict_notes=tuple(conflict_notes),
+            authority_notes=tuple(authority_notes),
         )
 
 
@@ -161,6 +191,8 @@ def build_evidence_pack(
 
 def _document_citations(
     evidence: Iterable[RetrievedEvidence],
+    *,
+    prioritize_nonnumeric: bool = False,
 ) -> tuple[tuple[EvidenceCitation, ...], int]:
     unique: dict[UUID, RetrievedEvidence] = {}
     for item in evidence:
@@ -169,6 +201,7 @@ def _document_citations(
     ordered = sorted(
         unique.values(),
         key=lambda item: (
+            int(prioritize_nonnumeric and _contains_numeric_claim(item.text)),
             _LAYER_RANK.get(item.layer, 99),
             -max(item.scores.values(), default=0.0),
             str(item.version_id),
@@ -201,7 +234,10 @@ def _document_citations(
         )
         for index, item in enumerate(selected, start=1)
     )
-    restricted_count = sum(item.access_level == "restricted" for item in unique.values())
+    restricted_count = sum(
+        not is_model_exportable_access_level(item.access_level)
+        for item in unique.values()
+    )
     return citations, restricted_count
 
 
@@ -352,6 +388,10 @@ def _canonical(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _contains_numeric_claim(text: str) -> bool:
+    return bool(_NUMERIC_CLAIM_PATTERN.search(text))
 
 
 def _json_safe(value: Any) -> Any:

@@ -14,7 +14,7 @@ _READ_ROLES = frozenset(
         "viewer",
     }
 )
-_RESTRICTED_MODEL_DENY = frozenset({"restricted"})
+_MODEL_EXPORT_ACCESS_LEVELS = frozenset({"public", "internal"})
 
 
 class AccessPolicy:
@@ -38,7 +38,16 @@ class AccessPolicy:
     def can_export_to_model(self, source: Any) -> bool:
         if source is None or not _value(source, "is_active", True):
             return False
-        return _value(source, "access_level", "internal") not in _RESTRICTED_MODEL_DENY
+        return is_model_exportable_access_level(
+            _value(source, "access_level", None)
+        )
+
+
+def is_model_exportable_access_level(access_level: Any) -> bool:
+    return (
+        isinstance(access_level, str)
+        and access_level in _MODEL_EXPORT_ACCESS_LEVELS
+    )
 
 
 def _value(source: Any, name: str, default: Any) -> Any:
@@ -47,4 +56,4 @@ def _value(source: Any, name: str, default: Any) -> Any:
     return getattr(source, name, default)
 
 
-__all__ = ["AccessPolicy"]
+__all__ = ["AccessPolicy", "is_model_exportable_access_level"]

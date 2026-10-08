@@ -139,6 +139,7 @@ class ToolContext:
     assessment_run_id: UUID | None
     snapshot_id: UUID
     index_version_id: UUID
+    artifact_production_run_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)

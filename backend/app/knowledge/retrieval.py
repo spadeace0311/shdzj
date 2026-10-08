@@ -75,6 +75,10 @@ class PostgresLexicalIndex:
         ]
         if filters.source_ids:
             conditions.append(KnowledgeSource.id.in_(filters.source_ids))
+        if filters.source_version_ids:
+            conditions.append(
+                KnowledgeChunk.version_id.in_(filters.source_version_ids)
+            )
         if filters.layers:
             conditions.append(KnowledgeSource.layer.in_(filters.layers))
         if filters.access_levels:
@@ -85,6 +89,12 @@ class PostgresLexicalIndex:
             conditions.append(
                 KnowledgeSourceVersion.version_metadata["event_id"].astext
                 == str(filters.event_id)
+            )
+        if filters.global_only:
+            conditions.append(
+                KnowledgeSourceVersion.version_metadata.op("?")(
+                    "event_id"
+                ).is_(False)
             )
         if filters.published_before is not None:
             conditions.append(
@@ -148,6 +158,10 @@ class HybridRetriever:
             raise KnowledgeIndexNotPublishedError(
                 "only published knowledge index versions can be retrieved"
             )
+        filters = replace(
+            filters,
+            source_version_ids=(self._index_version.source_version_id,),
+        )
 
         reasons: list[str] = []
         candidate_limit = limit * 3

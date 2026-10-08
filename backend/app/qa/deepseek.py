@@ -11,7 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.config import Settings
 from app.qa.domain import AnswerDraft, ExecutionPlan, KnowledgeQuery, MapIntent, ToolCallPlan
 from app.qa.planner import PlanPayload
-from app.qa.prompts import build_answer_messages, build_plan_messages
+from app.qa.prompts import (
+    build_answer_messages,
+    build_plan_messages,
+    build_stream_answer_messages,
+)
 
 
 class DeepSeekError(RuntimeError):
@@ -103,7 +107,12 @@ class DeepSeekAdapter:
         tool_results: Any,
     ) -> AsyncIterator[str]:
         self._require_api_key()
-        messages = build_answer_messages(question, context, evidence, tool_results)
+        messages = build_stream_answer_messages(
+            question,
+            context,
+            evidence,
+            tool_results,
+        )
         payload = self._request_payload(messages, response_format=None)
         payload["stream"] = True
         headers = self._headers()

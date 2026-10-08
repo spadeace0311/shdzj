@@ -22,7 +22,7 @@ from app.knowledge.index import KnowledgeFilters
 from app.knowledge.models import KnowledgeSnapshot
 from app.knowledge.retrieval import RetrievalResult
 from app.knowledge.snapshot import KnowledgeSnapshotService
-from app.qa.access import AccessPolicy
+from app.qa.access import AccessPolicy, is_model_exportable_access_level
 from app.qa.deepseek import DeepSeekAdapter
 from app.qa.domain import ExecutionPlan
 from app.qa.evidence import EvidenceBuilder, EvidencePack
@@ -33,6 +33,22 @@ from app.qa.tools import ToolContext, ToolRegistry, build_default_registry
 from app.qa.tools.registry import ToolExecution
 
 _CITATION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])(C[0-9]+)(?![A-Za-z0-9_])")
+_CITATION_TOKEN_PATTERN = re.compile(
+    r"\[(C[0-9]+)\]|(?<![A-Za-z0-9_])(C[0-9]+)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_PENDING_CITATION_PATTERN = re.compile(
+    r"(?:\[C[0-9]*|(?<![A-Za-z0-9_])C[0-9]*)$",
+    re.IGNORECASE,
+)
+_INCOMPLETE_BRACKET_CITATION_PATTERN = re.compile(
+    r"\[C[0-9]*",
+    re.IGNORECASE,
+)
+_INCOMPLETE_BARE_CITATION_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])C[0-9]*",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,9 +412,19 @@ class QuestionOrchestrator:
                 {"answer_id": str(answer_id)},
             )
 
+            stream_invalid_citation_keys: list[str] = []
             try:
                 if self._streaming and hasattr(self._deepseek, "stream_answer"):
                     text = ""
+                    stream_citations = _CitationStreamSanitizer(
+                        {
+                            citation.citation_key
+                            for citation in pack.citations
+                            if is_model_exportable_access_level(
+                                citation.access_level
+                            )
+                        }
+                    )
                     draft_structured: dict[str, Any] = {}
                     draft_citation_keys: list[str] = []
                     draft_degraded: list[str] = []
@@ -410,8 +436,19 @@ class QuestionOrchestrator:
                     ):
                         if not isinstance(chunk, str) or not chunk:
                             continue
-                        text += chunk
-                        yield AnswerEvent("answer_delta", {"text": chunk})
+                        safe_chunk = stream_citations.feed(chunk)
+                        if not safe_chunk:
+                            continue
+                        text += safe_chunk
+                        yield AnswerEvent("answer_delta", {"text": safe_chunk})
+                    trailing_text = stream_citations.finish()
+                    if trailing_text:
+                        text += trailing_text
+                        yield AnswerEvent(
+                            "answer_delta",
+                            {"text": trailing_text},
+                        )
+                    stream_invalid_citation_keys = stream_citations.invalid_keys
                 else:
                     draft = await self._deepseek.answer(
                         question,
@@ -461,6 +498,12 @@ class QuestionOrchestrator:
                 pack.citations,
                 draft_citation_keys,
             )
+            invalid_citation_keys = _ordered_unique(
+                [
+                    *invalid_citation_keys,
+                    *stream_invalid_citation_keys,
+                ]
+            )
             if invalid_citation_keys:
                 degraded_reasons.append("invalid_citation_key")
 
@@ -474,6 +517,8 @@ class QuestionOrchestrator:
                         {"text": disclosed[len(text) :]},
                     )
                 text = disclosed
+            if pack.authority_notes:
+                structured["authority_notes"] = list(pack.authority_notes)
 
             degraded_reasons.extend(draft_degraded)
             degraded_reasons = _ordered_unique(degraded_reasons)
@@ -538,6 +583,7 @@ class QuestionOrchestrator:
         filters = KnowledgeFilters(
             access_levels=("public", "internal", "restricted"),
             event_id=stored.event_id,
+            global_only=stored.event_id is None,
         )
 
         async def search(query: Any) -> RetrievalResult:
@@ -593,6 +639,7 @@ class QuestionOrchestrator:
                 assessment_run_id=stored.assessment_run_id,
                 snapshot_id=stored.snapshot_id,
                 index_version_id=stored.index_version_id,
+                artifact_production_run_id=stored.artifact_production_run_id,
             )
             return await self._registry.execute_plan(plan.tool_calls, context)
 
@@ -606,15 +653,24 @@ class QuestionOrchestrator:
         *,
         status: str = "partial",
     ) -> None:
-        citation_keys = _validate_citations(text, pack.citations, [])[1] if pack is not None else []
+        cleaned_text = text
+        citation_keys: list[str] = []
+        if text:
+            cleaned_text, citation_keys, _ = _validate_citations(
+                text,
+                pack.citations if pack is not None else (),
+                [],
+            )
         structured: dict[str, Any] = {}
         if pack is not None and pack.conflict_notes:
             structured["conflict_notes"] = list(pack.conflict_notes)
+        if pack is not None and pack.authority_notes:
+            structured["authority_notes"] = list(pack.authority_notes)
         await self._finish(
             answer_id,
             started_at,
             status=status,
-            text=text or None,
+            text=cleaned_text or None,
             structured=structured or None,
             citation_keys=citation_keys,
             degraded_reasons=_ordered_unique(degraded_reasons),
@@ -762,7 +818,9 @@ def _validate_citations(
     requested_keys: Iterable[str],
 ) -> tuple[str, list[str], list[str]]:
     available = {
-        citation.citation_key for citation in citations if citation.access_level != "restricted"
+        citation.citation_key
+        for citation in citations
+        if is_model_exportable_access_level(citation.access_level)
     }
     requested = [
         *requested_keys,
@@ -789,6 +847,57 @@ def _validate_citations(
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r" +\n", "\n", cleaned).strip()
     return cleaned, valid, invalid
+
+
+class _CitationStreamSanitizer:
+    def __init__(self, available_keys: Iterable[str]) -> None:
+        self._available = {key.upper() for key in available_keys}
+        self._buffer = ""
+        self.invalid_keys: list[str] = []
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk
+        return self._drain(final=False)
+
+    def finish(self) -> str:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> str:
+        if not self._buffer:
+            return ""
+        if final:
+            candidate = self._buffer
+            self._buffer = ""
+        else:
+            pending = _PENDING_CITATION_PATTERN.search(self._buffer)
+            if pending is None:
+                candidate = self._buffer
+                self._buffer = ""
+            else:
+                candidate = self._buffer[: pending.start()]
+                self._buffer = self._buffer[pending.start() :]
+
+        sanitized = _CITATION_TOKEN_PATTERN.sub(
+            self._replace_citation,
+            candidate,
+        )
+        if final:
+            sanitized = _INCOMPLETE_BRACKET_CITATION_PATTERN.sub(
+                "",
+                sanitized,
+            )
+            sanitized = _INCOMPLETE_BARE_CITATION_PATTERN.sub(
+                "",
+                sanitized,
+            )
+        return sanitized
+
+    def _replace_citation(self, match: re.Match[str]) -> str:
+        key = (match.group(1) or match.group(2)).upper()
+        if key not in self._available:
+            self.invalid_keys.append(key)
+            return ""
+        return f"[{key}]"
 
 
 def _append_conflict_notes(text: str, notes: Iterable[str]) -> str:

@@ -276,6 +276,30 @@ async def test_search_sparse_uses_sorted_bge_token_ids() -> None:
     assert client.queries[0]["using"] == "sparse"
 
 
+async def test_search_global_only_excludes_points_with_event_metadata() -> None:
+    client = FakeQdrantClient()
+    client.query_responses.append(
+        _query_response(
+            chunk_id=uuid4(),
+            source_id=uuid4(),
+            version_id=uuid4(),
+            score=0.42,
+        )
+    )
+
+    await KnowledgeIndex(client=client).search_dense(
+        _index_version(),
+        [0.25] * 1024,
+        KnowledgeFilters(global_only=True),
+        limit=3,
+    )
+
+    query_filter = client.queries[0]["query_filter"]
+    assert len(query_filter.must_not) == 1
+    condition = query_filter.must_not[0]
+    assert condition.is_null.key == "event_id"
+
+
 async def test_search_isolates_sources_with_same_version_string() -> None:
     client = FakeQdrantClient()
     source_version_a = uuid4()
