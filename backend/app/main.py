@@ -16,6 +16,7 @@ from app.events.router import router as events_router
 from app.knowledge.router import router as knowledge_router
 from app.loss.router import router as loss_router
 from app.qa.router import router as qa_router
+from app.system_health import SystemHealthResponse, collect_system_health
 
 logger = logging.getLogger(__name__)
 
@@ -47,3 +48,8 @@ app.include_router(qa_router)
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/system/health", response_model=SystemHealthResponse)
+async def system_health() -> SystemHealthResponse:
+    return await collect_system_health()

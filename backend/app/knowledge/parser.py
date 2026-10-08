@@ -4,6 +4,7 @@ import csv
 import io
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -397,11 +398,18 @@ def _parse_pdf(
     section_path: tuple[str, ...] = ()
 
     for page_number, page in enumerate(reader.pages, start=1):
-        font_runs: list[tuple[str, float]] = []
+        font_runs: list[tuple[str, float, bool]] = []
         page_text = page.extract_text(
             visitor_text=lambda text, _cm, _tm, _font_dict, font_size,
-            runs=font_runs: _record_pdf_font_run(runs, text, font_size)
+            runs=font_runs: _record_pdf_font_run(
+                runs,
+                text,
+                font_size,
+                _font_dict,
+            )
         ) or ""
+        if any(needs_decode for _text, _size, needs_decode in font_runs):
+            page_text = "".join(text for text, _size, _needs_decode in font_runs)
         text_characters += len(re.sub(r"\s+", "", page_text))
         page_blocks, section_path = _pdf_blocks_from_text(
             page_text,
@@ -419,21 +427,23 @@ def _parse_pdf(
 
 
 def _record_pdf_font_run(
-    runs: list[tuple[str, float]],
+    runs: list[tuple[str, float, bool]],
     text: object,
     font_size: object,
+    font_dict: object,
 ) -> None:
     raw_text = "" if text is None else str(text)
     size = 0.0 if font_size is None else float(font_size)
-    if raw_text.strip():
-        runs.append((raw_text, size))
+    if raw_text:
+        decoded_text = _decode_pdf_font_run(raw_text, font_dict)
+        runs.append((decoded_text, size, decoded_text != raw_text))
 
 
 def _pdf_blocks_from_text(
     page_text: str,
     *,
     page_number: int,
-    font_runs: list[tuple[str, float]],
+    font_runs: list[tuple[str, float, bool]],
     section_path: tuple[str, ...],
 ) -> tuple[list[ParsedBlock], tuple[str, ...]]:
     heading_model = _pdf_heading_model(font_runs)
@@ -471,11 +481,11 @@ def _pdf_blocks_from_text(
 
 
 def _pdf_heading_model(
-    runs: list[tuple[str, float]],
+    runs: list[tuple[str, float, bool]],
 ) -> dict[str, object]:
     fragments: dict[str, float] = {}
     size_counts: Counter[float] = Counter()
-    for raw_text, size in runs:
+    for raw_text, size, _needs_decode in runs:
         normalized = _normalize_pdf_text(raw_text)
         if not normalized or size <= 0:
             continue
@@ -527,6 +537,51 @@ def _pdf_heading_level(
 
 def _normalize_pdf_text(text: str) -> str:
     return " ".join(text.split())
+
+
+_PDF_GLYPH_NAME_PATTERN = re.compile(r"/([A-Za-z][A-Za-z0-9_.]*)")
+
+
+def _decode_pdf_font_run(text: str, font_dict: object) -> str:
+    """Recover text from Type3 encodings where PyPDF exposes glyph names."""
+    if not text or not isinstance(font_dict, Mapping):
+        return text
+    if font_dict.get("/Subtype") != "/Type3":
+        return text
+
+    encoding = font_dict.get("/Encoding")
+    if isinstance(encoding, Mapping):
+        differences = encoding.get("/Differences")
+    else:
+        differences = None
+    if not isinstance(differences, list):
+        return text
+
+    glyph_map: dict[str, str] = {}
+    current_code: int | None = None
+    for value in differences:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            current_code = value
+            continue
+        if current_code is None or not 0 <= current_code <= 255:
+            continue
+        glyph_name = str(value).lstrip("/")
+        glyph_map[glyph_name] = chr(current_code)
+        current_code += 1
+    if not glyph_map:
+        return text
+
+    glyph_names = _PDF_GLYPH_NAME_PATTERN.findall(text)
+    if not glyph_names or any(name not in glyph_map for name in glyph_names):
+        return text
+    if "".join(f"/{name}" for name in glyph_names) != re.sub(r"\s+", "", text):
+        return text
+    return _PDF_GLYPH_NAME_PATTERN.sub(
+        lambda match: glyph_map[match.group(1)],
+        text,
+    )
 
 
 def _parse_xlsx(

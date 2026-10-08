@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     knowledge_max_upload_bytes: int = 1_073_741_824
     knowledge_worker_poll_seconds: float = 1.0
     knowledge_worker_batch_size: int = 20
+    knowledge_worker_health_url: str = "http://knowledge-worker:8100"
+    knowledge_worker_health_port: int = 8100
     knowledge_online_refresh_interval_seconds: int = 86_400
     knowledge_job_max_attempts: int = 5
     knowledge_job_lease_seconds: int = 120
@@ -240,6 +242,7 @@ class Settings(BaseSettings):
             ("EMBEDDING_SERVICE_URL", self.embedding_service_url),
             ("EMBEDDING_MODEL_NAME", self.embedding_model_name),
             ("RERANKER_MODEL_NAME", self.reranker_model_name),
+            ("KNOWLEDGE_WORKER_HEALTH_URL", self.knowledge_worker_health_url),
             ("DEEPSEEK_BASE_URL", self.deepseek_base_url),
             ("DEEPSEEK_MODEL", self.deepseek_model),
         )
@@ -258,6 +261,10 @@ class Settings(BaseSettings):
             raise ValueError("KNOWLEDGE_JOB_MAX_ATTEMPTS must be between 1 and 100")
         if self.knowledge_worker_poll_seconds <= 0:
             raise ValueError("KNOWLEDGE_WORKER_POLL_SECONDS must be positive")
+        if not 1 <= self.knowledge_worker_health_port <= 65535:
+            raise ValueError(
+                "KNOWLEDGE_WORKER_HEALTH_PORT must be between 1 and 65535"
+            )
         if self.knowledge_job_lease_seconds <= 0:
             raise ValueError("KNOWLEDGE_JOB_LEASE_SECONDS must be positive")
         if self.deepseek_timeout_seconds <= 0:

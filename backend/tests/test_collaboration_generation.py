@@ -1309,9 +1309,7 @@ tasks:
                 )
             )
             assert stale_outbox is not None
-            stale_outbox.available_at = (
-                BASE_RECEIVED_AT + timedelta(days=1)
-            )
+            stale_outbox.available_at = datetime.now(UTC) + timedelta(days=1)
 
     dispatcher = CollaborationOutboxDispatcher(
         session_factory=session_factory,

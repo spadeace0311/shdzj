@@ -21,6 +21,34 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15
 
 验证时使用 `--project-name codex-task15` 和空闲端口，避免停止或复用宿主机已有容器；不得对用户现有卷执行 `down -v`。
 
+## 健康检查与 QA 依赖降级
+
+API 保留 `GET /health` 的简单存活契约。QA 依赖诊断使用：
+
+```text
+GET /system/health
+```
+
+响应包含总状态和 `postgresql`、`qdrant`、`embedding`、`knowledge_worker`
+四类检查，只返回 `ok`、`starting`、`unavailable` 等状态，不返回连接串、
+密码、Token、API Key 或错误正文。PostgreSQL 不可用时总状态为
+`unavailable`；Qdrant、embedding 或 knowledge-worker 任一项不可用时为
+`degraded`。Qdrant 失败不会阻止 API 启动，API 对 Qdrant 使用
+`service_started`，运行时由混合检索链路记录 `qdrant_unavailable` 并回退到
+PostgreSQL 词法检索。
+
+`embedding` 的健康检查要求 `/health` 返回 `status: ok`；
+`knowledge-worker` 在 `8100` 提供内部 `/health`，并在工作循环内刷新
+heartbeat。检查时使用独立 Compose project 和空闲宿主机端口，不要修改已有
+`.env` 或删除用户卷：
+
+```powershell
+$env:POSTGRES_HOST_PORT='55480'
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-final-suite up -d postgres qdrant embedding knowledge-worker
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-final-suite ps postgres qdrant embedding knowledge-worker
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-final-suite run --rm --no-deps api python -c "from fastapi.testclient import TestClient; from app.main import app; print(TestClient(app).get('/system/health').json())"
+```
+
 ## 模型首次下载和离线缓存
 
 `embedding` 服务使用 `embedding-models:/models` 卷，`HF_HOME=/models/huggingface`。首次启动会下载 `EMBEDDING_MODEL_NAME` 与 `RERANKER_MODEL_NAME` 两个模型，之后复用同一卷即可离线运行。
@@ -57,7 +85,26 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15 up -d
 ```
 
-`knowledge-worker` 与 `api` 只有在 `qdrant` 健康且 `embedding` 已启动后才开始工作。迁移头包含 AI 知识与问答表，启动后可用 `alembic current` 核验。
+`knowledge-worker` 在 `qdrant` 健康且 `embedding` 已启动后开始工作；API
+仍要求 PostgreSQL 健康，但只要求 Qdrant/embedding 已启动，Qdrant 延迟
+健康由运行链路记录降级。迁移头包含 AI 知识与问答表，启动后可用
+`alembic current` 核验。
+
+## 历史问答 API
+
+查询同一会话历史回答：
+
+```text
+GET /api/v1/qa/sessions/{session_id}/answers?limit=50&cursor=<answer_id>
+```
+
+接口要求当前用户身份有效；普通用户只能读取自己创建的会话，超级管理员可
+读取全部会话。结果按 `created_at DESC, id DESC` 稳定排序，`limit` 范围为
+`1..100`，cursor 指向上一页最后一条回答。返回项包含问题文本/状态/时间和
+完整 `answer`，answer 中包含 `model_name`、`model_version`、
+`prompt_version`、`execution_plan`、`tool_call_summary`、
+`structured`、`degraded_reasons` 等审计字段；旧回答缺少模型审计字段时以
+`null` 或空结构返回。
 
 ## 知识源上传、URL 入库、发布、回滚
 
@@ -182,6 +229,23 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15
 ```
 
 默认 `pytest -q` 通过 `addopts=-m 'not performance'` 排除 `performance` 标记；只有显式 `-m performance` 才会运行十万切片测试。阈值：100000 个 500..1000 中文字符切片下，20 次请求排序后第 19 个（索引 18）P95 延迟不超过 1.0 秒，且每次请求返回非空证据。测试结束无论 setup、用例主体或 Qdrant 清理是否失败，都会继续删除 Qdrant 集合和 benchmark PostgreSQL 数据行。
+
+真实 BGE 性能门禁不等价于上述确定性性能测试。先确认 embedding 返回
+`status: ok`，再在同一部署设备上记录 `POST /v1/embed` 的
+BGE-M3 稠密/稀疏向量延迟、`POST /v1/rerank` 延迟和 1 秒内可完成的请求
+比例；不要把测试容器的共享磁盘/网络或模型下载阶段作为生产延迟。本收尾
+未把未执行的真实 BGE 压测或真实 E2E 验收标记为通过。
+
+真实 E2E 账号前置条件：
+
+```text
+E2E_SUPERADMIN_USERNAME=superadmin
+E2E_VIEWER_USERNAME=e2e-viewer
+E2E_SUPERADMIN_PASSWORD=<run-only-password>
+```
+
+`e2e_fixture.py` 会使用一次性密码创建/更新 superadmin 和 viewer；不要把该
+密码写入 `.env`、日志或最终报告。
 
 ## 备份、恢复和磁盘扩容
 

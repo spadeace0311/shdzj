@@ -87,6 +87,11 @@ class QaAnswerView(BaseModel):
     session_id: UUID
     status: str
     text: str | None
+    model_name: str | None = None
+    model_version: str | None = None
+    prompt_version: str | None = None
+    execution_plan: dict[str, Any] = Field(default_factory=dict)
+    tool_call_summary: list[Any] = Field(default_factory=list)
     structured: dict[str, Any] | None
     citation_keys: list[str]
     degraded_reasons: list[str]
@@ -97,6 +102,14 @@ class QaAnswerView(BaseModel):
     citations: list[QaCitationResponse]
     tool_calls: list[QaToolCallResponse]
     map_actions: list[QaMapActionResponse]
+
+
+class QaHistoryItem(BaseModel):
+    question_id: UUID
+    question_text: str
+    question_status: str
+    question_created_at: datetime
+    answer: QaAnswerView
 
 
 class OperationLogPurgeFilters(BaseModel):

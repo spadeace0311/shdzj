@@ -22,12 +22,26 @@ from app.knowledge.models import (
     KnowledgeSourceVersion,
     KnowledgeWebSnapshot,
 )
+from app.knowledge.health import WorkerHealthState
 from app.knowledge.publication import KnowledgePublicationService
 from app.knowledge.storage import KnowledgeFileStore
 from app.knowledge.worker import KnowledgeWorker
 
 
 WORKER_ACTOR = "knowledge-worker-test"
+
+
+def test_worker_health_state_expires_after_stale_window() -> None:
+    now = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+    state = WorkerHealthState(stale_seconds=30)
+
+    state.mark_alive(now)
+
+    assert state.payload(now) == {
+        "status": "ok",
+        "last_heartbeat_at": "2026-10-08T12:00:00+00:00",
+    }
+    assert state.payload(now + timedelta(seconds=31))["status"] == "unavailable"
 
 
 @pytest.fixture(autouse=True)

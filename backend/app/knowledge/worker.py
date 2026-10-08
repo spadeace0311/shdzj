@@ -28,6 +28,11 @@ from app.knowledge.fetch import (
     fetch_web_document,
     load_fetch_policy,
 )
+from app.knowledge.health import (
+    WorkerHealthState,
+    run_health_server,
+    set_worker_health_state,
+)
 from app.knowledge.index import IndexedChunk, KnowledgeIndex
 from app.knowledge.models import (
     KnowledgeChunk,
@@ -448,16 +453,31 @@ async def run_worker() -> None:
     from app.db import SessionFactory
 
     worker = KnowledgeWorker()
-    while True:
-        processed = False
-        async with SessionFactory() as session:
-            async with session.begin():
-                processed = (
-                    await worker.enqueue_due_refreshes(session) > 0
-                ) or processed
-                processed = await worker.process_one(session) or processed
-        if not processed:
-            await asyncio.sleep(settings.knowledge_worker_poll_seconds)
+    state = WorkerHealthState(
+        stale_seconds=max(
+            30.0,
+            settings.knowledge_worker_poll_seconds * 10,
+        )
+    )
+    set_worker_health_state(state)
+    health_task = asyncio.create_task(
+        run_health_server(settings.knowledge_worker_health_port)
+    )
+    try:
+        while True:
+            state.mark_alive()
+            processed = False
+            async with SessionFactory() as session:
+                async with session.begin():
+                    processed = (
+                        await worker.enqueue_due_refreshes(session) > 0
+                    ) or processed
+                    processed = await worker.process_one(session) or processed
+            if not processed:
+                await asyncio.sleep(settings.knowledge_worker_poll_seconds)
+    finally:
+        health_task.cancel()
+        await asyncio.gather(health_task, return_exceptions=True)
 
 
 async def run_refresh_scan_once() -> int:

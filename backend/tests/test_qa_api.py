@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -316,6 +316,161 @@ async def test_get_answer_and_feedback_routes(qa_client) -> None:
     assert feedback.json()["rating"] == 5
 
 
+async def test_get_answer_exposes_persisted_audit_fields(qa_client) -> None:
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "审计字段读取", "event_id": None},
+    )
+    assert session.status_code == 201
+    answer_id, _question_id = await _insert_qa_answer(
+        UUID(session.json()["id"]),
+        question_text="模型审计字段是否可读？",
+        created_at=datetime.now(UTC) - timedelta(minutes=1),
+        model_name=settings.deepseek_model,
+        model_version="audit-model-1",
+        prompt_version=QA_PROMPT_VERSION,
+        execution_plan={"intent": "knowledge_query"},
+        tool_call_summary=[
+            {
+                "name": "fault.nearest",
+                "status": "ok",
+                "duration_ms": 12,
+                "source": "shanghai.fault",
+                "version": "v1",
+            }
+        ],
+    )
+
+    response = await qa_client.get(f"/api/v1/qa/answers/{answer_id}")
+
+    assert response.status_code == 200
+    assert response.json()["model_name"] == settings.deepseek_model
+    assert response.json()["model_version"] == "audit-model-1"
+    assert response.json()["prompt_version"] == QA_PROMPT_VERSION
+    assert response.json()["execution_plan"] == {"intent": "knowledge_query"}
+    assert response.json()["tool_call_summary"] == [
+        {
+            "name": "fault.nearest",
+            "status": "ok",
+            "duration_ms": 12,
+            "source": "shanghai.fault",
+            "version": "v1",
+        }
+    ]
+
+
+async def test_history_rejects_other_users_session(
+    qa_client,
+    session_factory,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            other_session = await QaRepository().create_session(
+                session,
+                AuthUser(
+                    username=QA_API_OTHER_ACTOR,
+                    role="viewer",
+                    workgroup=None,
+                ),
+                QaSessionCreate(title="其他用户历史", event_id=None),
+            )
+        other_session_id = other_session.id
+
+    response = await qa_client.get(
+        f"/api/v1/qa/sessions/{other_session_id}/answers"
+    )
+
+    assert response.status_code == 403
+
+
+async def test_history_is_stable_bounded_and_cursor_paginated(qa_client) -> None:
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "历史分页", "event_id": None},
+    )
+    assert session.status_code == 201
+    session_id = UUID(session.json()["id"])
+    base_time = datetime(2026, 10, 8, 1, 0, tzinfo=UTC)
+    first_answer, _ = await _insert_qa_answer(
+        session_id,
+        question_text="第一问",
+        created_at=base_time,
+    )
+    second_answer, _ = await _insert_qa_answer(
+        session_id,
+        question_text="第二问",
+        created_at=base_time + timedelta(seconds=1),
+    )
+    _third_answer, _ = await _insert_qa_answer(
+        session_id,
+        question_text="第三问",
+        created_at=base_time + timedelta(seconds=2),
+    )
+
+    first_page = await qa_client.get(
+        f"/api/v1/qa/sessions/{session_id}/answers",
+        params={"limit": 2},
+    )
+
+    assert first_page.status_code == 200
+    assert [item["question_text"] for item in first_page.json()] == [
+        "第三问",
+        "第二问",
+    ]
+    second_page = await qa_client.get(
+        f"/api/v1/qa/sessions/{session_id}/answers",
+            params={
+                "limit": 2,
+                "cursor": first_page.json()[-1]["answer"]["id"],
+            },
+        )
+    assert second_page.status_code == 200
+    assert [item["question_text"] for item in second_page.json()] == ["第一问"]
+
+    invalid_page = await qa_client.get(
+        f"/api/v1/qa/sessions/{session_id}/answers",
+        params={"limit": 101},
+    )
+    assert invalid_page.status_code == 422
+
+    assert str(first_answer) != str(second_answer)
+
+
+async def test_history_returns_old_answers_without_new_audit_fields(
+    qa_client,
+) -> None:
+    session = await qa_client.post(
+        "/api/v1/qa/sessions",
+        json={"title": "旧数据兼容", "event_id": None},
+    )
+    assert session.status_code == 201
+    session_id = UUID(session.json()["id"])
+    answer_id, _question_id = await _insert_qa_answer(
+        session_id,
+        question_text="旧数据回答",
+        created_at=datetime.now(UTC),
+        model_name=None,
+        model_version=None,
+        prompt_version=None,
+        execution_plan={},
+        tool_call_summary=[],
+    )
+
+    history = await qa_client.get(
+        f"/api/v1/qa/sessions/{session_id}/answers"
+    )
+
+    assert history.status_code == 200
+    item = history.json()[0]
+    assert item["question_text"] == "旧数据回答"
+    assert item["answer"]["id"] == str(answer_id)
+    assert item["answer"]["model_name"] is None
+    assert item["answer"]["model_version"] is None
+    assert item["answer"]["prompt_version"] is None
+    assert item["answer"]["execution_plan"] == {}
+    assert item["answer"]["tool_call_summary"] == []
+
+
 async def test_completed_answer_persists_qa_audit_provenance(qa_client) -> None:
     session = await qa_client.post(
         "/api/v1/qa/sessions",
@@ -551,6 +706,48 @@ async def _create_qa_session() -> UUID:
                 QaSessionCreate(title="流断开测试", event_id=None),
             )
             return qa_session.id
+
+
+async def _insert_qa_answer(
+    session_id: UUID,
+    *,
+    question_text: str,
+    created_at: datetime,
+    model_name: str | None = settings.deepseek_model,
+    model_version: str | None = None,
+    prompt_version: str | None = QA_PROMPT_VERSION,
+    execution_plan: dict | None = None,
+    tool_call_summary: list | None = None,
+) -> tuple[UUID, UUID]:
+    async with SessionFactory() as session:
+        async with session.begin():
+            question = QaQuestion(
+                session_id=session_id,
+                question_text=question_text,
+                status="completed",
+                created_at=created_at,
+            )
+            session.add(question)
+            await session.flush()
+            answer = QaAnswer(
+                question_id=question.id,
+                status="completed",
+                model_name=model_name,
+                model_version=model_version,
+                prompt_version=prompt_version,
+                execution_plan=dict(execution_plan or {}),
+                tool_call_summary=list(tool_call_summary or []),
+                citation_keys=[],
+                degraded_reasons=[],
+                duration_ms=0,
+                created_at=created_at,
+                updated_at=created_at,
+                completed_at=created_at,
+                text="历史回答",
+            )
+            session.add(answer)
+            await session.flush()
+            return answer.id, question.id
 
 
 async def _seed_knowledge_index() -> dict[str, object]:

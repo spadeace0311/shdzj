@@ -1,6 +1,8 @@
 from sqlalchemy import inspect
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.db import engine
+from app.config import settings
 
 
 KNOWLEDGE_TABLES = {
@@ -25,9 +27,13 @@ QA_TABLES = {
 
 
 async def test_knowledge_and_qa_tables_exist() -> None:
-    async with engine.connect() as connection:
-        names = await connection.run_sync(
-            lambda sync: set(inspect(sync).get_table_names())
-        )
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+    finally:
+        await engine.dispose()
     assert KNOWLEDGE_TABLES <= names
     assert QA_TABLES <= names

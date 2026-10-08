@@ -7,6 +7,7 @@ from app.knowledge.parser import (
     DocumentParser,
     UnreadableDocumentError,
     UnsupportedDocumentError,
+    _decode_pdf_font_run,
 )
 from docx import Document as DocxDocument
 from matplotlib.backends.backend_pdf import PdfPages
@@ -190,6 +191,58 @@ def test_pdf_body_repeating_heading_term_stays_body(tmp_path: Path) -> None:
     assert heading.text == "Emergency"
     assert body.text == "Emergency response."
     assert body.section_path == ("Emergency",)
+
+
+def test_pdf_type3_subset_glyph_names_decode_via_encoding_differences() -> None:
+    font = {
+        "/Subtype": "/Type3",
+        "/Encoding": {
+            "/Type": "/Encoding",
+            "/Differences": [
+                32,
+                "/uni00000001",
+                46,
+                "/uni0000000f",
+                67,
+                "/uni00000024",
+                69,
+                "/uni00000026",
+                79,
+                "/uni00000030",
+                97,
+                "/uni00000042",
+                99,
+                "/uni00000044",
+                101,
+                "/uni00000046",
+                103,
+                "/uni00000048",
+                "/uni00000049",
+                109,
+                "/uni0000004e",
+                "/uni0000004f",
+                "/uni00000050",
+                "/uni00000051",
+                114,
+                "/uni00000053",
+                "/uni00000054",
+                "/uni00000055",
+                121,
+                "/uni0000005a",
+            ],
+        },
+    }
+
+    decoded = _decode_pdf_font_run(
+        (
+            "/uni00000024/uni00000049/uni00000042/uni00000051/uni00000055"
+            "/uni00000046/uni00000053/uni00000001/uni00000030/uni0000004f"
+            "/uni00000046"
+        ),
+        font,
+    )
+
+    assert decoded == "Chapter One"
 
 
 def test_image_only_pdf_fails_without_ocr(tmp_path: Path) -> None:

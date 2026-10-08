@@ -27,6 +27,7 @@ from app.qa.schemas import (
     QaAnswerView,
     QaFeedbackCreate,
     QaFeedbackResponse,
+    QaHistoryItem,
     QaQuestionCreate,
     QaSessionCreate,
     QaSessionResponse,
@@ -135,6 +136,30 @@ async def get_qa_session(
             current_user,
         )
         return _session_response(qa_session)
+    except (LookupError, PermissionError, SQLAlchemyError) as exc:
+        raise _map_qa_error(exc) from exc
+
+
+@router.get(
+    "/qa/sessions/{session_id}/answers",
+    response_model=list[QaHistoryItem],
+)
+async def list_qa_answers(
+    session_id: UUID,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: UUID | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    repository: QaRepository = Depends(get_qa_repository),
+    current_user: AuthUser = Depends(get_current_user),
+) -> list[QaHistoryItem]:
+    try:
+        return await repository.list_answers(
+            session,
+            session_id,
+            current_user,
+            limit,
+            cursor,
+        )
     except (LookupError, PermissionError, SQLAlchemyError) as exc:
         raise _map_qa_error(exc) from exc
 

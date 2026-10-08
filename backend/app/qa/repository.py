@@ -33,6 +33,7 @@ from app.qa.schemas import (
     QaAnswerView,
     QaCitationResponse,
     QaFeedbackCreate,
+    QaHistoryItem,
     QaMapActionResponse,
     QaSessionCreate,
     QaSessionResponse,
@@ -129,23 +130,73 @@ class QaRepository:
         citations = await self._list_citations(session, answer.id)
         tool_calls = await self._list_tool_calls(session, answer.id)
         map_actions = await self._list_map_actions(session, answer.id)
-        return QaAnswerView(
-            id=answer.id,
-            question_id=answer.question_id,
-            session_id=qa_session.id,
-            status=answer.status,
-            text=answer.text,
-            structured=answer.structured,
-            citation_keys=list(answer.citation_keys or []),
-            degraded_reasons=list(answer.degraded_reasons or []),
-            duration_ms=answer.duration_ms,
-            created_at=answer.created_at or datetime.now(UTC),
-            updated_at=answer.updated_at or datetime.now(UTC),
-            completed_at=answer.completed_at,
-            citations=citations,
-            tool_calls=tool_calls,
-            map_actions=map_actions,
+        return _answer_view(
+            answer,
+            qa_session,
+            citations,
+            tool_calls,
+            map_actions,
         )
+
+    async def list_answers(
+        self,
+        session: AsyncSession,
+        session_id: UUID,
+        user: AuthUser,
+        limit: int,
+        cursor: UUID | None,
+    ) -> list[QaHistoryItem]:
+        qa_session = await self.get_session(session, session_id, user)
+        if not self._access.can_read_event(user, qa_session.event_id):
+            raise PermissionError("Insufficient permissions")
+
+        statement = select(QaAnswer, QaQuestion).join(
+            QaQuestion,
+            QaQuestion.id == QaAnswer.question_id,
+        ).where(QaQuestion.session_id == session_id)
+        if cursor is not None:
+            cursor_answer = await session.get(QaAnswer, cursor)
+            if cursor_answer is None:
+                return []
+            statement = statement.where(
+                (QaAnswer.created_at < cursor_answer.created_at)
+                | (
+                    (QaAnswer.created_at == cursor_answer.created_at)
+                    & (QaAnswer.id < cursor_answer.id)
+                )
+            )
+        rows = (
+            await session.execute(
+                statement.order_by(
+                    QaAnswer.created_at.desc(),
+                    QaAnswer.id.desc(),
+                ).limit(limit)
+            )
+        ).all()
+
+        history: list[QaHistoryItem] = []
+        for answer, question in rows:
+            citations = await self._list_citations(session, answer.id)
+            tool_calls = await self._list_tool_calls(session, answer.id)
+            map_actions = await self._list_map_actions(session, answer.id)
+            history.append(
+                QaHistoryItem(
+                    question_id=question.id,
+                    question_text=question.question_text,
+                    question_status=question.status,
+                    question_created_at=(
+                        question.created_at or datetime.now(UTC)
+                    ),
+                    answer=_answer_view(
+                        answer,
+                        qa_session,
+                        citations,
+                        tool_calls,
+                        map_actions,
+                    ),
+                )
+            )
+        return history
 
     async def record_feedback(
         self,
@@ -376,6 +427,37 @@ class KnowledgeVersionPurgeService:
         )
         await session.delete(version)
         await session.flush()
+
+
+def _answer_view(
+    answer: QaAnswer,
+    qa_session: QaSession,
+    citations: list[QaCitationResponse],
+    tool_calls: list[QaToolCallResponse],
+    map_actions: list[QaMapActionResponse],
+) -> QaAnswerView:
+    return QaAnswerView(
+        id=answer.id,
+        question_id=answer.question_id,
+        session_id=qa_session.id,
+        status=answer.status,
+        text=answer.text,
+        model_name=answer.model_name,
+        model_version=answer.model_version,
+        prompt_version=answer.prompt_version,
+        execution_plan=dict(answer.execution_plan or {}),
+        tool_call_summary=list(answer.tool_call_summary or []),
+        structured=answer.structured,
+        citation_keys=list(answer.citation_keys or []),
+        degraded_reasons=list(answer.degraded_reasons or []),
+        duration_ms=answer.duration_ms,
+        created_at=answer.created_at or datetime.now(UTC),
+        updated_at=answer.updated_at or datetime.now(UTC),
+        completed_at=answer.completed_at,
+        citations=citations,
+        tool_calls=tool_calls,
+        map_actions=map_actions,
+    )
 
 
 def _citation_response(row: QaCitation) -> QaCitationResponse:
