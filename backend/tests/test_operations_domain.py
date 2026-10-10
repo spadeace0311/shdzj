@@ -1,0 +1,159 @@
+from datetime import UTC, datetime, time
+from decimal import Decimal
+
+import pytest
+from geoalchemy2.elements import WKTElement
+from sqlalchemy import delete
+
+from app.events.domain import EventKind
+from app.operations.domain import OperationsScenario
+from app.operations.models import (
+    OperationsAuditLog,
+    OperationsRun,
+    OperationsSettings,
+    OperationsTestSchedule,
+)
+from app.operations.scenario import OperationsConfigurationError, ScenarioGenerator
+from app.regions.models import RegionBoundary
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_database_engine():
+    from app.db import engine
+
+    await engine.dispose()
+    yield
+    await engine.dispose()
+
+
+async def _reset_domain_tables(session) -> None:
+    await session.execute(delete(OperationsRun))
+    await session.execute(delete(OperationsTestSchedule))
+    await session.execute(delete(OperationsAuditLog))
+    await session.execute(delete(OperationsSettings))
+    await session.execute(delete(RegionBoundary))
+    await session.flush()
+
+
+async def _active_boundary(session) -> RegionBoundary:
+    boundary = RegionBoundary(
+        version="operations-test-boundary-v1",
+        name="上海市测试边界",
+        local_buffer_km=Decimal("50"),
+        geom=WKTElement(
+            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, "
+            "121.0 31.8, 121.0 30.8)))",
+            srid=4326,
+        ),
+        maritime_geom=WKTElement(
+            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, "
+            "121.0 31.8, 121.0 30.8)))",
+            srid=4326,
+        ),
+        source_uri="test://operations-boundary",
+        checksum="a" * 64,
+        is_active=True,
+    )
+    session.add(boundary)
+    await session.flush()
+    return boundary
+
+
+async def _settings(session) -> OperationsSettings:
+    record = OperationsSettings(
+        settings_key="default",
+        daily_test_enabled=True,
+        timezone="Asia/Shanghai",
+        daily_window_start=time(2, 0),
+        daily_window_end=time(4, 0),
+        test_magnitude_min=Decimal("5.0"),
+        test_magnitude_max=Decimal("5.9"),
+        test_depth_min_km=Decimal("5.00"),
+        test_depth_max_km=Decimal("20.00"),
+        drill_conflict_policy="pause",
+    )
+    session.add(record)
+    await session.flush()
+    return record
+
+
+async def test_generated_test_scenario_is_shanghai_5_to_6(session) -> None:
+    await _reset_domain_tables(session)
+    await _active_boundary(session)
+    settings_record = await _settings(session)
+
+    generator = ScenarioGenerator()
+    scenario = await generator.generate_test(
+        session,
+        settings_record,
+        observed_at=datetime(2026, 10, 10, 2, tzinfo=UTC),
+        seed=20261010,
+    )
+    event = generator.scenario_to_event(scenario)
+
+    assert event.kind is EventKind.TEST
+    assert Decimal("5.0") <= event.magnitude <= Decimal("5.9")
+    assert Decimal("5.00") <= event.depth_km <= Decimal("20.00")
+    assert scenario.place == "上海市（系统测试）"
+    assert scenario.place.endswith("测试）")
+    assert await generator.region_contains(session, scenario) is True
+
+
+async def test_generate_test_requires_active_boundary(session) -> None:
+    await _reset_domain_tables(session)
+    settings_record = await _settings(session)
+
+    with pytest.raises(
+        OperationsConfigurationError,
+        match="active_shanghai_boundary_required",
+    ):
+        await ScenarioGenerator().generate_test(
+            session,
+            settings_record,
+            observed_at=datetime(2026, 10, 10, 2, tzinfo=UTC),
+            seed=20261010,
+        )
+
+
+async def test_generated_scenario_is_deterministic_and_idempotent(session) -> None:
+    await _reset_domain_tables(session)
+    await _active_boundary(session)
+    settings_record = await _settings(session)
+    observed_at = datetime(2026, 10, 10, 2, tzinfo=UTC)
+    generator = ScenarioGenerator()
+
+    first = await generator.generate_test(
+        session,
+        settings_record,
+        observed_at=observed_at,
+        seed=20261010,
+    )
+    second = await generator.generate_test(
+        session,
+        settings_record,
+        observed_at=observed_at,
+        seed=20261010,
+    )
+
+    assert first == second
+    assert first.magnitude == first.magnitude.quantize(Decimal("0.1"))
+    assert first.depth_km == first.depth_km.quantize(Decimal("0.01"))
+    assert first.source_event_id == "operations-test:20261010:20261010"
+    assert generator.scenario_to_event(first) == generator.scenario_to_event(second)
+
+
+async def test_region_contains_rejects_outside_point(session) -> None:
+    await _reset_domain_tables(session)
+    await _active_boundary(session)
+    scenario = OperationsScenario(
+        origin_time=datetime(2026, 10, 10, 2, tzinfo=UTC),
+        longitude=Decimal("119.0"),
+        latitude=Decimal("29.0"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.5"),
+        place="上海市（系统测试）",
+        source_event_id="operations-test:20261010:20261010",
+        random_seed=20261010,
+    )
+
+    assert await ScenarioGenerator().region_contains(session, scenario) is False
