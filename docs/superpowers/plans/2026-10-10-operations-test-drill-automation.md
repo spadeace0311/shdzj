@@ -718,6 +718,11 @@ if result.is_new and result.is_current and result.event_kind in {
     )
 ```
 
+`ingest()` 对 `EventKind.MANUAL` 还必须完成与正式报一致的完整评估启动：解析当前激活的上海市
+区域边界，写入协同任务和评估任务 outbox，生成工作组人员快照，然后调用上述守卫。人工事件是授权
+用户明确发起的完整评估，不受自动评估的地理位置、震级或烈度阈值过滤；不得只入库后返回
+`not_applicable` 而遗漏评估与任务。相应失败测试必须验证一次手工正式事件同时创建协同和评估 outbox。
+
 守卫只处理 `event_type IN ('test', 'drill')` 的运行和计划，不修改正式/人工事件数据。
 
 - [ ] **Step 3: 实现协同和通知冻结**
