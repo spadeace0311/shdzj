@@ -200,6 +200,23 @@ async function runTriggerRequest(request: {
   }
 }
 
+function triggerFeedbackText(
+  actionLabel: string,
+  result: OperationsTriggerResult,
+): string {
+  const state = result.operation_state || result.outcome;
+  if (state === "deferred") {
+    return `${actionLabel}已延后`;
+  }
+  if (state === "canceled") {
+    return `${actionLabel}已终止`;
+  }
+  if (result.run_id) {
+    return `${actionLabel}已触发，运行编号 ${result.run_id}`;
+  }
+  return `${actionLabel}已受理`;
+}
+
 export function OperationsPage({ userRole }: OperationsPageProps) {
   const [overview, setOverview] = useState<OperationsOverview | null>(null);
   const [settings, setSettings] = useState<OperationsSettings | null>(null);
@@ -247,7 +264,7 @@ export function OperationsPage({ userRole }: OperationsPageProps) {
         request.mode === "manual_test" ? "手工测试" : "演练测试";
       setTriggerNotice({
         kind: "success",
-        text: `${actionLabel}已触发，运行编号 ${result.run_id ?? "-"}`,
+        text: triggerFeedbackText(actionLabel, result),
       });
       setPendingTrigger(null);
       await loadData();

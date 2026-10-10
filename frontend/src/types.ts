@@ -487,6 +487,8 @@ export type OperationsRunState =
   | "canceled"
   | "failed";
 
+export type OperationsTriggerState = OperationsRunState | "deferred";
+
 export type OperationsDrillConflictPolicy = "pause" | "terminate";
 
 export interface OperationsSettings {
@@ -567,7 +569,7 @@ export interface OperationsTriggerResult {
   run_id: string | null;
   revision_id: string | null;
   trigger_mode: OperationsTriggerMode;
-  operation_state: OperationsRunState;
+  operation_state: OperationsTriggerState;
   outcome: string;
   idempotency_key: string;
   event_kind: string | null;

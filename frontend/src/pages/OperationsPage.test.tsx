@@ -217,6 +217,33 @@ test("triggers a drill and keeps the permanent drill identifier visible", async 
   expect(screen.getByText("演练标识：不可移除")).toBeInTheDocument();
 });
 
+test.each([
+  ["deferred", "演练测试已延后"],
+  ["canceled", "演练测试已终止"],
+] as const)(
+  "shows %s drill feedback without a fake run number when there is no run",
+  async (state, expectedText) => {
+    triggerDrillMock.mockResolvedValue({
+      ...triggerResult("drill"),
+      event_id: null,
+      run_id: null,
+      revision_id: null,
+      operation_state: state,
+      outcome: state,
+      triggered_assessment: false,
+    });
+    renderPage();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "演练测试" }),
+    );
+
+    expect(await screen.findByText(expectedText)).toBeInTheDocument();
+    expect(screen.queryByText(/运行编号/)).not.toBeInTheDocument();
+    expect(triggerDrillMock).toHaveBeenCalledTimes(1);
+  },
+);
+
 test("disables manual test and shows the priority protection reason during a real event", async () => {
   getOverviewMock.mockResolvedValue({
     ...overview,
