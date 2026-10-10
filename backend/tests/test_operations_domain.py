@@ -5,7 +5,7 @@ import pytest
 from geoalchemy2.elements import WKTElement
 from sqlalchemy import delete
 
-from app.events.domain import EventKind
+from app.events.domain import EventKind, canonical_source_id
 from app.operations.domain import OperationsScenario
 from app.operations.models import (
     OperationsAuditLog,
@@ -95,7 +95,6 @@ async def test_generated_test_scenario_is_shanghai_5_to_6(session) -> None:
     assert Decimal("5.0") <= event.magnitude <= Decimal("5.9")
     assert Decimal("5.00") <= event.depth_km <= Decimal("20.00")
     assert scenario.place == "上海市（系统测试）"
-    assert scenario.place.endswith("测试）")
     assert await generator.region_contains(session, scenario) is True
 
 
@@ -139,7 +138,40 @@ async def test_generated_scenario_is_deterministic_and_idempotent(session) -> No
     assert first.magnitude == first.magnitude.quantize(Decimal("0.1"))
     assert first.depth_km == first.depth_km.quantize(Decimal("0.01"))
     assert first.source_event_id == "operations-test:20261010:20261010"
-    assert generator.scenario_to_event(first) == generator.scenario_to_event(second)
+    first_event = generator.scenario_to_event(first)
+    second_event = generator.scenario_to_event(second)
+    assert first_event == second_event
+    assert first_event.source == "operations"
+    assert first_event.source_event_id == first.source_event_id
+    assert canonical_source_id(first_event) == (
+        f"operations:{first.source_event_id}"
+    )
+
+
+async def test_random_sampling_reaches_endpoints_and_quantizes(session) -> None:
+    await _reset_domain_tables(session)
+    await _active_boundary(session)
+    settings_record = await _settings(session)
+    observed_at = datetime(2026, 10, 10, 2, tzinfo=UTC)
+    generator = ScenarioGenerator()
+    cases = (
+        (2, Decimal("5.0"), Decimal("6.87")),
+        (5, Decimal("5.9"), Decimal("10.23")),
+        (475, Decimal("5.1"), Decimal("5.00")),
+        (2246, Decimal("5.0"), Decimal("20.00")),
+    )
+
+    for seed, expected_magnitude, expected_depth in cases:
+        scenario = await generator.generate_test(
+            session,
+            settings_record,
+            observed_at=observed_at,
+            seed=seed,
+        )
+        assert scenario.magnitude == expected_magnitude
+        assert scenario.depth_km == expected_depth
+        assert scenario.magnitude == scenario.magnitude.quantize(Decimal("0.1"))
+        assert scenario.depth_km == scenario.depth_km.quantize(Decimal("0.01"))
 
 
 async def test_region_contains_rejects_outside_point(session) -> None:

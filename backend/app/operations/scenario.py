@@ -17,7 +17,7 @@ class OperationsConfigurationError(RuntimeError):
 
 class ScenarioGenerator:
     PLACE = "上海市（系统测试）"
-    SOURCE = "operations-test"
+    SOURCE = "operations"
     MAGNITUDE_STEP = Decimal("0.1")
     DEPTH_STEP = Decimal("0.01")
 
