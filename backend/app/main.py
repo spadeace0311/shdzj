@@ -15,6 +15,7 @@ from app.db import SessionFactory
 from app.events.router import router as events_router
 from app.knowledge.router import router as knowledge_router
 from app.loss.router import router as loss_router
+from app.operations.router import router as operations_router
 from app.qa.router import router as qa_router
 from app.system_health import SystemHealthResponse, collect_system_health
 
@@ -35,6 +36,7 @@ app = FastAPI(title="Shanghai Earthquake Emergency API", lifespan=lifespan)
 app.include_router(artifacts_router)
 app.include_router(assessment_router)
 app.include_router(loss_router)
+app.include_router(operations_router)
 app.include_router(auth_router)
 app.include_router(collaboration_router)
 app.include_router(events_router)

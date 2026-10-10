@@ -1,0 +1,430 @@
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
+
+import pytest
+from geoalchemy2.elements import WKTElement
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.collaboration.models import CollaborationSettings
+from app.db import SessionFactory, engine
+from app.events.domain import EventKind
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
+from app.events.service import LifecycleIngestOutcome
+from app.operations.models import (
+    OperationsAuditLog,
+    OperationsRun,
+    OperationsSettings,
+    OperationsTestSchedule,
+)
+from app.operations.repository import OperationsRepository
+from app.operations.schemas import DrillTriggerRequest, ManualTestTriggerRequest
+from app.operations.scenario import ScenarioGenerator
+from app.operations.service import OperationsService, RealEventPriorityActive
+from app.regions.models import RegionBoundary
+
+
+SOURCE = "operations-service-test"
+OBSERVED_AT = datetime(2040, 1, 15, 4, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+async def clean_operations_service_data():
+    await engine.dispose()
+    await _cleanup_data()
+    yield
+    await _cleanup_data()
+    await engine.dispose()
+
+
+async def _cleanup_data() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(OperationsRun))
+            await session.execute(delete(OperationsTestSchedule))
+            await session.execute(delete(OperationsAuditLog))
+            await session.execute(delete(OperationsSettings))
+            await session.execute(delete(EarthquakeEvent).where(EarthquakeEvent.source == SOURCE))
+            await session.execute(
+                delete(EarthquakeEvent).where(EarthquakeEvent.source == "operations")
+            )
+            await session.execute(delete(RawMessage).where(RawMessage.source == SOURCE))
+            await session.execute(delete(RawMessage).where(RawMessage.source == "operations"))
+            await session.execute(delete(EventLifecycleOutbox))
+
+
+async def _ensure_boundary(session) -> RegionBoundary:
+    existing = await session.scalar(
+        select(RegionBoundary).where(RegionBoundary.is_active.is_(True)).limit(1)
+    )
+    if existing is not None:
+        return existing
+    boundary = RegionBoundary(
+        version=f"service-test-boundary-{uuid.uuid4().hex}",
+        name="service test boundary",
+        local_buffer_km=Decimal("50"),
+        geom=WKTElement(
+            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, " "121.0 31.8, 121.0 30.8)))",
+            srid=4326,
+        ),
+        maritime_geom=WKTElement(
+            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, " "121.0 31.8, 121.0 30.8)))",
+            srid=4326,
+        ),
+        source_uri="test://operations-service-boundary",
+        checksum="a" * 64,
+        is_active=True,
+    )
+    session.add(boundary)
+    await session.flush()
+    return boundary
+
+
+async def _ensure_collaboration_settings(session) -> None:
+    existing = await session.scalar(select(CollaborationSettings.id).limit(1))
+    if existing is not None:
+        return
+    session.add(
+        CollaborationSettings(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000021"),
+            intensity_threshold=Decimal("2.0"),
+            row_version=1,
+        )
+    )
+    await session.flush()
+
+
+async def _seed_real_event(
+    session,
+    *,
+    event_type: str = "formal",
+    origin_time: datetime = OBSERVED_AT,
+) -> EarthquakeEvent:
+    event = EarthquakeEvent(
+        id=uuid.uuid4(),
+        source=SOURCE,
+        canonical_source_id=f"{SOURCE}:{uuid.uuid4()}",
+        event_type=event_type,
+        origin_time=origin_time,
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.2"),
+        place="operations service real event",
+        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+        lifecycle_state="formal_triggered" if event_type == "formal" else "not_applicable",
+    )
+    session.add(event)
+    await session.flush()
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source=SOURCE,
+        source_message_id=uuid.uuid4().hex,
+        message_kind=event_type,
+        checksum=uuid.uuid4().hex,
+        payload={"event_id": str(event.id)},
+    )
+    session.add(raw)
+    await session.flush()
+    revision = EarthquakeRevision(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        raw_message_id=raw.id,
+        revision_no=1,
+        revision_kind=event_type,
+        origin_time=event.origin_time,
+        longitude=event.longitude,
+        latitude=event.latitude,
+        depth_km=event.depth_km,
+        magnitude=event.magnitude,
+        place=event.place,
+        is_current=True,
+        ingested_at=origin_time,
+    )
+    session.add(revision)
+    await session.flush()
+    event.current_revision_id = revision.id
+    await session.flush()
+    return event
+
+
+def _service(**kwargs) -> OperationsService:
+    return OperationsService(SessionFactory, now=lambda: OBSERVED_AT, **kwargs)
+
+
+class FakeEventService:
+    def __init__(self) -> None:
+        self.calls: list[EventKind] = []
+
+    async def ingest_collected(self, **kwargs) -> LifecycleIngestOutcome:
+        event = kwargs["event"]
+        self.calls.append(event.kind)
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(event.source_event_id)))
+        return LifecycleIngestOutcome(
+            event_id=event_id,
+            revision_id=str(uuid.uuid4()),
+            revision_no=1,
+            event_kind=event.kind,
+            lifecycle_state="not_applicable",
+            is_current=True,
+            is_new=True,
+            triggered_assessment=True,
+            institutional_level=None,
+            service_level=None,
+            t1_at=None,
+        )
+
+
+async def test_manual_test_uses_real_event_service_and_creates_shanghai_event() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    result = await _service().trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="manual-real-1"),
+        "operator",
+    )
+
+    assert result.event_id is not None
+    assert result.run_id is not None
+    assert result.operation_state == "queued"
+    assert result.outcome == "triggered"
+
+    async with SessionFactory() as session:
+        event = await session.get(EarthquakeEvent, result.event_id)
+        run = await session.get(OperationsRun, result.run_id)
+        audit = await session.scalar(
+            select(OperationsAuditLog)
+            .where(OperationsAuditLog.action == "operations.manual_test.triggered")
+            .order_by(OperationsAuditLog.created_at.desc(), OperationsAuditLog.id.desc())
+            .limit(1)
+        )
+        revision = await session.scalar(
+            select(EarthquakeRevision)
+            .where(EarthquakeRevision.event_id == result.event_id)
+            .limit(1)
+        )
+
+    assert event is not None
+    assert event.event_type == "test"
+    assert Decimal("5.0") <= event.magnitude <= Decimal("5.9")
+    assert run is not None
+    assert run.event_id == event.id
+    assert run.operation_state == "queued"
+    assert run.trigger_mode == "manual_test"
+    assert audit is not None
+    assert revision is not None
+    assert revision.inside_shanghai is True
+
+
+async def test_drill_uses_real_event_service_and_marks_drill() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    result = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="drill-real-1"),
+        "operator",
+    )
+
+    async with SessionFactory() as session:
+        event = await session.get(EarthquakeEvent, result.event_id)
+        run = await session.get(OperationsRun, result.run_id)
+
+    assert event is not None
+    assert event.event_type == "drill"
+    assert run is not None
+    assert run.trigger_mode == "drill"
+    assert run.operation_state == "queued"
+
+
+async def test_idempotency_replay_returns_same_event_and_run() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    service = _service()
+    first = await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="replay-key"),
+        "operator",
+    )
+    second = await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="replay-key"),
+        "operator",
+    )
+    different = await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="different-key"),
+        "operator",
+    )
+
+    assert first.event_id == second.event_id
+    assert first.run_id == second.run_id
+    assert first.idempotency_key == second.idempotency_key == "replay-key"
+    assert different.event_id != first.event_id
+    assert different.run_id != first.run_id
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+
+    assert event_count == 2
+    assert run_count == 2
+
+
+async def test_manual_test_during_real_event_raises_priority_error() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await _seed_real_event(session)
+            await OperationsRepository().get_settings(session)
+
+    fake_event_service = FakeEventService()
+    service = _service(event_service=fake_event_service)
+
+    with pytest.raises(RealEventPriorityActive):
+        await service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key="blocked-test"),
+            "operator",
+        )
+
+    assert fake_event_service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_state"),
+    [("pause", "deferred"), ("terminate", "canceled")],
+)
+async def test_drill_during_real_event_does_not_create_event(
+    policy: str,
+    expected_state: str,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await _seed_real_event(session)
+            settings = await OperationsRepository().get_settings(session)
+            settings.drill_conflict_policy = policy
+
+    fake_event_service = FakeEventService()
+    result = await _service(event_service=fake_event_service).trigger_drill(
+        DrillTriggerRequest(idempotency_key=f"blocked-drill-{policy}"),
+        "operator",
+    )
+
+    assert result.operation_state == expected_state
+    assert result.outcome == expected_state
+    assert result.event_id is None
+    assert result.run_id is None
+    assert fake_event_service.calls == []
+
+    async with SessionFactory() as session:
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+
+    assert run_count == 0
+
+
+async def test_retry_repairs_missing_run_after_event_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    service = _service()
+    original = service._persist_run
+    failed = False
+
+    async def flaky_persist(session, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise SQLAlchemyError("simulated run insert failure")
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(service, "_persist_run", flaky_persist)
+
+    with pytest.raises(SQLAlchemyError):
+        await service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key="repair-key"),
+            "operator",
+        )
+
+    monkeypatch.setattr(service, "_persist_run", original)
+    result = await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="repair-key"),
+        "operator",
+    )
+
+    assert result.event_id is not None
+    assert result.run_id is not None
+
+    async with SessionFactory() as session:
+        run = await session.get(OperationsRun, result.run_id)
+        event = await session.get(EarthquakeEvent, result.event_id)
+
+    assert run is not None
+    assert event is not None
+    assert run.event_id == event.id
+
+
+async def test_scenario_seed_and_source_event_id_are_derived_from_key() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await OperationsRepository().get_settings(session)
+
+    generator = ScenarioGenerator()
+    service = _service()
+    key = " deterministic key with spaces "
+    seed = service._derive_seed(service._normalize_idempotency_key(key))
+    source_event_id = service._derive_source_event_id(
+        service._normalize_idempotency_key(key),
+        EventKind.TEST,
+    )
+
+    async with SessionFactory() as session:
+        settings = await OperationsRepository().get_settings(session)
+        first = await generator.generate_test(
+            session,
+            settings,
+            observed_at=OBSERVED_AT,
+            seed=seed,
+        )
+        second = await generator.generate_test(
+            session,
+            settings,
+            observed_at=OBSERVED_AT,
+            seed=seed,
+        )
+
+    assert first == second
+    assert source_event_id.startswith("operations-test:")
+    assert seed == int.from_bytes(
+        __import__("hashlib")
+        .sha256(service._normalize_idempotency_key(key).encode("utf-8"))
+        .digest()[:8],
+        "big",
+        signed=True,
+    )

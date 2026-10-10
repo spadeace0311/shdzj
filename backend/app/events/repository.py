@@ -759,6 +759,9 @@ class EventRepository:
             if historical_alias is not None:
                 return historical_alias
 
+        if event.source_event_id and event.kind not in _LOGICAL_EVENT_KINDS:
+            return None
+
         point = _point_geometry(event)
         return await session.scalar(
             select(EarthquakeEvent)
