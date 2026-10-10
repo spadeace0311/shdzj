@@ -260,6 +260,48 @@ async def test_disabled_scheduling_marks_plan_skipped() -> None:
     assert result.triggered == 0
 
 
+async def test_missing_event_id_fails_with_audit_and_does_not_retry() -> None:
+    await _ensure_settings()
+    await _ensure_schedule(OBSERVED_AT)
+    trigger = FakeTrigger(
+        [
+            _trigger_result(
+                event_id=None,
+                operation_state="queued",
+                outcome="triggered",
+            )
+        ]
+    )
+
+    scheduler = DailyTestScheduler()
+    first = await scheduler.dispatch_due(OBSERVED_AT, trigger)
+    second = await scheduler.dispatch_due(OBSERVED_AT, trigger)
+
+    assert first.failed == 1
+    assert second.failed == 0
+    assert len(trigger.calls) == 1
+
+    async with SessionFactory() as session:
+        schedule = await session.scalar(
+            select(OperationsTestSchedule)
+            .where(OperationsTestSchedule.local_date == OBSERVED_AT.astimezone(SHANGHAI).date())
+        )
+        audit = await session.scalar(
+            select(OperationsAuditLog)
+            .where(OperationsAuditLog.action == "operations.schedule.failed")
+            .order_by(OperationsAuditLog.created_at.desc(), OperationsAuditLog.id.desc())
+            .limit(1)
+        )
+
+    assert schedule is not None
+    assert schedule.state == "failed"
+    assert schedule.failure_reason == "trigger_result_missing_event_id"
+    assert audit is not None
+    assert audit.resource_type == "operations_test_schedule"
+    assert audit.resource_id == str(schedule.id)
+    assert audit.after_state["failure_reason"] == "trigger_result_missing_event_id"
+
+
 async def test_no_active_boundary_fails_without_infinite_retry() -> None:
     await _ensure_settings()
     await _ensure_schedule(OBSERVED_AT)
@@ -305,10 +347,23 @@ async def test_no_active_boundary_fails_without_infinite_retry() -> None:
                     == OBSERVED_AT.astimezone(SHANGHAI).date()
                 )
             )
+            audit = await session.scalar(
+                select(OperationsAuditLog)
+                .where(OperationsAuditLog.action == "operations.schedule.failed")
+                .order_by(
+                    OperationsAuditLog.created_at.desc(),
+                    OperationsAuditLog.id.desc(),
+                )
+                .limit(1)
+            )
         assert schedule is not None
         assert schedule.state == "failed"
         assert schedule.failure_reason
         assert "active_shanghai_boundary_required" in schedule.failure_reason
+        assert audit is not None
+        assert audit.resource_type == "operations_test_schedule"
+        assert audit.resource_id == str(schedule.id)
+        assert "active_shanghai_boundary_required" in audit.after_state["failure_reason"]
     finally:
         if active_before:
             async with SessionFactory() as session:

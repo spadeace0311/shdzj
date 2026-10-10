@@ -12,7 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import SessionFactory
-from app.operations.models import OperationsTestSchedule
+from app.operations.models import OperationsAuditLog, OperationsTestSchedule
 from app.operations.repository import OperationsRepository
 from app.operations.schemas import OperationsTriggerResult
 
@@ -217,9 +217,17 @@ class DailyTestScheduler:
                     )
                     if schedule is None or schedule.state != "due":
                         return "skipped"
+                    failure_reason = _safe_error_text(exc)
                     schedule.state = "failed"
-                    schedule.failure_reason = _safe_error_text(exc)
+                    schedule.failure_reason = failure_reason
                     schedule.updated_at = observed_at
+                    session.add(
+                        _schedule_failure_audit(
+                            schedule,
+                            observed_at,
+                            failure_reason,
+                        )
+                    )
                     await session.flush()
                     return "failed"
 
@@ -238,9 +246,17 @@ class DailyTestScheduler:
 
                 event_id = _coerce_event_id(result.event_id)
                 if event_id is None:
+                    failure_reason = "trigger_result_missing_event_id"
                     schedule.state = "failed"
-                    schedule.failure_reason = "trigger_result_missing_event_id"
+                    schedule.failure_reason = failure_reason
                     schedule.updated_at = observed_at
+                    session.add(
+                        _schedule_failure_audit(
+                            schedule,
+                            observed_at,
+                            failure_reason,
+                        )
+                    )
                     await session.flush()
                     return "failed"
 
@@ -279,6 +295,29 @@ def _coerce_event_id(value: object) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _schedule_failure_audit(
+    schedule: OperationsTestSchedule,
+    observed_at: datetime,
+    failure_reason: str,
+) -> OperationsAuditLog:
+    return OperationsAuditLog(
+        action="operations.schedule.failed",
+        actor=DailyTestScheduler.ACTOR,
+        resource_type="operations_test_schedule",
+        resource_id=str(schedule.id),
+        before_state={"state": "due"},
+        after_state={
+            "state": "failed",
+            "failure_reason": failure_reason,
+        },
+        detail={
+            "failure_reason": failure_reason,
+            "schedule_id": str(schedule.id),
+        },
+        created_at=observed_at,
+    )
 
 
 def _safe_error_text(exc: Exception) -> str:
