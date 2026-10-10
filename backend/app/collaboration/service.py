@@ -41,6 +41,7 @@ from app.event_object_cleanup import (
     enqueue_object_cleanup_intent,
 )
 from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.operations.priority import OperationsPriorityGuard
 
 
 class StaleTaskVersion(Exception):
@@ -84,9 +85,11 @@ class CollaborationTaskService:
         *,
         repository: CollaborationRepository | None = None,
         roster_service: RosterService | None = None,
+        priority_guard: OperationsPriorityGuard | None = None,
     ) -> None:
         self.repository = repository or CollaborationRepository()
         self.roster_service = roster_service or RosterService()
+        self.priority_guard = priority_guard or OperationsPriorityGuard()
 
     async def start(
         self,
@@ -158,6 +161,10 @@ class CollaborationTaskService:
         self._ensure_transition(task.status, TaskStatus.PENDING_REVIEW)
         if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         await self.repository.upsert_contributor(
@@ -206,6 +213,10 @@ class CollaborationTaskService:
         self._ensure_transition(task.status, TaskStatus.IN_PROGRESS)
         if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         self._apply_transition(task, TaskStatus.IN_PROGRESS, now=now)
@@ -292,6 +303,10 @@ class CollaborationTaskService:
         self._ensure_transition(task.status, TaskStatus.NOT_REQUIRED)
         if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         previous_status = task.status
@@ -877,6 +892,10 @@ class TemporaryTaskService(CollaborationTaskService):
             actor_identity,
         ):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         previous_status = task.status
@@ -1006,6 +1025,7 @@ class DeliverableService:
         repository: CollaborationRepository | None = None,
         roster_service: RosterService | None = None,
         artifact_store: ArtifactStore | None = None,
+        priority_guard: OperationsPriorityGuard | None = None,
     ) -> None:
         self.repository = repository or CollaborationRepository()
         self.roster_service = roster_service or RosterService()
@@ -1013,6 +1033,7 @@ class DeliverableService:
             settings.artifact_storage_root,
             namespace=settings.artifact_storage_namespace,
         )
+        self.priority_guard = priority_guard or OperationsPriorityGuard()
 
     async def add_text_version(
         self,
@@ -1039,6 +1060,10 @@ class DeliverableService:
             raise PermissionError("Insufficient permissions")
         if not isinstance(text_result, dict) or not text_result:
             raise ValueError("text_result must be a non-empty object")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         return await self._create_version(
             session,
@@ -1079,6 +1104,10 @@ class DeliverableService:
             return await self._version_from_event(session, task, idempotency_key)
         if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         stored = await self._store_manual_object(
             session,
@@ -1174,6 +1203,10 @@ class DeliverableService:
             return await self._publication_from_event(session, task, idempotency_key)
         if actor_identity.role != "superadmin":
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         version = await self._build_override_version(
             session,
@@ -1355,6 +1388,10 @@ class DeliverableService:
         if version is None or version.deliverable_id != deliverable.id:
             raise ValueError("version does not belong to deliverable")
         await _validate_version_for_publication(session, version, self.artifact_store)
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
         return await self._create_publication(
             session,
             deliverable,

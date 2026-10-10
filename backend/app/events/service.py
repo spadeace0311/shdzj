@@ -21,6 +21,7 @@ from app.events.response_rules import (
     ResponseInput,
     ResponseRuleEngine,
 )
+from app.operations.priority import OperationsPriorityGuard
 from app.regions.domain import RegionContext
 from app.regions.repository import RegionRepository
 
@@ -60,6 +61,7 @@ class EventService:
         region_repository: RegionRepository | None = None,
         production_controller: ArtifactProductionLifecycleController | None = None,
         roster_service: RosterService | None = None,
+        priority_guard: OperationsPriorityGuard | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._repository = repository or EventRepository(session_factory)
@@ -69,6 +71,7 @@ class EventService:
             or ArtifactProductionLifecycleController()
         )
         self._roster_service = roster_service or RosterService()
+        self._priority_guard = priority_guard or OperationsPriorityGuard()
 
     async def ingest(
         self,
@@ -85,6 +88,13 @@ class EventService:
         async with self._session_factory() as session:
             async with session.begin():
                 await self._repository.acquire_ingest_lock(session, event.source)
+                region_context = None
+                if event.kind is EventKind.MANUAL:
+                    region_context = await self._resolve_assessment_boundary(
+                        session,
+                        event,
+                        None,
+                    )
                 raw = await self._repository.get_or_create_raw_message(
                     session,
                     raw_payload,
@@ -101,7 +111,7 @@ class EventService:
                     provider="api",
                     ingest_lane="http",
                     ingested_at=normalized_received_at,
-                    region_context=None,
+                    region_context=region_context,
                 )
                 if result.is_new and result.is_current:
                     await self._production_controller.apply_current_event_transition(
@@ -111,6 +121,36 @@ class EventService:
                         revision_no=result.revision_no,
                         event_kind=result.event_kind,
                     )
+                    if result.event_kind is EventKind.MANUAL:
+                        await self._repository.enqueue_collaboration(
+                            session,
+                            event_id=result.event_id,
+                            revision_id=result.revision_id,
+                            revision_no=result.revision_no,
+                            trigger_reason="live",
+                            created_at=normalized_received_at,
+                        )
+                        await self._roster_service.snapshot_for_event(
+                            session,
+                            uuid.UUID(result.event_id),
+                        )
+                        await self._repository.enqueue_assessment(
+                            session,
+                            event_id=result.event_id,
+                            revision_id=result.revision_id,
+                            revision_no=result.revision_no,
+                            trigger_reason="live",
+                            created_at=normalized_received_at,
+                        )
+                    if result.event_kind in {
+                        EventKind.FORMAL,
+                        EventKind.MANUAL,
+                    }:
+                        await self._priority_guard.apply_real_event_start(
+                            session,
+                            event_id=result.event_id,
+                            observed_at=normalized_received_at,
+                        )
                 return result
 
     async def ingest_with_response_suggestion(
@@ -232,10 +272,13 @@ class EventService:
                         session,
                         uuid.UUID(result.event_id),
                     )
-                    if _assessment_applicable(
-                        event,
-                        region_context,
-                        response_input,
+                    if (
+                        result.event_kind is EventKind.MANUAL
+                        or _assessment_applicable(
+                            event,
+                            region_context,
+                            response_input,
+                        )
                     ):
                         triggered_assessment = await self._repository.enqueue_assessment(
                             session,
@@ -250,6 +293,15 @@ class EventService:
                             "assessment applicability rejected event_id=%s kind=%s",
                             result.event_id,
                             result.event_kind,
+                        )
+                    if result.event_kind in {
+                        EventKind.FORMAL,
+                        EventKind.MANUAL,
+                    }:
+                        await self._priority_guard.apply_real_event_start(
+                            session,
+                            event_id=result.event_id,
+                            observed_at=normalized_received_at,
                         )
 
                 (

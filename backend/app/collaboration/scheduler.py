@@ -12,6 +12,7 @@ from app.collaboration.domain import TimelinessState
 from app.collaboration.models import NotificationDelivery, WorkgroupTask
 from app.collaboration.roster import RosterService
 from app.events.models import EarthquakeEvent
+from app.operations.models import OperationsRun
 
 
 TERMINAL_TASK_STATUSES = {"completed", "not_required", "failed"}
@@ -150,7 +151,18 @@ class DeadlineScheduler:
     ) -> list[WorkgroupTask]:
         rows = await session.scalars(
             select(WorkgroupTask)
-            .where(WorkgroupTask.status.not_in(TERMINAL_TASK_STATUSES))
+            .where(
+                WorkgroupTask.status.not_in(TERMINAL_TASK_STATUSES),
+                ~select(OperationsRun.id)
+                .where(
+                    OperationsRun.event_id == WorkgroupTask.event_id,
+                    OperationsRun.operation_state.in_(
+                        ("paused", "canceled")
+                    ),
+                )
+                .correlate(WorkgroupTask)
+                .exists(),
+            )
             .order_by(WorkgroupTask.created_at, WorkgroupTask.id)
         )
         return list(rows)

@@ -68,6 +68,10 @@ from app.collaboration.service import (
 from app.config import settings
 from app.db import SessionFactory
 from app.event_object_cleanup import process_cleanup_intents
+from app.operations.priority import (
+    OperationsPriorityGuard,
+    OperationsWorkBlocked,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["workgroups"])
 logger = logging.getLogger(__name__)
@@ -87,6 +91,7 @@ def get_task_service() -> CollaborationTaskService:
     return CollaborationTaskService(
         repository=CollaborationRepository(),
         roster_service=RosterService(),
+        priority_guard=OperationsPriorityGuard(),
     )
 
 
@@ -94,6 +99,7 @@ def get_temporary_task_service() -> TemporaryTaskService:
     return TemporaryTaskService(
         repository=CollaborationRepository(),
         roster_service=RosterService(),
+        priority_guard=OperationsPriorityGuard(),
     )
 
 
@@ -101,6 +107,7 @@ def get_deliverable_service() -> DeliverableService:
     return DeliverableService(
         repository=CollaborationRepository(),
         roster_service=RosterService(),
+        priority_guard=OperationsPriorityGuard(),
     )
 
 
@@ -1253,6 +1260,7 @@ def _task_mutation_error_types() -> tuple[type[Exception], ...]:
         StaleTaskVersion,
         MissingRequiredDeliverableError,
         CleanupNamespaceUnavailableError,
+        OperationsWorkBlocked,
         TypeError,
         ValueError,
         SQLAlchemyError,
@@ -1262,6 +1270,8 @@ def _task_mutation_error_types() -> tuple[type[Exception], ...]:
 def _task_mutation_exception(exc: Exception) -> HTTPException:
     if isinstance(exc, StaleTaskVersion):
         return HTTPException(status_code=409, detail="task_version_conflict")
+    if isinstance(exc, OperationsWorkBlocked):
+        return HTTPException(status_code=409, detail="operations_work_blocked")
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, LookupError):
