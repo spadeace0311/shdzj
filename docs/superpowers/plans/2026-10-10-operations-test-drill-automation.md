@@ -15,6 +15,7 @@
 - 每日测试在上海时区 `02:00` 至 `04:00` 内随机选择一次执行时间，默认使用系统时区 `Asia/Shanghai`。
 - 每日测试震级范围为 `5.0` 至 `5.9`，震源深度范围为 `5.00` 至 `20.00` 千米，震中必须落在当前激活的上海市行政边界内。
 - 测试事件和成果保留 `400` 天；演练事件和成果保留 `2` 年；正式和人工事件长期保留。
+- 保留清理删除测试或演练事件时，关联的运维计划通过 `ON DELETE CASCADE` 清理；运维运行记录同样级联清理，不保留指向已删除事件的计划。
 - 所有测试成果的文件名、可见文字和元数据必须带不可移除的“测试”标识；演练成果必须带不可移除的“演练”标识。
 - 真实正式报或人工正式事件优先。真实事件激活后，待执行测试继续延后，运行中的自动成果按现有 `real_event_priority` 逻辑终止；演练冲突策略可配置为 `pause` 或 `terminate`。
 - 配置为 `pause` 时，尚未执行的演练保持暂停状态；已经进入成果工作流的演练按现有安全边界终止并记录 `resume_required=true`，不做不可靠的 Temporal 中途挂起。
@@ -246,14 +247,16 @@ scheduled_at TIMESTAMPTZ
 state VARCHAR(16)
 scenario JSONB NULL
 random_seed BIGINT
-event_id UUID NULL FK earthquake_events ON DELETE SET NULL
+event_id UUID NULL FK earthquake_events ON DELETE CASCADE
 failure_reason TEXT NULL
 triggered_at TIMESTAMPTZ NULL
 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-检查约束必须限制状态值；`triggered` 状态要求 `event_id` 和 `triggered_at` 非空。
+检查约束必须限制状态值；`triggered` 状态要求 `event_id` 和 `triggered_at` 非空。事件删除采用
+`ON DELETE CASCADE`，由数据库同时清理关联计划，避免 `SET NULL` 与 `triggered` 检查约束冲突；
+该行为与测试/演练事件保留清理一致。
 
 `OperationsRun` 必须包含：
 
