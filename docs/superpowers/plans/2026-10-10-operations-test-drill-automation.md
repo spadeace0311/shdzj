@@ -10,6 +10,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-17-shanghai-earthquake-emergency-decision-system-design.md`
 
+**Execution order:** 执行顺序为 Task 1、Task 2、Task 5、Task 3、Task 4、Task 6、Task 7、Task 8、Task 9。
+Task 5 提前，是因为 Task 3 的触发服务必须注入 Task 5 产出的真实事件优先级守卫；任务编号保持不变，避免追踪标识漂移。
+
 ## Global Constraints
 
 - 每日测试在上海时区 `02:00` 至 `04:00` 内随机选择一次执行时间，默认使用系统时区 `Asia/Shanghai`。
