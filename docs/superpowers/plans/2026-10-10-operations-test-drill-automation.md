@@ -406,7 +406,7 @@ async def test_generated_test_scenario_is_shanghai_5_to_6(
     assert event.kind is EventKind.TEST
     assert Decimal("5.0") <= event.magnitude <= Decimal("5.9")
     assert Decimal("5.00") <= event.depth_km <= Decimal("20.00")
-    assert scenario.place.endswith("测试")
+    assert scenario.place == "上海市（系统测试）"
     assert await generator.region_contains(session, scenario) is True
 ```
 
@@ -439,6 +439,8 @@ FROM (
 - `row_version` 不匹配抛出 `StaleOperationsSettings`。
 - 修改窗口、震级和演练冲突策略后写审计记录。
 - `daily_window_start >= daily_window_end`、`magnitude_min > magnitude_max`、非法策略被拒绝。
+- 同日 schedule 可读取且返回同一记录；不存在的日期返回 `None`。
+- 按 event_id 可读取唯一 run；不存在的 event_id 返回 `None`。
 
 Expected: FAIL，因为 repository 尚未实现。
 
