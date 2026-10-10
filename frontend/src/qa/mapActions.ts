@@ -388,6 +388,23 @@ function circleFeature(
   };
 }
 
+function highlightedPointFeature(
+  coordinates: [number, number],
+  featureId: string,
+  featureIdProperty: string,
+): GeoJSON.Feature<GeoJSON.Point> {
+  return {
+    type: "Feature",
+    properties: {
+      [featureIdProperty]: featureId,
+    },
+    geometry: {
+      type: "Point",
+      coordinates,
+    },
+  };
+}
+
 export function applyQaMapAction(
   map: QaActionMap,
   action: QaMapAction,
@@ -463,10 +480,35 @@ export function applyQaMapAction(
     if (!layer || !map.getLayer(layer.id)) {
       return false;
     }
+    const featureId = action.feature_id ?? referenceFor(action.target_ref);
+    const coordinates = validCoordinatePair(action.coordinates)
+      ? action.coordinates
+      : undefined;
+    if (coordinates) {
+      const data: GeoJSON.FeatureCollection<GeoJSON.Point> = {
+        type: "FeatureCollection",
+        features: [
+          highlightedPointFeature(
+            coordinates,
+            featureId,
+            layer.featureIdProperty,
+          ),
+        ],
+      };
+      const existingSource = map.getSource(layer.source);
+      if (existingSource && "setData" in (existingSource as object)) {
+        (existingSource as unknown as GeoJsonSourceLike).setData(data);
+      } else {
+        map.addSource(layer.source, {
+          type: "geojson",
+          data,
+        } satisfies GeoJSONSourceSpecification);
+      }
+    }
     map.setFilter(layer.id, [
       "==",
       ["get", layer.featureIdProperty],
-      action.feature_id ?? referenceFor(action.target_ref),
+      featureId,
     ]);
     return true;
   }

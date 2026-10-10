@@ -830,8 +830,8 @@ async def _build_index(
             )
         manifest["index_batch_size"] = batch_size
         if rebuild is not None:
-            await index.commit_rebuild(rebuild)
             activated_rebuild = rebuild
+            await index.commit_rebuild(rebuild)
             manifest["collection_alias"] = rebuild.alias_name
             manifest["physical_collection_name"] = rebuild.staging_name
             index_version.collection_name = rebuild.alias_name

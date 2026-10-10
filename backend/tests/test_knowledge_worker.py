@@ -630,6 +630,50 @@ async def test_real_index_compensates_cancellation_after_alias_activation(
         await _delete_actor_data(session_factory)
 
 
+@pytest.mark.parametrize("previous_alias_exists", [True, False])
+async def test_real_index_compensates_cancellation_inside_commit_rebuild(
+    session_factory,
+    previous_alias_exists: bool,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        if previous_alias_exists:
+            client.aliases[alias_name] = logical_name
+
+        async with session_factory() as session:
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            source = await session.get(KnowledgeSource, version.source_id)
+            assert version is not None
+            assert source is not None
+            client.fail_alias_update_after_apply = asyncio.CancelledError()
+            with pytest.raises(asyncio.CancelledError):
+                await _build_index(
+                    session,
+                    index,
+                    _FakeEmbeddings(),
+                    version,
+                    source,
+                    2,
+                    force_rebuild=True,
+                    batch_size=10,
+                )
+
+        if previous_alias_exists:
+            assert client.aliases.get(alias_name) == logical_name
+        else:
+            assert alias_name not in client.aliases
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 async def test_real_index_compensates_when_mark_success_fails(
     session_factory,
     monkeypatch,
@@ -1017,6 +1061,7 @@ class _AliasQdrantClient:
         self.aliases: dict[str, str] = {}
         self.alias_operations: list[list[object]] = []
         self.deleted_collections: list[str] = []
+        self.fail_alias_update_after_apply: BaseException | None = None
 
     async def collection_exists(self, collection_name: str) -> bool:
         return collection_name in self.collections
@@ -1067,6 +1112,10 @@ class _AliasQdrantClient:
                     create_alias,
                     "collection_name",
                 )
+        failure = self.fail_alias_update_after_apply
+        self.fail_alias_update_after_apply = None
+        if failure is not None:
+            raise failure
 
     async def get_aliases(self) -> object:
         return SimpleNamespace(

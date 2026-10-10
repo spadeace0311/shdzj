@@ -803,6 +803,7 @@ it("applies a non-loss highlight through production LossMap QA layers", async ()
     target_ref: "fault:f1",
     layer_id: "faults",
     feature_id: "f1",
+    coordinates: [121.1, 31.1],
     reason: "突出断裂带",
     valid_until: "2099-01-01T00:00:00Z",
   });
@@ -819,6 +820,17 @@ it("applies a non-loss highlight through production LossMap QA layers", async ()
     ["get", "fault_key"],
     "f1",
   ]);
+  const faultSource = map.sources.get("loss-map-qa-faults-source") as
+    | { data?: GeoJSON.FeatureCollection<GeoJSON.Point> }
+    | undefined;
+  expect(faultSource?.data?.features).toHaveLength(1);
+  expect(faultSource?.data?.features[0]?.properties).toMatchObject({
+    fault_key: "f1",
+  });
+  expect(faultSource?.data?.features[0]?.geometry).toMatchObject({
+    type: "Point",
+    coordinates: [121.1, 31.1],
+  });
   expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
 });
 
