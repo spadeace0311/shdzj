@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext, type Page } from "@playwright/tes
 
 const USERNAME = process.env.E2E_SUPERADMIN_USERNAME ?? "superadmin";
 const API_BASE_URL = (process.env.E2E_API_BASE_URL ?? "").replace(/\/+$/, "");
+const ALLOW_EVENT_PURGE = process.env.E2E_ALLOW_EVENT_PURGE === "1";
 const TEST_PLACE = "上海市（系统测试）";
 const PRODUCTION_TIMEOUT_MS = 240_000;
 const RETENTION_TEST_DAYS = 400;
@@ -12,8 +13,16 @@ const REPORT_AND_DECK_OUTPUT_COUNT = 12;
 const credentialMissingReason =
   "缺少真实超级管理员密码环境变量 E2E_SUPERADMIN_PASSWORD；" +
   "该 E2E 不得在无真实凭据时伪造通过。";
+const eventPurgeNotAllowedReason =
+  "未设置 E2E_ALLOW_EVENT_PURGE=1；该 E2E 会创建正式事件并要求在专用一次性 " +
+  "codex-operations 环境中通过超级管理员 purge API 清理，不允许污染长期保留数据。";
 
-test.skip(!process.env.E2E_SUPERADMIN_PASSWORD, credentialMissingReason);
+test.skip(
+  !process.env.E2E_SUPERADMIN_PASSWORD || !ALLOW_EVENT_PURGE,
+  !process.env.E2E_SUPERADMIN_PASSWORD
+    ? credentialMissingReason
+    : eventPurgeNotAllowedReason,
+);
 
 interface TriggerPayload {
   event_id: string | null;
@@ -37,6 +46,8 @@ interface AssessmentPayload {
 
 interface ArtifactPayload {
   artifact_key: string;
+  production_mode: string;
+  file_name: string;
 }
 
 interface ProductionPayload {
@@ -94,6 +105,23 @@ async function getApiToken(request: APIRequestContext): Promise<string> {
   const payload = (await response.json()) as { access_token?: string };
   expect(typeof payload.access_token).toBe("string");
   return payload.access_token as string;
+}
+
+async function purgeFormalEvent(
+  request: APIRequestContext,
+  token: string,
+  eventId: string,
+): Promise<void> {
+  const response = await request.delete(
+    apiUrl(`/api/v1/admin/events/${encodeURIComponent(eventId)}/purge`),
+    {
+      headers: {
+        ...authorizedHeaders(token),
+        "Idempotency-Key": crypto.randomUUID(),
+      },
+    },
+  );
+  expect(response.status()).toBe(204);
 }
 
 async function loginThroughUi(page: Page): Promise<void> {
@@ -231,6 +259,10 @@ test("operations test trigger, artifact production, real-event priority, and ret
     TOTAL_OUTPUT_COUNT,
   );
   expect(production.failed_count).toBe(0);
+  for (const artifact of artifacts) {
+    expect(artifact.production_mode).toBe("test");
+    expect(artifact.file_name).toContain("【测试】");
+  }
 
   await page.getByRole("link", { name: "事件列表" }).click();
   await expect(
@@ -257,48 +289,66 @@ test("operations test trigger, artifact production, real-event priority, and ret
     page.locator(".artifact-mode-bar").getByText("【测试】", { exact: true }),
   ).toBeVisible();
 
-  const formalRunId = crypto.randomUUID();
-  const formalPlace = `上海运营正式事件 E2E ${formalRunId}`;
-  const formalResponse = await request.post(apiUrl("/api/v1/events/manual"), {
-    headers: authorizedHeaders(token),
-    data: {
-      origin_time: new Date().toISOString(),
-      longitude: "121.47",
-      latitude: "31.23",
-      magnitude: "5.2",
-      depth_km: "10.0",
-      source: "shanghai-operations-e2e",
-      source_event_id: `OPERATIONS-FORMAL-${formalRunId}`,
-      place: formalPlace,
-      event_kind: "manual",
-    },
-  });
-  expect(formalResponse.status()).toBe(201);
-  const formalPayload = (await formalResponse.json()) as {
-    event_kind?: string;
-  };
-  expect(formalPayload.event_kind).toBe("manual");
-
-  const conflictResponse = await request.post(
-    apiUrl("/api/v1/operations/test-trigger"),
-    {
-      headers: {
-        ...authorizedHeaders(token),
-        "Idempotency-Key": crypto.randomUUID(),
+  let formalEventId: string | null = null;
+  try {
+    const formalRunId = crypto.randomUUID();
+    const formalPlace = `上海运营正式事件 E2E ${formalRunId}`;
+    const formalResponse = await request.post(apiUrl("/api/v1/events/manual"), {
+      headers: authorizedHeaders(token),
+      data: {
+        origin_time: new Date().toISOString(),
+        longitude: "121.47",
+        latitude: "31.23",
+        magnitude: "5.2",
+        depth_km: "10.0",
+        source: "shanghai-operations-e2e",
+        source_event_id: `OPERATIONS-FORMAL-${formalRunId}`,
+        place: formalPlace,
+        event_kind: "manual",
       },
-    },
-  );
-  expect(conflictResponse.status()).toBe(409);
-  const conflictPayload = (await conflictResponse.json()) as {
-    detail?: string;
-  };
-  expect(conflictPayload.detail).toBe("real_event_priority_active");
+    });
+    expect(formalResponse.status()).toBe(201);
+    const formalPayload = (await formalResponse.json()) as {
+      event_id?: string;
+      event_kind?: string;
+    };
+    formalEventId = formalPayload.event_id ?? null;
+    expect(formalPayload.event_kind).toBe("manual");
+    expect(typeof formalEventId).toBe("string");
 
-  await page.getByRole("link", { name: "测试与演练" }).click();
-  await expect(
-    page.getByRole("heading", { name: "真实事件优先保护中" }),
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "手工测试" })).toBeDisabled();
+    const conflictResponse = await request.post(
+      apiUrl("/api/v1/operations/test-trigger"),
+      {
+        headers: {
+          ...authorizedHeaders(token),
+          "Idempotency-Key": crypto.randomUUID(),
+        },
+      },
+    );
+    expect(conflictResponse.status()).toBe(409);
+    const conflictPayload = (await conflictResponse.json()) as {
+      detail?: string;
+    };
+    expect(conflictPayload.detail).toBe("real_event_priority_active");
+
+    await page.getByRole("link", { name: "测试与演练" }).click();
+    await expect(
+      page.getByRole("heading", { name: "真实事件优先保护中" }),
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "手工测试" })).toBeDisabled();
+  } finally {
+    if (formalEventId) {
+      await purgeFormalEvent(request, token, formalEventId);
+    }
+  }
+
+  if (formalEventId) {
+    const purgedFormalResponse = await request.get(
+      apiUrl(`/api/v1/events/${encodeURIComponent(formalEventId)}`),
+      { headers: authorizedHeaders(token) },
+    );
+    expect(purgedFormalResponse.status()).toBe(404);
+  }
 
   const retainedResponse = await request.get(
     apiUrl(`/api/v1/events/${encodeURIComponent(testEventId)}`),

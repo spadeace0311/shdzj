@@ -164,7 +164,11 @@ LIMIT 1;
 
 真实正式报通过 `ingest_collected()` 入库，手工正式事件通过 `ingest()` 入库；两条路径都会在同一事务内调用优先级守卫。守卫只处理 `test`/`drill`，不修改正式或人工事件。
 
-保护窗口为滚动 7 天：当前 `formal|manual` 事件，且 `origin_time <= observed_at`，被视为活动真实事件。
+保护窗口为滚动 7 天：同时满足以下条件的当前 `formal|manual` 事件被视为活动真实事件：
+
+- `current_revision_id IS NOT NULL`。
+- `origin_time >= observed_at - 7 days`。
+- `origin_time <= observed_at`。
 
 冲突结果：
 
@@ -178,8 +182,8 @@ LIMIT 1;
 
 设置中的 `drill_conflict_policy` 只影响演练冲突：
 
-- `pause`：尚未执行的演练保持暂停/延后语义；已经进入成果工作流的演练按现有安全边界终止，并记录 `resume_required=true`，不尝试在 Temporal 中不可靠地中途挂起。
-- `terminate`：冲突演练直接进入取消状态，`resume_required` 不自动置位。
+- `pause`：尚未创建运行的新演练触发请求返回 `operation_state=deferred`，不生成 `operations_runs` 行；已经存在且处于 `queued|running` 的演练运行改为 `paused`，`resume_required=true`。成果生产层仍按真实事件优先安全边界终止非正式生产，不尝试在 Temporal 中不可靠地中途挂起。
+- `terminate`：新演练触发请求返回 `operation_state=canceled`；已经存在的演练运行改为 `canceled`，`resume_required` 不自动置位。
 
 暂停或取消的测试/演练会被 `OperationsWorkBlocked` 冻结：协同成果提交、退回、取消、上传和发布返回 `409 operations_work_blocked`，截止提醒也不会再新建。真实事件窗口结束只恢复到期每日测试计划，不自动重启已经进入安全暂停边界的演练。
 
@@ -270,7 +274,16 @@ Compose 服务健康检查执行：
 python -m app.process_health operations
 ```
 
-健康状态由 `operations_worker.py` 在每次成功循环后调用 `mark_alive()`。最近一次成功循环超过陈旧窗口后，进程健康检查返回 `unavailable`。
+该命令只检查当前容器中是否存在命令行包含 `app.operations.worker` 的进程，返回 `0` 表示进程存在，`1` 表示进程不存在。它不读取 `app.operations.health.OperationsHealthState` 中的 `last_heartbeat_at`，因此进程存活但循环卡死时仍可能被 Compose 判定为健康。
+
+`OperationsHealthState` 心跳目前只由 worker 进程内部维护，`health_app` 未作为 Compose healthcheck 暴露。要发现“进程存在但循环卡死”，应检查最近成功循环日志：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations logs --tail=100 operations-worker |
+  Select-String 'operations worker cycle counts='
+```
+
+如果最近一次 `operations worker cycle counts=` 时间超过 `OPERATIONS_WORKER_POLL_SECONDS` 与陈旧窗口之和，应把循环卡死与进程存活分开诊断，不要仅凭 `process_health operations` 返回成功就认为调度和保留循环正常。
 
 查看服务状态：
 
@@ -408,6 +421,7 @@ E2E 使用真实登录、真实数据库和真实 API，不使用 mock。需要�
 
 - `E2E_SUPERADMIN_USERNAME`（可选，默认 `superadmin`）。
 - `E2E_SUPERADMIN_PASSWORD`（必填）。
+- `E2E_ALLOW_EVENT_PURGE=1`（必填）：仅允许在专用一次性 `codex-operations` 验收环境运行。测试会创建手工正式事件并在 `finally` 中调用超级管理员 `DELETE /api/v1/admin/events/{event_id}/purge` 清理；未设置该变量时测试直接 skip，避免正式/人工长期保留数据被污染。
 - `E2E_BASE_URL`（可选，默认 `http://localhost:5173`）。
 - `E2E_API_BASE_URL`（可选，设为绝对 API 地址后只有 Playwright 控制请求直连该地址，页面仍走 Vite `/api` 代理）。
 
@@ -415,6 +429,7 @@ E2E 使用真实登录、真实数据库和真实 API，不使用 mock。需要�
 cd frontend
 $env:E2E_SUPERADMIN_USERNAME = "<超级管理员用户名>"
 $env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
+$env:E2E_ALLOW_EVENT_PURGE = "1"
 $env:E2E_BASE_URL = "http://127.0.0.1:5173"
 $env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
 npm run test:e2e -- operations.spec.ts

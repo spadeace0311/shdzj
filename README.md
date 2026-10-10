@@ -220,12 +220,13 @@ npm ci
 npx playwright install chromium
 $env:E2E_SUPERADMIN_USERNAME = "<超级管理员用户名>"
 $env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
+$env:E2E_ALLOW_EVENT_PURGE = "1"
 $env:E2E_BASE_URL = "http://127.0.0.1:5173"
 $env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
 npm run test:e2e -- operations.spec.ts
 ```
 
-E2E 缺失真实凭据或真实 API 不可用时必须 skip 并报告原因，不会伪造通过。运维页面、每日计划、手工触发、真实事件优先、保留核验、worker 恢复和只读 SQL 的完整操作步骤请参阅 [运维、测试与演练运行手册](docs/runbooks/operations-test-drill.md)。
+`E2E_ALLOW_EVENT_PURGE=1` 只在专用一次性 `codex-operations` 验收环境设置；测试会创建手工正式事件，并在结束时通过超级管理员 purge API 清理，不削弱正式/人工事件长期保留规则。E2E 缺失真实凭据、purge 授权或真实 API 不可用时必须 skip 并报告原因，不会伪造通过。运维页面、每日计划、手工触发、真实事件优先、保留核验、worker 恢复和只读 SQL 的完整操作步骤请参阅 [运维、测试与演练运行手册](docs/runbooks/operations-test-drill.md)。
 
 ## 端到端测试
 
