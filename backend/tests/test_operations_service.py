@@ -11,13 +11,14 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.collaboration.models import CollaborationSettings
 from app.db import SessionFactory, engine
-from app.events.domain import EventKind
+from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import (
     EarthquakeEvent,
     EarthquakeRevision,
     EventLifecycleOutbox,
     RawMessage,
 )
+from app.events.repository import EventRepository
 from app.events.service import LifecycleIngestOutcome
 from app.operations.models import (
     OperationsAuditLog,
@@ -56,8 +57,12 @@ async def _cleanup_data() -> None:
             await session.execute(
                 delete(EarthquakeEvent).where(EarthquakeEvent.source == "operations")
             )
+            await session.execute(
+                delete(EarthquakeEvent).where(EarthquakeEvent.source == "manual-source")
+            )
             await session.execute(delete(RawMessage).where(RawMessage.source == SOURCE))
             await session.execute(delete(RawMessage).where(RawMessage.source == "operations"))
+            await session.execute(delete(RawMessage).where(RawMessage.source == "manual-source"))
             await session.execute(delete(EventLifecycleOutbox))
 
 
@@ -181,6 +186,16 @@ class FakeEventService:
             service_level=None,
             t1_at=None,
         )
+
+
+class SequencedPriorityGuard:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def has_active_real_event(self, session, observed_at) -> bool:
+        del session, observed_at
+        self.calls += 1
+        return self.calls > 1
 
 
 async def test_manual_test_uses_real_event_service_and_creates_shanghai_event() -> None:
@@ -428,3 +443,115 @@ async def test_scenario_seed_and_source_event_id_are_derived_from_key() -> None:
         "big",
         signed=True,
     )
+
+
+async def test_same_key_across_manual_test_and_drill_conflicts_before_event_ingest() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    service = _service()
+    first = await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="shared-cross-mode-key"),
+        "operator",
+    )
+
+    with pytest.raises(ValueError, match="idempotency_key conflicts"):
+        await service.trigger_drill(
+            DrillTriggerRequest(idempotency_key="shared-cross-mode-key"),
+            "operator",
+        )
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        drill_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(
+                EarthquakeEvent.source == "operations",
+                EarthquakeEvent.event_type == "drill",
+            )
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+
+    assert first.event_id is not None
+    assert event_count == 1
+    assert drill_count == 0
+    assert run_count == 1
+
+
+async def test_race_losing_trigger_event_is_removed_before_run_insert() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    service = _service()
+    service._priority_guard = SequencedPriorityGuard()
+
+    with pytest.raises(RealEventPriorityActive):
+        await service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key="race-key"),
+            "operator",
+        )
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        raw_count = await session.scalar(
+            select(func.count()).select_from(RawMessage).where(RawMessage.source == "operations")
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+
+    assert event_count == 0
+    assert raw_count == 0
+    assert run_count == 0
+
+
+async def test_manual_events_still_merge_by_time_and_space() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            existing = EarthquakeEvent(
+                source="manual-source",
+                canonical_source_id="manual-source:existing",
+                event_type="manual",
+                origin_time=OBSERVED_AT,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="manual merge fixture",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="not_applicable",
+            )
+            session.add(existing)
+            await session.flush()
+            incoming = NormalizedEvent(
+                kind=EventKind.MANUAL,
+                source="manual-source",
+                source_event_id="manual-source:incoming",
+                origin_time=OBSERVED_AT,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="manual merge fixture",
+            )
+            found = await EventRepository(SessionFactory)._find_canonical_event(
+                session,
+                incoming,
+                "manual-source:manual-source:incoming",
+            )
+
+    assert found is not None
+    assert found.id == existing.id

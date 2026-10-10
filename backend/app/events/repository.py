@@ -759,7 +759,10 @@ class EventRepository:
             if historical_alias is not None:
                 return historical_alias
 
-        if event.source_event_id and event.kind not in _LOGICAL_EVENT_KINDS:
+        if event.source_event_id and (
+            event.kind in {EventKind.TEST, EventKind.DRILL}
+            or event.source == "operations"
+        ):
             return None
 
         point = _point_geometry(event)
