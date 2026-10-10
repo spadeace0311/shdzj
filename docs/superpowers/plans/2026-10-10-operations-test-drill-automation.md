@@ -427,7 +427,11 @@ FROM (
 ) AS active_boundary
 ```
 
-震级按 `0.1` 步长，深度按 `0.01` 步长；地点固定为 `上海市（系统测试）`；`source_event_id` 为 `operations-test:{YYYYMMDD}:{seed}`。没有激活边界时抛出 `OperationsConfigurationError("active_shanghai_boundary_required")`，不得回退到硬编码坐标。
+震级按 `0.1` 步长，深度按 `0.01` 步长；地点固定为 `上海市（系统测试）`；事件 `source` 固定为
+`operations`，`source_event_id` 为 `operations-test:{YYYYMMDD}:{seed}`，由 canonical source
+组合为 `operations:operations-test:{YYYYMMDD}:{seed}`，不得把 `operations-test` 同时放进两段。
+没有激活边界时抛出 `OperationsConfigurationError("active_shanghai_boundary_required")`，
+不得回退到硬编码坐标。
 
 实现 `region_contains()` 使用同一激活边界执行 `ST_Covers(geom, point)`，测试可注入查询结果。
 
@@ -439,6 +443,8 @@ FROM (
 - `row_version` 不匹配抛出 `StaleOperationsSettings`。
 - 修改窗口、震级和演练冲突策略后写审计记录。
 - `daily_window_start >= daily_window_end`、`magnitude_min > magnitude_max`、非法策略被拒绝。
+- 震级和深度必须是 `Decimal`，分别位于 `[-2.0, 12.0]` 与 `[0, 1000]`；更新前按数据库列精度量化，
+  保证审计快照与最终持久化值一致。
 - 同日 schedule 可读取且返回同一记录；不存在的日期返回 `None`。
 - 按 event_id 可读取唯一 run；不存在的 event_id 返回 `None`。
 
