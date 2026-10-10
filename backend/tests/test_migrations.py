@@ -16,8 +16,9 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0025_qa_audit_provenance"
+LATEST_REVISION = "0026_operations_automation"
 PREVIOUS_REVISION = "0022_cleanup_namespace"
+PREVIOUS_OPERATIONS_REVISION = "0025_qa_audit_provenance"
 CLEANUP_INTENT_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"

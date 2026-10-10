@@ -1,3 +1,4 @@
+from datetime import datetime
 from functools import lru_cache
 
 from pydantic import SecretStr, field_validator, model_validator
@@ -78,6 +79,11 @@ class Settings(BaseSettings):
     collaboration_worker_batch_size: int = 50
     collaboration_outbox_max_attempts: int = 10
     collaboration_outbox_lease_seconds: int = 60
+    operations_worker_enabled: bool = False
+    operations_worker_poll_seconds: float = 30.0
+    operations_daily_window_start: str = "02:00"
+    operations_daily_window_end: str = "04:00"
+    operations_retention_interval_seconds: int = 86_400
     knowledge_storage_root: str = "/var/lib/knowledge"
     knowledge_max_upload_bytes: int = 1_073_741_824
     knowledge_worker_poll_seconds: float = 1.0
@@ -232,6 +238,37 @@ class Settings(BaseSettings):
         if self.collaboration_outbox_lease_seconds <= 0:
             raise ValueError("COLLABORATION_OUTBOX_LEASE_SECONDS must be positive")
         return self
+
+    @model_validator(mode="after")
+    def validate_operations_configuration(self) -> "Settings":
+        if self.operations_worker_poll_seconds <= 0:
+            raise ValueError("OPERATIONS_WORKER_POLL_SECONDS must be positive")
+        if self.operations_retention_interval_seconds < 60:
+            raise ValueError(
+                "OPERATIONS_RETENTION_INTERVAL_SECONDS must be at least 60"
+            )
+
+        start = self._parse_operations_window(
+            self.operations_daily_window_start,
+            "OPERATIONS_DAILY_WINDOW_START",
+        )
+        end = self._parse_operations_window(
+            self.operations_daily_window_end,
+            "OPERATIONS_DAILY_WINDOW_END",
+        )
+        if start >= end:
+            raise ValueError(
+                "OPERATIONS_DAILY_WINDOW_START must be earlier than "
+                "OPERATIONS_DAILY_WINDOW_END"
+            )
+        return self
+
+    @staticmethod
+    def _parse_operations_window(value: str, field_name: str) -> datetime:
+        try:
+            return datetime.strptime(value, "%H:%M")
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must use HH:MM format") from exc
 
     @model_validator(mode="after")
     def validate_knowledge_configuration(self) -> "Settings":
