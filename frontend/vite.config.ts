@@ -26,7 +26,10 @@ export default {
     globals: true,
     setupFiles: ["./tests/setup.ts"],
     css: true,
-    include: ["./tests/**/*.{test,spec}.{ts,tsx}"],
+    include: [
+      "./tests/**/*.{test,spec}.{ts,tsx}",
+      "./src/pages/**/*.test.{ts,tsx}",
+    ],
   },
 } satisfies UserConfig & {
   test: {

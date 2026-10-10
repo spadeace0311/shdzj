@@ -10,6 +10,7 @@ import { EventDetailPage } from "./pages/EventDetailPage";
 import { EventListPage } from "./pages/EventListPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ManualEventPage } from "./pages/ManualEventPage";
+import { OperationsPage } from "./pages/OperationsPage";
 import { SmartQaPage } from "./pages/SmartQaPage";
 import { WorkgroupTasksPage } from "./pages/WorkgroupTasksPage";
 
@@ -70,6 +71,14 @@ function ConsoleShell({
               人工触发
             </NavLink>
             <NavLink
+              to="/operations"
+              className={({ isActive }) =>
+                isActive ? "nav-link nav-link--active" : "nav-link"
+              }
+            >
+              测试与演练
+            </NavLink>
+            <NavLink
               to="/collector"
               className={({ isActive }) => (isActive ? "nav-link nav-link--active" : "nav-link")}
             >
@@ -117,6 +126,10 @@ function ConsoleShell({
             <Route path="/qa" element={<SmartQaPage />} />
             <Route path="/events/:eventId" element={<EventDetailPage />} />
             <Route path="/manual" element={<ManualEventPage />} />
+            <Route
+              path="/operations"
+              element={<OperationsPage userRole={userRole} />}
+            />
             <Route path="/collector" element={<CollectorStatusPage />} />
             <Route
               path="/data-assets"

@@ -473,6 +473,107 @@ export interface CurrentUser {
   workgroup: string | null;
 }
 
+export type OperationsTriggerMode =
+  | "scheduled_test"
+  | "manual_test"
+  | "drill"
+  | "manual_event";
+
+export type OperationsRunState =
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "canceled"
+  | "failed";
+
+export type OperationsDrillConflictPolicy = "pause" | "terminate";
+
+export interface OperationsSettings {
+  row_version: number;
+  daily_test_enabled: boolean;
+  timezone: string;
+  daily_window_start: string;
+  daily_window_end: string;
+  test_magnitude_min: string;
+  test_magnitude_max: string;
+  test_depth_min_km: string;
+  test_depth_max_km: string;
+  drill_conflict_policy: OperationsDrillConflictPolicy;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface OperationsSettingsUpdateInput {
+  expected_version: number;
+  daily_test_enabled?: boolean;
+  timezone?: string;
+  daily_window_start?: string;
+  daily_window_end?: string;
+  test_magnitude_min?: string;
+  test_magnitude_max?: string;
+  test_depth_min_km?: string;
+  test_depth_max_km?: string;
+  drill_conflict_policy?: OperationsDrillConflictPolicy;
+}
+
+export interface OperationsSchedule {
+  id: string;
+  local_date: string;
+  window_start: string;
+  window_end: string;
+  scheduled_at: string;
+  state: string;
+  scenario: Record<string, unknown> | null;
+  random_seed: number;
+  event_id: string | null;
+  failure_reason: string | null;
+  triggered_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OperationsRun {
+  id: string;
+  event_id: string;
+  schedule_id: string | null;
+  trigger_mode: OperationsTriggerMode;
+  operation_state: OperationsRunState;
+  priority: number;
+  idempotency_key: string;
+  triggered_by: string;
+  resume_required: boolean;
+  detail: Record<string, unknown>;
+  started_at: string | null;
+  paused_at: string | null;
+  completed_at: string | null;
+  canceled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OperationsOverview {
+  observed_at: string;
+  real_event_priority_active: boolean;
+  settings: OperationsSettings;
+  next_schedule: OperationsSchedule | null;
+  today_schedule: OperationsSchedule | null;
+  recent_runs: OperationsRun[];
+  active_run_count: number;
+}
+
+export interface OperationsTriggerResult {
+  event_id: string | null;
+  run_id: string | null;
+  revision_id: string | null;
+  trigger_mode: OperationsTriggerMode;
+  operation_state: OperationsRunState;
+  outcome: string;
+  idempotency_key: string;
+  event_kind: string | null;
+  triggered_assessment: boolean;
+}
+
 export type ArtifactGroup = "map" | "background" | "core";
 
 export type ArtifactStatus = "complete" | "degraded" | "failed";

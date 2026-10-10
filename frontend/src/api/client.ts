@@ -24,6 +24,10 @@ import type {
   LossGridArtifact,
   LossResult,
   ManualEventInput,
+  OperationsOverview,
+  OperationsSettings,
+  OperationsSettingsUpdateInput,
+  OperationsTriggerResult,
   ProductionFilters,
   ProductionRun,
   QaAnswer,
@@ -356,6 +360,67 @@ export async function getCollectorStatus(): Promise<CollectorStatus> {
   return requestJson<CollectorStatus>("/api/v1/collector/status", {
     headers: authenticatedHeaders("请先登录后查看采集状态"),
   });
+}
+
+function operationsHeaders(
+  message = "请先登录后使用运维控制台",
+): Record<string, string> {
+  return authenticatedHeaders(message);
+}
+
+export async function getOperationsOverview(): Promise<OperationsOverview> {
+  return requestJson<OperationsOverview>("/api/v1/operations/overview", {
+    headers: operationsHeaders(),
+  });
+}
+
+export async function getOperationsSettings(): Promise<OperationsSettings> {
+  return requestJson<OperationsSettings>("/api/v1/operations/settings", {
+    headers: operationsHeaders(),
+  });
+}
+
+export async function updateOperationsSettings(
+  input: OperationsSettingsUpdateInput,
+): Promise<OperationsSettings> {
+  return requestJson<OperationsSettings>("/api/v1/operations/settings", {
+    method: "PUT",
+    headers: {
+      ...operationsHeaders(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function triggerOperationsTest(
+  idempotencyKey = newIdempotencyKey(),
+): Promise<OperationsTriggerResult> {
+  return requestJson<OperationsTriggerResult>(
+    "/api/v1/operations/test-trigger",
+    {
+      method: "POST",
+      headers: {
+        ...operationsHeaders(),
+        "Idempotency-Key": idempotencyKey,
+      },
+    },
+  );
+}
+
+export async function triggerOperationsDrill(
+  idempotencyKey = newIdempotencyKey(),
+): Promise<OperationsTriggerResult> {
+  return requestJson<OperationsTriggerResult>(
+    "/api/v1/operations/drill-trigger",
+    {
+      method: "POST",
+      headers: {
+        ...operationsHeaders(),
+        "Idempotency-Key": idempotencyKey,
+      },
+    },
+  );
 }
 
 export async function createManualEvent(
