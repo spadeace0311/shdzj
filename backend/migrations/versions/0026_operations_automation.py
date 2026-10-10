@@ -93,8 +93,7 @@ def upgrade() -> None:
             name="ck_operations_settings_magnitude_range",
         ),
         sa.CheckConstraint(
-            "test_depth_min_km BETWEEN 0 AND 1000 "
-            "AND test_depth_max_km BETWEEN 0 AND 1000",
+            "test_depth_min_km BETWEEN 0 AND 1000 " "AND test_depth_max_km BETWEEN 0 AND 1000",
             name="ck_operations_settings_depth_range",
         ),
         sa.CheckConstraint(
@@ -150,14 +149,13 @@ def upgrade() -> None:
             name="ck_operations_test_schedule_state",
         ),
         sa.CheckConstraint(
-            "state <> 'triggered' "
-            "OR (event_id IS NOT NULL AND triggered_at IS NOT NULL)",
+            "state <> 'triggered' " "OR (event_id IS NOT NULL AND triggered_at IS NOT NULL)",
             name="ck_operations_test_schedule_triggered",
         ),
         sa.ForeignKeyConstraint(
             ["event_id"],
             ["earthquake_events.id"],
-            ondelete="SET NULL",
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
@@ -263,8 +261,18 @@ def upgrade() -> None:
         sa.Column("actor", sa.String(length=64), nullable=False),
         sa.Column("resource_type", sa.String(length=64), nullable=False),
         sa.Column("resource_id", sa.String(length=128), nullable=False),
-        sa.Column("before_state", sa.String(length=32), nullable=False),
-        sa.Column("after_state", sa.String(length=32), nullable=False),
+        sa.Column(
+            "before_state",
+            JSONB_TYPE,
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column(
+            "after_state",
+            JSONB_TYPE,
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
         sa.Column(
             "detail",
             JSONB_TYPE,

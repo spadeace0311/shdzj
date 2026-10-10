@@ -1646,9 +1646,10 @@ async def _legacy_workgroup_membership_state() -> dict[str, object]:
     try:
         async with engine.connect() as connection:
             rows = (
-                await connection.execute(
-                    text(
-                        """
+                (
+                    await connection.execute(
+                        text(
+                            """
                         SELECT
                             u.username,
                             m.workgroup_code,
@@ -1664,23 +1665,22 @@ async def _legacy_workgroup_membership_state() -> dict[str, object]:
                         WHERE u.username LIKE 'migration-workgroup-%'
                         ORDER BY u.username
                         """
+                        )
                     )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
             checks = await connection.run_sync(
                 lambda sync: {
                     item["name"]
-                    for item in inspect(sync).get_check_constraints(
-                        "workgroup_memberships"
-                    )
+                    for item in inspect(sync).get_check_constraints("workgroup_memberships")
                 }
             )
             attendance_checks = await connection.run_sync(
                 lambda sync: {
                     item["name"]
-                    for item in inspect(sync).get_check_constraints(
-                        "workgroup_attendance"
-                    )
+                    for item in inspect(sync).get_check_constraints("workgroup_attendance")
                 }
             )
         return {
@@ -1727,21 +1727,13 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
         _set_revision(LATEST_REVISION)
         state = await _legacy_workgroup_membership_state()
         rows = state["rows"]
-        assert rows["migration-workgroup-member"]["workgroup_code"] == (
-            "monitoring_forecast"
-        )
+        assert rows["migration-workgroup-member"]["workgroup_code"] == ("monitoring_forecast")
         assert rows["migration-workgroup-member"]["duty_role"] == "member"
         assert rows["migration-workgroup-leader"]["duty_role"] == "leader"
         assert rows["migration-workgroup-deputy"]["duty_role"] == "deputy"
         assert rows["migration-workgroup-deputy"]["deputy_order"] is None
-        assert (
-            "ck_workgroup_membership_deputy_order_required"
-            not in state["membership_checks"]
-        )
-        assert (
-            "ck_workgroup_attendance_deputy_order_required"
-            not in state["attendance_checks"]
-        )
+        assert "ck_workgroup_membership_deputy_order_required" not in state["membership_checks"]
+        assert "ck_workgroup_attendance_deputy_order_required" not in state["attendance_checks"]
 
         engine = create_async_engine(settings.database_url, poolclass=NullPool)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1851,9 +1843,7 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
                                     workgroup="监测预报组",
                                 )
                             )
-                            response = await client.get(
-                                f"/api/v1/collaboration/tasks/{task.id}"
-                            )
+                            response = await client.get(f"/api/v1/collaboration/tasks/{task.id}")
                             assert response.status_code == 200
                             assert response.json()["can_work"] is True
                         app.dependency_overrides[get_current_user] = lambda: (
@@ -1863,9 +1853,7 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
                                 workgroup=None,
                             )
                         )
-                        response = await client.get(
-                            f"/api/v1/collaboration/tasks/{task.id}"
-                        )
+                        response = await client.get(f"/api/v1/collaboration/tasks/{task.id}")
                         assert response.status_code == 403
                     app.dependency_overrides.pop(get_roster_session, None)
                     app.dependency_overrides.pop(get_current_user, None)
@@ -1874,16 +1862,10 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
 
         _set_revision(PREVIOUS_REVISION)
         downgraded = await _legacy_workgroup_membership_state()
-        assert all(
-            row["workgroup_code"] is None
-            for row in downgraded["rows"].values()
-        )
+        assert all(row["workgroup_code"] is None for row in downgraded["rows"].values())
         _set_revision(LATEST_REVISION)
         re_upgraded = await _legacy_workgroup_membership_state()
-        assert (
-            re_upgraded["rows"]["migration-workgroup-deputy"]["deputy_order"]
-            is None
-        )
+        assert re_upgraded["rows"]["migration-workgroup-deputy"]["deputy_order"] is None
     finally:
         _set_revision(LATEST_REVISION)
         await _delete_legacy_workgroup_users()
@@ -2343,4 +2325,459 @@ async def test_0022_cleanup_namespace_backfills_safely_and_is_reversible() -> No
                 )
         finally:
             await engine.dispose()
+        _set_revision(LATEST_REVISION)
+
+
+OPERATIONS_TABLES = {
+    "operations_settings",
+    "operations_test_schedules",
+    "operations_runs",
+    "operations_audit_logs",
+}
+
+OPERATIONS_COLUMNS = {
+    "operations_settings": {
+        "id",
+        "settings_key",
+        "daily_test_enabled",
+        "timezone",
+        "daily_window_start",
+        "daily_window_end",
+        "test_magnitude_min",
+        "test_magnitude_max",
+        "test_depth_min_km",
+        "test_depth_max_km",
+        "drill_conflict_policy",
+        "row_version",
+        "updated_by",
+        "created_at",
+        "updated_at",
+    },
+    "operations_test_schedules": {
+        "id",
+        "local_date",
+        "window_start",
+        "window_end",
+        "scheduled_at",
+        "state",
+        "scenario",
+        "random_seed",
+        "event_id",
+        "failure_reason",
+        "triggered_at",
+        "created_at",
+        "updated_at",
+    },
+    "operations_runs": {
+        "id",
+        "event_id",
+        "schedule_id",
+        "trigger_mode",
+        "operation_state",
+        "priority",
+        "idempotency_key",
+        "triggered_by",
+        "resume_required",
+        "detail",
+        "started_at",
+        "paused_at",
+        "completed_at",
+        "canceled_at",
+        "created_at",
+        "updated_at",
+    },
+    "operations_audit_logs": {
+        "id",
+        "action",
+        "actor",
+        "resource_type",
+        "resource_id",
+        "before_state",
+        "after_state",
+        "detail",
+        "created_at",
+    },
+}
+
+OPERATIONS_NON_NULL_COLUMNS = {
+    "operations_settings": {
+        "id",
+        "settings_key",
+        "daily_test_enabled",
+        "timezone",
+        "daily_window_start",
+        "daily_window_end",
+        "test_magnitude_min",
+        "test_magnitude_max",
+        "test_depth_min_km",
+        "test_depth_max_km",
+        "drill_conflict_policy",
+        "row_version",
+        "created_at",
+        "updated_at",
+    },
+    "operations_test_schedules": {
+        "id",
+        "local_date",
+        "window_start",
+        "window_end",
+        "scheduled_at",
+        "state",
+        "random_seed",
+        "created_at",
+        "updated_at",
+    },
+    "operations_runs": {
+        "id",
+        "event_id",
+        "trigger_mode",
+        "operation_state",
+        "priority",
+        "idempotency_key",
+        "triggered_by",
+        "resume_required",
+        "detail",
+        "created_at",
+        "updated_at",
+    },
+    "operations_audit_logs": {
+        "id",
+        "action",
+        "actor",
+        "resource_type",
+        "resource_id",
+        "before_state",
+        "after_state",
+        "detail",
+        "created_at",
+    },
+}
+
+OPERATIONS_NULL_COLUMNS = {
+    "operations_settings": {"updated_by"},
+    "operations_test_schedules": {
+        "scenario",
+        "event_id",
+        "failure_reason",
+        "triggered_at",
+    },
+    "operations_runs": {
+        "schedule_id",
+        "started_at",
+        "paused_at",
+        "completed_at",
+        "canceled_at",
+    },
+    "operations_audit_logs": set(),
+}
+
+
+async def _operations_tables_exist() -> bool:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
+    finally:
+        await engine.dispose()
+    return OPERATIONS_TABLES <= names
+
+
+async def _operations_schema_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            table_names = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+            if not OPERATIONS_TABLES <= table_names:
+                return {"exists": False}
+
+            def snapshot(sync) -> dict[str, object]:
+                inspector = inspect(sync)
+                return {
+                    "columns": {
+                        table: {column["name"] for column in inspector.get_columns(table)}
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                    "column_nullability": {
+                        table: {
+                            column["name"]: column["nullable"]
+                            for column in inspector.get_columns(table)
+                        }
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                    "indexes": {
+                        table: {
+                            index["name"]: bool(index["unique"])
+                            for index in inspector.get_indexes(table)
+                        }
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                    "checks": {
+                        table: {
+                            constraint["name"]
+                            for constraint in inspector.get_check_constraints(table)
+                        }
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                    "unique_constraints": {
+                        table: {
+                            constraint["name"]
+                            for constraint in inspector.get_unique_constraints(table)
+                        }
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                    "foreign_keys": {
+                        table: {
+                            foreign_key["name"]: foreign_key.get("options", {}).get("ondelete")
+                            for foreign_key in inspector.get_foreign_keys(table)
+                        }
+                        for table in sorted(OPERATIONS_TABLES)
+                    },
+                }
+
+            state = await connection.run_sync(snapshot)
+    finally:
+        await engine.dispose()
+    return {"exists": True, **state}
+
+
+async def _operations_default_settings_state() -> dict[str, object]:
+    engine = create_async_engine(settings.database_url)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text(
+                    """
+                    SELECT
+                        settings_key,
+                        daily_test_enabled,
+                        timezone,
+                        to_char(daily_window_start, 'HH24:MI') AS daily_window_start,
+                        to_char(daily_window_end, 'HH24:MI') AS daily_window_end,
+                        test_magnitude_min,
+                        test_magnitude_max,
+                        test_depth_min_km,
+                        test_depth_max_km,
+                        drill_conflict_policy,
+                        row_version
+                    FROM operations_settings
+                    WHERE settings_key = 'default'
+                    """
+                )
+            )
+            row = result.mappings().one()
+            count = await connection.scalar(text("SELECT count(*) FROM operations_settings"))
+    finally:
+        await engine.dispose()
+    normalized = dict(row)
+    for key in (
+        "test_magnitude_min",
+        "test_magnitude_max",
+        "test_depth_min_km",
+        "test_depth_max_km",
+    ):
+        normalized[key] = str(normalized[key])
+    return {"row": normalized, "count": count}
+
+
+async def test_0026_operations_automation_is_reversible() -> None:
+    _set_revision(PREVIOUS_OPERATIONS_REVISION)
+    assert await _operations_tables_exist() is False
+    try:
+        _set_revision(LATEST_REVISION)
+        state = await _operations_schema_state()
+        assert state["exists"] is True
+        assert state["columns"] == OPERATIONS_COLUMNS
+
+        for table in OPERATIONS_TABLES:
+            nullability = state["column_nullability"][table]
+            assert {
+                column for column, nullable in nullability.items() if not nullable
+            } == OPERATIONS_NON_NULL_COLUMNS[table]
+            assert {
+                column for column, nullable in nullability.items() if nullable
+            } == OPERATIONS_NULL_COLUMNS[table]
+
+        assert state["checks"] == {
+            "operations_settings": {
+                "ck_operations_settings_depth_order",
+                "ck_operations_settings_depth_range",
+                "ck_operations_settings_drill_conflict_policy",
+                "ck_operations_settings_magnitude_order",
+                "ck_operations_settings_magnitude_range",
+                "ck_operations_settings_window_order",
+            },
+            "operations_test_schedules": {
+                "ck_operations_test_schedule_state",
+                "ck_operations_test_schedule_triggered",
+            },
+            "operations_runs": {
+                "ck_operations_run_operation_state",
+                "ck_operations_run_trigger_mode",
+            },
+            "operations_audit_logs": set(),
+        }
+        assert state["unique_constraints"] == {
+            "operations_settings": {"uq_operations_settings_key"},
+            "operations_test_schedules": {"uq_operations_test_schedule_local_date"},
+            "operations_runs": {
+                "uq_operations_run_event",
+                "uq_operations_run_idempotency",
+                "uq_operations_run_schedule",
+            },
+            "operations_audit_logs": set(),
+        }
+        assert state["indexes"]["operations_settings"] == {
+            "uq_operations_settings_key": True,
+        }
+        assert state["indexes"]["operations_test_schedules"] == {
+            "uq_operations_test_schedule_local_date": True,
+            "ix_operations_test_schedules_event_id": False,
+            "ix_operations_test_schedules_state": False,
+        }
+        assert state["indexes"]["operations_runs"] == {
+            "uq_operations_run_event": True,
+            "uq_operations_run_idempotency": True,
+            "uq_operations_run_schedule": True,
+            "ix_operations_runs_operation_state": False,
+            "ix_operations_runs_priority": False,
+        }
+        assert state["indexes"]["operations_audit_logs"] == {
+            "ix_operations_audit_logs_actor_created": False,
+            "ix_operations_audit_logs_resource": False,
+        }
+        assert state["foreign_keys"]["operations_test_schedules"] == {
+            "operations_test_schedules_event_id_fkey": "CASCADE"
+        }
+        assert state["foreign_keys"]["operations_runs"] == {
+            "operations_runs_event_id_fkey": "CASCADE",
+            "operations_runs_schedule_id_fkey": "SET NULL",
+        }
+
+        default_settings = await _operations_default_settings_state()
+        assert default_settings["count"] == 1
+        assert default_settings["row"] == {
+            "settings_key": "default",
+            "daily_test_enabled": True,
+            "timezone": "Asia/Shanghai",
+            "daily_window_start": "02:00",
+            "daily_window_end": "04:00",
+            "test_magnitude_min": "5.0",
+            "test_magnitude_max": "5.9",
+            "test_depth_min_km": "5.00",
+            "test_depth_max_km": "20.00",
+            "drill_conflict_policy": "pause",
+            "row_version": 1,
+        }
+
+        event_id = uuid.uuid4()
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO earthquake_events (
+                            id,
+                            source,
+                            canonical_source_id,
+                            event_type,
+                            origin_time,
+                            longitude,
+                            latitude,
+                            depth_km,
+                            magnitude,
+                            place,
+                            geom,
+                            lifecycle_state
+                        ) VALUES (
+                            :id,
+                            'test',
+                            :canonical_source_id,
+                            'drill',
+                            :origin_time,
+                            121.5,
+                            31.2,
+                            10,
+                            5.5,
+                            'operations migration cascade test',
+                            ST_SetSRID(ST_MakePoint(121.5, 31.2), 4326),
+                            'not_applicable'
+                        )
+                        """
+                    ),
+                    {
+                        "id": event_id,
+                        "canonical_source_id": f"operations-cascade-{event_id}",
+                        "origin_time": datetime(2026, 9, 25, 1, 0, tzinfo=UTC),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO operations_test_schedules (
+                            id,
+                            local_date,
+                            window_start,
+                            window_end,
+                            scheduled_at,
+                            state,
+                            random_seed,
+                            event_id,
+                            triggered_at
+                        ) VALUES (
+                            :id,
+                            :local_date,
+                            :window_start,
+                            :window_end,
+                            :scheduled_at,
+                            'triggered',
+                            123456,
+                            :event_id,
+                            :triggered_at
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "local_date": datetime(2026, 9, 25).date(),
+                        "window_start": datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
+                        "window_end": datetime(2026, 9, 25, 4, 0, tzinfo=UTC),
+                        "scheduled_at": datetime(2026, 9, 25, 1, 0, tzinfo=UTC),
+                        "event_id": event_id,
+                        "triggered_at": datetime(2026, 9, 25, 1, 30, tzinfo=UTC),
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("DELETE FROM earthquake_events WHERE id = :id"),
+                    {"id": event_id},
+                )
+                schedule_count = await connection.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM operations_test_schedules
+                        WHERE event_id = :id
+                        """
+                    ),
+                    {"id": event_id},
+                )
+                assert schedule_count == 0
+        finally:
+            await engine.dispose()
+
+        _set_revision(PREVIOUS_OPERATIONS_REVISION)
+        assert await _operations_tables_exist() is False
+
+        _set_revision(LATEST_REVISION)
+        assert await _operations_tables_exist() is True
+        assert (await _operations_default_settings_state())["count"] == 1
+    finally:
         _set_revision(LATEST_REVISION)

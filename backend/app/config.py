@@ -244,9 +244,7 @@ class Settings(BaseSettings):
         if self.operations_worker_poll_seconds <= 0:
             raise ValueError("OPERATIONS_WORKER_POLL_SECONDS must be positive")
         if self.operations_retention_interval_seconds < 60:
-            raise ValueError(
-                "OPERATIONS_RETENTION_INTERVAL_SECONDS must be at least 60"
-            )
+            raise ValueError("OPERATIONS_RETENTION_INTERVAL_SECONDS must be at least 60")
 
         start = self._parse_operations_window(
             self.operations_daily_window_start,
@@ -258,8 +256,7 @@ class Settings(BaseSettings):
         )
         if start >= end:
             raise ValueError(
-                "OPERATIONS_DAILY_WINDOW_START must be earlier than "
-                "OPERATIONS_DAILY_WINDOW_END"
+                "OPERATIONS_DAILY_WINDOW_START must be earlier than " "OPERATIONS_DAILY_WINDOW_END"
             )
         return self
 
@@ -291,17 +288,13 @@ class Settings(BaseSettings):
         if not 1 <= self.knowledge_worker_batch_size <= 1_000:
             raise ValueError("KNOWLEDGE_WORKER_BATCH_SIZE must be between 1 and 1000")
         if self.knowledge_online_refresh_interval_seconds < 60:
-            raise ValueError(
-                "KNOWLEDGE_ONLINE_REFRESH_INTERVAL_SECONDS must be at least 60"
-            )
+            raise ValueError("KNOWLEDGE_ONLINE_REFRESH_INTERVAL_SECONDS must be at least 60")
         if not 1 <= self.knowledge_job_max_attempts <= 100:
             raise ValueError("KNOWLEDGE_JOB_MAX_ATTEMPTS must be between 1 and 100")
         if self.knowledge_worker_poll_seconds <= 0:
             raise ValueError("KNOWLEDGE_WORKER_POLL_SECONDS must be positive")
         if not 1 <= self.knowledge_worker_health_port <= 65535:
-            raise ValueError(
-                "KNOWLEDGE_WORKER_HEALTH_PORT must be between 1 and 65535"
-            )
+            raise ValueError("KNOWLEDGE_WORKER_HEALTH_PORT must be between 1 and 65535")
         if self.knowledge_job_lease_seconds <= 0:
             raise ValueError("KNOWLEDGE_JOB_LEASE_SECONDS must be positive")
         if self.deepseek_timeout_seconds <= 0:

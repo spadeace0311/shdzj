@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, time
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -35,8 +35,7 @@ class OperationsSettings(Base):
             name="ck_operations_settings_magnitude_range",
         ),
         CheckConstraint(
-            "test_depth_min_km BETWEEN 0 AND 1000 "
-            "AND test_depth_max_km BETWEEN 0 AND 1000",
+            "test_depth_min_km BETWEEN 0 AND 1000 " "AND test_depth_max_km BETWEEN 0 AND 1000",
             name="ck_operations_settings_depth_range",
         ),
         CheckConstraint(
@@ -62,7 +61,7 @@ class OperationsSettings(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    settings_key: Mapped[str] = mapped_column(String(32), unique=True)
+    settings_key: Mapped[str] = mapped_column(String(32))
     daily_test_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
@@ -134,8 +133,7 @@ class OperationsTestSchedule(Base):
             name="ck_operations_test_schedule_state",
         ),
         CheckConstraint(
-            "state <> 'triggered' "
-            "OR (event_id IS NOT NULL AND triggered_at IS NOT NULL)",
+            "state <> 'triggered' " "OR (event_id IS NOT NULL AND triggered_at IS NOT NULL)",
             name="ck_operations_test_schedule_triggered",
         ),
         Index("ix_operations_test_schedules_event_id", "event_id"),
@@ -147,7 +145,7 @@ class OperationsTestSchedule(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    local_date: Mapped[datetime] = mapped_column(Date, unique=True)
+    local_date: Mapped[date] = mapped_column(Date)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -155,8 +153,7 @@ class OperationsTestSchedule(Base):
     scenario: Mapped[dict | None] = mapped_column(JSONB)
     random_seed: Mapped[int] = mapped_column(BigInteger)
     event_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("earthquake_events.id", ondelete="SET NULL"),
-        index=True,
+        ForeignKey("earthquake_events.id", ondelete="CASCADE"),
     )
     failure_reason: Mapped[str | None] = mapped_column(Text)
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -196,16 +193,14 @@ class OperationsRun(Base):
     )
     event_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("earthquake_events.id", ondelete="CASCADE"),
-        unique=True,
     )
     schedule_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("operations_test_schedules.id", ondelete="SET NULL"),
-        unique=True,
     )
     trigger_mode: Mapped[str] = mapped_column(String(32))
     operation_state: Mapped[str] = mapped_column(String(16))
     priority: Mapped[int] = mapped_column(SmallInteger)
-    idempotency_key: Mapped[str] = mapped_column(String(160), unique=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160))
     triggered_by: Mapped[str] = mapped_column(String(64))
     resume_required: Mapped[bool] = mapped_column(
         Boolean,
@@ -251,8 +246,16 @@ class OperationsAuditLog(Base):
     actor: Mapped[str] = mapped_column(String(64))
     resource_type: Mapped[str] = mapped_column(String(64))
     resource_id: Mapped[str] = mapped_column(String(128))
-    before_state: Mapped[str] = mapped_column(String(32))
-    after_state: Mapped[str] = mapped_column(String(32))
+    before_state: Mapped[dict] = mapped_column(
+        JSONB,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    after_state: Mapped[dict] = mapped_column(
+        JSONB,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
     detail: Mapped[dict] = mapped_column(
         JSONB,
         default=dict,

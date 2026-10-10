@@ -13,7 +13,5 @@ OPERATIONS_TABLES = {
 
 async def test_operations_tables_exist() -> None:
     async with engine.connect() as connection:
-        names = await connection.run_sync(
-            lambda sync: set(inspect(sync).get_table_names())
-        )
+        names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     assert OPERATIONS_TABLES <= names
