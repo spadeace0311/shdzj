@@ -209,11 +209,11 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 http://localhost:5173/operations
 ```
 
-`operations-worker` 健康检查：
+`operations-worker` 健康检查使用成功循环心跳文件，而不是只检查进程存在：
 
 ```powershell
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations ps
-docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations exec operations-worker python -m app.process_health operations
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations exec operations-worker python -m app.operations.health_check --file /tmp/operations-worker-health.json
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations logs --tail=100 operations-worker
 ```
 
@@ -235,6 +235,7 @@ $env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
 $env:E2E_ALLOW_EVENT_PURGE = "1"
 $env:E2E_BASE_URL = "http://127.0.0.1:5173"
 $env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
+$env:E2E_API_HEALTH_URL = "http://127.0.0.1:8000"
 npm run test:e2e -- operations.spec.ts
 ```
 
@@ -251,6 +252,7 @@ E2E 使用真实登录和真实后端数据库，准备测试事件、39 项专�
 - `E2E_VIEWER_USERNAME`（可选）：非超级管理员验收账号，默认 `e2e-viewer`。夹具使用与超级管理员相同的测试密码创建该账号，用于真实 403 权限链路。
 - `E2E_BASE_URL`（可选）：前端地址，默认 `http://localhost:5173`。
 - `E2E_API_BASE_URL`（可选）：只影响 Playwright `APIRequestContext` 发出的 API 请求。留空时这些请求使用 Vite 的 `/api` 相对路径；设为绝对地址时，只有测试中的 API 请求直连该地址，页面 UI 的 `/api` 请求仍走 Vite 代理。
+- `E2E_API_HEALTH_URL`（可选）：真实 API 健康检查地址；未设置时优先使用 `E2E_API_BASE_URL`，再回退到 `http://127.0.0.1:8000`。健康检查不会回退到前端 origin。
 
 干净环境的准备顺序如下。先构建后端、迁移数据库、启动 API、`collaboration-worker`、成果 Worker 和 Temporal Worker：
 

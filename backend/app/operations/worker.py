@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -13,11 +14,15 @@ from app.collaboration.retention import (
     CollaborationRetentionResult,
     CollaborationRetentionService,
 )
+from app.artifacts.retention import ArtifactRetentionService
+from app.artifacts.storage import ArtifactStore
 from app.config import Settings, settings
 from app.db import SessionFactory
+from app.event_object_cleanup import process_cleanup_intents
 from app.operations.health import (
     OperationsHealthState,
     get_operations_health_state,
+    set_operations_health_state,
 )
 from app.operations.priority import OperationsPriorityGuard
 from app.operations.scheduler import DailyTestScheduler, OperationsSchedulerResult
@@ -33,9 +38,13 @@ class OperationsWorkerCycleResult:
     tests_triggered: int = 0
     tests_deferred: int = 0
     schedules_failed: int = 0
+    runs_reconciled: int = 0
     retention_ran: bool = False
     retention_test_deleted: int = 0
     retention_drill_deleted: int = 0
+    artifact_test_deleted: int = 0
+    artifact_drill_deleted: int = 0
+    cleanup_failed_count: int = 0
 
     def counts(self) -> dict[str, int | bool]:
         return {
@@ -44,9 +53,13 @@ class OperationsWorkerCycleResult:
             "tests_triggered": self.tests_triggered,
             "tests_deferred": self.tests_deferred,
             "schedules_failed": self.schedules_failed,
+            "runs_reconciled": self.runs_reconciled,
             "retention_ran": self.retention_ran,
             "retention_test_deleted": self.retention_test_deleted,
             "retention_drill_deleted": self.retention_drill_deleted,
+            "artifact_test_deleted": self.artifact_test_deleted,
+            "artifact_drill_deleted": self.artifact_drill_deleted,
+            "cleanup_failed_count": self.cleanup_failed_count,
         }
 
 
@@ -59,6 +72,8 @@ async def run_operations_cycle(
     operations_service: object | None = None,
     priority_guard: object | None = None,
     retention_service: object | None = None,
+    artifact_retention_service: ArtifactRetentionService | None = None,
+    artifact_store: ArtifactStore | None = None,
     health_state: OperationsHealthState | None = None,
     last_retention_at: datetime | None = None,
 ) -> OperationsWorkerCycleResult:
@@ -71,6 +86,9 @@ async def run_operations_cycle(
     )
     priority_guard = priority_guard or OperationsPriorityGuard()
     retention_service = retention_service or CollaborationRetentionService()
+    artifact_retention_service = (
+        artifact_retention_service or ArtifactRetentionService()
+    )
     health_state = health_state or get_operations_health_state()
 
     async with session_factory() as session:
@@ -89,20 +107,60 @@ async def run_operations_cycle(
     async with session_factory() as session:
         async with session.begin():
             await priority_guard.release_deferred_runs(session, observed_at)
+            runs_reconciled = (
+                await operations_service.reconcile_runs(
+                    session,
+                    observed_at,
+                )
+                if hasattr(session, "scalars")
+                else 0
+            )
 
     retention_ran = False
     retention_result = CollaborationRetentionResult()
+    artifact_retention_result = None
+    cleanup_result = None
     if _retention_is_due(
         observed_at,
         last_retention_at,
         configured.operations_retention_interval_seconds,
     ):
-        async with session_factory() as session:
-            async with session.begin():
-                retention_result = await retention_service.purge_due(
-                    session,
-                    observed_at,
-                )
+        if isinstance(retention_service, CollaborationRetentionService):
+            artifact_store = artifact_store or ArtifactStore(
+                configured.artifact_storage_root,
+                namespace=getattr(
+                    configured,
+                    "artifact_storage_namespace",
+                    None,
+                ),
+            )
+            async with session_factory() as session:
+                async with session.begin():
+                    artifact_retention_result = (
+                        await artifact_retention_service.retain_expired(
+                            session,
+                            observed_at=observed_at,
+                            storage_namespace=artifact_store.storage_namespace,
+                        )
+                    )
+                    retention_result = await retention_service.purge_due(
+                        session,
+                        observed_at,
+                        storage_namespace=artifact_store.storage_namespace,
+                    )
+            cleanup_result = await process_cleanup_intents(
+                session_factory,
+                artifact_store,
+            )
+            if not cleanup_result.succeeded:
+                raise RuntimeError("operations retention cleanup incomplete")
+        else:
+            async with session_factory() as session:
+                async with session.begin():
+                    retention_result = await retention_service.purge_due(
+                        session,
+                        observed_at,
+                    )
         retention_ran = True
 
     health_state.mark_alive(observed_at)
@@ -112,9 +170,27 @@ async def run_operations_cycle(
         tests_triggered=scheduler_result.triggered,
         tests_deferred=scheduler_result.deferred,
         schedules_failed=scheduler_result.failed,
+        runs_reconciled=runs_reconciled,
         retention_ran=retention_ran,
         retention_test_deleted=retention_result.test_deleted,
         retention_drill_deleted=retention_result.drill_deleted,
+        artifact_test_deleted=(
+            artifact_retention_result.test_deleted
+            if artifact_retention_result is not None
+            else 0
+        ),
+        artifact_drill_deleted=(
+            artifact_retention_result.drill_deleted
+            if artifact_retention_result is not None
+            else 0
+        ),
+        cleanup_failed_count=(
+            cleanup_result.failed_count + cleanup_result.dead_letter_count
+            + cleanup_result.namespace_mismatch_count
+            + cleanup_result.unprocessable_count
+            if cleanup_result is not None
+            else 0
+        ),
     )
     _log_worker_cycle(result)
     return result
@@ -229,6 +305,16 @@ def main() -> None:
         level=logging.INFO,
         format='{"time":"%(asctime)s","level":"%(levelname)s",'
         '"logger":"%(name)s","message":"%(message)s"}',
+    )
+    health_file = os.environ.get(
+        "OPERATIONS_HEALTH_FILE",
+        "/tmp/operations-worker-health.json",
+    )
+    set_operations_health_state(
+        OperationsHealthState(
+            stale_seconds=30,
+            health_file=health_file,
+        )
     )
     try:
         asyncio.run(_run_process())

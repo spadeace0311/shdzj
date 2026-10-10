@@ -6,10 +6,12 @@ import io
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from PIL import Image, ImageDraw
-from sqlalchemy import func, select
+from geoalchemy2.elements import WKTElement
+from sqlalchemy import delete, func, select
 
 from app.artifacts.models import (
     ArtifactOverrideRequest,
@@ -26,6 +28,12 @@ from app.artifacts.service import (
 )
 from app.artifacts.storage import ArtifactStore
 from app.db import engine
+from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
+from app.operations.models import OperationsRun
+from app.operations.priority import (
+    OperationsWorkBlocked,
+    RealEventPriorityActive,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +52,18 @@ def _jpeg_bytes(color: tuple[int, int, int]) -> bytes:
     return output.getvalue()
 
 
+def _marked_test_jpeg_bytes() -> bytes:
+    image = Image.new("RGB", (4761, 3369), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 80, 1200, 1200), fill=(0, 0, 255))
+    image.info["comment"] = "【测试】"
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=35, dpi=(300, 300))
+    return output.getvalue()
+
+
 _VALID_JPEG_BYTES = _jpeg_bytes((255, 0, 0))
+_MARKED_TEST_JPEG_BYTES = _marked_test_jpeg_bytes()
 _OTHER_JPEG_BYTES = _jpeg_bytes((0, 0, 255))
 _VALID_JPEG_CHECKSUM = hashlib.sha256(_VALID_JPEG_BYTES).hexdigest()
 _VALID_JPEG_SIZE = len(_VALID_JPEG_BYTES)
@@ -230,6 +249,184 @@ async def test_expected_current_artifact_id_mismatch_does_not_publish(
 
     assert current is not None
     assert current.artifact_id == published.id
+
+
+async def test_test_override_forces_filename_marker_and_metadata(
+    artifact_override_service,
+    seeded_event,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            event = await session.get(EarthquakeEvent, seeded_event.id)
+            revision = await session.get(
+                EarthquakeRevision,
+                seeded_event.current_revision_id,
+            )
+            assert event is not None and revision is not None
+            event.event_type = "test"
+            revision.revision_kind = "test"
+
+    response = await artifact_override_service.override(
+        actor_id="admin-id",
+        event_id=seeded_event.id,
+        artifact_key="map.epicenter",
+        output_profile="a3v-professional",
+        revision_id=seeded_event.current_revision_id,
+        reason="标记化覆盖",
+        expected_current_artifact_id=None,
+        idempotency_key="00000000-0000-0000-0000-000000000101",
+        upload=io.BytesIO(_MARKED_TEST_JPEG_BYTES),
+    )
+
+    assert response.production_mode == "test"
+    assert response.marker == "test"
+    assert response.file_name.startswith("【测试】")
+    async with session_factory() as session:
+        artifact = await session.get(
+            GeneratedArtifact,
+            response.artifact_id,
+        )
+    assert artifact is not None
+    assert artifact.marker == {
+        "marker": "【测试】",
+        "operation_marker": "test",
+    }
+
+
+async def test_override_rejects_paused_test_operation(
+    artifact_override_service,
+    seeded_event,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            event = await session.get(EarthquakeEvent, seeded_event.id)
+            revision = await session.get(
+                EarthquakeRevision,
+                seeded_event.current_revision_id,
+            )
+            assert event is not None and revision is not None
+            event.event_type = "test"
+            revision.revision_kind = "test"
+            session.add(
+                OperationsRun(
+                    event_id=event.id,
+                    trigger_mode="manual_test",
+                    operation_state="paused",
+                    priority=100,
+                    idempotency_key="paused-override-test",
+                    triggered_by="test",
+                    resume_required=True,
+                    detail={},
+                )
+            )
+
+    with pytest.raises(OperationsWorkBlocked):
+        await artifact_override_service.override(
+            actor_id="admin-id",
+            event_id=seeded_event.id,
+            artifact_key="map.epicenter",
+            output_profile="a3v-professional",
+            revision_id=seeded_event.current_revision_id,
+            reason="暂停覆盖",
+            expected_current_artifact_id=None,
+            idempotency_key="00000000-0000-0000-0000-000000000102",
+            upload=io.BytesIO(_MARKED_TEST_JPEG_BYTES),
+        )
+
+
+async def test_override_rejects_active_real_event(
+    artifact_override_service,
+    seeded_event,
+    session_factory,
+) -> None:
+    real_id = uuid.uuid4()
+    async with session_factory() as session:
+        async with session.begin():
+            target_event = await session.get(
+                EarthquakeEvent,
+                seeded_event.id,
+            )
+            target_revision = await session.get(
+                EarthquakeRevision,
+                seeded_event.current_revision_id,
+            )
+            assert target_event is not None and target_revision is not None
+            target_event.event_type = "test"
+            target_revision.revision_kind = "test"
+            event = EarthquakeEvent(
+                id=real_id,
+                source="artifact-real-priority",
+                canonical_source_id=f"artifact-real-priority:{real_id}",
+                event_type="manual",
+                origin_time=datetime.now(UTC),
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="real priority",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="not_applicable",
+                real_event_activated_at=datetime.now(UTC),
+            )
+            session.add(event)
+            await session.flush()
+            raw = RawMessage(
+                id=uuid.uuid4(),
+                source="artifact-real-priority",
+                source_message_id=uuid.uuid4().hex,
+                message_kind="manual",
+                checksum=uuid.uuid4().hex,
+                payload={"event_id": str(real_id)},
+            )
+            session.add(raw)
+            await session.flush()
+            revision = EarthquakeRevision(
+                id=uuid.uuid4(),
+                event_id=real_id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="manual",
+                origin_time=event.origin_time,
+                longitude=event.longitude,
+                latitude=event.latitude,
+                depth_km=event.depth_km,
+                magnitude=event.magnitude,
+                place=event.place,
+                is_current=True,
+                ingested_at=datetime.now(UTC),
+            )
+            session.add(revision)
+            await session.flush()
+            event.current_revision_id = revision.id
+
+    try:
+        with pytest.raises(RealEventPriorityActive):
+            await artifact_override_service.override(
+                actor_id="admin-id",
+                event_id=seeded_event.id,
+                artifact_key="map.epicenter",
+                output_profile="a3v-professional",
+                revision_id=seeded_event.current_revision_id,
+                reason="真实事件覆盖",
+                expected_current_artifact_id=None,
+                idempotency_key="00000000-0000-0000-0000-000000000103",
+                upload=io.BytesIO(_MARKED_TEST_JPEG_BYTES),
+            )
+    finally:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(EarthquakeEvent).where(
+                        EarthquakeEvent.id == real_id
+                    )
+                )
+                await session.execute(
+                    delete(RawMessage).where(
+                        RawMessage.source == "artifact-real-priority"
+                    )
+                )
 
 
 async def test_same_bytes_failure_preserves_current_publication_file(

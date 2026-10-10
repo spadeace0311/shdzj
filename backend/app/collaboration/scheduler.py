@@ -157,7 +157,7 @@ class DeadlineScheduler:
                 .where(
                     OperationsRun.event_id == WorkgroupTask.event_id,
                     OperationsRun.operation_state.in_(
-                        ("paused", "canceled")
+                        ("paused", "canceled", "failed")
                     ),
                 )
                 .correlate(WorkgroupTask)

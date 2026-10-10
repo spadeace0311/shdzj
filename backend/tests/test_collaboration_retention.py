@@ -13,7 +13,12 @@ from sqlalchemy.pool import NullPool
 
 from app.collaboration.domain import WorkgroupCode
 from app.collaboration.generation import CollaborationTaskGenerator
-from app.collaboration.models import WorkgroupTask
+from app.artifacts.models import ProductionRun
+from app.collaboration.models import (
+    TaskDeliverable,
+    TaskDeliverableVersion,
+    WorkgroupTask,
+)
 from app.collaboration.retention import CollaborationRetentionService
 from app.collaboration.templates import TaskTemplateCatalog, TaskTemplateDefinition
 from app.config import settings
@@ -23,6 +28,7 @@ from app.events.models import (
     EventLifecycleOutbox,
     RawMessage,
 )
+from app.event_object_cleanup import EventObjectCleanupIntent
 
 
 @pytest.fixture
@@ -360,14 +366,14 @@ async def test_retention_purges_test_at_exact_four_hundred_day_boundary(
     assert await session.get(EarthquakeEvent, event.id) is None
 
 
-async def test_retention_uses_calendar_two_year_boundary_for_drill(
+async def test_retention_uses_fixed_two_year_boundary_for_drill(
     session,
     event_factory,
     task_factory,
 ):
     observed_at = datetime(2025, 3, 1, tzinfo=UTC)
     exact_anniversary = datetime(2023, 3, 1, tzinfo=UTC)
-    one_day_younger = datetime(2023, 3, 2, tzinfo=UTC)
+    one_day_younger = datetime(2023, 3, 3, tzinfo=UTC)
     exact_event = await event_factory(
         event_type="drill",
         origin_time=exact_anniversary,
@@ -429,6 +435,104 @@ async def test_retention_protects_event_with_active_workgroup_task(
     assert result.protected_active_dependencies == 1
     assert await session.get(EarthquakeEvent, event.id) is not None
     assert await session.get(WorkgroupTask, task.id) is not None
+
+
+async def test_retention_protects_active_production_run(
+    session,
+    event_factory,
+    task_factory,
+) -> None:
+    event = await event_factory(event_type="test", age_days=401)
+    await task_factory(event, status="completed")
+    revision = await session.scalar(
+        select(EarthquakeRevision).where(
+            EarthquakeRevision.event_id == event.id,
+            EarthquakeRevision.is_current.is_(True),
+        )
+    )
+    assert revision is not None
+    session.add(
+        ProductionRun(
+            event_id=event.id,
+            revision_id=revision.id,
+            revision_no=revision.revision_no,
+            production_mode="test",
+            launch_mode="assessment_child",
+            status="running",
+            priority=100,
+            deadline_basis_at=OBSERVED_AT,
+            deadline_at=OBSERVED_AT + timedelta(minutes=5),
+            deadline_kind="event_deadline",
+            catalog_version="retention-test",
+            generation_seq=1,
+            generation_scope="full",
+            required_outputs=[],
+            is_current=True,
+            snapshot={},
+        )
+    )
+    await session.flush()
+
+    result = await CollaborationRetentionService().purge_due(
+        session,
+        observed_at=OBSERVED_AT,
+    )
+
+    assert result.test_deleted == 0
+    assert result.protected_active_dependencies == 1
+    assert await session.get(EarthquakeEvent, event.id) is not None
+
+
+async def test_retention_enqueues_idempotent_manual_object_cleanup(
+    session,
+    event_factory,
+    task_factory,
+) -> None:
+    event = await event_factory(event_type="test", age_days=401)
+    task = await task_factory(event, status="completed")
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="retention.manual",
+        title="Retention manual output",
+        is_required=False,
+        requirement_kind="manual_file",
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+    version_id = uuid.uuid4()
+    session.add(
+        TaskDeliverableVersion(
+            id=version_id,
+            deliverable_id=deliverable.id,
+            version_no=1,
+            source_kind="manual",
+            storage_key="objects/aa/bb/retention-manual.txt",
+            file_name="retention-manual.txt",
+            checksum="f" * 64,
+            mime_type="text/plain",
+            size_bytes=1,
+            created_by="system",
+        )
+    )
+    await session.flush()
+    namespace = "test-retention-namespace"
+
+    result = await CollaborationRetentionService().purge_due(
+        session,
+        observed_at=OBSERVED_AT,
+        storage_namespace=namespace,
+    )
+
+    assert result.test_deleted == 1
+    intent = await session.scalar(
+        select(EventObjectCleanupIntent).where(
+            EventObjectCleanupIntent.source_kind == "event_retention",
+            EventObjectCleanupIntent.source_key == str(version_id),
+        )
+    )
+    assert intent is not None
+    assert intent.storage_namespace == namespace
 
 
 async def test_retention_logs_only_aggregate_counts(

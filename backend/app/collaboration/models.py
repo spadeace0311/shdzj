@@ -599,6 +599,10 @@ class TaskDeliverableVersion(Base):
             "source_kind IN ('automatic', 'manual', 'superadmin_override')",
             name="ck_collaboration_deliverable_source_kind",
         ),
+        CheckConstraint(
+            "operation_marker IS NULL OR operation_marker IN ('test', 'drill')",
+            name="ck_collaboration_deliverable_operation_marker",
+        ),
         Index(
             "uq_collaboration_deliverable_artifact_publication",
             "deliverable_id",
@@ -629,6 +633,7 @@ class TaskDeliverableVersion(Base):
     )
     storage_key: Mapped[str | None] = mapped_column(Text)
     file_name: Mapped[str | None] = mapped_column(String(512))
+    operation_marker: Mapped[str | None] = mapped_column(String(16))
     checksum: Mapped[str | None] = mapped_column(String(64))
     mime_type: Mapped[str | None] = mapped_column(String(128))
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
@@ -660,6 +665,10 @@ class TaskDeliverablePublication(Base):
             "published_role IN ('leader', 'deputy', 'superadmin')",
             name="ck_collaboration_publication_role",
         ),
+        CheckConstraint(
+            "operation_marker IS NULL OR operation_marker IN ('test', 'drill')",
+            name="ck_collaboration_publication_operation_marker",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -675,6 +684,7 @@ class TaskDeliverablePublication(Base):
         ForeignKey("collaboration_deliverable_versions.id", ondelete="CASCADE"),
         index=True,
     )
+    operation_marker: Mapped[str | None] = mapped_column(String(16))
     published_by: Mapped[str] = mapped_column(String(64))
     published_role: Mapped[str] = mapped_column(String(32))
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import func, insert, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.regions.models import RegionBoundary
@@ -40,6 +40,17 @@ async def import_geojson(
     maritime_wkt = (
         _multipolygon_wkt(maritime_polygons) if maritime_polygons else "MULTIPOLYGON EMPTY"
     )
+    await _validate_postgis_geometry(
+        session,
+        administrative_wkt,
+        "administrative boundary geometry must be valid and have positive area",
+    )
+    if maritime_polygons:
+        await _validate_postgis_geometry(
+            session,
+            maritime_wkt,
+            "maritime geometry must be valid and have positive area",
+        )
 
     if activate:
         await session.execute(update(RegionBoundary).values(is_active=False))
@@ -170,13 +181,41 @@ def _validate_polygon(coordinates: object) -> list[list[list[Decimal]]]:
         if not isinstance(ring, list) or not ring:
             raise ValueError("polygon ring is empty")
         if len(ring) < 4:
-            raise ValueError("polygon ring must contain at least four coordinates")
+            raise ValueError(
+                "polygon ring must be closed and contain at least four coordinates"
+            )
         positions = [_validate_position(position) for position in ring]
+        if positions[0] != positions[-1]:
+            raise ValueError("polygon ring must be closed")
         for current, following in zip(positions, positions[1:] + positions[:1]):
             if abs(following[0] - current[0]) > Decimal("180"):
                 raise ValueError("polygon segment must not cross the antimeridian")
         polygon.append(positions)
     return polygon
+
+
+async def _validate_postgis_geometry(
+    session: AsyncSession,
+    wkt: str,
+    error_message: str,
+) -> None:
+    geometry = func.ST_GeomFromText(wkt, 4326)
+    is_valid, is_empty, area = (
+        await session.execute(
+            select(
+                func.ST_IsValid(geometry),
+                func.ST_IsEmpty(geometry),
+                func.ST_Area(geometry),
+            )
+        )
+    ).one()
+    if (
+        not is_valid
+        or is_empty
+        or area is None
+        or Decimal(str(area)) <= 0
+    ):
+        raise ValueError(error_message)
 
 
 def _validate_position(position: object) -> list[Decimal]:

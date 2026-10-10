@@ -12,7 +12,7 @@ from app.config import settings
 
 BACKEND_DIR = Path(__file__).parents[1]
 AUDIT_REVISION = "0025_qa_audit_provenance"
-LATEST_REVISION = "0026_operations_automation"
+LATEST_REVISION = "0027_operations_safety_hardening"
 PREVIOUS_REVISION = "0024_ai_knowledge_qa"
 
 

@@ -15,6 +15,7 @@ from app.operations.models import (
     OperationsTestSchedule,
 )
 from app.operations.repository import OperationsRepository, StaleOperationsSettings
+from app.operations.scenario import OperationsConfigurationError
 
 
 @pytest.fixture(autouse=True)
@@ -198,6 +199,40 @@ async def test_update_settings_writes_audit_and_versions(session) -> None:
     assert audit.after_state["test_magnitude_min"] == "5.2"
     assert audit.after_state["test_depth_min_km"] == "10.23"
     assert audit.detail["expected_version"] == 1
+
+
+async def test_update_settings_rejects_unknown_zoneinfo(session) -> None:
+    await _reset_repository_tables(session)
+    repository = OperationsRepository()
+    settings = await repository.get_settings(session)
+
+    with pytest.raises(ValueError, match="invalid_timezone"):
+        await repository.update_settings(
+            session,
+            "operations-test",
+            settings.row_version,
+            {"timezone": "Not/AZone"},
+        )
+
+    assert settings.row_version == 1
+    assert settings.timezone == "Asia/Shanghai"
+
+
+async def test_get_settings_reports_existing_invalid_timezone_stably(session) -> None:
+    await _reset_repository_tables(session)
+    session.add(
+        OperationsSettings(
+            settings_key="default",
+            timezone="Not/AZone",
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(
+        OperationsConfigurationError,
+        match="invalid_operations_timezone",
+    ):
+        await OperationsRepository().get_settings(session)
 
 
 async def test_update_settings_initializes_missing_row(session) -> None:

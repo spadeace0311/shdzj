@@ -40,6 +40,14 @@ beforeEach(() => {
   createManualEventMock.mockReset();
 });
 
+test("manual entry exposes no legacy test or drill choices", () => {
+  renderManualPage();
+
+  expect(screen.queryByLabelText("事件类型")).not.toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "测试" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "演练" })).not.toBeInTheDocument();
+});
+
 test("submits all required manual event fields", async () => {
   createManualEventMock.mockResolvedValue({ event_id: "event-2" });
 

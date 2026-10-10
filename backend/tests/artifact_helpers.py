@@ -988,6 +988,13 @@ class ArtifactAssessmentFixture:
                 if stored is None:
                     raise LookupError("expired artifact fixture was not persisted")
                 stored.generated_at = generated_at
+                if production_mode in {"test", "drill"}:
+                    event = await session.get(EarthquakeEvent, self.event_id)
+                    revision = await session.get(EarthquakeRevision, self.revision_id)
+                    if event is None or revision is None:
+                        raise LookupError("retention event fixture was not found")
+                    event.origin_time = generated_at
+                    revision.origin_time = generated_at
         return artifact
 
     async def bindings_for(

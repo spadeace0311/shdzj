@@ -35,6 +35,7 @@ from app.config import settings
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 from app.event_object_cleanup import cleanup_event_objects
 from app.main import app
+from app.operations.models import OperationsRun
 
 
 @pytest.fixture
@@ -1115,6 +1116,161 @@ async def test_deliverable_list_and_publish_routes(
         await client.aclose()
         app.dependency_overrides.pop(get_roster_session, None)
         app.dependency_overrides.pop(get_current_user, None)
+
+
+async def test_test_event_routes_keep_irremovable_marker(
+    session,
+    superadmin_user,
+) -> None:
+    task = await _new_task_for_deliverable(session)
+    event = await session.get(EarthquakeEvent, task.event_id)
+    assert event is not None
+    event.event_type = "test"
+    session.add(
+        OperationsRun(
+            event_id=event.id,
+            trigger_mode="manual_test",
+            operation_state="queued",
+            priority=100,
+            idempotency_key=f"marker-run-{uuid.uuid4()}",
+            triggered_by="marker-test",
+            detail={},
+        )
+    )
+    await session.flush()
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="marker.result",
+        title="Marked result",
+        is_required=False,
+        requirement_kind=DeliverableRequirementKind.MANUAL_TEXT,
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+    client = await _client(
+        session,
+        AuthUser(superadmin_user.username, superadmin_user.role, None),
+    )
+    try:
+        text_response = await client.post(
+            f"/api/v1/collaboration/deliverables/{deliverable.id}/versions",
+            json={"text_result": {"result": "unmarked"}, "basis_text": "upload"},
+            headers={"Idempotency-Key": "marker-text"},
+        )
+        assert text_response.status_code == 200
+        text_body = text_response.json()
+        assert text_body["operation_marker"] == "test"
+        assert text_body["text_result"]["_operation_marker"] == "test"
+
+        file_response = await client.post(
+            f"/api/v1/collaboration/deliverables/{deliverable.id}/versions/file",
+            files={"file": ("正式专报.docx", b"docx", "text/plain")},
+            data={"basis_text": "upload"},
+            headers={"Idempotency-Key": "marker-file"},
+        )
+        assert file_response.status_code == 200
+        file_body = file_response.json()
+        assert file_body["operation_marker"] == "test"
+        assert file_body["file_name"].startswith("【测试】")
+
+        version_id = text_body["id"]
+        await session.refresh(task)
+        published = await client.post(
+            f"/api/v1/collaboration/deliverables/{deliverable.id}/publish",
+            json={"version_id": version_id, "publication_note": "publish"},
+            headers={
+                "If-Match": str(task.row_version),
+                "Idempotency-Key": "marker-publish",
+            },
+        )
+        assert published.status_code == 200
+        assert published.json()["operation_marker"] == "test"
+
+        await session.refresh(task)
+        override = await client.post(
+            f"/api/v1/collaboration/deliverables/{deliverable.id}/override",
+            json={"text_result": {"result": "override"}, "basis_text": "override"},
+            headers={
+                    "If-Match": str(task.row_version),
+                "Idempotency-Key": "marker-override",
+            },
+        )
+        assert override.status_code == 200
+        override_body = override.json()
+        assert override_body["operation_marker"] == "test"
+
+        await session.refresh(task)
+        restored = await client.post(
+            f"/api/v1/collaboration/deliverables/{deliverable.id}/restore",
+            json={"version_id": version_id, "publication_note": "restore"},
+            headers={
+                "If-Match": str(task.row_version),
+                "Idempotency-Key": "marker-restore",
+            },
+        )
+        assert restored.status_code == 200
+        assert restored.json()["operation_marker"] == "test"
+    finally:
+        await client.aclose()
+        app.dependency_overrides.pop(get_roster_session, None)
+        app.dependency_overrides.pop(get_cleanup_session, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+async def test_publish_repairs_legacy_unmarked_test_text(
+    session,
+    superadmin_user,
+) -> None:
+    task = await _new_task_for_deliverable(session)
+    event = await session.get(EarthquakeEvent, task.event_id)
+    assert event is not None
+    event.event_type = "test"
+    session.add(
+        OperationsRun(
+            event_id=event.id,
+            trigger_mode="manual_test",
+            operation_state="queued",
+            priority=100,
+            idempotency_key=f"legacy-marker-run-{uuid.uuid4()}",
+            triggered_by="marker-test",
+            detail={},
+        )
+    )
+    deliverable = TaskDeliverable(
+        task_id=task.id,
+        deliverable_code="legacy-marker.result",
+        title="Legacy marked result",
+        is_required=False,
+        requirement_kind=DeliverableRequirementKind.MANUAL_TEXT,
+        display_order=1,
+    )
+    session.add(deliverable)
+    await session.flush()
+    version = TaskDeliverableVersion(
+        deliverable_id=deliverable.id,
+        version_no=1,
+        source_kind=DeliverableSourceKind.MANUAL,
+        text_result={"result": "legacy"},
+        created_by=superadmin_user.username,
+    )
+    session.add(version)
+    await session.flush()
+
+    publication = await DeliverableService().publish(
+        session,
+        deliverable.id,
+        version_id=version.id,
+        actor=superadmin_user,
+    )
+
+    await session.refresh(version)
+    assert version.operation_marker == "test"
+    assert version.text_result == {
+        "result": "legacy",
+        "_operation_marker": "test",
+    }
+    assert publication.operation_marker == "test"
 
 
 async def _new_task_for_deliverable(session) -> WorkgroupTask:

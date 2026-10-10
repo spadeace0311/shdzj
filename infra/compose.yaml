@@ -307,6 +307,7 @@ services:
       - ../.env
     environment:
       OPERATIONS_WORKER_ENABLED: "true"
+      OPERATIONS_HEALTH_FILE: "/tmp/operations-worker-health.json"
     command: ["python", "-m", "app.operations.worker"]
     restart: unless-stopped
     volumes:
@@ -317,7 +318,19 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-m", "app.process_health", "operations"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-m",
+          "app.operations.health_check",
+          "--file",
+          "/tmp/operations-worker-health.json",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   collector:
     build:

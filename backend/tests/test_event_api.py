@@ -300,17 +300,39 @@ def test_manual_event_returns_created() -> None:
             "magnitude": 3.2,
             "depth_km": 8.0,
             "source": "Shanghai-Network",
-            "event_kind": "test",
+            "event_kind": "manual",
         },
     )
 
     assert response.status_code == 201
     body = response.json()
-    assert body["event_kind"] == "test"
+    assert body["event_kind"] == "manual"
     assert body["institutional_level"] is None
     assert body["service_level"] is None
     assert body["lifecycle_state"] == "not_applicable"
     assert body["t1_at"] is None
+
+
+def test_manual_event_rejects_legacy_test_and_drill_kinds() -> None:
+    client = _client(
+        FakeEventService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    )
+
+    for event_kind in ("test", "drill"):
+        response = client.post(
+            "/api/v1/events/manual",
+            json={
+                "origin_time": "2026-09-17T02:30:05Z",
+                "longitude": 121.54,
+                "latitude": 31.22,
+                "magnitude": 3.2,
+                "depth_km": 8.0,
+                "source": "Shanghai-Network",
+                "event_kind": event_kind,
+            },
+        )
+        assert response.status_code == 422
 
 
 def test_invalid_cenc_payload_returns_400() -> None:

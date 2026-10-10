@@ -10,6 +10,8 @@ from geoalchemy2.elements import WKTElement
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.artifacts.models import ProductionRun, ProductionTask
+from app.assessment.models import AssessmentRun
 from app.collaboration.models import CollaborationSettings
 from app.db import SessionFactory, engine
 from app.events.domain import EventKind, NormalizedEvent
@@ -241,6 +243,133 @@ async def test_manual_test_uses_real_event_service_and_creates_shanghai_event() 
     assert audit is not None
     assert revision is not None
     assert revision.inside_shanghai is True
+
+
+async def test_run_reconciliation_uses_current_terminal_state() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    result = await _service().trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="reconcile-completed"),
+        "operator",
+    )
+    assert result.run_id is not None
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            event = await session.get(EarthquakeEvent, result.event_id)
+            revision_id = uuid.UUID(result.revision_id)
+            outbox = await session.scalar(
+                select(EventLifecycleOutbox)
+                .where(EventLifecycleOutbox.event_id == event.id)
+                .limit(1)
+            )
+            assert event is not None and outbox is not None
+            assessment_id = uuid.uuid4()
+            assessment = AssessmentRun(
+                id=assessment_id,
+                event_id=event.id,
+                revision_id=revision_id,
+                outbox_id=outbox.id,
+                run_no=1,
+                status="completed",
+                priority=100,
+                deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                snapshot={},
+                report_ingested_at=OBSERVED_AT,
+                deadline_basis_at=OBSERVED_AT,
+            )
+            session.add(assessment)
+            await session.flush()
+            production_id = uuid.uuid4()
+            production = ProductionRun(
+                id=production_id,
+                assessment_run_id=assessment.id,
+                event_id=event.id,
+                revision_id=revision_id,
+                revision_no=1,
+                production_mode="test",
+                launch_mode="assessment_child",
+                status="completed",
+                priority=100,
+                deadline_basis_at=OBSERVED_AT,
+                deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                deadline_kind="event_deadline",
+                catalog_version="reconciliation-test",
+                generation_seq=1,
+                generation_scope="full",
+                required_outputs=[],
+                is_current=True,
+                snapshot={},
+            )
+            session.add(production)
+            await session.flush()
+            session.add(
+                ProductionTask(
+                    production_run_id=production.id,
+                    artifact_key="reconcile.test",
+                    output_profile="test",
+                    kind="automatic",
+                    priority=100,
+                    sequence=1,
+                    status="succeeded",
+                    deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                    attempt_count=1,
+                    max_attempts=3,
+                    result={"status": "complete"},
+                )
+            )
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            reconciled = await _service().reconcile_runs(
+                session,
+                OBSERVED_AT,
+            )
+    assert reconciled >= 0
+
+    async with SessionFactory() as session:
+        run = await session.get(OperationsRun, result.run_id)
+    assert run is not None
+    assert run.operation_state == "completed"
+
+
+async def test_resume_drill_creates_a_new_authorized_operation() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    first = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="resume-source"),
+        "operator",
+    )
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, first.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.paused_at = OBSERVED_AT
+
+    resumed = await _service().resume_drill(first.run_id, "superadmin")
+
+    async with SessionFactory() as session:
+        old_run = await session.get(OperationsRun, first.run_id)
+        new_run = await session.get(OperationsRun, resumed.run_id)
+
+    assert resumed.run_id is not None
+    assert resumed.resumed_from_run_id == first.run_id
+    assert resumed.run_id != first.run_id
+    assert old_run is not None
+    assert old_run.operation_state == "paused"
+    assert old_run.resume_required is True
+    assert new_run is not None
+    assert new_run.operation_state == "queued"
 
 
 async def test_drill_uses_real_event_service_and_marks_drill() -> None:
@@ -647,22 +776,23 @@ async def test_manual_key_cannot_impersonate_scheduled_trigger() -> None:
             schedule_id = schedule.id
 
     service = _service()
-    await service.trigger_manual_test(
-        ManualTestTriggerRequest(idempotency_key=f"scheduled:{schedule_id}"),
-        "operator",
-    )
-
-    with pytest.raises(ValueError, match="idempotency_key conflicts"):
-        await service.trigger_scheduled_test(schedule_id, "operator")
+    with pytest.raises(ValueError, match="reserved namespace"):
+        await service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key=f"scheduled:{schedule_id}"),
+            "operator",
+        )
 
     missing_schedule_id = uuid.uuid4()
-    await service.trigger_manual_test(
-        ManualTestTriggerRequest(idempotency_key=f"scheduled:{missing_schedule_id}"),
-        "operator",
-    )
+    with pytest.raises(ValueError, match="reserved namespace"):
+        await service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key=f"scheduled:{missing_schedule_id}"),
+            "operator",
+        )
 
-    with pytest.raises(ValueError, match="idempotency_key conflicts"):
-        await service.trigger_scheduled_test(missing_schedule_id, "operator")
+    scheduled_result = await service.trigger_scheduled_test(
+        schedule_id,
+        "operations-scheduler",
+    )
 
     async with SessionFactory() as session:
         run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
@@ -672,5 +802,7 @@ async def test_manual_key_cannot_impersonate_scheduled_trigger() -> None:
             .where(OperationsRun.trigger_mode == "scheduled_test")
         )
 
-    assert run_count == 2
-    assert scheduled_run_count == 0
+    assert scheduled_result.event_id is not None
+    assert scheduled_result.run_id is not None
+    assert run_count == 1
+    assert scheduled_run_count == 1

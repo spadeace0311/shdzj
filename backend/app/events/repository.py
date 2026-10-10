@@ -335,6 +335,17 @@ class EventRepository:
         if becomes_current:
             _apply_current_event_fields(canonical, event, revision.id, geom, revision_kind)
             canonical.lifecycle_state = _lifecycle_state_for_kind(revision_kind)
+            if revision_kind in {
+                EventKind.FORMAL,
+                EventKind.MANUAL,
+                EventKind.CORRECTION,
+            }:
+                if canonical.real_event_activated_at is None:
+                    canonical.real_event_activated_at = _normalize_utc(
+                        ingested_at,
+                        "ingested_at",
+                    )
+                canonical.real_event_closed_at = None
             if revision_kind in {EventKind.MANUAL, EventKind.TEST, EventKind.DRILL}:
                 canonical.t1_at = None
         if revision_kind is EventKind.FORMAL and becomes_current and canonical.t1_at is None:

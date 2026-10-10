@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-import calendar
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifacts.models import ProductionRun, ProductionTask
 from app.assessment.models import AssessmentRun
-from app.collaboration.models import WorkgroupTask
+from app.collaboration.models import (
+    TaskDeliverable,
+    TaskDeliverableVersion,
+    WorkgroupTask,
+)
+from app.event_object_cleanup import enqueue_object_cleanup_intent
 from app.events.models import EarthquakeEvent, EventLifecycleOutbox
+from app.operations.retention_clock import retention_cutoff
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +44,8 @@ class CollaborationRetentionService:
         self,
         session: AsyncSession,
         observed_at: datetime,
+        *,
+        storage_namespace: str | None = None,
     ) -> CollaborationRetentionResult:
         observed_at = _as_utc(observed_at)
         result = CollaborationRetentionResult()
@@ -47,6 +55,7 @@ class CollaborationRetentionService:
                 session,
                 event_type=event_type,
                 cutoff=cutoff,
+                storage_namespace=storage_namespace,
             )
             result = CollaborationRetentionResult(
                 test_deleted=(
@@ -80,6 +89,7 @@ class CollaborationRetentionService:
         *,
         event_type: str,
         cutoff: datetime,
+        storage_namespace: str | None,
     ) -> tuple[int, int, int]:
         deleted = 0
         protected = 0
@@ -107,7 +117,18 @@ class CollaborationRetentionService:
                 if await self._has_active_dependencies(session, event.id):
                     protected += 1
                     continue
+                manual_paths = await self._manual_storage_paths(session, event.id)
                 await session.delete(event)
+                for version_id, storage_path in manual_paths:
+                    if storage_namespace is not None:
+                        await enqueue_object_cleanup_intent(
+                            session,
+                            event_id=event.id,
+                            source_kind="event_retention",
+                            source_key=str(version_id),
+                            storage_path=storage_path,
+                            storage_namespace=storage_namespace,
+                        )
                 deleted += 1
             await session.flush()
         return deleted, protected, batches
@@ -146,24 +167,63 @@ class CollaborationRetentionService:
                 .with_for_update()
             )
         )
-        return any(row.status in ACTIVE_ASSESSMENT_STATUSES for row in assessments)
+        if any(row.status in ACTIVE_ASSESSMENT_STATUSES for row in assessments):
+            return True
+
+        production_runs = (
+            await session.scalars(
+                select(ProductionRun)
+                .where(ProductionRun.event_id == event_id)
+                .with_for_update()
+            )
+        )
+        if any(row.status in {"pending", "running"} for row in production_runs):
+            return True
+
+        production_tasks = (
+            await session.scalars(
+                select(ProductionTask)
+                .join(
+                    ProductionRun,
+                    ProductionRun.id == ProductionTask.production_run_id,
+                )
+                .where(ProductionRun.event_id == event_id)
+                .with_for_update()
+            )
+        )
+        return any(
+            row.status in {"pending", "ready", "running"}
+            for row in production_tasks
+        )
+
+    @staticmethod
+    async def _manual_storage_paths(
+        session: AsyncSession,
+        event_id: object,
+    ) -> list[tuple[object, str]]:
+        rows = await session.execute(
+            select(TaskDeliverableVersion.id, TaskDeliverableVersion.storage_key)
+            .join(
+                TaskDeliverable,
+                TaskDeliverable.id == TaskDeliverableVersion.deliverable_id,
+            )
+            .join(
+                WorkgroupTask,
+                WorkgroupTask.id == TaskDeliverable.task_id,
+            )
+            .where(
+                WorkgroupTask.event_id == event_id,
+                TaskDeliverableVersion.storage_key.is_not(None),
+            )
+        )
+        return list(rows.all())
 
     @staticmethod
     def _cutoff_for(event_type: str, observed_at: datetime) -> datetime:
-        if event_type == "test":
-            return observed_at - timedelta(days=400)
-        if event_type == "drill":
-            return _subtract_calendar_years(observed_at, 2)
-        raise ValueError(f"unsupported event type: {event_type}")
+        return retention_cutoff(event_type, observed_at)
 
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("observed_at must include timezone information")
     return value.astimezone(UTC)
-
-
-def _subtract_calendar_years(value: datetime, years: int) -> datetime:
-    target_year = value.year - years
-    target_day = min(value.day, calendar.monthrange(target_year, value.month)[1])
-    return value.replace(year=target_year, day=target_day)

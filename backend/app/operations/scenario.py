@@ -30,7 +30,39 @@ class ScenarioGenerator:
         seed: int,
     ) -> OperationsScenario:
         observed_at = _require_aware_datetime(observed_at, "observed_at")
-        point = await self._active_boundary_point(session)
+        boundary = await self._locked_active_boundary(session)
+        if boundary is None:
+            raise OperationsConfigurationError(
+                "active_shanghai_boundary_required"
+            )
+        validity = (
+            await session.execute(
+                select(
+                    func.ST_IsValid(RegionBoundary.geom),
+                    func.ST_IsEmpty(RegionBoundary.geom),
+                    func.ST_Area(RegionBoundary.geom),
+                )
+                .where(RegionBoundary.id == boundary.id)
+            )
+        ).one()
+        is_valid, is_empty, area = validity
+        area_decimal = Decimal(str(area)) if area is not None else Decimal("0")
+        if not is_valid or is_empty or area_decimal <= 0:
+            raise OperationsConfigurationError(
+                "invalid_active_shanghai_boundary"
+            )
+        point = (
+            await session.execute(
+                select(
+                    func.ST_X(
+                        func.ST_PointOnSurface(RegionBoundary.geom)
+                    ).label("longitude"),
+                    func.ST_Y(
+                        func.ST_PointOnSurface(RegionBoundary.geom)
+                    ).label("latitude"),
+                ).where(RegionBoundary.id == boundary.id)
+            )
+        ).one()
         if point is None:
             raise OperationsConfigurationError(
                 "active_shanghai_boundary_required"
@@ -49,12 +81,15 @@ class ScenarioGenerator:
             settings.test_depth_max_km,
             self.DEPTH_STEP,
         )
-        longitude, latitude = point
+        longitude, latitude = (
+            Decimal(str(point.longitude)),
+            Decimal(str(point.latitude)),
+        )
         observed_utc = observed_at.astimezone(UTC)
         source_event_id = (
             f"operations-test:{observed_utc.strftime('%Y%m%d')}:{seed}"
         )
-        return OperationsScenario(
+        scenario = OperationsScenario(
             origin_time=observed_utc,
             longitude=longitude,
             latitude=latitude,
@@ -63,7 +98,13 @@ class ScenarioGenerator:
             place=self.PLACE,
             source_event_id=source_event_id,
             random_seed=seed,
+            boundary_version=boundary.version,
         )
+        if not await self.region_contains(session, scenario):
+            raise OperationsConfigurationError(
+                "active_shanghai_boundary_required"
+            )
+        return scenario
 
     def scenario_to_event(self, scenario: OperationsScenario) -> NormalizedEvent:
         return NormalizedEvent(
@@ -87,42 +128,37 @@ class ScenarioGenerator:
             func.ST_MakePoint(scenario.longitude, scenario.latitude),
             4326,
         )
-        value = await session.scalar(
+        statement = (
             select(func.ST_Covers(RegionBoundary.geom, point))
             .where(RegionBoundary.is_active.is_(True))
             .order_by(RegionBoundary.id)
             .limit(1)
         )
+        if scenario.boundary_version:
+            statement = (
+                select(func.ST_Covers(RegionBoundary.geom, point))
+                .where(RegionBoundary.version == scenario.boundary_version)
+                .order_by(RegionBoundary.id)
+                .limit(1)
+                .with_for_update()
+            )
+        value = await session.scalar(statement)
         if value is None:
             raise OperationsConfigurationError(
                 "active_shanghai_boundary_required"
             )
         return bool(value)
 
-    @staticmethod
-    async def _active_boundary_point(
+    async def _locked_active_boundary(
+        self,
         session: AsyncSession,
-    ) -> tuple[Decimal, Decimal] | None:
-        row = (
-            await session.execute(
-                select(
-                    func.ST_X(
-                        func.ST_PointOnSurface(RegionBoundary.geom)
-                    ).label("longitude"),
-                    func.ST_Y(
-                        func.ST_PointOnSurface(RegionBoundary.geom)
-                    ).label("latitude"),
-                )
-                .where(RegionBoundary.is_active.is_(True))
-                .order_by(RegionBoundary.id)
-                .limit(1)
-            )
-        ).mappings().one_or_none()
-        if row is None:
-            return None
-        return (
-            Decimal(str(row["longitude"])),
-            Decimal(str(row["latitude"])),
+    ) -> RegionBoundary | None:
+        return await session.scalar(
+            select(RegionBoundary)
+            .where(RegionBoundary.is_active.is_(True))
+            .order_by(RegionBoundary.id)
+            .limit(1)
+            .with_for_update()
         )
 
 

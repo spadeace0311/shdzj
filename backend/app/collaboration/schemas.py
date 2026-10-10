@@ -161,6 +161,7 @@ class DeliverableVersionResponse(BaseModel):
     artifact_publication_id: UUID | None
     storage_key: str | None
     file_name: str | None
+    operation_marker: str | None
     checksum: str | None
     mime_type: str | None
     size_bytes: int | None
@@ -175,6 +176,7 @@ class DeliverablePublicationResponse(BaseModel):
     id: UUID
     deliverable_id: UUID
     version_id: UUID
+    operation_marker: str | None
     published_by: str
     published_role: str
     published_at: datetime

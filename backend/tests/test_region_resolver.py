@@ -186,6 +186,28 @@ async def test_resolve_uses_one_active_boundary_select_without_legacy_lookup() -
             },
             "antimeridian",
         ),
+        (
+            {
+                "type": "Polygon",
+                "coordinates": [[[121, 31], [122, 31], [122, 30]]],
+            },
+            "closed",
+        ),
+        (
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [121, 31],
+                        [122, 30],
+                        [121, 30],
+                        [122, 31],
+                        [121, 31],
+                    ]
+                ],
+            },
+            "valid",
+        ),
     ],
 )
 async def test_importer_rejects_invalid_geometry(

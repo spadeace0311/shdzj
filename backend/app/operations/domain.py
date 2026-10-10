@@ -39,3 +39,4 @@ class OperationsScenario:
     place: str
     source_event_id: str
     random_seed: int
+    boundary_version: str | None = None

@@ -28,7 +28,11 @@ from app.collaboration.models import (
 from app.collaboration.notifications import DeadlineScheduler
 from app.collaboration.roster import MemberInput, RosterService
 from app.collaboration.router import get_roster_session
-from app.collaboration.service import CollaborationTaskService, DeliverableService
+from app.collaboration.service import (
+    CollaborationTaskService,
+    DeliverableService,
+    TemporaryTaskService,
+)
 from app.config import settings
 from app.db import SessionFactory, engine
 from app.events.domain import EventKind, NormalizedEvent
@@ -39,9 +43,16 @@ from app.events.models import (
     RawMessage,
 )
 from app.events.response_rules import ResponseInput
+from app.events.router import get_event_service
 from app.events.service import EventService
 from app.main import app
-from app.operations.models import OperationsRun, OperationsSettings, OperationsTestSchedule
+from app.operations.models import (
+    OperationsAuditLog,
+    OperationsRun,
+    OperationsSettings,
+    OperationsTestSchedule,
+)
+from app.operations.repository import OperationsRepository
 from app.operations.priority import (
     OperationsPriorityGuard,
     OperationsWorkBlocked,
@@ -85,6 +96,7 @@ async def _cleanup_priority_data() -> None:
     async with SessionFactory() as session:
         async with session.begin():
             await session.execute(delete(OperationsRun))
+            await session.execute(delete(OperationsAuditLog))
             await session.execute(delete(OperationsTestSchedule))
             await session.execute(delete(OperationsSettings))
             await session.execute(
@@ -312,29 +324,33 @@ async def _seed_notification_recipient(
 async def _ingest_formal(
     *,
     source_event_id: str = "PRIORITY-FORMAL-1",
+    origin_time: datetime | None = None,
+    received_at: datetime | None = None,
 ) -> object:
+    origin_time = origin_time or (OBSERVED_AT - timedelta(minutes=5))
+    received_at = received_at or OBSERVED_AT
     event = NormalizedEvent(
         kind=EventKind.FORMAL,
         source=SOURCE,
         source_event_id=source_event_id,
-        origin_time=OBSERVED_AT - timedelta(minutes=5),
+        origin_time=origin_time,
         longitude=Decimal("121.500000"),
         latitude=Decimal("31.200000"),
         depth_km=Decimal("10.00"),
         magnitude=Decimal("5.2"),
         place="priority formal event",
-        report_time=OBSERVED_AT,
+        report_time=received_at,
     )
     return await EventService(SessionFactory).ingest_collected(
         raw_payload={
             "EventID": source_event_id,
             "type": "formal",
-            "receivedAt": OBSERVED_AT.isoformat(),
+            "receivedAt": received_at.isoformat(),
         },
         event=event,
         provider="fan",
         lane="websocket",
-        received_at=OBSERVED_AT,
+        received_at=received_at,
         response_input=ResponseInput(
             magnitude=event.magnitude,
             depth_km=event.depth_km,
@@ -347,7 +363,50 @@ async def _ingest_formal(
             inside_shanghai=True,
             distance_to_boundary_km=Decimal("0"),
             boundary_version="priority-test-boundary",
-            computed_at=OBSERVED_AT,
+            computed_at=received_at,
+        ),
+    )
+
+
+async def _ingest_correction(
+    *,
+    source_event_id: str = "PRIORITY-FORMAL-1",
+) -> object:
+    event = NormalizedEvent(
+        kind=EventKind.CORRECTION,
+        source=SOURCE,
+        source_event_id=source_event_id,
+        origin_time=OBSERVED_AT - timedelta(minutes=4),
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("11.00"),
+        magnitude=Decimal("5.3"),
+        place="priority corrected event",
+        report_time=OBSERVED_AT + timedelta(minutes=1),
+    )
+    return await EventService(SessionFactory).ingest_collected(
+        raw_payload={
+            "EventID": source_event_id,
+            "type": "correction",
+            "receivedAt": (OBSERVED_AT + timedelta(minutes=1)).isoformat(),
+        },
+        event=event,
+        provider="fan",
+        lane="websocket",
+        received_at=OBSERVED_AT + timedelta(minutes=1),
+        response_input=ResponseInput(
+            magnitude=event.magnitude,
+            depth_km=event.depth_km,
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            deaths=None,
+            max_intensity=None,
+        ),
+        region_context=RegionContext(
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            boundary_version="priority-test-boundary",
+            computed_at=OBSERVED_AT + timedelta(minutes=1),
         ),
     )
 
@@ -369,12 +428,226 @@ async def test_collected_formal_ingestion_applies_priority_guard() -> None:
     async with SessionFactory() as session:
         stored_schedule = await session.get(OperationsTestSchedule, schedule_id)
         stored_run = await session.get(OperationsRun, run_id)
+        events = (
+            await session.execute(
+                select(
+                    EarthquakeEvent.event_type,
+                    EarthquakeEvent.real_event_activated_at,
+                    EarthquakeEvent.current_revision_id,
+                ).where(EarthquakeEvent.source == SOURCE)
+            )
+        ).all()
 
     assert stored_schedule is not None
-    assert stored_schedule.state == "deferred"
+    assert stored_schedule.state == "deferred", events
     assert stored_run is not None
     assert stored_run.operation_state == "canceled"
     assert stored_run.detail["reason"] == "real_event_priority"
+
+
+async def test_formal_ingestion_survives_dirty_operations_timezone() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            settings = await OperationsRepository().get_settings(session)
+            settings.timezone = "Not/AZone"
+            test_event, _revision = await _seed_event(
+                session,
+                event_type="test",
+            )
+            run = await _seed_run(session, test_event)
+            run_id = run.id
+
+    await _ingest_formal()
+
+    async with SessionFactory() as session:
+        stored_run = await session.get(OperationsRun, run_id)
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == SOURCE)
+        )
+
+    assert event_count == 2
+    assert stored_run is not None
+    assert stored_run.operation_state == "canceled"
+    assert stored_run.detail["reason"] == "real_event_priority"
+
+
+async def test_late_ingested_formal_uses_ingestion_activation_time() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _seed_schedule(session)
+            await OperationsRepository().get_settings(session)
+
+    await _ingest_formal(
+        source_event_id="PRIORITY-LATE-FORMAL",
+        origin_time=OBSERVED_AT - timedelta(days=8),
+        received_at=OBSERVED_AT,
+    )
+
+    async with SessionFactory() as session:
+        event = await session.scalar(
+            select(EarthquakeEvent).where(
+                EarthquakeEvent.source == SOURCE,
+                EarthquakeEvent.event_type == "formal",
+            )
+        )
+        assert event is not None
+        assert event.origin_time < OBSERVED_AT - timedelta(days=7)
+        assert event.real_event_activated_at == OBSERVED_AT
+        assert await OperationsPriorityGuard().has_active_real_event(
+            session,
+            OBSERVED_AT,
+        )
+
+
+async def test_late_ingested_manual_uses_ingestion_activation_time() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_active_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    manual = NormalizedEvent(
+        kind=EventKind.MANUAL,
+        source=SOURCE,
+        source_event_id="PRIORITY-LATE-MANUAL",
+        origin_time=OBSERVED_AT - timedelta(days=8),
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.2"),
+        place="late manual priority event",
+    )
+    result = await EventService(SessionFactory).ingest(
+        {"EventID": manual.source_event_id, "kind": "manual"},
+        manual,
+        received_at=OBSERVED_AT,
+    )
+
+    async with SessionFactory() as session:
+        event = await session.get(EarthquakeEvent, result.event_id)
+        assert event is not None
+        assert event.origin_time < OBSERVED_AT - timedelta(days=7)
+        assert event.real_event_activated_at == OBSERVED_AT
+        assert await OperationsPriorityGuard().has_active_real_event(
+            session,
+            OBSERVED_AT,
+        )
+
+
+async def test_formal_to_correction_keeps_real_event_priority_active() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            schedule = await _seed_schedule(session)
+            test_event, _test_revision = await _seed_event(
+                session,
+                event_type="test",
+            )
+            test_run = await _seed_run(session, test_event)
+            schedule_id = schedule.id
+            test_run_id = test_run.id
+
+    await _ingest_formal()
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            drill_event, _drill_revision = await _seed_event(
+                session,
+                event_type="drill",
+                origin_time=OBSERVED_AT - timedelta(minutes=1),
+            )
+            drill_run = await _seed_run(session, drill_event)
+            drill_run_id = drill_run.id
+
+    correction = await _ingest_correction()
+    correction_event_id = correction.event_id
+
+    async with SessionFactory() as session:
+        event = await session.get(EarthquakeEvent, correction_event_id)
+        stored_schedule = await session.get(OperationsTestSchedule, schedule_id)
+        stored_test_run = await session.get(OperationsRun, test_run_id)
+        stored_drill_run = await session.get(OperationsRun, drill_run_id)
+        audits = (
+            await session.scalars(
+                select(OperationsAuditLog)
+                .where(
+                    OperationsAuditLog.action.in_(
+                        (
+                            "operations.priority.schedule_deferred",
+                            "operations.priority.drill_paused",
+                        )
+                    )
+                )
+                .order_by(OperationsAuditLog.created_at, OperationsAuditLog.id)
+            )
+        ).all()
+        active = await OperationsPriorityGuard().has_active_real_event(
+            session,
+            OBSERVED_AT + timedelta(minutes=1),
+        )
+
+    assert event is not None
+    assert event.event_type == "correction"
+    assert event.real_event_activated_at == OBSERVED_AT
+    assert active is True
+    assert stored_schedule is not None
+    assert stored_schedule.state == "deferred"
+    assert stored_test_run is not None
+    assert stored_test_run.operation_state == "canceled"
+    assert stored_drill_run is not None
+    assert stored_drill_run.operation_state == "paused"
+    assert stored_drill_run.resume_required is True
+    assert {audit.action for audit in audits} >= {
+        "operations.priority.schedule_deferred",
+        "operations.priority.drill_paused",
+    }
+    assert all(
+        audit.detail.get("real_event_id") == correction_event_id
+        for audit in audits
+        if audit.action == "operations.priority.drill_paused"
+    )
+
+
+async def test_legacy_manual_api_rejects_test_and_drill_during_real_event() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_active_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await _seed_event(
+                session,
+                event_type="manual",
+                origin_time=OBSERVED_AT,
+            )
+
+    app.dependency_overrides[get_event_service] = lambda: EventService(SessionFactory)
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        "priority-operator",
+        "group_leader",
+        None,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    )
+    try:
+        for event_kind in ("test", "drill"):
+            response = await client.post(
+                "/api/v1/events/manual",
+                json={
+                    "origin_time": OBSERVED_AT.isoformat(),
+                    "longitude": 121.5,
+                    "latitude": 31.2,
+                    "magnitude": 5.2,
+                    "depth_km": 10.0,
+                    "source": SOURCE,
+                    "event_kind": event_kind,
+                },
+            )
+            assert response.status_code == 422
+    finally:
+        await client.aclose()
+        app.dependency_overrides.pop(get_event_service, None)
 
 
 async def test_manual_ingestion_starts_full_assessment_and_applies_priority_guard() -> None:
@@ -511,11 +784,21 @@ async def test_release_deferred_runs_restores_only_due_schedules(session) -> Non
     await session.refresh(due)
     await session.refresh(future)
     await session.refresh(run)
+    release_audit = await session.scalar(
+        select(OperationsAuditLog).where(
+            OperationsAuditLog.action
+            == "operations.priority.schedule_released",
+            OperationsAuditLog.resource_id == str(due.id),
+        )
+    )
     assert released == 1
     assert due.state == "scheduled"
     assert future.state == "deferred"
     assert run.operation_state == "paused"
     assert run.resume_required is True
+    assert release_audit is not None
+    assert release_audit.before_state["state"] == "deferred"
+    assert release_audit.after_state["state"] == "scheduled"
 
 
 async def test_active_real_event_prevents_release(session) -> None:
@@ -759,6 +1042,75 @@ async def test_frozen_event_blocks_new_task_mutations_and_router_maps_409(
     assert response.json()["detail"] == "operations_work_blocked"
 
 
+async def test_frozen_event_blocks_start_complete_update_and_temporary_tasks(
+    session,
+) -> None:
+    event, revision = await _seed_event(session, event_type="test")
+    await _seed_run(session, event, operation_state="canceled")
+    admin = await _seed_superadmin(session)
+    service = CollaborationTaskService()
+    start_task = await _seed_task(
+        session,
+        event=event,
+        revision=revision,
+        status="pending",
+    )
+    complete_task = await _seed_task(
+        session,
+        event=event,
+        revision=revision,
+        status="pending_review",
+    )
+    update_task = await _seed_task(
+        session,
+        event=event,
+        revision=revision,
+        status="pending",
+    )
+
+    with pytest.raises(OperationsWorkBlocked):
+        await service.start(
+            session,
+            start_task.id,
+            admin,
+            start_task.row_version,
+        )
+    with pytest.raises(OperationsWorkBlocked):
+        await service.complete(
+            session,
+            complete_task.id,
+            admin,
+            complete_task.row_version,
+        )
+    with pytest.raises(OperationsWorkBlocked):
+        await service.update(
+            session,
+            update_task.id,
+            admin,
+            update_task.row_version,
+            title="blocked update",
+        )
+    with pytest.raises(OperationsWorkBlocked):
+        await TemporaryTaskService().create(
+            session,
+            event_id=event.id,
+            workgroup_code="comprehensive_coordination",
+            title="blocked temporary task",
+            instruction="must not be created",
+            priority=10,
+            due_at=OBSERVED_AT + timedelta(hours=1),
+            actor=admin,
+        )
+    with pytest.raises(OperationsWorkBlocked):
+        await TemporaryTaskService().update(
+            session,
+            update_task.id,
+            admin,
+            update_task.row_version,
+            title="blocked temporary update",
+        )
+
+
 async def test_frozen_event_blocks_upload_and_publish(session) -> None:
     event, revision = await _seed_event(session, event_type="drill")
     await _seed_run(session, event, operation_state="paused")
@@ -847,7 +1199,7 @@ async def test_idempotent_replay_remains_available_when_event_is_frozen(session)
     assert replayed.status == "pending_review"
 
 
-@pytest.mark.parametrize("run_state", ["paused", "canceled"])
+@pytest.mark.parametrize("run_state", ["paused", "canceled", "failed"])
 async def test_frozen_event_tasks_do_not_generate_deadline_notifications(
     session,
     run_state: str,

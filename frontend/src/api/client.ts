@@ -423,6 +423,17 @@ export async function triggerOperationsDrill(
   );
 }
 
+export async function resumeOperationsDrill(
+  runId: string,
+): Promise<OperationsTriggerResult> {
+  return requestJson<OperationsTriggerResult>(
+    `/api/v1/operations/runs/${encodeURIComponent(runId)}/resume`,
+    {
+      method: "POST",
+    },
+  );
+}
+
 export async function createManualEvent(
   input: ManualEventInput,
 ): Promise<EventIngestResponse> {

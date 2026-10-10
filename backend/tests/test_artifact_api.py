@@ -17,7 +17,9 @@ from app.auth.router import get_current_user
 from app.auth.service import AuthUser
 from app.config import settings
 from app.db import engine
+from app.events.models import EarthquakeEvent, EarthquakeRevision
 from app.main import app
+from app.operations.models import OperationsRun
 
 
 class RecordingArtifactWorkflowStarter:
@@ -35,6 +37,16 @@ def _jpeg_bytes(color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
     image = Image.new("RGB", (4761, 3369), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((80, 80, 1200, 1200), fill=color)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=35, dpi=(300, 300))
+    return output.getvalue()
+
+
+def _marked_test_jpeg_bytes() -> bytes:
+    image = Image.new("RGB", (4761, 3369), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 80, 1200, 1200), fill=(0, 0, 255))
+    image.info["comment"] = "【测试】"
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=35, dpi=(300, 300))
     return output.getvalue()
@@ -440,3 +452,57 @@ async def test_override_conflict_returns_409(
     )
 
     assert response.status_code == 409
+
+
+async def test_override_rejects_frozen_test_run_at_api(
+    artifact_client,
+    seeded_artifact_assessment,
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            event = await session.get(
+                EarthquakeEvent,
+                seeded_artifact_assessment.event.id,
+            )
+            revision = await session.get(
+                EarthquakeRevision,
+                seeded_artifact_assessment.revision.id,
+            )
+            assert event is not None and revision is not None
+            event.event_type = "test"
+            revision.revision_kind = "test"
+            session.add(
+                OperationsRun(
+                    event_id=event.id,
+                    trigger_mode="manual_test",
+                    operation_state="paused",
+                    priority=100,
+                    idempotency_key="artifact-api-paused",
+                    triggered_by="test",
+                    resume_required=True,
+                    detail={},
+                )
+            )
+
+    response = await artifact_client.post(
+        f"/api/v1/events/{seeded_artifact_assessment.event.id}"
+        "/artifacts/map.epicenter/override?output_profile=a3v-professional",
+        files={
+            "file": (
+                "正式专报.jpg",
+                _marked_test_jpeg_bytes(),
+                "image/jpeg",
+            )
+        },
+        data={
+            "revision_id": str(seeded_artifact_assessment.revision.id),
+            "reason": "frozen override",
+        },
+        headers={
+            "Idempotency-Key": "10000000-0000-0000-0000-000000000105"
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "operations_work_blocked"

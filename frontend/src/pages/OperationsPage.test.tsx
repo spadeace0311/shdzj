@@ -5,6 +5,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 import {
   getOperationsOverview,
   getOperationsSettings,
+  resumeOperationsDrill,
   triggerOperationsDrill,
   triggerOperationsTest,
   updateOperationsSettings,
@@ -22,6 +23,7 @@ vi.mock("../api/client", () => ({
   updateOperationsSettings: vi.fn(),
   triggerOperationsTest: vi.fn(),
   triggerOperationsDrill: vi.fn(),
+  resumeOperationsDrill: vi.fn(),
 }));
 
 const getOverviewMock = vi.mocked(getOperationsOverview);
@@ -29,6 +31,7 @@ const getSettingsMock = vi.mocked(getOperationsSettings);
 const updateSettingsMock = vi.mocked(updateOperationsSettings);
 const triggerTestMock = vi.mocked(triggerOperationsTest);
 const triggerDrillMock = vi.mocked(triggerOperationsDrill);
+const resumeDrillMock = vi.mocked(resumeOperationsDrill);
 
 const settings: OperationsSettings = {
   row_version: 4,
@@ -122,6 +125,7 @@ const triggerResult = (mode: OperationsTriggerResult["trigger_mode"]) =>
     idempotency_key: "uuid-key",
     event_kind: mode === "drill" ? "drill" : "test",
     triggered_assessment: true,
+    resumed_from_run_id: null,
   }) satisfies OperationsTriggerResult;
 
 function renderPage(userRole = "superadmin") {
@@ -138,6 +142,7 @@ beforeEach(() => {
   updateSettingsMock.mockReset();
   triggerTestMock.mockReset();
   triggerDrillMock.mockReset();
+  resumeDrillMock.mockReset();
   getOverviewMock.mockResolvedValue(overview);
   getSettingsMock.mockResolvedValue(settings);
   updateSettingsMock.mockImplementation(async (input) => ({
@@ -170,6 +175,33 @@ test("shows a random Shanghai 5.0-5.9 test scenario and calls the operations API
   expect(triggerTestMock.mock.calls[0][0]).toMatch(
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   );
+});
+
+test("superadmin can resume a paused drill run from the run table", async () => {
+  getOverviewMock.mockResolvedValue({
+    ...overview,
+    recent_runs: [
+      {
+        ...overview.recent_runs[0],
+        id: "paused-drill",
+        trigger_mode: "drill",
+        operation_state: "paused",
+        resume_required: true,
+      },
+    ],
+  });
+  resumeDrillMock.mockResolvedValue({
+    ...triggerResult("drill"),
+    resumed_from_run_id: "paused-drill",
+  });
+  renderPage();
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: "恢复演练" }),
+  );
+
+  expect(await screen.findByText(/演练恢复已触发/)).toBeInTheDocument();
+  expect(resumeDrillMock).toHaveBeenCalledWith("paused-drill");
 });
 
 test("reuses the same idempotency key when the same request is retried", async () => {

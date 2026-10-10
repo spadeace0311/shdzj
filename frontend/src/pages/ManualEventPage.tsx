@@ -155,16 +155,6 @@ export function ManualEventPage() {
               required
             />
 
-            <label htmlFor="event_kind">事件类型</label>
-            <select
-              id="event_kind"
-              value={form.event_kind}
-              onChange={(event) => updateField("event_kind", event.target.value)}
-            >
-              <option value="manual">人工事件</option>
-              <option value="test">测试</option>
-              <option value="drill">演练</option>
-            </select>
           </div>
         </fieldset>
 

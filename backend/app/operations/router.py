@@ -40,6 +40,11 @@ async def get_overview(
         return await service.get_overview(datetime.now(UTC))
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
+    except OperationsConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc) or "operations_configuration_unavailable",
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise _validation_error(str(exc)) from exc
 
@@ -53,6 +58,11 @@ async def get_settings(
         return await service.get_settings()
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
+    except OperationsConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc) or "operations_configuration_unavailable",
+        ) from exc
 
 
 @router.put("/settings", response_model=OperationsSettingsRecord)
@@ -76,6 +86,13 @@ async def update_settings(
         ) from exc
     except (TypeError, ValueError) as exc:
         raise _validation_error(str(exc)) from exc
+    except OperationsConfigurationError as exc:
+        detail = (
+            "invalid_operations_timezone"
+            if str(exc) == "invalid_operations_timezone"
+            else "operations_configuration_unavailable"
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except SQLAlchemyError as exc:
         raise _storage_unavailable() from exc
 
@@ -150,6 +167,22 @@ async def list_runs(
         raise _validation_error(str(exc)) from exc
 
 
+@router.post(
+    "/runs/{run_id}/resume",
+    response_model=OperationsTriggerResult,
+    status_code=201,
+)
+async def resume_drill_run(
+    run_id: str,
+    service: OperationsService = Depends(get_operations_service),
+    current_user: AuthUser = Depends(require_role("superadmin")),
+) -> OperationsTriggerResult:
+    try:
+        return await service.resume_drill(run_id, current_user)
+    except Exception as exc:
+        raise _map_trigger_error(exc) from exc
+
+
 def _with_manual_request(
     request: ManualTestTriggerRequest | None,
     idempotency_key: str | None,
@@ -182,9 +215,14 @@ def _map_trigger_error(exc: Exception) -> HTTPException:
             detail="operations_work_blocked",
         )
     if isinstance(exc, OperationsConfigurationError):
+        detail = (
+            "invalid_operations_timezone"
+            if str(exc) == "invalid_operations_timezone"
+            else "operations_configuration_unavailable"
+        )
         return HTTPException(
             status_code=503,
-            detail="operations_configuration_unavailable",
+            detail=detail,
         )
     if isinstance(exc, LookupError):
         return HTTPException(status_code=404, detail=str(exc))

@@ -145,6 +145,7 @@ class EventService:
                     if result.event_kind in {
                         EventKind.FORMAL,
                         EventKind.MANUAL,
+                        EventKind.CORRECTION,
                     }:
                         await self._priority_guard.apply_real_event_start(
                             session,
@@ -297,6 +298,7 @@ class EventService:
                     if result.event_kind in {
                         EventKind.FORMAL,
                         EventKind.MANUAL,
+                        EventKind.CORRECTION,
                     }:
                         await self._priority_guard.apply_real_event_start(
                             session,

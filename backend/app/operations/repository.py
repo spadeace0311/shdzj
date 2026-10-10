@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -14,6 +15,7 @@ from app.operations.models import (
     OperationsSettings,
     OperationsTestSchedule,
 )
+from app.operations.scenario import OperationsConfigurationError
 
 
 class StaleOperationsSettings(Exception):
@@ -57,6 +59,7 @@ class OperationsRepository:
     ) -> OperationsSettings:
         settings = await session.scalar(_settings_select(for_update=for_update))
         if settings is not None:
+            _validate_timezone(settings.timezone)
             return settings
 
         await session.execute(
@@ -69,6 +72,7 @@ class OperationsRepository:
         settings = await session.scalar(_settings_select(for_update=for_update))
         if settings is None:
             raise RuntimeError("operations settings could not be initialized")
+        _validate_timezone(settings.timezone)
         return settings
 
     async def update_settings(
@@ -138,7 +142,7 @@ class OperationsRepository:
             timezone = patch["timezone"]
             if not isinstance(timezone, str) or not timezone.strip():
                 raise ValueError("timezone must be a non-empty string")
-            normalized["timezone"] = timezone
+            normalized["timezone"] = _validated_timezone(timezone)
 
         start = patch.get("daily_window_start", settings.daily_window_start)
         end = patch.get("daily_window_end", settings.daily_window_end)
@@ -309,3 +313,20 @@ def _settings_state(settings: OperationsSettings) -> dict:
         "drill_conflict_policy": settings.drill_conflict_policy,
         "row_version": int(settings.row_version),
     }
+
+
+def _validated_timezone(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("invalid_timezone") from exc
+    return value.strip()
+
+
+def _validate_timezone(value: str) -> None:
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise OperationsConfigurationError(
+            "invalid_operations_timezone"
+        ) from exc

@@ -95,6 +95,7 @@ async def test_generated_test_scenario_is_shanghai_5_to_6(session) -> None:
     assert Decimal("5.0") <= event.magnitude <= Decimal("5.9")
     assert Decimal("5.00") <= event.depth_km <= Decimal("20.00")
     assert scenario.place == "上海市（系统测试）"
+    assert scenario.boundary_version == "operations-test-boundary-v1"
     assert await generator.region_contains(session, scenario) is True
 
 
@@ -189,3 +190,78 @@ async def test_region_contains_rejects_outside_point(session) -> None:
     )
 
     assert await ScenarioGenerator().region_contains(session, scenario) is False
+
+
+async def test_generate_test_rejects_invalid_or_degenerate_boundary(session) -> None:
+    await _reset_domain_tables(session)
+    settings_record = await _settings(session)
+    session.add(
+        RegionBoundary(
+            version="invalid-active-boundary",
+            name="invalid boundary",
+            local_buffer_km=Decimal("50"),
+            geom=WKTElement(
+                "MULTIPOLYGON (((121.0 30.8, 122.2 31.8, 121.0 31.8, "
+                "122.2 30.8, 121.0 30.8)))",
+                srid=4326,
+            ),
+            maritime_geom=WKTElement(
+                "MULTIPOLYGON EMPTY",
+                srid=4326,
+            ),
+            source_uri="test://operations-invalid-boundary",
+            checksum="b" * 64,
+            is_active=True,
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(
+        OperationsConfigurationError,
+        match="invalid_active_shanghai_boundary",
+    ):
+        await ScenarioGenerator().generate_test(
+            session,
+            settings_record,
+            observed_at=datetime(2026, 10, 10, 2, tzinfo=UTC),
+            seed=99,
+        )
+
+
+async def test_region_contains_keeps_scenario_boundary_version(session) -> None:
+    await _reset_domain_tables(session)
+    first = await _active_boundary(session)
+    settings_record = await _settings(session)
+    generator = ScenarioGenerator()
+    scenario = await generator.generate_test(
+        session,
+        settings_record,
+        observed_at=datetime(2026, 10, 10, 2, tzinfo=UTC),
+        seed=5,
+    )
+
+    first.is_active = False
+    session.add(
+        RegionBoundary(
+            version="operations-test-boundary-v2",
+            name="new boundary",
+            local_buffer_km=Decimal("50"),
+            geom=WKTElement(
+                "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+                "119.0 30.0, 119.0 29.0)))",
+                srid=4326,
+            ),
+            maritime_geom=WKTElement(
+                "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+                "119.0 30.0, 119.0 29.0)))",
+                srid=4326,
+            ),
+            source_uri="test://operations-boundary-v2",
+            checksum="c" * 64,
+            is_active=True,
+        )
+    )
+    await session.flush()
+
+    assert scenario.boundary_version == first.version
+    assert await generator.region_contains(session, scenario) is True

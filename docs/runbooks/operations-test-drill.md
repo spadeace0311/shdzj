@@ -164,11 +164,13 @@ LIMIT 1;
 
 真实正式报通过 `ingest_collected()` 入库，手工正式事件通过 `ingest()` 入库；两条路径都会在同一事务内调用优先级守卫。守卫只处理 `test`/`drill`，不修改正式或人工事件。
 
-保护窗口为滚动 7 天：同时满足以下条件的当前 `formal|manual` 事件被视为活动真实事件：
+保护窗口为滚动 7 天：同时满足以下条件的当前 `formal|manual|correction` 事件被视为活动真实事件：
 
 - `current_revision_id IS NOT NULL`。
-- `origin_time >= observed_at - 7 days`。
-- `origin_time <= observed_at`。
+- `real_event_activated_at`（旧数据可安全回退到当前修订的 `ingested_at` 或事件 `created_at`）在最近 7 天内。
+- 激活时间不晚于 `observed_at`。
+
+激活时间由当前修订首次入库时间写入，不使用调用者可控的 `origin_time`。正式报延迟入库、手工正式事件延迟补录，以及后续 correction 都不会把七日前的地震时间误当成新激活时间。
 
 冲突结果：
 
@@ -185,7 +187,9 @@ LIMIT 1;
 - `pause`：尚未创建运行的新演练触发请求返回 `operation_state=deferred`，不生成 `operations_runs` 行；已经存在且处于 `queued|running` 的演练运行改为 `paused`，`resume_required=true`。成果生产层仍按真实事件优先安全边界终止非正式生产，不尝试在 Temporal 中不可靠地中途挂起。
 - `terminate`：新演练触发请求返回 `operation_state=canceled`；已经存在的演练运行改为 `canceled`，`resume_required` 不自动置位。
 
-暂停或取消的测试/演练会被 `OperationsWorkBlocked` 冻结：协同成果提交、退回、取消、上传和发布返回 `409 operations_work_blocked`，截止提醒也不会再新建。真实事件窗口结束只恢复到期每日测试计划，不自动重启已经进入安全暂停边界的演练。
+暂停、取消或失败的测试/演练会被 `OperationsWorkBlocked` 冻结：任务接收、提交、退回、取消、更新、临时任务创建/更新、成果上传、发布和 superadmin 覆盖均返回 `409 operations_work_blocked`，截止提醒也不会再新建。真实事件窗口结束只恢复到期每日测试计划，不自动重启已经进入安全暂停边界的演练。
+
+superadmin 可通过 `/operations` 的“恢复演练”按钮或 `POST /api/v1/operations/runs/{run_id}/resume` 恢复暂停演练。恢复不会假装取消过的 Temporal 工作流继续运行，而是创建一个新的、权限受控且审计完整的演练运行；原暂停运行保留为历史。
 
 查询被暂停或取消的演练：
 
@@ -206,13 +210,13 @@ ORDER BY r.created_at DESC;
 
 ### 8.1 边界
 
-协作事件保留由 `operations-worker` 调用 `CollaborationRetentionService.purge_due()`：
+协作事件和成果保留由 `operations-worker` 按同一事件时钟统一编排：
 
 - 测试事件保留 400 天。
-- 演练事件保留 2 个自然年。
+- 演练事件保留 730 天。
 - 正式和人工事件长期保留。
 
-事件成果文件保留由 `artifact-worker` 的 `ArtifactRetentionService` 处理，测试文件 400 天、演练文件 2 年；正式和人工成果不删除。两者是不同进程的独立保留周期。
+worker 先删除到期生成成果并登记对象清理 intent，再删除到期事件及其协作手工文件 intent，最后在同一循环中消费可重入的存储清理 receipt。活动 `ProductionRun` 或 `ProductionTask` 会阻止事件删除，避免 Temporal 继续运行时数据库已级联删除。
 
 未到期数据不会被删除。E2E 会读取测试事件 `origin_time` 并与 400 天边界比较，确认未到期事件仍可通过真实 API 查询。
 
@@ -271,19 +275,19 @@ WHERE event_type NOT IN ('test', 'drill')
 Compose 服务健康检查执行：
 
 ```text
-python -m app.process_health operations
+python -m app.operations.health_check --file /tmp/operations-worker-health.json
 ```
 
-该命令只检查当前容器中是否存在命令行包含 `app.operations.worker` 的进程，返回 `0` 表示进程存在，`1` 表示进程不存在。它不读取 `app.operations.health.OperationsHealthState` 中的 `last_heartbeat_at`，因此进程存活但循环卡死时仍可能被 Compose 判定为健康。
+该命令读取 worker 成功完成一轮循环后原子写入的 `last_heartbeat_at`。最近 30 秒内没有成功心跳就返回 unhealthy；因此进程存活但循环持续失败时 Compose 会触发重试，而不是只看进程是否存在。健康检查配置为 `interval=30s`、`timeout=5s`、`retries=3`、`start_period=60s`。
 
-`OperationsHealthState` 心跳目前只由 worker 进程内部维护，`health_app` 未作为 Compose healthcheck 暴露。要发现“进程存在但循环卡死”，应检查最近成功循环日志：
+继续检查最近成功循环日志：
 
 ```powershell
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations logs --tail=100 operations-worker |
   Select-String 'operations worker cycle counts='
 ```
 
-如果最近一次 `operations worker cycle counts=` 时间超过 `OPERATIONS_WORKER_POLL_SECONDS` 与陈旧窗口之和，应把循环卡死与进程存活分开诊断，不要仅凭 `process_health operations` 返回成功就认为调度和保留循环正常。
+如果最近一次 `operations worker cycle counts=` 时间超过 `OPERATIONS_WORKER_POLL_SECONDS` 与 30 秒陈旧窗口之和，应把循环卡死与进程存活分开诊断，不要仅凭进程存在就认为调度和保留循环正常。
 
 查看服务状态：
 
@@ -311,7 +315,7 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 
 ### 9.4 运行对账
 
-当前 `operations-worker` 不会把评估或成果终态回写到 `operations_runs`。`operations_runs.operation_state` 记录触发侧状态；真实评估和成果状态由既有 API 提供。对账应使用只读 SQL 对照两边：
+`operations-worker` 每个循环会读取当前修订的 `AssessmentRun`、`ProductionRun` 和 `ProductionTask` 终态，把仍处于 `queued|running` 的测试/演练回写为 `completed` 或 `failed`。对账只处理当前修订，不把评估尚未开始的空状态误判为完成。上述 SQL 仍可用于人工核验：
 
 ```sql
 SELECT r.id AS operations_run_id,
@@ -331,7 +335,7 @@ ORDER BY r.created_at DESC
 LIMIT 50;
 ```
 
-不要把 `operations_runs.operation_state=queued` 当作评估失败；先确认 `assessment_runs`、`artifact_production_runs` 和对应 worker 状态。
+不要把 `operations_runs.operation_state=queued` 当作评估失败；先确认 `assessment_runs`、`artifact_production_runs` 和对应 worker 状态。状态变更会写 `operations_audit_logs` 的 `operations.run.completed` 或 `operations.run.failed` 行。
 
 ## 10. 从数据库核验计划、运行和审计
 
@@ -424,6 +428,7 @@ E2E 使用真实登录、真实数据库和真实 API，不使用 mock。需要�
 - `E2E_ALLOW_EVENT_PURGE=1`（必填）：仅允许在专用一次性 `codex-operations` 验收环境运行。测试会创建手工正式事件并在 `finally` 中调用超级管理员 `DELETE /api/v1/admin/events/{event_id}/purge` 清理；未设置该变量时测试直接 skip，避免正式/人工长期保留数据被污染。
 - `E2E_BASE_URL`（可选，默认 `http://localhost:5173`）。
 - `E2E_API_BASE_URL`（可选，设为绝对 API 地址后只有 Playwright 控制请求直连该地址，页面仍走 Vite `/api` 代理）。
+- `E2E_API_HEALTH_URL`（可选，真实 API 健康检查地址；未设置时优先使用 `E2E_API_BASE_URL`，再回退到 `http://127.0.0.1:8000`）。
 
 ```powershell
 cd frontend
@@ -432,6 +437,7 @@ $env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
 $env:E2E_ALLOW_EVENT_PURGE = "1"
 $env:E2E_BASE_URL = "http://127.0.0.1:5173"
 $env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
+$env:E2E_API_HEALTH_URL = "http://127.0.0.1:8000"
 npm run test:e2e -- operations.spec.ts
 ```
 

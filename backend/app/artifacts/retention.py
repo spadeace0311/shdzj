@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,8 @@ from app.event_object_locks import (
     lock_event_write,
     storage_path_reference_count,
 )
+from app.events.models import EarthquakeEvent
+from app.operations.retention_clock import retention_cutoff
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +44,8 @@ class ArtifactRetentionService:
     ) -> ArtifactRetentionResult:
         observed_at = _as_utc(observed_at)
         thresholds = (
-            ("test", observed_at - timedelta(days=400)),
-            ("drill", observed_at - timedelta(days=730)),
+            ("test", retention_cutoff("test", observed_at)),
+            ("drill", retention_cutoff("drill", observed_at)),
         )
         expired: list[GeneratedArtifact] = []
         for production_mode, cutoff in thresholds:
@@ -54,9 +56,13 @@ class ArtifactRetentionService:
                         ProductionRun,
                         ProductionRun.id == GeneratedArtifact.production_run_id,
                     )
+                    .join(
+                        EarthquakeEvent,
+                        EarthquakeEvent.id == ProductionRun.event_id,
+                    )
                     .where(
                         ProductionRun.production_mode == production_mode,
-                        GeneratedArtifact.generated_at < cutoff,
+                        EarthquakeEvent.origin_time <= cutoff,
                     )
                     .order_by(GeneratedArtifact.id)
                 )

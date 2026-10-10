@@ -1045,7 +1045,10 @@ async def _run_retention_loop(
                 artifact_store,
                 lease_owner=cleanup_owner,
             )
-            if configured.artifact_retention_enabled:
+            if (
+                configured.artifact_retention_enabled
+                and not getattr(configured, "operations_worker_enabled", False)
+            ):
                 observed_at = datetime.now(UTC)
                 async with session_factory() as session:
                     async with session.begin():

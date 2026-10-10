@@ -16,9 +16,9 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).parents[1]
 MIGRATIONS_DIR = Path(__file__).parents[1] / "migrations" / "versions"
 ALEMBIC_VERSION_LENGTH = 32
-LATEST_REVISION = "0026_operations_automation"
+LATEST_REVISION = "0027_operations_safety_hardening"
 PREVIOUS_REVISION = "0022_cleanup_namespace"
-PREVIOUS_OPERATIONS_REVISION = "0025_qa_audit_provenance"
+PREVIOUS_OPERATIONS_REVISION = "0026_operations_automation"
 CLEANUP_INTENT_REVISION = "0021_cleanup_intents"
 INTENSITY_PREVIOUS_REVISION = "0010_assessment_orchestration"
 DATA_ASSET_PREVIOUS_REVISION = "0011_intensity_assessment"
@@ -1283,6 +1283,54 @@ async def test_0010_assessment_orchestration_is_reversible() -> None:
         _set_revision(LATEST_REVISION)
         assert await _assessment_orchestration_tables_exist() is True
     finally:
+        _set_revision(LATEST_REVISION)
+
+
+async def test_0027_safety_hardening_is_reversible() -> None:
+    engine = create_async_engine(settings.database_url)
+
+    async def columns(table_name: str) -> set[str]:
+        async with engine.begin() as connection:
+            return await connection.run_sync(
+                lambda sync: {
+                    column["name"]
+                    for column in inspect(sync).get_columns(table_name)
+                }
+            )
+
+    try:
+        _set_revision(PREVIOUS_OPERATIONS_REVISION)
+        previous_events = await columns("earthquake_events")
+        previous_versions = await columns("collaboration_deliverable_versions")
+        previous_publications = await columns(
+            "collaboration_deliverable_publications"
+        )
+        assert "real_event_activated_at" not in previous_events
+        assert "operation_marker" not in previous_versions
+        assert "operation_marker" not in previous_publications
+
+        _set_revision(LATEST_REVISION)
+        latest_events = await columns("earthquake_events")
+        latest_versions = await columns("collaboration_deliverable_versions")
+        latest_publications = await columns(
+            "collaboration_deliverable_publications"
+        )
+        assert {
+            "real_event_activated_at",
+            "real_event_closed_at",
+        } <= latest_events
+        assert "operation_marker" in latest_versions
+        assert "operation_marker" in latest_publications
+
+        _set_revision(PREVIOUS_OPERATIONS_REVISION)
+        downgraded_events = await columns("earthquake_events")
+        downgraded_versions = await columns(
+            "collaboration_deliverable_versions"
+        )
+        assert "real_event_activated_at" not in downgraded_events
+        assert "operation_marker" not in downgraded_versions
+    finally:
+        await engine.dispose()
         _set_revision(LATEST_REVISION)
 
 
@@ -2601,7 +2649,7 @@ async def _operations_default_settings_state() -> dict[str, object]:
 
 async def test_0026_operations_automation_is_reversible() -> None:
     _set_revision(PREVIOUS_OPERATIONS_REVISION)
-    assert await _operations_tables_exist() is False
+    assert await _operations_tables_exist() is True
     try:
         _set_revision(LATEST_REVISION)
         state = await _operations_schema_state()
@@ -2835,7 +2883,7 @@ async def test_0026_operations_automation_is_reversible() -> None:
             await engine.dispose()
 
         _set_revision(PREVIOUS_OPERATIONS_REVISION)
-        assert await _operations_tables_exist() is False
+        assert await _operations_tables_exist() is True
 
         _set_revision(LATEST_REVISION)
         assert await _operations_tables_exist() is True

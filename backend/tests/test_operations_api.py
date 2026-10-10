@@ -59,6 +59,19 @@ class FakeOperationsService:
             event_kind="drill",
         )
 
+    async def resume_drill(self, run_id, actor):
+        del actor
+        return OperationsTriggerResult(
+            event_id=UUID("00000000-0000-4000-8000-000000000033"),
+            run_id=UUID("00000000-0000-4000-8000-000000000034"),
+            operation_state="queued",
+            outcome="triggered",
+            trigger_mode="drill",
+            idempotency_key=str(uuid4()),
+            event_kind="drill",
+            resumed_from_run_id=UUID(str(run_id)),
+        )
+
     async def get_overview(self, observed_at):
         del observed_at
         return OperationsOverviewRecord(
@@ -182,6 +195,29 @@ def test_viewer_endpoints_require_authentication() -> None:
     assert runs.status_code == 401
 
 
+def test_drill_resume_requires_superadmin_and_returns_run_link() -> None:
+    with _client(
+        service=FakeOperationsService(),
+        current_user=AuthUser("operator", "group_leader", None),
+    ) as client:
+        forbidden = client.post(
+            "/api/v1/operations/runs/00000000-0000-4000-8000-000000000001/resume"
+        )
+    assert forbidden.status_code == 403
+
+    with _client(
+        service=FakeOperationsService(),
+        current_user=AuthUser("admin", "superadmin", None),
+    ) as client:
+        resumed = client.post(
+            "/api/v1/operations/runs/00000000-0000-4000-8000-000000000001/resume"
+        )
+    assert resumed.status_code == 201
+    assert resumed.json()["resumed_from_run_id"] == (
+        "00000000-0000-4000-8000-000000000001"
+    )
+
+
 @pytest.mark.parametrize("role", ["viewer", "group_member"])
 def test_viewer_can_read_but_cannot_trigger(role: str) -> None:
     service = FakeOperationsService()
@@ -219,6 +255,25 @@ def test_leader_can_trigger_with_idempotency_header() -> None:
     assert response.json()["idempotency_key"] == "api-test-key"
     assert response.json()["operation_state"] == "queued"
     assert service.triggered_keys == ["api-test-key"]
+
+
+def test_settings_reject_unknown_timezone_before_service_call() -> None:
+    service = FakeOperationsService()
+    with _client(
+        service=service,
+        current_user=AuthUser("admin", "superadmin", None),
+    ) as client:
+        response = client.put(
+            "/api/v1/operations/settings",
+            json={
+                "expected_version": 1,
+                "timezone": "Not/AZone",
+            },
+        )
+
+    assert response.status_code == 422
+    assert "invalid_timezone" in response.text
+    assert service.settings_version == 1
 
 
 def test_missing_header_generates_and_returns_stable_key() -> None:

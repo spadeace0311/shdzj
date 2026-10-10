@@ -9,6 +9,7 @@ import { Link } from "react-router-dom";
 import {
   getOperationsOverview,
   getOperationsSettings,
+  resumeOperationsDrill,
   triggerOperationsDrill,
   triggerOperationsTest,
   updateOperationsSettings,
@@ -229,6 +230,7 @@ export function OperationsPage({ userRole }: OperationsPageProps) {
     idempotencyKey: string;
   } | null>(null);
   const [triggerBusy, setTriggerBusy] = useState<TriggerMode | null>(null);
+  const [resumingRunId, setResumingRunId] = useState<string | null>(null);
   const [triggerNotice, setTriggerNotice] = useState<TriggerNotice | null>(null);
 
   const loadData = useCallback(async () => {
@@ -282,6 +284,26 @@ export function OperationsPage({ userRole }: OperationsPageProps) {
     const request = { mode, idempotencyKey: newIdempotencyKey() };
     setPendingTrigger(request);
     void executeTrigger(request);
+  }
+
+  async function resumeDrill(runId: string) {
+    setResumingRunId(runId);
+    setTriggerNotice(null);
+    try {
+      const result = await resumeOperationsDrill(runId);
+      setTriggerNotice({
+        kind: "success",
+        text: triggerFeedbackText("演练恢复", result),
+      });
+      await loadData();
+    } catch {
+      setTriggerNotice({
+        kind: "error",
+        text: "演练恢复失败",
+      });
+    } finally {
+      setResumingRunId(null);
+    }
   }
 
   async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
@@ -477,6 +499,7 @@ export function OperationsPage({ userRole }: OperationsPageProps) {
                       <th scope="col">状态</th>
                       <th scope="col">触发人</th>
                       <th scope="col">开始时间</th>
+                      {userRole === "superadmin" ? <th scope="col">操作</th> : null}
                     </tr>
                   </thead>
                   <tbody>
@@ -495,6 +518,22 @@ export function OperationsPage({ userRole }: OperationsPageProps) {
                         </td>
                         <td>{run.triggered_by}</td>
                         <td>{formatDateTime(run.started_at)}</td>
+                        {userRole === "superadmin" ? (
+                          <td>
+                            {run.trigger_mode === "drill" &&
+                            run.operation_state === "paused" &&
+                            run.resume_required ? (
+                              <button
+                                className="text-button"
+                                type="button"
+                                disabled={resumingRunId !== null}
+                                onClick={() => void resumeDrill(run.id)}
+                              >
+                                {resumingRunId === run.id ? "恢复中" : "恢复演练"}
+                              </button>
+                            ) : null}
+                          </td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>

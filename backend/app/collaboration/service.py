@@ -41,6 +41,12 @@ from app.event_object_cleanup import (
     enqueue_object_cleanup_intent,
 )
 from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.operations.markers import (
+    enforce_marker_file_name,
+    enforce_marker_text,
+    marker_filename_prefix,
+    operation_marker,
+)
 from app.operations.priority import OperationsPriorityGuard
 
 
@@ -113,6 +119,10 @@ class CollaborationTaskService:
         self._ensure_transition(task.status, TaskStatus.IN_PROGRESS)
         if not await self._can_work_task(session, actor_identity, task):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         await self.repository.upsert_contributor(
@@ -258,6 +268,10 @@ class CollaborationTaskService:
         self._ensure_transition(task.status, TaskStatus.COMPLETED)
         if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
         if not await self.repository.required_deliverables_satisfied(session, task.id):
             raise MissingRequiredDeliverableError("task has unsatisfied required deliverables")
 
@@ -353,6 +367,10 @@ class CollaborationTaskService:
             return task
         if not await self._can_confirm(session, task, actor_identity):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         now = datetime.now(UTC)
         changes: dict[str, Any] = {}
@@ -533,6 +551,18 @@ async def _event_id_for_deliverable(
     return event_id
 
 
+async def _operation_marker_for_event(
+    session: AsyncSession,
+    event_id: uuid.UUID,
+) -> str | None:
+    event_type = await session.scalar(
+        select(EarthquakeEvent.event_type).where(EarthquakeEvent.id == event_id)
+    )
+    if event_type is None:
+        raise LookupError("event_not_found")
+    return operation_marker(event_type)
+
+
 def _validate_idempotent_replay(
     previous: CollaborationTaskEvent,
     actor: _Actor,
@@ -702,6 +732,10 @@ class TemporaryTaskService(CollaborationTaskService):
         )
         if event is None:
             raise LookupError("event_not_found")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            event_uuid,
+        )
         existing = await self._existing_creation(
             session,
             effective_key,
@@ -806,6 +840,10 @@ class TemporaryTaskService(CollaborationTaskService):
             actor_identity,
         ):
             raise PermissionError("Insufficient permissions")
+        await self.priority_guard.ensure_event_work_allowed(
+            session,
+            task.event_id,
+        )
 
         if task.status in {
             TaskStatus.COMPLETED.value,
@@ -1109,6 +1147,8 @@ class DeliverableService:
             task.event_id,
         )
 
+        marker = await _operation_marker_for_event(session, task.event_id)
+        file_name = enforce_marker_file_name(file_name, marker)
         stored = await self._store_manual_object(
             session,
             source=source,
@@ -1211,6 +1251,7 @@ class DeliverableService:
         version = await self._build_override_version(
             session,
             deliverable,
+            task,
             actor_identity,
             source=source,
             file_name=file_name,
@@ -1388,6 +1429,7 @@ class DeliverableService:
         if version is None or version.deliverable_id != deliverable.id:
             raise ValueError("version does not belong to deliverable")
         await _validate_version_for_publication(session, version, self.artifact_store)
+        await self._ensure_publication_operation_marker(session, task, version)
         await self.priority_guard.ensure_event_work_allowed(
             session,
             task.event_id,
@@ -1403,6 +1445,47 @@ class DeliverableService:
             idempotency_key=idempotency_key,
             event_type=event_type,
         )
+
+    async def _ensure_publication_operation_marker(
+        self,
+        session: AsyncSession,
+        task: WorkgroupTask,
+        version: TaskDeliverableVersion,
+    ) -> None:
+        marker = await _operation_marker_for_event(session, task.event_id)
+        if marker is None:
+            return
+
+        expected_prefix = marker_filename_prefix(marker)
+        if (
+            version.storage_key is not None
+            and version.file_name
+            and not version.file_name.startswith(expected_prefix)
+        ):
+            old_key = version.storage_key
+            source_path = self.artifact_store.resolve(old_key)
+            with source_path.open("rb") as source:
+                stored = self.artifact_store.store_immutable_stream(
+                    source,
+                    file_name=enforce_marker_file_name(version.file_name, marker),
+                )
+            await lock_artifact_object(session, old_key)
+            await lock_artifact_object(session, stored.relative_path)
+            version.storage_key = stored.relative_path
+            version.file_name = stored.file_name
+            version.checksum = stored.checksum
+            version.size_bytes = stored.size_bytes
+            await enqueue_object_cleanup_intent(
+                session,
+                event_id=task.event_id,
+                source_kind="marker_repair",
+                source_key=str(version.id),
+                storage_path=old_key,
+                storage_namespace=self.artifact_store.storage_namespace,
+            )
+
+        version.operation_marker = marker
+        version.text_result = enforce_marker_text(version.text_result, marker)
 
     async def _create_version(
         self,
@@ -1422,6 +1505,7 @@ class DeliverableService:
         idempotency_key: str | None,
     ) -> TaskDeliverableVersion:
         now = datetime.now(UTC)
+        marker = await _operation_marker_for_event(session, task.event_id)
         version_no = await self.repository.next_deliverable_version_no(session, deliverable.id)
         previous = await self.repository.latest_deliverable_version(
             session, deliverable.id, for_update=True
@@ -1431,11 +1515,16 @@ class DeliverableService:
             version_no=version_no,
             source_kind=source_kind.value,
             storage_key=storage_key,
-            file_name=file_name,
+            file_name=(
+                enforce_marker_file_name(file_name, marker)
+                if file_name is not None
+                else None
+            ),
+            operation_marker=marker,
             checksum=checksum,
             mime_type=mime_type,
             size_bytes=size_bytes,
-            text_result=text_result,
+            text_result=enforce_marker_text(text_result, marker),
             created_by=actor.username,
             basis_text=basis_text,
             supersedes_version_id=previous.id if previous is not None else None,
@@ -1490,6 +1579,7 @@ class DeliverableService:
         publication = TaskDeliverablePublication(
             deliverable_id=deliverable.id,
             version_id=version.id,
+            operation_marker=version.operation_marker,
             published_by=actor.username,
             published_role=published_role,
             published_at=now,
@@ -1527,6 +1617,7 @@ class DeliverableService:
         self,
         session: AsyncSession,
         deliverable: TaskDeliverable,
+        task: WorkgroupTask,
         actor: _Actor,
         *,
         source: BinaryIO | None,
@@ -1535,6 +1626,7 @@ class DeliverableService:
         text_result: dict[str, Any] | None,
         basis_text: str | None,
     ) -> TaskDeliverableVersion:
+        marker = await _operation_marker_for_event(session, task.event_id)
         next_version = await self.repository.next_deliverable_version_no(session, deliverable.id)
         previous = await self.repository.latest_deliverable_version(
             session, deliverable.id, for_update=True
@@ -1542,6 +1634,7 @@ class DeliverableService:
         if source is not None:
             if not file_name:
                 raise ValueError("file_name is required for file overrides")
+            file_name = enforce_marker_file_name(file_name, marker)
             stored = await self._store_manual_object(
                 session,
                 source,
@@ -1553,20 +1646,23 @@ class DeliverableService:
                 source_kind=DeliverableSourceKind.SUPERADMIN_OVERRIDE.value,
                 storage_key=stored.relative_path,
                 file_name=stored.file_name,
+                operation_marker=marker,
                 checksum=stored.checksum,
                 mime_type=mime_type,
                 size_bytes=stored.size_bytes,
-                text_result=text_result,
+                text_result=enforce_marker_text(text_result, marker),
                 created_by=actor.username,
                 basis_text=basis_text,
                 supersedes_version_id=previous.id if previous is not None else None,
             )
         if not isinstance(text_result, dict) or not text_result:
             raise ValueError("text_result is required for text overrides")
+        text_result = enforce_marker_text(text_result, marker)
         return TaskDeliverableVersion(
             deliverable_id=deliverable.id,
             version_no=next_version,
             source_kind=DeliverableSourceKind.SUPERADMIN_OVERRIDE.value,
+            operation_marker=marker,
             text_result=text_result,
             created_by=actor.username,
             basis_text=basis_text,

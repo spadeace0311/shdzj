@@ -19,13 +19,23 @@ class RegionContextResolver:
         self._session_factory = session_factory
         self._repository = repository
 
-    async def resolve(self, longitude: Decimal, latitude: Decimal) -> RegionContext:
+    async def resolve(
+        self,
+        longitude: Decimal,
+        latitude: Decimal,
+        *,
+        boundary_version: str | None = None,
+    ) -> RegionContext:
         self._validate_coordinates(longitude, latitude)
         computed_at = datetime.now(UTC)
 
         try:
             async with self._session_factory() as session:
-                query = self._build_query(longitude, latitude)
+                query = self._build_query(
+                    longitude,
+                    latitude,
+                    boundary_version=boundary_version,
+                )
                 row = (await session.execute(query)).mappings().one_or_none()
                 if row is None:
                     return self._pending(computed_at)
@@ -35,7 +45,12 @@ class RegionContextResolver:
             return self._pending(computed_at)
 
     @staticmethod
-    def _build_query(longitude: Decimal, latitude: Decimal):
+    def _build_query(
+        longitude: Decimal,
+        latitude: Decimal,
+        *,
+        boundary_version: str | None = None,
+    ):
         point = func.ST_SetSRID(func.ST_MakePoint(longitude, latitude), 4326)
         boundary_geography = RegionBoundary.geom.cast(Geography)
         point_geography = point.cast(Geography)
@@ -50,7 +65,7 @@ class RegionContextResolver:
             func.ST_Covers(RegionBoundary.maritime_geom, point),
         )
 
-        return (
+        query = (
             select(
                 RegionBoundary.version,
                 inside_land.label("inside_land"),
@@ -62,6 +77,9 @@ class RegionContextResolver:
             .where(RegionBoundary.is_active.is_(True))
             .limit(1)
         )
+        if boundary_version:
+            query = query.where(RegionBoundary.version == boundary_version)
+        return query
 
     @staticmethod
     def _context_from_row(row, computed_at: datetime) -> RegionContext:

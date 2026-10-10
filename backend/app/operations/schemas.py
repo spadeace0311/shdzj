@@ -4,8 +4,9 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ManualTestTriggerRequest(BaseModel):
@@ -29,6 +30,17 @@ class OperationsSettingsUpdateRequest(BaseModel):
     test_depth_min_km: Decimal | None = Field(default=None, ge=0, le=1000)
     test_depth_max_km: Decimal | None = Field(default=None, ge=0, le=1000)
     drill_conflict_policy: Literal["pause", "terminate"] | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("invalid_timezone") from exc
+        return value.strip()
 
 
 class OperationsSettingsRecord(BaseModel):
@@ -97,6 +109,7 @@ class OperationsTriggerResult(BaseModel):
     idempotency_key: str
     event_kind: str | None = None
     triggered_assessment: bool = False
+    resumed_from_run_id: UUID | None = None
 
 
 class OperationsOverviewRecord(BaseModel):

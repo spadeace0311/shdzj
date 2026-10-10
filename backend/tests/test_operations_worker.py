@@ -7,17 +7,22 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app import process_health
+from app.artifacts.models import ProductionRun, ProductionTask
+from app.artifacts.storage import ArtifactStore
+from app.assessment.models import AssessmentRun
 from app.collaboration.retention import CollaborationRetentionResult
 from app.config import settings
+from app.events.models import EarthquakeEvent, EarthquakeRevision
 from app.operations.health import (
     OperationsHealthState,
     get_operations_health_state,
     health_app,
+    read_health_payload,
     set_operations_health_state,
 )
 from app.operations.models import OperationsTestSchedule
@@ -294,6 +299,100 @@ async def test_real_scheduler_reports_created_only_for_first_cycle() -> None:
     assert second.schedules_created == 0
 
 
+async def test_cycle_uses_integrated_retention_and_cleanup(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            event = await session.get(
+                EarthquakeEvent,
+                seeded_artifact_assessment.event_id,
+            )
+            revision = await session.get(
+                EarthquakeRevision,
+                seeded_artifact_assessment.revision_id,
+            )
+            assert event is not None and revision is not None
+            event.event_type = "test"
+            revision.revision_kind = "test"
+            assessments = (
+                await session.scalars(
+                    select(AssessmentRun).where(
+                        AssessmentRun.event_id
+                        == seeded_artifact_assessment.event_id
+                    )
+                )
+            ).all()
+            for assessment in assessments:
+                assessment.status = "completed"
+            productions = (
+                await session.scalars(
+                    select(ProductionRun).where(
+                        ProductionRun.event_id
+                        == seeded_artifact_assessment.event_id
+                    )
+                )
+            ).all()
+            for production in productions:
+                production.status = "completed"
+            production_tasks = (
+                await session.scalars(
+                    select(ProductionTask).where(
+                        ProductionTask.production_run_id.in_(
+                            select(ProductionRun.id).where(
+                                ProductionRun.event_id
+                                == seeded_artifact_assessment.event_id
+                            )
+                        )
+                    )
+                )
+            ).all()
+            for production_task in production_tasks:
+                production_task.status = "succeeded"
+
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        namespace="operations-integrated-retention",
+    )
+    result = await run_operations_cycle(
+        session_factory=session_factory,
+        observed_at=seeded_artifact_assessment.now,
+        configured=SimpleNamespace(
+            operations_retention_interval_seconds=60,
+            artifact_storage_root=str(tmp_path / "artifacts"),
+            artifact_storage_namespace=store.storage_namespace,
+        ),
+        scheduler=_FakeScheduler(_scheduler_result()),
+        operations_service=OperationsService(
+            session_factory=session_factory,
+            now=lambda: seeded_artifact_assessment.now,
+        ),
+        priority_guard=_FakePriorityGuard(),
+        artifact_store=store,
+        health_state=_FakeHealthState(),
+        last_retention_at=(
+            seeded_artifact_assessment.now - timedelta(seconds=61)
+        ),
+    )
+
+    assert result.artifact_test_deleted == 1
+    assert result.retention_test_deleted == 1
+    assert result.cleanup_failed_count == 0
+    async with session_factory() as session:
+        event = await session.get(
+            EarthquakeEvent,
+            seeded_artifact_assessment.event_id,
+        )
+    assert event is None
+    assert artifact.id is not None
+
+
 async def test_worker_loop_stops_before_cycle_when_event_is_set() -> None:
     stop_event = asyncio.Event()
     stop_event.set()
@@ -364,6 +463,69 @@ def test_health_endpoint_uses_operations_state() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert get_operations_health_state() is not state
+
+
+def test_health_file_tracks_fresh_and_stale_heartbeat(tmp_path: Path) -> None:
+    health_file = tmp_path / "operations-health.json"
+    state = OperationsHealthState(
+        stale_seconds=30,
+        health_file=health_file,
+    )
+    set_operations_health_state(state)
+    state = OperationsHealthState(
+        stale_seconds=30,
+        health_file=health_file,
+    )
+    now = datetime(2026, 10, 11, 2, 30, tzinfo=UTC)
+    state.mark_alive(now)
+
+    status, heartbeat = read_health_payload(
+        health_file,
+        now=now + timedelta(seconds=29),
+    )
+    assert status == "ok"
+    assert datetime.fromisoformat(heartbeat) == now
+
+    status, heartbeat = read_health_payload(
+        health_file,
+        now=now + timedelta(seconds=31),
+    )
+    assert status == "unavailable"
+    assert heartbeat == ""
+
+
+async def test_repeated_cycle_failures_do_not_refresh_health_file(
+    tmp_path: Path,
+) -> None:
+    health_file = tmp_path / "operations-health.json"
+    failures = 0
+    stop_event = asyncio.Event()
+
+    async def failing_cycle(**kwargs: object) -> OperationsWorkerCycleResult:
+        del kwargs
+        nonlocal failures
+        failures += 1
+        raise RuntimeError("repeated cycle failure")
+
+    async def stop_after_three(_seconds: float) -> None:
+        if failures >= 3:
+            stop_event.set()
+
+    await run_operations_worker(
+        stop_event,
+        session_factory=_FakeSessionFactory(),
+        configured=SimpleNamespace(
+            operations_worker_enabled=True,
+            operations_worker_poll_seconds=0.01,
+        ),
+        sleep=stop_after_three,
+        worker_cycle=failing_cycle,
+    )
+
+    status, heartbeat = read_health_payload(health_file)
+    assert status == "unavailable"
+    assert heartbeat == ""
+    set_operations_health_state(OperationsHealthState(stale_seconds=30))
 
 
 def _write_cmdline(path: Path, *parts: str) -> None:

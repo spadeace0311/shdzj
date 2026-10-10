@@ -64,6 +64,14 @@ class EarthquakeEvent(Base):
     response_suggestion: Mapped[dict | None] = mapped_column(JSONB)
     response_rule_version: Mapped[str | None] = mapped_column(String(32))
     current_revision_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    real_event_activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    real_event_closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
     t1_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     lifecycle_state: Mapped[str] = mapped_column(
         String(32),

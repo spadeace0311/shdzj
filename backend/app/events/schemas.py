@@ -24,7 +24,7 @@ class ManualEventRequest(BaseModel):
     source: str = Field(min_length=1, max_length=32)
     source_event_id: str | None = Field(default=None, max_length=128)
     place: str = Field(default="", max_length=256)
-    event_kind: str = Field(default="manual", pattern="^(manual|test|drill)$")
+    event_kind: str = Field(default="manual", pattern="^manual$")
 
     @field_validator("source")
     @classmethod

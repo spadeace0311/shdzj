@@ -574,6 +574,7 @@ export interface OperationsTriggerResult {
   idempotency_key: string;
   event_kind: string | null;
   triggered_assessment: boolean;
+  resumed_from_run_id: string | null;
 }
 
 export type ArtifactGroup = "map" | "background" | "core";
@@ -604,6 +605,7 @@ export interface ArtifactSummary {
   needs_review: boolean;
   production_mode: string;
   publication_mode: ArtifactPublicationMode;
+  marker: string | null;
   file_name: string;
   format: string;
   size_bytes: number;
@@ -664,6 +666,8 @@ export interface ArtifactOverrideResponse {
   checksum: string;
   size_bytes: number;
   generated_at: string;
+  production_mode: string | null;
+  marker: string | null;
   superseded_artifact_id: string | null;
 }
 

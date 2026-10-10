@@ -17,6 +17,7 @@ class ArtifactSummaryResponse(BaseModel):
     needs_review: bool
     production_mode: str
     publication_mode: str
+    marker: str | None
     file_name: str
     format: str
     size_bytes: int

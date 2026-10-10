@@ -40,6 +40,15 @@ from app.event_object_locks import (
     storage_path_reference_count,
 )
 from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.operations.markers import (
+    enforce_marker_file_name,
+    marker_filename_prefix,
+    production_mode_marker,
+)
+from app.operations.priority import (
+    OperationsPriorityGuard,
+    RealEventPriorityActive,
+)
 
 
 class IdempotencyConflictError(ValueError):
@@ -74,6 +83,8 @@ class ArtifactOverrideResponse:
     checksum: str
     size_bytes: int
     generated_at: datetime
+    production_mode: str | None = None
+    marker: str | None = None
     superseded_artifact_id: uuid.UUID | None = None
 
     def to_body(self) -> dict[str, Any]:
@@ -88,6 +99,8 @@ class ArtifactOverrideResponse:
             "checksum": self.checksum,
             "size_bytes": self.size_bytes,
             "generated_at": self.generated_at.isoformat(),
+            "production_mode": self.production_mode,
+            "marker": self.marker,
             "superseded_artifact_id": (
                 str(self.superseded_artifact_id)
                 if self.superseded_artifact_id is not None
@@ -112,6 +125,16 @@ class ArtifactOverrideResponse:
                 datetime.fromisoformat(str(generated_at))
                 if generated_at is not None
                 else datetime.now(UTC)
+            ),
+            production_mode=(
+                str(body["production_mode"])
+                if body.get("production_mode") is not None
+                else None
+            ),
+            marker=(
+                str(body["marker"])
+                if body.get("marker") is not None
+                else None
             ),
             superseded_artifact_id=(
                 uuid.UUID(str(body["superseded_artifact_id"]))
@@ -439,6 +462,7 @@ class ArtifactOverrideService:
         poll_interval: float = 0.05,
         after_stage_before_store_hook: (Callable[[], Awaitable[None]] | None) = None,
         before_cleanup_reference_check_hook: (Callable[[], Awaitable[None]] | None) = None,
+        priority_guard: OperationsPriorityGuard | None = None,
     ) -> None:
         self._session_factory = session_factory
         if catalog is None and repository is not None:
@@ -469,6 +493,7 @@ class ArtifactOverrideService:
         self._poll_interval = poll_interval
         self._after_stage_before_store_hook = after_stage_before_store_hook
         self._before_cleanup_reference_check_hook = before_cleanup_reference_check_hook
+        self._priority_guard = priority_guard or OperationsPriorityGuard()
 
     @staticmethod
     def endpoint_for(
@@ -513,7 +538,8 @@ class ArtifactOverrideService:
             output_profile=output_profile,
         )
         definition = context["definition"]
-        file_name = _upload_file_name(upload, definition)
+        production_mode = str(context["production_mode"])
+        file_name = _upload_file_name(upload, definition, production_mode)
         staged: Path | None = None
         stored: StoredArtifactFile | None = None
         claim: ArtifactOverrideRequest | None = None
@@ -931,6 +957,15 @@ class ArtifactOverrideService:
         )
         if event is None or event.current_revision_id != revision_id:
             raise IdempotencyConflictError("override revision is no longer current")
+        await self._priority_guard.ensure_event_work_allowed(session, event_id)
+        if (
+            event.event_type in {"test", "drill"}
+            and await self._priority_guard.has_active_real_event(
+                session,
+                datetime.now(UTC),
+            )
+        ):
+            raise RealEventPriorityActive()
         if assessment_run_id is not None:
             assessment = await session.get(
                 AssessmentRun,
@@ -955,6 +990,14 @@ class ArtifactOverrideService:
             page_count=validation.page_count,
             generated_at=now,
             publication_mode="superadmin_override",
+            marker={
+                "marker": marker_filename_prefix(
+                    production_mode_marker(production_mode)
+                ),
+                "operation_marker": production_mode_marker(production_mode),
+            }
+            if production_mode in {"test", "drill"}
+            else None,
             render_manifest={
                 "override": {
                     "actor_id": actor_id,
@@ -1025,6 +1068,8 @@ class ArtifactOverrideService:
             checksum=artifact.checksum,
             size_bytes=artifact.size_bytes,
             generated_at=artifact.generated_at,
+            production_mode=production_mode,
+            marker=production_mode_marker(production_mode),
         )
         request_row = await session.scalar(
             select(ArtifactOverrideRequest)
@@ -1078,13 +1123,19 @@ def _optional_uuid(
 def _upload_file_name(
     upload: BinaryIO,
     definition: ArtifactDefinition,
+    production_mode: str,
 ) -> str:
     raw_name = getattr(upload, "name", None)
     if raw_name:
-        candidate = Path(str(raw_name)).name
-        if candidate not in {"", ".", ".."}:
-            return candidate
-    return f"{definition.artifact_key}.{definition.format}"
+        return enforce_marker_file_name(
+            str(raw_name),
+            production_mode_marker(production_mode),
+        )
+    file_name = f"{definition.artifact_key}.{definition.format}"
+    return enforce_marker_file_name(
+        file_name,
+        production_mode_marker(production_mode),
+    )
 
 
 def _rewind_upload(upload: BinaryIO) -> None:

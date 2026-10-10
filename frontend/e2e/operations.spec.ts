@@ -2,6 +2,11 @@ import { expect, test, type APIRequestContext, type Page } from "@playwright/tes
 
 const USERNAME = process.env.E2E_SUPERADMIN_USERNAME ?? "superadmin";
 const API_BASE_URL = (process.env.E2E_API_BASE_URL ?? "").replace(/\/+$/, "");
+const API_HEALTH_URL = (
+  process.env.E2E_API_HEALTH_URL ??
+  API_BASE_URL ??
+  "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 const ALLOW_EVENT_PURGE = process.env.E2E_ALLOW_EVENT_PURGE === "1";
 const TEST_PLACE = "上海市（系统测试）";
 const PRODUCTION_TIMEOUT_MS = 240_000;
@@ -84,7 +89,7 @@ function delay(milliseconds: number): Promise<void> {
 }
 
 async function ensureRealApiIsAvailable(request: APIRequestContext): Promise<void> {
-  const response = await request.get(apiUrl("/health"));
+  const response = await request.get(`${API_HEALTH_URL}/health`);
   if (response.status() !== 200) {
     test.skip(
       true,

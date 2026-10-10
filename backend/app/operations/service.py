@@ -13,6 +13,8 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.artifacts.models import ProductionRun, ProductionTask
+from app.assessment.models import AssessmentRun
 from app.db import SessionFactory
 from app.events.domain import EventKind
 from app.events.models import (
@@ -28,7 +30,7 @@ from app.operations.models import (
     OperationsSettings,
     OperationsTestSchedule,
 )
-from app.operations.priority import OperationsPriorityGuard
+from app.operations.priority import OperationsPriorityGuard, RealEventPriorityActive
 from app.operations.repository import OperationsRepository
 from app.operations.scenario import ScenarioGenerator
 from app.operations.schemas import (
@@ -44,11 +46,6 @@ from app.operations.schemas import (
 from app.regions.service import RegionContextResolver
 
 
-class RealEventPriorityActive(RuntimeError):
-    def __init__(self) -> None:
-        super().__init__("real_event_priority_active")
-
-
 class OperationsService:
     DEFAULT_LIMIT = 20
     MAX_LIMIT = 100
@@ -56,6 +53,10 @@ class OperationsService:
     ACTIVE_RUN_STATES = ("queued", "running", "paused")
     MANUAL_PRIORITY = 100
     SCHEDULED_PRIORITY = 10
+    RESERVED_IDEMPOTENCY_PREFIXES = (
+        "scheduled:",
+        "operations-scheduler:",
+    )
 
     def __init__(
         self,
@@ -106,7 +107,7 @@ class OperationsService:
         schedule_uuid = _coerce_uuid(schedule_id, "schedule_id")
         observed_at = _as_utc(self._now())
         actor_name = _actor_name(actor)
-        key = f"scheduled:{schedule_uuid}"
+        key = f"operations-scheduler:{schedule_uuid}"
 
         existing_run = await self._get_run_by_idempotency_key(key)
         if existing_run is not None:
@@ -162,6 +163,7 @@ class OperationsService:
         region_context = await self._region_resolver.resolve(
             scenario.longitude,
             scenario.latitude,
+            boundary_version=scenario.boundary_version,
         )
         event = self._scenario_generator.scenario_to_event(scenario)
         outcome = await self._event_service.ingest_collected(
@@ -290,6 +292,174 @@ class OperationsService:
                 )
                 return _settings_record(settings)
 
+    async def resume_drill(
+        self,
+        run_id: object,
+        actor: object,
+    ) -> OperationsTriggerResult:
+        run_uuid = _coerce_uuid(run_id, "run_id")
+        observed_at = _as_utc(self._now())
+        async with self._session_factory() as session:
+            async with session.begin():
+                await _acquire_priority_lock(session)
+                run = await session.get(
+                    OperationsRun,
+                    run_uuid,
+                    with_for_update=True,
+                )
+                if run is None:
+                    raise LookupError("operations_run_not_found")
+                if run.trigger_mode != TriggerMode.DRILL.value:
+                    raise ValueError("only paused drill runs can be resumed")
+                if run.operation_state != "paused":
+                    raise ValueError("only paused drill runs can be resumed")
+                if not run.resume_required:
+                    raise ValueError("drill run is not marked for resumption")
+                if await self._priority_guard.has_active_real_event(
+                    session,
+                    observed_at,
+                ):
+                    raise RealEventPriorityActive()
+
+        result = await self.trigger_drill(
+            DrillTriggerRequest(idempotency_key=str(uuid.uuid4())),
+            actor,
+        )
+        return result.model_copy(update={"resumed_from_run_id": run_uuid})
+
+    async def reconcile_runs(
+        self,
+        session: AsyncSession,
+        observed_at: datetime,
+    ) -> int:
+        observed_at = _as_utc(observed_at)
+        rows = (
+            await session.scalars(
+                select(OperationsRun)
+                .join(
+                    EarthquakeEvent,
+                    EarthquakeEvent.id == OperationsRun.event_id,
+                )
+                .where(
+                    EarthquakeEvent.event_type.in_(("test", "drill")),
+                    OperationsRun.operation_state.in_(("queued", "running")),
+                )
+                .order_by(OperationsRun.id)
+                .with_for_update(of=OperationsRun)
+            )
+        ).all()
+
+        reconciled = 0
+        for run in rows:
+            assessment_statuses = (
+                await session.scalars(
+                    select(AssessmentRun.status)
+                    .join(
+                        EarthquakeEvent,
+                        EarthquakeEvent.id == AssessmentRun.event_id,
+                    )
+                    .where(
+                        AssessmentRun.event_id == run.event_id,
+                        AssessmentRun.revision_id
+                        == EarthquakeEvent.current_revision_id,
+                    )
+                )
+            ).all()
+            production_statuses = (
+                await session.scalars(
+                    select(ProductionRun.status)
+                    .join(
+                        EarthquakeEvent,
+                        EarthquakeEvent.id == ProductionRun.event_id,
+                    )
+                    .where(
+                        ProductionRun.event_id == run.event_id,
+                        ProductionRun.revision_id
+                        == EarthquakeEvent.current_revision_id,
+                    )
+                )
+            ).all()
+            task_statuses = (
+                await session.scalars(
+                    select(ProductionTask.status)
+                    .join(
+                        ProductionRun,
+                        ProductionRun.id == ProductionTask.production_run_id,
+                    )
+                    .join(
+                        EarthquakeEvent,
+                        EarthquakeEvent.id == ProductionRun.event_id,
+                    )
+                    .where(
+                        ProductionRun.event_id == run.event_id,
+                        ProductionRun.revision_id
+                        == EarthquakeEvent.current_revision_id,
+                    )
+                )
+            ).all()
+
+            statuses = list(assessment_statuses)
+            statuses.extend(production_statuses)
+            statuses.extend(task_statuses)
+            if not statuses:
+                continue
+
+            next_state: str | None = None
+            if any(
+                status in {"pending", "running", "ready"}
+                for status in statuses
+            ):
+                next_state = "running"
+            elif any(
+                status in {"failed", "canceled", "timed_out"}
+                for status in statuses
+            ):
+                next_state = "failed"
+            elif all(
+                status
+                in {
+                    "completed",
+                    "partial",
+                    "succeeded",
+                    "degraded",
+                }
+                for status in statuses
+            ):
+                next_state = "completed"
+
+            if next_state is None or next_state == run.operation_state:
+                continue
+
+            before = _run_state(run)
+            run.operation_state = next_state
+            run.updated_at = observed_at
+            if next_state == "running" and run.started_at is None:
+                run.started_at = observed_at
+            elif next_state == "completed":
+                run.completed_at = observed_at
+            elif next_state == "failed":
+                run.completed_at = observed_at
+                run.resume_required = False
+            session.add(
+                OperationsAuditLog(
+                    action=f"operations.run.{next_state}",
+                    actor="operations-worker",
+                    resource_type="operations_run",
+                    resource_id=str(run.id),
+                    before_state=before,
+                    after_state=_run_state(run),
+                    detail={
+                        "reconciliation": True,
+                        "event_id": str(run.event_id),
+                    },
+                    created_at=observed_at,
+                )
+            )
+            reconciled += 1
+
+        await session.flush()
+        return reconciled
+
     async def _trigger_manual(
         self,
         trigger_mode: TriggerMode,
@@ -330,6 +500,7 @@ class OperationsService:
         region_context = await self._region_resolver.resolve(
             scenario.longitude,
             scenario.latitude,
+            boundary_version=scenario.boundary_version,
         )
         event = self._scenario_generator.scenario_to_event(scenario)
         if event_kind is EventKind.DRILL:
@@ -443,6 +614,7 @@ class OperationsService:
                 place=str(value["place"]),
                 source_event_id=str(value.get("source_event_id") or ""),
                 random_seed=int(value["random_seed"]),
+                boundary_version=str(value.get("boundary_version") or ""),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation):
             return None
@@ -685,6 +857,10 @@ class OperationsService:
         normalized = key.strip()
         if len(normalized) > 160:
             raise ValueError("idempotency_key is too long")
+        if normalized.startswith(
+            OperationsService.RESERVED_IDEMPOTENCY_PREFIXES
+        ):
+            raise ValueError("idempotency_key uses a reserved namespace")
         return normalized
 
     @staticmethod
@@ -793,6 +969,17 @@ def _run_record(run: OperationsRun) -> OperationsRunRecord:
         created_at=run.created_at,
         updated_at=run.updated_at,
     )
+
+
+def _run_state(run: OperationsRun) -> dict:
+    return {
+        "operation_state": run.operation_state,
+        "resume_required": bool(run.resume_required),
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "paused_at": run.paused_at.isoformat() if run.paused_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "canceled_at": run.canceled_at.isoformat() if run.canceled_at else None,
+    }
 
 
 def _settings_record(settings: OperationsSettings) -> OperationsSettingsRecord:

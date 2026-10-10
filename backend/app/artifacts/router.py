@@ -45,6 +45,10 @@ from app.artifacts.service import (
     ArtifactProductionService,
     IdempotencyConflictError,
 )
+from app.operations.priority import (
+    OperationsWorkBlocked,
+    RealEventPriorityActive,
+)
 from app.artifacts.storage import ArtifactStore
 from app.artifacts.workflow import (
     ArtifactProductionWorkflow,
@@ -149,6 +153,7 @@ def _artifact_summary(artifact: GeneratedArtifact) -> ArtifactSummaryResponse:
         needs_review=artifact.needs_review,
         production_mode=artifact.production_mode,
         publication_mode=artifact.publication_mode,
+        marker=_mode_marker(artifact.production_mode),
         file_name=artifact.file_name,
         format=artifact.format,
         size_bytes=artifact.size_bytes,
@@ -620,6 +625,16 @@ async def override_artifact(
         raise HTTPException(
             status_code=422,
             detail=f"{exc.error_category}: {exc.summary}",
+        ) from exc
+    except RealEventPriorityActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+    except OperationsWorkBlocked as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
         ) from exc
     except KeyError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
