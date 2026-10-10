@@ -1646,10 +1646,9 @@ async def _legacy_workgroup_membership_state() -> dict[str, object]:
     try:
         async with engine.connect() as connection:
             rows = (
-                (
-                    await connection.execute(
-                        text(
-                            """
+                await connection.execute(
+                    text(
+                        """
                         SELECT
                             u.username,
                             m.workgroup_code,
@@ -1665,22 +1664,23 @@ async def _legacy_workgroup_membership_state() -> dict[str, object]:
                         WHERE u.username LIKE 'migration-workgroup-%'
                         ORDER BY u.username
                         """
-                        )
                     )
                 )
-                .mappings()
-                .all()
-            )
+            ).mappings().all()
             checks = await connection.run_sync(
                 lambda sync: {
                     item["name"]
-                    for item in inspect(sync).get_check_constraints("workgroup_memberships")
+                    for item in inspect(sync).get_check_constraints(
+                        "workgroup_memberships"
+                    )
                 }
             )
             attendance_checks = await connection.run_sync(
                 lambda sync: {
                     item["name"]
-                    for item in inspect(sync).get_check_constraints("workgroup_attendance")
+                    for item in inspect(sync).get_check_constraints(
+                        "workgroup_attendance"
+                    )
                 }
             )
         return {
@@ -1727,13 +1727,21 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
         _set_revision(LATEST_REVISION)
         state = await _legacy_workgroup_membership_state()
         rows = state["rows"]
-        assert rows["migration-workgroup-member"]["workgroup_code"] == ("monitoring_forecast")
+        assert rows["migration-workgroup-member"]["workgroup_code"] == (
+            "monitoring_forecast"
+        )
         assert rows["migration-workgroup-member"]["duty_role"] == "member"
         assert rows["migration-workgroup-leader"]["duty_role"] == "leader"
         assert rows["migration-workgroup-deputy"]["duty_role"] == "deputy"
         assert rows["migration-workgroup-deputy"]["deputy_order"] is None
-        assert "ck_workgroup_membership_deputy_order_required" not in state["membership_checks"]
-        assert "ck_workgroup_attendance_deputy_order_required" not in state["attendance_checks"]
+        assert (
+            "ck_workgroup_membership_deputy_order_required"
+            not in state["membership_checks"]
+        )
+        assert (
+            "ck_workgroup_attendance_deputy_order_required"
+            not in state["attendance_checks"]
+        )
 
         engine = create_async_engine(settings.database_url, poolclass=NullPool)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1843,7 +1851,9 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
                                     workgroup="监测预报组",
                                 )
                             )
-                            response = await client.get(f"/api/v1/collaboration/tasks/{task.id}")
+                            response = await client.get(
+                                f"/api/v1/collaboration/tasks/{task.id}"
+                            )
                             assert response.status_code == 200
                             assert response.json()["can_work"] is True
                         app.dependency_overrides[get_current_user] = lambda: (
@@ -1853,7 +1863,9 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
                                 workgroup=None,
                             )
                         )
-                        response = await client.get(f"/api/v1/collaboration/tasks/{task.id}")
+                        response = await client.get(
+                            f"/api/v1/collaboration/tasks/{task.id}"
+                        )
                         assert response.status_code == 403
                     app.dependency_overrides.pop(get_roster_session, None)
                     app.dependency_overrides.pop(get_current_user, None)
@@ -1862,10 +1874,16 @@ async def test_0023_backfills_legacy_workgroups_and_keeps_member_access() -> Non
 
         _set_revision(PREVIOUS_REVISION)
         downgraded = await _legacy_workgroup_membership_state()
-        assert all(row["workgroup_code"] is None for row in downgraded["rows"].values())
+        assert all(
+            row["workgroup_code"] is None
+            for row in downgraded["rows"].values()
+        )
         _set_revision(LATEST_REVISION)
         re_upgraded = await _legacy_workgroup_membership_state()
-        assert re_upgraded["rows"]["migration-workgroup-deputy"]["deputy_order"] is None
+        assert (
+            re_upgraded["rows"]["migration-workgroup-deputy"]["deputy_order"]
+            is None
+        )
     finally:
         _set_revision(LATEST_REVISION)
         await _delete_legacy_workgroup_users()
@@ -2672,6 +2690,7 @@ async def test_0026_operations_automation_is_reversible() -> None:
         }
 
         event_id = uuid.uuid4()
+        schedule_id = uuid.uuid4()
         engine = create_async_engine(settings.database_url)
         try:
             async with engine.begin() as connection:
@@ -2740,13 +2759,44 @@ async def test_0026_operations_automation_is_reversible() -> None:
                         """
                     ),
                     {
-                        "id": uuid.uuid4(),
+                        "id": schedule_id,
                         "local_date": datetime(2026, 9, 25).date(),
                         "window_start": datetime(2026, 9, 25, 2, 0, tzinfo=UTC),
                         "window_end": datetime(2026, 9, 25, 4, 0, tzinfo=UTC),
                         "scheduled_at": datetime(2026, 9, 25, 1, 0, tzinfo=UTC),
                         "event_id": event_id,
                         "triggered_at": datetime(2026, 9, 25, 1, 30, tzinfo=UTC),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO operations_runs (
+                            id,
+                            event_id,
+                            schedule_id,
+                            trigger_mode,
+                            operation_state,
+                            priority,
+                            idempotency_key,
+                            triggered_by
+                        ) VALUES (
+                            :id,
+                            :event_id,
+                            :schedule_id,
+                            'drill',
+                            'queued',
+                            100,
+                            :idempotency_key,
+                            'migration-test'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "event_id": event_id,
+                        "schedule_id": schedule_id,
+                        "idempotency_key": f"operations-cascade-run-{event_id}",
                     },
                 )
         finally:
@@ -2770,6 +2820,17 @@ async def test_0026_operations_automation_is_reversible() -> None:
                     {"id": event_id},
                 )
                 assert schedule_count == 0
+                run_count = await connection.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM operations_runs
+                        WHERE event_id = :id
+                        """
+                    ),
+                    {"id": event_id},
+                )
+                assert run_count == 0
         finally:
             await engine.dispose()
 
