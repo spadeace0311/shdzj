@@ -677,6 +677,7 @@ git commit -m "feat: schedule daily random test earthquakes"
 - Modify: `backend/app/events/service.py`
 - Modify: `backend/app/collaboration/service.py`
 - Modify: `backend/app/collaboration/scheduler.py`
+- Modify: `backend/app/collaboration/router.py`
 - Create: `backend/tests/test_operations_priority.py`
 
 **Interfaces:**
@@ -724,10 +725,17 @@ if result.is_new and result.is_current and result.event_kind in {
 `not_applicable` 而遗漏评估与任务。相应失败测试必须验证一次手工正式事件同时创建协同和评估 outbox。
 
 守卫只处理 `event_type IN ('test', 'drill')` 的运行和计划，不修改正式/人工事件数据。
+首期没有真实事件关闭字段，因此 `has_active_real_event()` 将
+`origin_time <= observed_at` 且位于滚动 7 天保护窗口内的当前 `formal|manual` 事件视为活动。
+`release_deferred_runs()` 只在该窗口结束且没有活动真实事件时，把到期的
+`operations_test_schedules.state='deferred'` 恢复为 `scheduled`，不自动重启已经暂停的演练；
+已进入安全暂停边界的演练继续保持 `resume_required=true`。
 
 - [ ] **Step 3: 实现协同和通知冻结**
 
 在任务提交、退回、取消、成果上传和发布前调用 `ensure_event_work_allowed()`；被冻结时返回 409 `operations_work_blocked`。
+在 `collaboration/router.py` 的统一任务变更异常映射中把 `OperationsWorkBlocked`
+映射为 HTTP 409 和稳定 detail `operations_work_blocked`。
 
 在 `DeadlineScheduler.run_once()` 查询非终态任务时排除关联运行状态为 `paused|canceled` 的事件，避免冻结任务继续产生提醒。已存在待发送通知不再新建，已有通知由现有通知服务决定是否保留为审计记录。
 
