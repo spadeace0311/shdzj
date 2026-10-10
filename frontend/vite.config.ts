@@ -24,6 +24,9 @@ export default {
   test: {
     environment: "jsdom",
     globals: true,
+    env: {
+      TZ: "Asia/Shanghai",
+    },
     setupFiles: ["./tests/setup.ts"],
     css: true,
     include: [
@@ -35,6 +38,7 @@ export default {
   test: {
     environment: string;
     globals: boolean;
+    env: Record<string, string>;
     setupFiles: string[];
     css: boolean;
     include: string[];

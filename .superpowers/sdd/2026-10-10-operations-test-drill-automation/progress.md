@@ -122,6 +122,8 @@ Preflight rulings:
 - Task 8: complete (commits `6411955..909d110`, review clean after 1 fix round; 3 deferred Minors; live E2E pending credentials).
 - Task 9: implementer dispatch base is `909d110`.
 - Task 9: implementer `Plato the 2nd` (`01a1275e-623d-7a91-bf28-7725aea0465d`) dispatched.
+- Task 9: implementer `BLOCKED`, commit `e03dab3`; backend full suite 1742 passed, 3 skipped, 8 deselected, 4 failed; migration round-trip 32 passed; frontend default timezone 215 passed/1 failed and Shanghai timezone 216 passed; E2E explicitly skipped. Real blockers: stale QA-audit head assertion, timezone-dependent frontend test, and full backend command not starting Temporal.
+- Task 9: fix round 1/5 dispatched to original implementer (fix QA migration-head ownership, deterministic Vitest timezone, document/start Temporal for full verification, rerun all suites).
 - Task 9: backend full-suite command first collided with host port `5432`; rerun with project port `15433` produced `4 failed, 1742 passed, 3 skipped, 8 deselected`.
 - Task 9: backend skips confirmed as `tests/test_data_asset_mdb_host_integration.py` (`3 skipped`, reason: Shanghai MDB is not installed on this host).
 - Task 9: backend failures classified as three Temporal integration failures (`temporal` is not a dependency of `api` in the brief command) and one stale QA-audit migration assertion (`0025` vs current `0026`).
@@ -133,6 +135,9 @@ Preflight rulings:
 - Task 9: final `alembic current` is `0026_operations_automation (head)`; `git diff --check` clean before commit.
 - Task 9: independent verification outcome `BLOCKED`: full backend/frontend suites are not fully green without fixing the stale QA-audit test, the timezone-portable frontend test, and documenting/starting Temporal as a full-suite dependency.
 - Task 9: no application code was changed by Task 9; existing deferred Minors and rulings remain open and are carried forward in `final-report.md`.
+- Task 9: fix round 1/5 completed. QA-audit test now verifies `0025` as an ancestor of `0026` and restores `0026`; Vitest config pins `TZ=Asia/Shanghai`; README documents starting `postgres temporal-postgres temporal` before full backend verification.
+- Task 9: post-fix backend full suite passed `1746 passed, 3 skipped, 8 deselected, 0 failed`; QA-audit focused regression `2 passed`; migration/operations worker `32 passed`; frontend `216 passed` without `TZ` override; operations E2E `1 skipped`; final `alembic current` `0026_operations_automation (head)`.
+- Task 9: final status `DONE_WITH_CONCERNS`: live operations E2E remains pending credentials/purge authorization; Shanghai MDB host integration remains skipped; existing deferred Minors remain open.
 
 ## Progress
 
@@ -144,4 +149,4 @@ Preflight rulings:
 - [x] Task 6: 运维工作进程与保留调度
 - [x] Task 7: 运维前端与手工入口
 - [x] Task 8: E2E、运行手册和交接说明
-- [x] Task 9: 子系统全量验证与最终报告（BLOCKED，证据已记录）
+- [x] Task 9: 子系统全量验证与最终报告（DONE_WITH_CONCERNS）

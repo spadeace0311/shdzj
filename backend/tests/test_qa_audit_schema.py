@@ -12,6 +12,7 @@ from app.config import settings
 
 BACKEND_DIR = Path(__file__).parents[1]
 AUDIT_REVISION = "0025_qa_audit_provenance"
+LATEST_REVISION = "0026_operations_automation"
 PREVIOUS_REVISION = "0024_ai_knowledge_qa"
 
 
@@ -85,11 +86,30 @@ async def _qa_answer_columns() -> set[str]:
         await engine.dispose()
 
 
-def test_qa_audit_migration_is_alembic_head() -> None:
+def test_qa_audit_migration_is_ancestor_of_alembic_head() -> None:
     config = Config(str(BACKEND_DIR / "alembic.ini"))
     config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
 
-    assert ScriptDirectory.from_config(config).get_current_head() == AUDIT_REVISION
+    scripts = ScriptDirectory.from_config(config)
+    assert scripts.get_current_head() == LATEST_REVISION
+    assert scripts.get_revision(AUDIT_REVISION) is not None
+
+    ancestors: set[str] = set()
+    pending = [scripts.get_revision(LATEST_REVISION)]
+    while pending:
+        revision = pending.pop()
+        if revision.revision in ancestors:
+            continue
+        ancestors.add(revision.revision)
+        down_revisions = revision.down_revision
+        if down_revisions is None:
+            continue
+        if isinstance(down_revisions, tuple):
+            pending.extend(scripts.get_revision(item) for item in down_revisions)
+        else:
+            pending.append(scripts.get_revision(down_revisions))
+
+    assert AUDIT_REVISION in ancestors
 
 
 async def test_qa_audit_provenance_columns_are_reversible() -> None:
@@ -147,4 +167,4 @@ async def test_qa_audit_provenance_columns_are_reversible() -> None:
         _set_revision(AUDIT_REVISION)
         assert "model_name" in await _qa_answer_columns()
     finally:
-        _set_revision(AUDIT_REVISION)
+        _set_revision(LATEST_REVISION)

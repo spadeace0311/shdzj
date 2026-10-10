@@ -2,21 +2,51 @@
 
 ## Objective
 
-Run the operations subsystem full verification and migration round-trip, record every raw command and its real result, and publish the final report without modifying application code.
+Run the operations subsystem full verification and migration round-trip, fix the three blockers found in the first pass, record every raw command and result, and publish the final report without changing business implementation code.
 
 ## Environment Adaptations
 
 - The existing `codex-operations` project already had healthy `postgres`, `qdrant`, and `embedding` containers.
-- The first exact backend command recreated `codex-operations-postgres-1` and collided with host port `5432`.
-- All reruns stayed in the `codex-operations` project and used `POSTGRES_HOST_PORT=15433`.
-- The frontend `run` command starts `api` as a dependency; host port `8000` was occupied by another project, so `API_PORT=18000` was used.
+- Host port `5432` was occupied by another project, so `POSTGRES_HOST_PORT=15433` was used.
+- The frontend `run` command starts `api`; host port `8000` was occupied, so `API_PORT=18000` was used.
 - No other project containers or volumes were reused or stopped.
+
+## Fixes Applied
+
+### QA-audit migration ownership
+
+- Added `LATEST_REVISION = "0026_operations_automation"`.
+- Renamed the head assertion to `test_qa_audit_migration_is_ancestor_of_alembic_head`.
+- The test now asserts the Alembic head is `0026_operations_automation`, verifies `0025_qa_audit_provenance` resolves, and walks down-revisions to prove `0025` is an ancestor.
+- The reversible-column test now restores `0026_operations_automation` in its `finally`.
+
+### Deterministic frontend timezone
+
+- Added `env: { TZ: "Asia/Shanghai" }` to the Vitest configuration in `frontend/vite.config.ts`.
+- Extended the local configuration type with `env: Record<string, string>`.
+- No command-line `TZ` override is required.
+
+### Full backend Temporal startup documentation
+
+- README now shows the `codex-operations` full verification sequence:
+  - start `postgres temporal-postgres temporal`;
+  - migrate to head;
+  - run `pytest -q`.
+- The text explains that complete assessment and collaboration integration tests require Temporal and warns against reusing or stopping other projects.
 
 ## Raw Commands and Results
 
-### 1. Backend Full Suite
+### 1. Start Services and Migrate
 
-Command:
+```powershell
+$env:POSTGRES_HOST_PORT='15433'
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d postgres temporal-postgres temporal
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api alembic upgrade head
+```
+
+Result: services healthy and migration complete.
+
+### 2. Backend Full Suite
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
@@ -26,59 +56,25 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 Result:
 
 ```text
-4 failed, 1742 passed, 3 skipped, 8 deselected, 26 warnings in 2336.35s
+1746 passed, 3 skipped, 8 deselected, 28 warnings in 2509.70s
 ```
 
-Failures:
-
-```text
-tests/test_assessment_temporal.py::test_temporal_delayed_assessment_does_not_launch_stale_artifact_child
-tests/test_collaboration_end_to_end.py::test_formal_event_closes_all_seven_groups_with_dual_versions
-tests/test_collaboration_end_to_end.py::test_correction_keeps_frozen_version_and_drill_flows_through_worker
-tests/test_qa_audit_schema.py::test_qa_audit_migration_is_alembic_head
-```
-
-The three Temporal failures were caused by `temporal` not being a dependency of `api`; the command did not start it. The QA-audit failure is a stale assertion for `0025_qa_audit_provenance`.
-
-### 2. Backend Skip Identification
-
-Command:
+### 3. QA-audit Schema Regression
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
-docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api pytest tests/test_data_asset_mdb_host_integration.py -q -rs
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api pytest tests/test_qa_audit_schema.py -v
 ```
 
 Result:
 
 ```text
-3 skipped
-SKIPPED [1] ... Shanghai MDB is not installed on this host
-SKIPPED [1] ... Shanghai MDB is not installed on this host
-SKIPPED [1] ... Shanghai MDB is not installed on this host
+2 passed
 ```
 
-### 3. Temporal Availability Recheck
+After this test, `alembic current` was checked as `0026_operations_automation (head)`.
 
-Command:
-
-```powershell
-docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d temporal-postgres temporal
-$env:POSTGRES_HOST_PORT='15433'
-docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api pytest -q tests/test_assessment_temporal.py::test_temporal_delayed_assessment_does_not_launch_stale_artifact_child tests/test_collaboration_end_to_end.py::test_formal_event_closes_all_seven_groups_with_dual_versions tests/test_collaboration_end_to_end.py::test_correction_keeps_frozen_version_and_drill_flows_through_worker
-```
-
-Result:
-
-```text
-3 passed in 225.18s
-```
-
-This recheck ran only after the migration round-trip restored the database to `0026_operations_automation`. It confirms the three full-suite failures are environmental, not application regressions.
-
-### 4. Migration Upgrade/Downgrade/Re-Upgrade
-
-Command:
+### 4. Migration and Operations Worker Round-trip
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
@@ -88,19 +84,12 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 Result:
 
 ```text
-32 passed, 1 warning in 752.21s
+32 passed, 1 warning in 752.58s
 ```
 
-`test_0026_operations_automation_is_reversible` verified:
+`test_0026_operations_automation_is_reversible` verified upgrade, downgrade, re-upgrade, default settings, and cascade cleanup.
 
-- `0025 -> 0026` upgrade creates the four operations tables and default settings.
-- `0026 -> 0025` downgrade removes the tables.
-- `0025 -> 0026` re-upgrade restores tables and exactly one default settings row.
-- Deleting an operations test/drill event cascades to `operations_test_schedules` and `operations_runs`.
-
-### 5. Frontend Unit Suite, Default Timezone
-
-Command:
+### 5. Frontend Unit Suite
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
@@ -112,42 +101,13 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 Result:
 
 ```text
-Test Files  1 failed | 22 passed
-Tests       1 failed | 215 passed
-```
-
-Failure:
-
-```text
-workgroup-tasks.test.tsx:720 expected due_at "2026-10-03T02:00:00.000Z"
-received due_at "2026-10-03T10:00:00.000Z"
-```
-
-The input `2026-10-03T10:00` is treated as UTC in the default container timezone.
-
-### 6. Frontend Unit Suite, Shanghai Timezone
-
-Command:
-
-```powershell
-$env:POSTGRES_HOST_PORT='15433'
-$env:API_BIND_HOST='127.0.0.1'
-$env:API_PORT='18000'
-docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm -e TZ=Asia/Shanghai frontend npm test
-```
-
-Result:
-
-```text
 Test Files  23 passed
 Tests       216 passed
 ```
 
-This confirms the default-timezone failure is a test-portability issue.
+No command-line timezone override was used.
 
-### 7. Frontend Operations E2E
-
-Command:
+### 6. Frontend Operations E2E
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
@@ -162,11 +122,9 @@ Result:
 1 skipped
 ```
 
-The skip requires either `E2E_SUPERADMIN_PASSWORD` or `E2E_ALLOW_EVENT_PURGE=1`; both are absent. It was not recorded as a pass.
+The skip is expected because `E2E_SUPERADMIN_PASSWORD` and `E2E_ALLOW_EVENT_PURGE=1` are absent. It is not recorded as a pass.
 
-### 8. Final Migration State
-
-Command:
+### 7. Final Migration State
 
 ```powershell
 $env:POSTGRES_HOST_PORT='15433'
@@ -181,18 +139,18 @@ Result:
 
 ## Classification
 
-| Finding | Severity | Type | Verified disposition |
-| --- | --- | --- | --- |
-| Three Temporal integration failures in Step 1 | Important | test harness/environment | All 3 pass after starting `temporal` and restoring head |
-| Stale QA-audit Alembic head assertion | Important | test-suite regression | Still failing; leaves DB at `0025` |
-| Frontend due-date timezone assertion | Minor | test portability | Passes with `TZ=Asia/Shanghai`; fails default container |
-| Operations E2E live run | Expected limitation | missing credentials/purge gate | Explicitly skipped, not passed |
-| Shanghai MDB backend integration | Expected limitation | host-only data missing | 3 skipped |
+| Finding | Severity | Disposition |
+| --- | --- | --- |
+| Stale QA-audit head assertion | Important | Fixed; 2 focused tests pass and head restored to `0026` |
+| Full backend command lacked Temporal | Important | Fixed in README; full backend now 0 failed |
+| Frontend date test depended on host timezone | Minor | Fixed in Vitest config; 216 tests pass |
+| Operations E2E live run | Expected limitation | Explicitly skipped, not passed |
+| Shanghai MDB backend integration | Expected limitation | 3 skipped, source not installed |
 
 ## Final State
 
-- Status: `BLOCKED`
-- HEAD before Task 9: `909d110`
-- Task 9 modifies only `.superpowers/sdd/2026-10-10-operations-test-drill-automation`
-- No application source files changed.
-- `git diff --check` was run before commit and was clean.
+- Status: `DONE_WITH_CONCERNS`
+- Final migration head: `0026_operations_automation`
+- Business implementation files were not modified.
+- Only the allowed test, config, README, and SDD report files were changed.
+- `git diff --check` is clean before commit.

@@ -191,6 +191,18 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-operat
 docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d
 ```
 
+全量后端验收必须覆盖评估和协同的真实 Temporal 集成测试。API 服务本身不依赖 Temporal，但完整测试前需在同一个 `codex-operations` project 中先启动 `postgres`、`temporal-postgres` 和 `temporal`，再迁移并运行测试：
+
+```powershell
+# 若宿主 5432 已占用，先在当前终端设置不冲突端口，例如：
+# $env:POSTGRES_HOST_PORT = "15433"
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d postgres temporal-postgres temporal
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api pytest -q
+```
+
+不要复用或停止其他项目的容器或卷；端口冲突时只覆盖当前 `codex-operations` 的宿主端口。
+
 启动后访问运维页面：
 
 ```text
