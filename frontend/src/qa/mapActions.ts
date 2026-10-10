@@ -97,13 +97,89 @@ export const QA_LAYER_CATALOG: QaLayerCatalog = {
 export const LOSS_QA_LAYER_CATALOG: QaLayerCatalog = {
   targets: {},
   layers: {
+    epicenter: {
+      id: "loss-map-qa-epicenter",
+      source: "loss-map-qa-epicenter-source",
+      featureIdProperty: "event_id",
+    },
+    faults: {
+      id: "loss-map-qa-faults",
+      source: "loss-map-qa-faults-source",
+      featureIdProperty: "fault_key",
+    },
+    historical_earthquakes: {
+      id: "loss-map-qa-historical",
+      source: "loss-map-qa-historical-source",
+      featureIdProperty: "historical_event_id",
+    },
+    population: {
+      id: "loss-map-qa-population",
+      source: "loss-map-qa-population-source",
+      featureIdProperty: "area_code",
+    },
+    intensity: {
+      id: "loss-map-qa-intensity",
+      source: "loss-map-qa-intensity-source",
+      featureIdProperty: "event_id",
+    },
     loss: {
       id: "loss-map-town-fill",
       source: "loss-map-town-loss",
       featureIdProperty: "area_code",
     },
+    artifacts: {
+      id: "loss-map-qa-artifacts",
+      source: "loss-map-qa-artifacts-source",
+      featureIdProperty: "artifact_id",
+    },
   },
 };
+
+function layerTypeForKey(key: string): "circle" | "line" | "fill" {
+  if (key === "faults") {
+    return "line";
+  }
+  if (key === "population" || key === "loss") {
+    return "fill";
+  }
+  return "circle";
+}
+
+export function ensureQaLayerCatalog(
+  map: QaActionMap,
+  catalog: QaLayerCatalog,
+  options: { skipLayerIds?: Set<string> } = {},
+): void {
+  const skipLayerIds = options.skipLayerIds ?? new Set<string>();
+  for (const [key, layer] of Object.entries(catalog.layers)) {
+    if (skipLayerIds.has(layer.id)) {
+      continue;
+    }
+    if (!map.getSource(layer.source)) {
+      map.addSource(layer.source, {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
+      } satisfies GeoJSONSourceSpecification);
+    }
+    if (!map.getLayer(layer.id)) {
+      map.addLayer({
+        id: layer.id,
+        type: layerTypeForKey(key),
+        source: layer.source,
+        layout: {
+          visibility: "visible",
+        },
+        paint: {
+          "circle-radius": 5,
+          "circle-color": "#176b9b",
+        },
+      } as LayerSpecification);
+    }
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

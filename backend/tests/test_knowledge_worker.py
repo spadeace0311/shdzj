@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -14,7 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import settings
 from app.embedding.schemas import DENSE_DIMENSIONS, EmbeddingBatch
 from app.knowledge.domain import KnowledgeJobStatus, KnowledgeVersionStatus
-from app.knowledge.index import IndexedChunk, KnowledgeIndex
+from app.knowledge.index import (
+    IndexedChunk,
+    KnowledgeIndex,
+    KnowledgeIndexRebuild,
+)
 from app.knowledge.models import (
     KnowledgeChunk,
     KnowledgeIndexVersion,
@@ -26,7 +31,7 @@ from app.knowledge.models import (
 from app.knowledge.health import WorkerHealthState
 from app.knowledge.publication import KnowledgePublicationService
 from app.knowledge.storage import KnowledgeFileStore
-from app.knowledge.worker import KnowledgeWorker, _build_index
+from app.knowledge.worker import KnowledgeWorker, _build_index, _mark_success
 from qdrant_client.models import Distance, SparseVectorParams, VectorParams
 
 
@@ -575,6 +580,132 @@ async def test_real_index_compensates_outer_commit_failure(
         )
     finally:
         await _delete_actor_data(session_factory)
+
+
+async def test_real_index_compensates_cancellation_after_alias_activation(
+    session_factory,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        client.aliases[alias_name] = logical_name
+
+        async with session_factory() as session:
+            version = await session.get(KnowledgeSourceVersion, version_id)
+            source = await session.get(KnowledgeSource, version.source_id)
+            assert version is not None
+            assert source is not None
+            original_flush = session.flush
+            flush_calls = 0
+
+            async def cancel_after_activation() -> None:
+                nonlocal flush_calls
+                flush_calls += 1
+                if flush_calls == 2:
+                    raise asyncio.CancelledError
+                await original_flush()
+
+            session.flush = cancel_after_activation
+            with pytest.raises(asyncio.CancelledError):
+                await _build_index(
+                    session,
+                    index,
+                    _FakeEmbeddings(),
+                    version,
+                    source,
+                    2,
+                    force_rebuild=True,
+                    batch_size=10,
+                )
+
+        assert client.aliases.get(alias_name) == logical_name
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_real_index_compensates_when_mark_success_fails(
+    session_factory,
+    monkeypatch,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        client.aliases[alias_name] = logical_name
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "mark success failure"},
+        )
+        worker = KnowledgeWorker(index=index, embeddings=_FakeEmbeddings())
+
+        async def fail_mark_success(
+            session: AsyncSession,
+            job_id: UUID,
+            now: datetime,
+        ) -> None:
+            await _mark_success(session, job_id, now)
+            raise RuntimeError("mark success failed")
+
+        monkeypatch.setattr(
+            "app.knowledge.worker._mark_success",
+            fail_mark_success,
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                assert await worker.process_one(session) is True
+        monkeypatch.undo()
+
+        assert client.aliases.get(alias_name) == logical_name
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_real_index_compensation_is_state_aware_and_idempotent() -> None:
+    client = _AliasQdrantClient()
+    index = KnowledgeIndex(client=client)
+    rebuild = KnowledgeIndexRebuild(
+        logical_name="logical",
+        alias_name="logical-active",
+        staging_name="logical-staging",
+        previous_name="logical",
+        previous_alias_exists=True,
+    )
+
+    client.aliases[rebuild.alias_name] = rebuild.previous_name or ""
+    await index.compensate_rebuild(rebuild)
+    await index.compensate_rebuild(rebuild)
+
+    assert client.aliases[rebuild.alias_name] == "logical"
+    assert client.alias_operations == []
+
+    no_previous = KnowledgeIndexRebuild(
+        logical_name="logical",
+        alias_name="logical-active",
+        staging_name="logical-staging",
+        previous_name=None,
+        previous_alias_exists=False,
+    )
+    client.aliases.clear()
+    await index.compensate_rebuild(no_previous)
+    await index.compensate_rebuild(no_previous)
+
+    assert no_previous.alias_name not in client.aliases
+    assert client.alias_operations == []
 
 
 @pytest.mark.parametrize("job_type", ["ingest", "index"])

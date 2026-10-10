@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
-  GeoJSONSourceSpecification,
-  LayerSpecification,
   Map as MaplibreMap,
   MapOptions,
   RasterSourceSpecification,
@@ -11,6 +9,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import type { QaMapAction } from "../types";
 import {
   applyQaMapAction,
+  ensureQaLayerCatalog,
   QA_LAYER_CATALOG,
   type QaActionMap,
   type QaLayerCatalog,
@@ -24,23 +23,6 @@ interface QaMapProps {
 const BASEMAP_SOURCE = "qa-amap";
 const BASEMAP_LAYER = "qa-amap-layer";
 const BACKGROUND_LAYER = "qa-background";
-
-function emptyFeatureCollection(): GeoJSON.FeatureCollection {
-  return {
-    type: "FeatureCollection",
-    features: [],
-  };
-}
-
-function layerTypeForKey(key: string): "circle" | "line" | "fill" {
-  if (key === "faults") {
-    return "line";
-  }
-  if (key === "population" || key === "loss") {
-    return "fill";
-  }
-  return "circle";
-}
 
 function catalogWithEpicenter(
   epicenter?: [number, number],
@@ -167,28 +149,7 @@ export function QaMap({ actions, epicenter }: QaMapProps) {
       return;
     }
 
-    for (const [key, layer] of Object.entries(QA_LAYER_CATALOG.layers)) {
-      if (!map.getSource(layer.source)) {
-        map.addSource(layer.source, {
-          type: "geojson",
-          data: emptyFeatureCollection(),
-        } satisfies GeoJSONSourceSpecification);
-      }
-      if (!map.getLayer(layer.id)) {
-        map.addLayer({
-          id: layer.id,
-          type: layerTypeForKey(key),
-          source: layer.source,
-          layout: {
-            visibility: "visible",
-          },
-          paint: {
-            "circle-radius": 5,
-            "circle-color": "#176b9b",
-          },
-        } as LayerSpecification);
-      }
-    }
+    ensureQaLayerCatalog(map as unknown as QaActionMap, QA_LAYER_CATALOG);
   }, [mapReady]);
 
   useEffect(() => {

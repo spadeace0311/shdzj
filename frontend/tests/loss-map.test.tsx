@@ -797,6 +797,73 @@ it("applies production loss set_layers visibility through the real LossMap layer
   expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
 });
 
+it("applies a non-loss highlight through production LossMap QA layers", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "highlight",
+    target_ref: "fault:f1",
+    layer_id: "faults",
+    feature_id: "f1",
+    reason: "突出断裂带",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "highlight",
+    ),
+  );
+  expect(map.setFilter).toHaveBeenCalledWith("loss-map-qa-faults", [
+    "==",
+    ["get", "fault_key"],
+    "f1",
+  ]);
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
+it("applies a multi-layer set_layers action through production LossMap QA layers", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "set_layers",
+    layers: {
+      faults: false,
+      epicenter: true,
+      loss: true,
+    },
+    visibility: {
+      faults: false,
+      epicenter: true,
+      loss: true,
+    },
+    reason: "同步图层可见性",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "set_layers",
+    ),
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "loss-map-qa-faults",
+    "visibility",
+    "none",
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "loss-map-qa-epicenter",
+    "visibility",
+    "visible",
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "loss-map-town-fill",
+    "visibility",
+    "visible",
+  );
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
 function spatializedProduct(
   productId: string,
   productType: LossProductSummary["product_type"],

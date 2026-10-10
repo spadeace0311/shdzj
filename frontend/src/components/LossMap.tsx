@@ -14,6 +14,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { getAccessToken } from "../api/client";
 import {
   applyQaMapAction,
+  ensureQaLayerCatalog,
   LOSS_QA_LAYER_CATALOG,
   type QaActionMap,
 } from "../qa/mapActions";
@@ -148,6 +149,21 @@ export function LossMap({
   const { eventId: actionEventId, action: latestAction } =
     useMapActionConsumer();
   const centerKey = center.join("|");
+
+  useEffect(() => {
+    if (!mapReady) {
+      return;
+    }
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+    ensureQaLayerCatalog(
+      map as unknown as QaActionMap,
+      LOSS_QA_LAYER_CATALOG,
+      { skipLayerIds: new Set([TOWN_FILL_LAYER]) },
+    );
+  }, [mapReady]);
 
   useEffect(() => {
     if (

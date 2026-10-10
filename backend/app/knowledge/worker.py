@@ -106,6 +106,7 @@ class KnowledgeWorker:
         if job is None:
             return False
 
+        job_id = job.id
         force_rebuild = bool(job.request_payload.get("force"))
         try:
             async with session.begin_nested():
@@ -134,7 +135,9 @@ class KnowledgeWorker:
                     )
                     await _mark_success(session, job.id, self._now())
         except Exception as exc:
-            await _mark_failure(session, job.id, exc, self._now())
+            if self._pending_alias_rebuild is not None:
+                await self.compensate_pending_alias_rebuild()
+            await _mark_failure(session, job_id, exc, self._now())
         return True
 
     def clear_pending_alias_rebuild(self) -> None:
@@ -571,6 +574,7 @@ async def _mark_failure(
     job = await session.get(KnowledgeJob, job_id, with_for_update=True)
     if job is None:
         return
+    await session.refresh(job, with_for_update=True)
     safe_error = _safe_error_text(error)
     job.last_error = safe_error
     version = await session.get(
@@ -578,6 +582,8 @@ async def _mark_failure(
         job.version_id,
         with_for_update=True,
     )
+    if version is not None:
+        await session.refresh(version, with_for_update=True)
     if job.attempt_count >= job.max_attempts:
         job.status = KnowledgeJobStatus.DEAD_LETTER.value
         job.available_at = now
@@ -831,7 +837,7 @@ async def _build_index(
             index_version.collection_name = rebuild.alias_name
         index_version.manifest = manifest
         await session.flush()
-    except Exception:
+    except BaseException:
         if rebuild is not None:
             if activated_rebuild is not None:
                 await index.compensate_rebuild(rebuild)
