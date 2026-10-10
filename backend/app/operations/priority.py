@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.events.models import EarthquakeEvent
@@ -31,6 +31,7 @@ class PriorityResult:
 
 class OperationsPriorityGuard:
     PROTECTION_WINDOW = timedelta(days=7)
+    PRIORITY_LOCK_KEY = "operations-priority"
     REAL_EVENT_TYPES = ("formal", "manual")
     TEST_EVENT_TYPES = ("test", "drill")
     ACTIVE_RUN_STATES = ("queued", "running")
@@ -69,6 +70,7 @@ class OperationsPriorityGuard:
         real_event_id = _coerce_uuid(event_id, "event_id")
         if not _supports_query_session(session):
             return PriorityResult()
+        await _acquire_priority_lock(session)
         if not await self._is_active_real_event(
             session,
             real_event_id,
@@ -152,8 +154,8 @@ class OperationsPriorityGuard:
         event_uuid = _coerce_uuid(event_id, "event_id")
         if not _supports_query_session(session):
             return
-        frozen_run_id = await session.scalar(
-            select(OperationsRun.id)
+        operation_state = await session.scalar(
+            select(OperationsRun.operation_state)
             .join(
                 EarthquakeEvent,
                 EarthquakeEvent.id == OperationsRun.event_id,
@@ -161,11 +163,12 @@ class OperationsPriorityGuard:
             .where(
                 OperationsRun.event_id == event_uuid,
                 EarthquakeEvent.event_type.in_(self.TEST_EVENT_TYPES),
-                OperationsRun.operation_state.in_(self.FROZEN_RUN_STATES),
             )
+            .order_by(OperationsRun.id)
             .limit(1)
+            .with_for_update(of=OperationsRun)
         )
-        if frozen_run_id is not None:
+        if operation_state in self.FROZEN_RUN_STATES:
             raise OperationsWorkBlocked()
 
     async def release_deferred_runs(
@@ -176,6 +179,7 @@ class OperationsPriorityGuard:
         normalized = _as_utc(observed_at)
         if not _supports_query_session(session):
             return 0
+        await _acquire_priority_lock(session)
         if await self.has_active_real_event(session, normalized):
             return 0
 
@@ -241,3 +245,14 @@ def _coerce_uuid(value: object, field_name: str) -> uuid.UUID:
 
 def _supports_query_session(session: object) -> bool:
     return callable(getattr(session, "scalar", None))
+
+
+async def _acquire_priority_lock(session: AsyncSession) -> None:
+    await session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended(:lock_key, 0)"
+            ")"
+        ),
+        {"lock_key": OperationsPriorityGuard.PRIORITY_LOCK_KEY},
+    )

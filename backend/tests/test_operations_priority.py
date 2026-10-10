@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -533,6 +534,151 @@ async def test_active_real_event_prevents_release(session) -> None:
     await session.refresh(schedule)
     assert released == 0
     assert schedule.state == "deferred"
+
+
+async def test_work_guard_locks_run_against_concurrent_real_event_freeze() -> None:
+    async with SessionFactory() as setup:
+        async with setup.begin():
+            real_event, _real_revision = await _seed_event(
+                session=setup,
+                event_type="manual",
+            )
+            test_event, _test_revision = await _seed_event(
+                session=setup,
+                event_type="test",
+            )
+            run = await _seed_run(setup, test_event)
+            real_event_id = real_event.id
+            test_event_id = test_event.id
+            run_id = run.id
+
+    local_engine = create_async_engine(
+        settings.database_url,
+        poolclass=NullPool,
+    )
+    session_factory = async_sessionmaker(
+        local_engine,
+        expire_on_commit=False,
+    )
+    try:
+        async with session_factory() as work_session:
+            async with work_session.begin():
+                await OperationsPriorityGuard().ensure_event_work_allowed(
+                    work_session,
+                    test_event_id,
+                )
+
+                async def freeze_event():
+                    async with session_factory() as freeze_session:
+                        async with freeze_session.begin():
+                            return await OperationsPriorityGuard().apply_real_event_start(
+                                freeze_session,
+                                event_id=real_event_id,
+                                observed_at=OBSERVED_AT,
+                            )
+
+                freeze_task = asyncio.create_task(freeze_event())
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.shield(freeze_task),
+                        timeout=0.5,
+                    )
+
+        priority_result = await freeze_task
+    finally:
+        await local_engine.dispose()
+
+    async with SessionFactory() as verification:
+        stored_run = await verification.get(OperationsRun, run_id)
+
+    assert priority_result.canceled_test_runs == 1
+    assert stored_run is not None
+    assert stored_run.operation_state == "canceled"
+    assert stored_run.detail["reason"] == "real_event_priority"
+
+
+async def test_release_deferred_runs_serializes_with_real_event_freeze() -> None:
+    async with SessionFactory() as setup:
+        async with setup.begin():
+            real_event, _revision = await _seed_event(
+                session=setup,
+                event_type="manual",
+            )
+            schedule = await _seed_schedule(
+                setup,
+                state="deferred",
+                scheduled_at=OBSERVED_AT - timedelta(minutes=1),
+            )
+            real_event_id = real_event.id
+            schedule_id = schedule.id
+
+    class BlockingReleaseGuard(OperationsPriorityGuard):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checked = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def has_active_real_event(
+            self,
+            session: AsyncSession,
+            observed_at: datetime,
+        ) -> bool:
+            del session, observed_at
+            self.checked.set()
+            await self.resume.wait()
+            return False
+
+    local_engine = create_async_engine(
+        settings.database_url,
+        poolclass=NullPool,
+    )
+    session_factory = async_sessionmaker(
+        local_engine,
+        expire_on_commit=False,
+    )
+    release_guard = BlockingReleaseGuard()
+    try:
+        async def release_schedules():
+            async with session_factory() as release_session:
+                async with release_session.begin():
+                    return await release_guard.release_deferred_runs(
+                        release_session,
+                        OBSERVED_AT,
+                    )
+
+        async def freeze_event():
+            async with session_factory() as freeze_session:
+                async with freeze_session.begin():
+                    return await OperationsPriorityGuard().apply_real_event_start(
+                        freeze_session,
+                        event_id=real_event_id,
+                        observed_at=OBSERVED_AT,
+                    )
+
+        release_task = asyncio.create_task(release_schedules())
+        await asyncio.wait_for(release_guard.checked.wait(), timeout=1)
+        freeze_task = asyncio.create_task(freeze_event())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(freeze_task),
+                timeout=0.5,
+            )
+        release_guard.resume.set()
+        released = await release_task
+        priority_result = await freeze_task
+    finally:
+        await local_engine.dispose()
+
+    async with SessionFactory() as verification:
+        stored_schedule = await verification.get(
+            OperationsTestSchedule,
+            schedule_id,
+        )
+
+    assert released == 1
+    assert priority_result.deferred_schedules == 1
+    assert stored_schedule is not None
+    assert stored_schedule.state == "deferred"
 
 
 async def test_frozen_event_blocks_new_task_mutations_and_router_maps_409(
