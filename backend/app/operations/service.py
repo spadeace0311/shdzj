@@ -110,6 +110,18 @@ class OperationsService:
 
         existing_run = await self._get_run_by_idempotency_key(key)
         if existing_run is not None:
+            if (
+                existing_run.trigger_mode != TriggerMode.SCHEDULED_TEST.value
+                or existing_run.schedule_id != schedule_uuid
+            ):
+                raise ValueError("idempotency_key conflicts with a different operation")
+            async with self._session_factory() as session:
+                event = await session.get(
+                    EarthquakeEvent,
+                    existing_run.event_id,
+                )
+            if event is None or event.event_type != EventKind.TEST.value:
+                raise ValueError("idempotency_key conflicts with a different operation")
             return _trigger_result(
                 existing_run,
                 revision_id=_revision_id_from_run(existing_run),
@@ -468,6 +480,7 @@ class OperationsService:
         event_uuid = _coerce_uuid(event_id, "event_id")
         blocked_state: str | None = None
         real_event_rejected = False
+        conflict_error: ValueError | None = None
         run: OperationsRun | None = None
 
         async with self._session_factory() as session:
@@ -490,21 +503,27 @@ class OperationsService:
                     else:
                         blocked_state = "deferred"
                 else:
-                    run = await self._persist_run(
-                        session,
-                        event_id=event_uuid,
-                        revision_id=revision_id,
-                        schedule_id=schedule_id,
-                        trigger_mode=trigger_mode.value,
-                        operation_state="queued",
-                        priority=priority,
-                        idempotency_key=idempotency_key,
-                        triggered_by=triggered_by,
-                        observed_at=observed_at,
-                    )
+                    try:
+                        run = await self._persist_run(
+                            session,
+                            event_id=event_uuid,
+                            revision_id=revision_id,
+                            schedule_id=schedule_id,
+                            trigger_mode=trigger_mode.value,
+                            operation_state="queued",
+                            priority=priority,
+                            idempotency_key=idempotency_key,
+                            triggered_by=triggered_by,
+                            observed_at=observed_at,
+                        )
+                    except ValueError as exc:
+                        conflict_error = exc
+                        await self._delete_rejected_event(session, event_uuid)
 
         if real_event_rejected:
             raise RealEventPriorityActive()
+        if conflict_error is not None:
+            raise conflict_error
         if blocked_state is not None:
             return _blocked_trigger_result(
                 key=idempotency_key,

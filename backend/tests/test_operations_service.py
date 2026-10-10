@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -555,3 +556,121 @@ async def test_manual_events_still_merge_by_time_and_space() -> None:
 
     assert found is not None
     assert found.id == existing.id
+
+
+async def test_concurrent_cross_mode_same_key_leaves_no_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    manual_service = _service()
+    drill_service = _service()
+    barrier = asyncio.Barrier(2)
+    manual_preflight = manual_service._get_run_by_idempotency_key
+    drill_preflight = drill_service._get_run_by_idempotency_key
+
+    async def manual_wait(key):
+        result = await manual_preflight(key)
+        await barrier.wait()
+        return result
+
+    async def drill_wait(key):
+        result = await drill_preflight(key)
+        await barrier.wait()
+        return result
+
+    monkeypatch.setattr(
+        manual_service,
+        "_get_run_by_idempotency_key",
+        manual_wait,
+    )
+    monkeypatch.setattr(
+        drill_service,
+        "_get_run_by_idempotency_key",
+        drill_wait,
+    )
+
+    results = await asyncio.gather(
+        manual_service.trigger_manual_test(
+            ManualTestTriggerRequest(idempotency_key="concurrent-shared-key"),
+            "operator",
+        ),
+        drill_service.trigger_drill(
+            DrillTriggerRequest(idempotency_key="concurrent-shared-key"),
+            "operator",
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, Exception) for result in results) == 1
+    assert any(
+        isinstance(result, ValueError) and "idempotency_key conflicts" in str(result)
+        for result in results
+    )
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        raw_count = await session.scalar(
+            select(func.count()).select_from(RawMessage).where(RawMessage.source == "operations")
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+
+    assert event_count == 1
+    assert raw_count == 1
+    assert run_count == 1
+
+
+async def test_manual_key_cannot_impersonate_scheduled_trigger() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            schedule = OperationsTestSchedule(
+                local_date=OBSERVED_AT.date(),
+                window_start=OBSERVED_AT - timedelta(hours=2),
+                window_end=OBSERVED_AT,
+                scheduled_at=OBSERVED_AT - timedelta(minutes=5),
+                state="due",
+                random_seed=123,
+            )
+            session.add(schedule)
+            await session.flush()
+            schedule_id = schedule.id
+
+    service = _service()
+    await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key=f"scheduled:{schedule_id}"),
+        "operator",
+    )
+
+    with pytest.raises(ValueError, match="idempotency_key conflicts"):
+        await service.trigger_scheduled_test(schedule_id, "operator")
+
+    missing_schedule_id = uuid.uuid4()
+    await service.trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key=f"scheduled:{missing_schedule_id}"),
+        "operator",
+    )
+
+    with pytest.raises(ValueError, match="idempotency_key conflicts"):
+        await service.trigger_scheduled_test(missing_schedule_id, "operator")
+
+    async with SessionFactory() as session:
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+        scheduled_run_count = await session.scalar(
+            select(func.count())
+            .select_from(OperationsRun)
+            .where(OperationsRun.trigger_mode == "scheduled_test")
+        )
+
+    assert run_count == 2
+    assert scheduled_run_count == 0
