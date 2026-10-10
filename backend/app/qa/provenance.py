@@ -15,6 +15,15 @@ _NUMBER_PATTERN = re.compile(
 _COORDINATE_PAIR_PATTERN = re.compile(
     r"(?<![\w.])(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)(?![\w])"
 )
+
+_AREA_WORDS = (
+    "面积",
+    "平方公里",
+    "平方千米",
+    "area",
+    "km²",
+    "km2",
+)
 _DISTANCE_WORDS = (
     "距离",
     "公里",
@@ -33,6 +42,7 @@ _COORDINATE_WORDS = (
     "东经",
     "北纬",
     "经纬",
+    "震中",
     "lon",
     "lat",
 )
@@ -42,16 +52,50 @@ _POPULATION_WORDS = (
     "常住",
     "流动",
     "居民",
+    "受灾",
+    "死亡",
+    "受伤",
+    "压埋",
     "population",
     "resident",
     "floating",
 )
-_AREA_WORDS = (
-    "面积",
-    "平方公里",
-    "平方千米",
-    "area",
-    "km²",
+
+_METRIC_ALIASES = (
+    ("受灾人口", "affected_population"),
+    ("受影响人口", "affected_population"),
+    ("常住人口", "resident_population"),
+    ("流动人口", "floating_population"),
+    ("全覆盖人口", "full_population"),
+    ("总人口", "full_population"),
+    ("人口", "full_population"),
+    ("死亡人数", "deaths"),
+    ("受伤人数", "injuries"),
+    ("压埋人数", "buried"),
+    ("倒塌面积", "collapsed_area_m2"),
+    ("破坏面积", "total_area_m2"),
+    ("影响面积", "area_sq_km"),
+    ("面积", "area_sq_km"),
+    ("震级", "magnitude"),
+    ("经度", "coordinate"),
+    ("纬度", "coordinate"),
+    ("坐标", "coordinate"),
+)
+
+_UNIT_ALIASES = (
+    ("平方公里", "km2"),
+    ("平方千米", "km2"),
+    ("平方米", "m2"),
+    ("公里", "km"),
+    ("千米", "km"),
+    ("万人", "person"),
+    ("人", "person"),
+    ("户", "household"),
+    ("km²", "km2"),
+    ("km2", "km2"),
+    ("m2", "m2"),
+    ("km", "km"),
+    ("m", "m"),
 )
 
 
@@ -62,6 +106,21 @@ class _Claim:
     value: Decimal
     start: int
     end: int
+    metric: str | None = None
+    unit: str | None = None
+    entity: str | None = None
+    scope: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceValue:
+    kind: str
+    value: Decimal
+    metric: str | None
+    unit: str | None
+    entity: str | None
+    scope: str | None
+    structured: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,16 +141,17 @@ class NumericProvenanceValidator:
         if not isinstance(text, str):
             return NumericProvenanceResult(False, _FAILED_TEXT, ("invalid_text",))
 
-        tool_values = _tool_provenance(executions)
-        evidence_values = _evidence_provenance(model_evidence)
-        claims = _key_claims(text)
+        sources = [
+            *_tool_provenance(executions),
+            *_evidence_provenance(model_evidence),
+        ]
+        entities = _ordered_unique(
+            source.entity for source in sources if source.entity
+        )
+        claims = _key_claims(text, entities=entities)
         unverified: list[str] = []
         for claim in claims:
-            allowed = tool_values.get(claim.kind, set()) | evidence_values.get(
-                claim.kind,
-                set(),
-            )
-            if claim.value not in allowed:
+            if not any(_source_matches(claim, source) for source in sources):
                 unverified.append(claim.kind)
 
         if unverified:
@@ -107,10 +167,8 @@ class NumericProvenanceValidator:
         )
 
 
-def _tool_provenance(
-    executions: Iterable[Any],
-) -> dict[str, set[Decimal]]:
-    values: dict[str, set[Decimal]] = {}
+def _tool_provenance(executions: Iterable[Any]) -> list[_SourceValue]:
+    sources: list[_SourceValue] = []
     for execution in executions:
         result = getattr(execution, "result", getattr(execution, "tool_result", None))
         if str(getattr(result, "status", "unknown")) != "ok":
@@ -118,26 +176,75 @@ def _tool_provenance(
         value = getattr(result, "value", None)
         if not isinstance(value, Mapping):
             continue
-        _add_tool_value(values, value)
-    return values
+        parameters = _mapping(getattr(result, "parameters", {}))
+        scope = _area_scope(parameters)
+        _add_tool_value(
+            sources,
+            value,
+            inherited_unit=_normalize_unit(getattr(result, "unit", None)),
+            inherited_scope=scope,
+        )
+    return sources
 
 
 def _evidence_provenance(
     model_evidence: Iterable[Mapping[str, Any]],
-) -> dict[str, set[Decimal]]:
-    values: dict[str, set[Decimal]] = {}
+) -> list[_SourceValue]:
+    sources: list[_SourceValue] = []
     for item in model_evidence:
-        text = item.get("text") if isinstance(item, Mapping) else None
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("kind") == "structured":
+            metric_key = item.get("metric_key")
+            metric_value = item.get("value")
+            kind = _kind_for_metric(metric_key, item.get("unit"))
+            parsed = _decimal(metric_value)
+            if kind is None or parsed is None:
+                continue
+            scope = _mapping(item.get("scope") or {})
+            entity = _entity_value(scope)
+            metric = _canonical_metric(metric_key)
+            unit = _normalize_unit(item.get("unit")) or _unit_for_metric_key(
+                metric_key
+            )
+            sources.append(
+                _SourceValue(
+                    kind=kind,
+                    value=parsed,
+                    metric=metric,
+                    unit=unit,
+                    entity=entity,
+                    scope=_area_scope(scope),
+                    structured=entity is not None,
+                )
+            )
+            continue
+
+        text = item.get("text")
         if not isinstance(text, str):
             continue
         for claim in _key_claims(text):
-            values.setdefault(claim.kind, set()).add(claim.value)
-    return values
+            sources.append(
+                _SourceValue(
+                    kind=claim.kind,
+                    value=claim.value,
+                    metric=claim.metric,
+                    unit=claim.unit,
+                    entity=claim.entity,
+                    scope=claim.scope,
+                    structured=claim.entity is not None,
+                )
+            )
+    return sources
 
 
 def _add_tool_value(
-    values: dict[str, set[Decimal]],
+    sources: list[_SourceValue],
     value: Mapping[str, Any],
+    *,
+    inherited_unit: str | None,
+    inherited_scope: str | None,
+    inherited_entity: str | None = None,
 ) -> None:
     metrics = value.get("metrics")
     if isinstance(metrics, list):
@@ -146,54 +253,106 @@ def _add_tool_value(
                 continue
             metric_key = metric.get("metric_key")
             metric_value = metric.get("numeric_value")
-            kind = _kind_for_key(metric_key)
+            unit = _normalize_unit(metric.get("unit")) or inherited_unit
+            kind = _kind_for_metric(metric_key, unit)
             parsed = _decimal(metric_value)
-            if kind is not None and parsed is not None:
-                values.setdefault(kind, set()).add(parsed)
+            if kind is None or parsed is None:
+                continue
+            entity = _entity_value(metric) or inherited_entity
+            sources.append(
+                _SourceValue(
+                    kind=kind,
+                    value=parsed,
+                    metric=_canonical_metric(metric_key),
+                    unit=unit or _unit_for_metric_key(metric_key),
+                    entity=entity,
+                    scope=_area_scope(metric) or inherited_scope,
+                    structured=entity is not None,
+                )
+            )
 
     statistics = value.get("statistics")
     if isinstance(statistics, Mapping):
         for key, metric_value in statistics.items():
-            kind = _kind_for_key(key)
+            kind = _kind_for_metric(key, inherited_unit)
             parsed = _decimal(metric_value)
-            if kind is not None and parsed is not None:
-                values.setdefault(kind, set()).add(parsed)
+            if kind is None or parsed is None:
+                continue
+            sources.append(
+                _SourceValue(
+                    kind=kind,
+                    value=parsed,
+                    metric=_canonical_metric(key),
+                    unit=inherited_unit or _unit_for_metric_key(key),
+                    entity=None,
+                    scope=inherited_scope,
+                    structured=False,
+                )
+            )
 
     for key, metric_value in value.items():
         if key in {"metrics", "statistics"}:
             continue
-        kind = _kind_for_key(key)
+        kind = _kind_for_metric(key, inherited_unit)
         parsed = _decimal(metric_value)
         if kind is not None and parsed is not None:
-            values.setdefault(kind, set()).add(parsed)
-        elif isinstance(metric_value, Mapping):
-            _add_tool_value(values, metric_value)
+            entity = _entity_value(value) or inherited_entity
+            sources.append(
+                _SourceValue(
+                    kind=kind,
+                    value=parsed,
+                    metric=_canonical_metric(key),
+                    unit=inherited_unit or _unit_for_metric_key(key),
+                    entity=entity,
+                    scope=_area_scope(value) or inherited_scope,
+                    structured=entity is not None,
+                )
+            )
+            continue
+        if isinstance(metric_value, Mapping):
+            _add_tool_value(
+                sources,
+                metric_value,
+                inherited_unit=inherited_unit,
+                inherited_scope=inherited_scope,
+                inherited_entity=_entity_value(value) or inherited_entity,
+            )
         elif isinstance(metric_value, list):
             for child in metric_value:
                 if isinstance(child, Mapping):
-                    _add_tool_value(values, child)
+                    _add_tool_value(
+                        sources,
+                        child,
+                        inherited_unit=inherited_unit,
+                        inherited_scope=inherited_scope,
+                        inherited_entity=_entity_value(value) or inherited_entity,
+                    )
 
 
-def _kind_for_key(key: Any) -> str | None:
-    if not isinstance(key, str):
-        return None
-    normalized = key.strip().lower()
-    if normalized in {"longitude", "latitude", "lon", "lat"}:
-        return "coordinate"
-    if normalized in {"magnitude"}:
-        return "magnitude"
-    if normalized in {"distance_km"}:
-        return "distance"
-    if normalized.endswith("_km"):
-        return "distance"
-    if normalized.endswith("_population") or "population" in normalized:
-        return "population"
-    if "area" in normalized:
-        return "area"
-    return None
+def _source_matches(claim: _Claim, source: _SourceValue) -> bool:
+    if source.kind != claim.kind or source.value != claim.value:
+        return False
+    if source.entity and claim.entity and source.entity != claim.entity:
+        return False
+    if source.structured and source.entity and not claim.entity:
+        return False
+    if claim.entity and not source.entity:
+        return False
+    if source.scope and claim.scope and source.scope != claim.scope:
+        return False
+    if source.metric and claim.metric and source.metric != claim.metric:
+        return False
+    if source.unit and claim.unit and source.unit != claim.unit:
+        return False
+    return True
 
 
-def _key_claims(text: str) -> list[_Claim]:
+def _key_claims(
+    text: str,
+    *,
+    entities: Iterable[str] = (),
+) -> list[_Claim]:
+    known_entities = tuple(_ordered_unique(entities))
     sanitized = _CITATION_PATTERN.sub(" ", text)
     claims: list[_Claim] = []
     pair_ranges: set[tuple[int, int]] = set()
@@ -206,8 +365,10 @@ def _key_claims(text: str) -> list[_Claim]:
         if not _plausible_coordinate(first) or not _plausible_coordinate(second):
             continue
         window = _window(sanitized, match.start(), match.end())
-        if not any(word in window for word in _COORDINATE_WORDS) and "震中" not in window:
+        prefix = _prefix(sanitized, match.start())
+        if not any(word in window for word in _COORDINATE_WORDS):
             continue
+        common = _claim_metadata(window, prefix, "coordinate", known_entities)
         claims.extend(
             [
                 _Claim(
@@ -216,6 +377,7 @@ def _key_claims(text: str) -> list[_Claim]:
                     value=first,
                     start=match.start(1),
                     end=match.end(1),
+                    **common,
                 ),
                 _Claim(
                     kind="coordinate",
@@ -223,23 +385,29 @@ def _key_claims(text: str) -> list[_Claim]:
                     value=second,
                     start=match.start(2),
                     end=match.end(2),
+                    **common,
                 ),
             ]
         )
         pair_ranges.add((match.start(), match.end()))
 
     for match in _NUMBER_PATTERN.finditer(sanitized):
-        if any(start <= match.start() and match.end() <= end for start, end in pair_ranges):
+        if any(
+            start <= match.start() and match.end() <= end
+            for start, end in pair_ranges
+        ):
             continue
         parsed = _decimal(match.group(0))
         if parsed is None:
             continue
         window = _window(sanitized, match.start(), match.end())
+        prefix = _prefix(sanitized, match.start())
         if _non_metric_number(window):
             continue
         kind = _claim_kind(window)
         if kind is None:
             continue
+        metadata = _claim_metadata(window, prefix, kind, known_entities)
         claims.append(
             _Claim(
                 kind=kind,
@@ -247,9 +415,24 @@ def _key_claims(text: str) -> list[_Claim]:
                 value=parsed,
                 start=match.start(),
                 end=match.end(),
+                **metadata,
             )
         )
     return claims
+
+
+def _claim_metadata(
+    window: str,
+    prefix: str,
+    kind: str,
+    entities: tuple[str, ...],
+) -> dict[str, str | None]:
+    return {
+        "metric": _metric_for_window(window, kind),
+        "unit": _unit_for_window(window, kind),
+        "entity": _entity_in_window(prefix, entities),
+        "scope": _scope_for_window(prefix),
+    }
 
 
 def _claim_kind(window: str) -> str | None:
@@ -264,6 +447,154 @@ def _claim_kind(window: str) -> str | None:
         return "magnitude"
     if any(word in lowered for word in _POPULATION_WORDS):
         return "population"
+    return None
+
+
+def _metric_for_window(window: str, kind: str) -> str | None:
+    lowered = window.lower()
+    for alias, metric in _METRIC_ALIASES:
+        if alias.lower() in lowered:
+            return metric
+    if kind == "distance":
+        return "distance_km"
+    if kind == "area":
+        return "area_sq_km"
+    if kind == "coordinate":
+        return "coordinate"
+    if kind == "magnitude":
+        return "magnitude"
+    return None
+
+
+def _unit_for_window(window: str, kind: str) -> str | None:
+    lowered = window.lower()
+    for alias, unit in _UNIT_ALIASES:
+        if alias.lower() in lowered:
+            return unit
+    if kind == "distance":
+        return "km"
+    if kind == "area":
+        return "km2"
+    return None
+
+
+def _entity_in_window(
+    window: str,
+    entities: tuple[str, ...],
+) -> str | None:
+    normalized_window = window.lower()
+    best: str | None = None
+    best_position = -1
+    for entity in entities:
+        position = normalized_window.rfind(entity.lower())
+        if position > best_position:
+            best_position = position
+            best = entity
+    return best
+
+
+def _scope_for_window(window: str) -> str | None:
+    if "镇" in window or "街道" in window:
+        return "town"
+    if "县" in window or "区" in window:
+        return "county"
+    if "全市" in window or "市" in window:
+        return "city"
+    return None
+
+
+def _kind_for_metric(key: Any, unit: str | None = None) -> str | None:
+    if not isinstance(key, str):
+        return None
+    normalized = key.strip().lower()
+    if normalized in {"longitude", "latitude", "lon", "lat"}:
+        return "coordinate"
+    if normalized == "magnitude":
+        return "magnitude"
+    if (
+        "area" in normalized
+        or normalized.endswith("_m2")
+        or normalized.endswith("_sq_km")
+    ):
+        return "area"
+    if normalized == "distance_km" or normalized.endswith("_km"):
+        return "distance"
+    if (
+        normalized.endswith("_population")
+        or "population" in normalized
+        or normalized in {"deaths", "injuries", "buried"}
+    ):
+        return "population"
+    if unit in {"person", "人"}:
+        return "population"
+    return None
+
+
+def _canonical_metric(key: Any) -> str | None:
+    if not isinstance(key, str):
+        return None
+    normalized = key.strip().lower()
+    if normalized in {"longitude", "latitude", "lon", "lat"}:
+        return "coordinate"
+    aliases = {
+        "total_population": "full_population",
+        "population": "full_population",
+        "area": "area_sq_km",
+        "radius_km": "distance_km",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _unit_for_metric_key(key: Any) -> str | None:
+    if not isinstance(key, str):
+        return None
+    normalized = key.strip().lower()
+    if normalized.endswith("_sq_km"):
+        return "km2"
+    if normalized.endswith("_m2") or "area" in normalized:
+        return "m2"
+    if normalized.endswith("_km"):
+        return "km"
+    if (
+        normalized.endswith("_population")
+        or "population" in normalized
+        or normalized in {"deaths", "injuries", "buried"}
+    ):
+        return "person"
+    return None
+
+
+def _normalize_unit(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    aliases = {
+        "km²": "km2",
+        "square kilometers": "km2",
+        "平方千米": "km2",
+        "平方公里": "km2",
+        "square meters": "m2",
+        "平方米": "m2",
+        "people": "person",
+        "persons": "person",
+        "人": "person",
+        "户": "household",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _entity_value(value: Mapping[str, Any]) -> str | None:
+    for key in ("area_name", "area_code"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().lower()
+    return None
+
+
+def _area_scope(value: Mapping[str, Any]) -> str | None:
+    candidate = value.get("area_scope")
+    if candidate in {"city", "county", "town"}:
+        return str(candidate)
     return None
 
 
@@ -288,6 +619,10 @@ def _non_metric_number(window: str) -> bool:
 
 def _window(text: str, start: int, end: int) -> str:
     return text[max(0, start - 80) : min(len(text), end + 80)]
+
+
+def _prefix(text: str, start: int) -> str:
+    return text[max(0, start - 80) : start]
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -318,11 +653,16 @@ def _plausible_coordinate(value: Decimal) -> bool:
     return Decimal("-180") <= value <= Decimal("180")
 
 
-def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _ordered_unique(values: Iterable[Any]) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
-        if value not in result:
-            result.append(value)
+        text = str(value)
+        if text not in result:
+            result.append(text)
     return tuple(result)
 
 

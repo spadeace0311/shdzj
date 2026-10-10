@@ -9,7 +9,6 @@ import {
   MapActionProvider,
   useMapActionPublisher,
 } from "../src/qa/MapActionContext";
-import { QA_LAYER_CATALOG } from "../src/qa/mapActions";
 import type {
   IntensityGridArtifact,
   LossAreaFeature,
@@ -188,7 +187,7 @@ function LossActionHarness({ action }: { action: QaMapAction }) {
       <LossMap
         center={[31.2, 121.5]}
         tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
-        townFeatures={[]}
+        townFeatures={[townFeature]}
         gridArtifact={null}
         fusedIntensityArtifact={null}
       />
@@ -745,24 +744,43 @@ it("applies frozen bounds, buffer center and highlighted feature IDs", async () 
   );
 });
 
-it("executes dictionary set_layers visibility through MapLibre", async () => {
+it("applies a production loss highlight through the real LossMap layer", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "highlight",
+    target_ref: "loss:310115001",
+    layer_id: "loss",
+    feature_id: "310115001",
+    reason: "突出受灾街镇",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "highlight",
+    ),
+  );
+  expect(map.setFilter).toHaveBeenCalledWith("loss-map-town-fill", [
+    "==",
+    ["get", "area_code"],
+    "310115001",
+  ]);
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
+it("applies production loss set_layers visibility through the real LossMap layer", async () => {
   const { map } = await renderLossActionHarness({
     action_type: "set_layers",
     layers: {
-      epicenter: true,
-      faults: false,
+      loss: false,
     },
     visibility: {
-      epicenter: true,
-      faults: false,
-      population: false,
+      loss: false,
     },
-    reason: "图层联动",
+    reason: "隐藏损失图层",
     valid_until: "2099-01-01T00:00:00Z",
   });
-  for (const layer of Object.values(QA_LAYER_CATALOG.layers)) {
-    map.layers.set(layer.id, { id: layer.id });
-  }
 
   fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
 
@@ -772,15 +790,11 @@ it("executes dictionary set_layers visibility through MapLibre", async () => {
     ),
   );
   expect(map.setLayoutProperty).toHaveBeenCalledWith(
-    "qa-epicenter",
-    "visibility",
-    "visible",
-  );
-  expect(map.setLayoutProperty).toHaveBeenCalledWith(
-    "qa-faults",
+    "loss-map-town-fill",
     "visibility",
     "none",
   );
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
 });
 
 function spatializedProduct(

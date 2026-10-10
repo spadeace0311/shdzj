@@ -94,6 +94,17 @@ export const QA_LAYER_CATALOG: QaLayerCatalog = {
   },
 };
 
+export const LOSS_QA_LAYER_CATALOG: QaLayerCatalog = {
+  targets: {},
+  layers: {
+    loss: {
+      id: "loss-map-town-fill",
+      source: "loss-map-town-loss",
+      featureIdProperty: "area_code",
+    },
+  },
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

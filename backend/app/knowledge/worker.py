@@ -94,8 +94,10 @@ class KnowledgeWorker:
             else online_search_enabled
         )
         self._now = now or (lambda: datetime.now(UTC))
+        self._pending_alias_rebuild: Any | None = None
 
     async def process_one(self, session: AsyncSession) -> bool:
+        self._pending_alias_rebuild = None
         job = await _claim_next_job(
             session,
             lease_seconds=self._lease_seconds,
@@ -134,6 +136,17 @@ class KnowledgeWorker:
         except Exception as exc:
             await _mark_failure(session, job.id, exc, self._now())
         return True
+
+    def clear_pending_alias_rebuild(self) -> None:
+        self._pending_alias_rebuild = None
+
+    async def compensate_pending_alias_rebuild(self) -> None:
+        rebuild = self._pending_alias_rebuild
+        self._pending_alias_rebuild = None
+        if rebuild is None:
+            return
+        await self._index.compensate_rebuild(rebuild)
+        await self._index.abort_rebuild(rebuild)
 
     async def _existing_success(
         self,
@@ -304,7 +317,7 @@ class KnowledgeWorker:
                 batch_size=self._batch_size,
             )
 
-        await _build_index(
+        activated_rebuild = await _build_index(
             session,
             self._index,
             self._embeddings,
@@ -314,6 +327,7 @@ class KnowledgeWorker:
             force_rebuild=force_rebuild,
             batch_size=self._batch_size,
         )
+        self._pending_alias_rebuild = activated_rebuild
         version.indexed_at = self._now()
         if force_rebuild:
             job.result_payload = {
@@ -468,11 +482,17 @@ async def run_worker() -> None:
             state.mark_alive()
             processed = False
             async with SessionFactory() as session:
-                async with session.begin():
-                    processed = (
-                        await worker.enqueue_due_refreshes(session) > 0
-                    ) or processed
-                    processed = await worker.process_one(session) or processed
+                try:
+                    async with session.begin():
+                        processed = (
+                            await worker.enqueue_due_refreshes(session) > 0
+                        ) or processed
+                        processed = await worker.process_one(session) or processed
+                except BaseException:
+                    await worker.compensate_pending_alias_rebuild()
+                    raise
+                else:
+                    worker.clear_pending_alias_rebuild()
             if not processed:
                 await asyncio.sleep(settings.knowledge_worker_poll_seconds)
     finally:
@@ -722,7 +742,7 @@ async def _build_index(
     *,
     force_rebuild: bool,
     batch_size: int,
-) -> None:
+) -> Any | None:
     index_version = await session.scalar(
         select(KnowledgeIndexVersion)
         .where(KnowledgeIndexVersion.source_version_id == version.id)
@@ -766,6 +786,7 @@ async def _build_index(
     version.status = KnowledgeVersionStatus.EMBEDDING.value
     rebuild = None
     target_collection = None
+    activated_rebuild = None
     try:
         await index.ensure_collection(index_version)
         if force_rebuild:
@@ -804,6 +825,7 @@ async def _build_index(
         manifest["index_batch_size"] = batch_size
         if rebuild is not None:
             await index.commit_rebuild(rebuild)
+            activated_rebuild = rebuild
             manifest["collection_alias"] = rebuild.alias_name
             manifest["physical_collection_name"] = rebuild.staging_name
             index_version.collection_name = rebuild.alias_name
@@ -811,12 +833,15 @@ async def _build_index(
         await session.flush()
     except Exception:
         if rebuild is not None:
+            if activated_rebuild is not None:
+                await index.compensate_rebuild(rebuild)
             await index.abort_rebuild(rebuild)
         raise
     if version_was_published:
         version.status = KnowledgeVersionStatus.PUBLISHED.value
     else:
         version.status = KnowledgeVersionStatus.INDEXED.value
+    return activated_rebuild
 
 
 async def _queue_job(

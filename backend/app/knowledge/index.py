@@ -298,6 +298,25 @@ class KnowledgeIndex:
         )
         await self._client.update_collection_aliases(operations)
 
+    async def compensate_rebuild(self, rebuild: KnowledgeIndexRebuild) -> None:
+        if rebuild.previous_alias_exists:
+            previous_name = rebuild.previous_name or rebuild.logical_name
+            operations = [
+                CreateAliasOperation(
+                    create_alias=CreateAlias(
+                        alias_name=rebuild.alias_name,
+                        collection_name=previous_name,
+                    )
+                )
+            ]
+        else:
+            operations = [
+                DeleteAliasOperation(
+                    delete_alias=DeleteAlias(alias_name=rebuild.alias_name)
+                )
+            ]
+        await self._client.update_collection_aliases(operations)
+
     async def abort_rebuild(self, rebuild: KnowledgeIndexRebuild) -> None:
         if await self._client.collection_exists(rebuild.staging_name):
             await self._client.delete_collection(rebuild.staging_name)

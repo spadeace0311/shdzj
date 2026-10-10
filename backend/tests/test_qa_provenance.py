@@ -89,3 +89,129 @@ def test_ignores_citation_keys_dates_and_non_metric_numbers() -> None:
     )
 
     assert validation.safe is True
+
+
+def _town_metrics() -> dict:
+    return {
+        "metrics": [
+            {
+                "area_scope": "town",
+                "area_code": "town-a",
+                "area_name": "甲镇",
+                "metric_key": "affected_population",
+                "value_type": "central",
+                "numeric_value": 120000,
+                "unit": "人",
+            },
+            {
+                "area_scope": "town",
+                "area_code": "town-b",
+                "area_name": "乙镇",
+                "metric_key": "affected_population",
+                "value_type": "central",
+                "numeric_value": 80000,
+                "unit": "人",
+            },
+        ]
+    }
+
+
+def test_swapped_town_values_are_unsafe() -> None:
+    validation = _validator().validate(
+        "甲镇受灾人口 120000 人，乙镇受灾人口 80000 人。",
+        executions=[
+            _execution(
+                "loss.get_metrics",
+                {
+                    "metrics": [
+                        {
+                            **metric,
+                            "numeric_value": (
+                                80000 if metric["area_name"] == "甲镇" else 120000
+                            ),
+                        }
+                        for metric in _town_metrics()["metrics"]
+                    ]
+                },
+            )
+        ],
+        model_evidence=[],
+    )
+
+    assert validation.safe is False
+    assert "population" in validation.unverified_claim_kinds
+
+
+def test_correct_town_bound_values_remain_safe() -> None:
+    validation = _validator().validate(
+        "甲镇受灾人口 120000 人，乙镇受灾人口 80000 人。",
+        executions=[_execution("loss.get_metrics", _town_metrics())],
+        model_evidence=[],
+    )
+
+    assert validation.safe is True
+
+
+def test_area_sq_km_classifies_as_area_not_distance() -> None:
+    validation = _validator().validate(
+        "影响面积约 125 平方公里。",
+        executions=[
+            _execution(
+                "loss.get_metrics",
+                {"area_sq_km": 125, "unit": "km²"},
+            )
+        ],
+        model_evidence=[],
+    )
+
+    assert validation.safe is True
+
+
+def test_mismatched_unit_or_metric_does_not_validate() -> None:
+    metric_mismatch = _validator().validate(
+        "甲镇受灾人口 120000 人。",
+        executions=[
+            _execution(
+                "loss.get_metrics",
+                {
+                    "metrics": [
+                        {
+                            "area_scope": "town",
+                            "area_code": "town-a",
+                            "area_name": "甲镇",
+                            "metric_key": "full_population",
+                            "value_type": "central",
+                            "numeric_value": 120000,
+                            "unit": "人",
+                        }
+                    ]
+                },
+            )
+        ],
+        model_evidence=[],
+    )
+    unit_mismatch = _validator().validate(
+        "甲镇受灾人口 120000 人。",
+        executions=[
+            _execution(
+                "loss.get_metrics",
+                {
+                    "metrics": [
+                        {
+                            "area_scope": "town",
+                            "area_code": "town-a",
+                            "area_name": "甲镇",
+                            "metric_key": "affected_population",
+                            "value_type": "central",
+                            "numeric_value": 120000,
+                            "unit": "户",
+                        }
+                    ]
+                },
+            )
+        ],
+        model_evidence=[],
+    )
+
+    assert metric_mismatch.safe is False
+    assert unit_mismatch.safe is False

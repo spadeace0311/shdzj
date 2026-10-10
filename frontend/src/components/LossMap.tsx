@@ -14,7 +14,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { getAccessToken } from "../api/client";
 import {
   applyQaMapAction,
-  QA_LAYER_CATALOG,
+  LOSS_QA_LAYER_CATALOG,
   type QaActionMap,
 } from "../qa/mapActions";
 import {
@@ -171,7 +171,7 @@ export function LossMap({
       const applied = applyQaMapAction(
         mapRef.current as unknown as QaActionMap,
         latestAction,
-        QA_LAYER_CATALOG,
+        LOSS_QA_LAYER_CATALOG,
       );
       if (applied) {
         setLastActionType(latestAction.action_type);

@@ -8,12 +8,13 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from sqlalchemy import delete, select
+from sqlalchemy.engine.base import RootTransaction
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.embedding.schemas import DENSE_DIMENSIONS, EmbeddingBatch
 from app.knowledge.domain import KnowledgeJobStatus, KnowledgeVersionStatus
-from app.knowledge.index import IndexedChunk
+from app.knowledge.index import IndexedChunk, KnowledgeIndex
 from app.knowledge.models import (
     KnowledgeChunk,
     KnowledgeIndexVersion,
@@ -25,7 +26,8 @@ from app.knowledge.models import (
 from app.knowledge.health import WorkerHealthState
 from app.knowledge.publication import KnowledgePublicationService
 from app.knowledge.storage import KnowledgeFileStore
-from app.knowledge.worker import KnowledgeWorker
+from app.knowledge.worker import KnowledgeWorker, _build_index
+from qdrant_client.models import Distance, SparseVectorParams, VectorParams
 
 
 WORKER_ACTOR = "knowledge-worker-test"
@@ -396,6 +398,185 @@ async def test_late_batch_upsert_failure_preserves_old_points(
         await _delete_actor_data(session_factory)
 
 
+async def _seeded_real_index(
+    session_factory,
+) -> tuple[UUID, list[UUID], _AliasQdrantClient, str, KnowledgeIndex]:
+    version_id, chunk_ids = await _seed_published_indexed_version(
+        session_factory
+    )
+    async with session_factory() as session:
+        index_version = await session.scalar(
+            select(KnowledgeIndexVersion).where(
+                KnowledgeIndexVersion.source_version_id == version_id
+            )
+        )
+        assert index_version is not None
+        logical_name = index_version.collection_name
+    client = _AliasQdrantClient()
+    client.collections.add(logical_name)
+    client.collection_infos[logical_name] = _alias_collection_info()
+    index = KnowledgeIndex(client=client)
+    return version_id, chunk_ids, client, logical_name, index
+
+
+async def _build_index_with_failing_flush(
+    session_factory,
+    version_id: UUID,
+    index: KnowledgeIndex,
+) -> None:
+    async with session_factory() as session:
+        version = await session.get(KnowledgeSourceVersion, version_id)
+        source = await session.get(KnowledgeSource, version.source_id)
+        assert version is not None
+        assert source is not None
+        original_flush = session.flush
+        flush_calls = 0
+
+        async def fail_after_activation() -> None:
+            nonlocal flush_calls
+            flush_calls += 1
+            if flush_calls == 2:
+                raise RuntimeError("post-activation flush failed")
+            await original_flush()
+
+        session.flush = fail_after_activation
+        with pytest.raises(RuntimeError, match="post-activation flush failed"):
+            await _build_index(
+                session,
+                index,
+                _FakeEmbeddings(),
+                version,
+                source,
+                2,
+                force_rebuild=True,
+                batch_size=10,
+            )
+
+
+async def test_real_index_restores_previous_alias_after_post_activation_failure(
+    session_factory,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        client.aliases[alias_name] = logical_name
+
+        await _build_index_with_failing_flush(
+            session_factory,
+            version_id,
+            index,
+        )
+
+        assert client.aliases.get(alias_name) == logical_name
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_real_index_removes_new_alias_after_post_activation_failure(
+    session_factory,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+
+        await _build_index_with_failing_flush(
+            session_factory,
+            version_id,
+            index,
+        )
+
+        assert alias_name not in client.aliases
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_real_index_success_leaves_new_alias_active(
+    session_factory,
+) -> None:
+    try:
+        version_id, chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "real alias success"},
+        )
+        worker = KnowledgeWorker(index=index, embeddings=_FakeEmbeddings())
+
+        assert await _process_one(session_factory, worker) is True
+
+        assert client.aliases.get(alias_name) is not None
+        assert client.aliases[alias_name] != logical_name
+        assert client.aliases[alias_name] in client.collections
+        assert len(client.aliases) == 1
+        assert len(
+            {
+                collection
+                for collection in client.collections
+                if collection != logical_name
+            }
+        ) == 1
+        del chunk_ids
+    finally:
+        await _delete_actor_data(session_factory)
+
+
+async def test_real_index_compensates_outer_commit_failure(
+    session_factory,
+    monkeypatch,
+) -> None:
+    try:
+        version_id, _chunk_ids, client, logical_name, index = (
+            await _seeded_real_index(session_factory)
+        )
+        alias_name = f"{logical_name}-active"
+        client.aliases[alias_name] = logical_name
+        await _seed_job(
+            session_factory,
+            version_id,
+            "index",
+            payload={"force": True, "reason": "outer commit failure"},
+        )
+        worker = KnowledgeWorker(index=index, embeddings=_FakeEmbeddings())
+
+        def fail_root_commit(_transaction: object) -> None:
+            raise RuntimeError("outer commit failed")
+
+        monkeypatch.setattr(RootTransaction, "commit", fail_root_commit)
+        async with session_factory() as session:
+            with pytest.raises(RuntimeError, match="outer commit failed"):
+                async with session.begin():
+                    await worker.process_one(session)
+            await worker.compensate_pending_alias_rebuild()
+        monkeypatch.undo()
+
+        assert client.aliases.get(alias_name) == logical_name
+        assert not any(
+            collection.startswith(f"{logical_name}-")
+            and collection != logical_name
+            for collection in client.collections
+        )
+    finally:
+        await _delete_actor_data(session_factory)
+
+
 @pytest.mark.parametrize("job_type", ["ingest", "index"])
 async def test_worker_dead_letters_after_attempt_budget(
     session_factory,
@@ -688,8 +869,111 @@ async def test_online_refresh_scan_is_disabled_when_online_search_is_off(
 
 async def _process_one(session_factory, worker: KnowledgeWorker) -> bool:
     async with session_factory() as session:
-        async with session.begin():
-            return await worker.process_one(session)
+        try:
+            async with session.begin():
+                result = await worker.process_one(session)
+        except BaseException:
+            await worker.compensate_pending_alias_rebuild()
+            raise
+        worker.clear_pending_alias_rebuild()
+        return result
+
+
+class _AliasQdrantClient:
+    def __init__(self) -> None:
+        self.collections: set[str] = set()
+        self.collection_infos: dict[str, object] = {}
+        self.aliases: dict[str, str] = {}
+        self.alias_operations: list[list[object]] = []
+        self.deleted_collections: list[str] = []
+
+    async def collection_exists(self, collection_name: str) -> bool:
+        return collection_name in self.collections
+
+    async def get_collection(self, collection_name: str, **kwargs: object) -> object:
+        del kwargs
+        return self.collection_infos[collection_name]
+
+    async def create_collection(
+        self,
+        collection_name: str,
+        **kwargs: object,
+    ) -> bool:
+        del kwargs
+        self.collections.add(collection_name)
+        self.collection_infos[collection_name] = _alias_collection_info()
+        return True
+
+    async def upsert(
+        self,
+        collection_name: str,
+        points: list,
+        **kwargs: object,
+    ) -> None:
+        del collection_name, points, kwargs
+
+    async def scroll(
+        self,
+        collection_name: str,
+        *,
+        limit: int = 10,
+        with_payload: bool = True,
+        **kwargs: object,
+    ) -> tuple[list, object]:
+        del collection_name, limit, with_payload, kwargs
+        return [], None
+
+    async def update_collection_aliases(self, operations: list[object]) -> None:
+        self.alias_operations.append(operations)
+        for operation in operations:
+            delete_alias = getattr(operation, "delete_alias", None)
+            if delete_alias is not None:
+                self.aliases.pop(getattr(delete_alias, "alias_name"), None)
+                continue
+            create_alias = getattr(operation, "create_alias", None)
+            if create_alias is not None:
+                self.aliases[getattr(create_alias, "alias_name")] = getattr(
+                    create_alias,
+                    "collection_name",
+                )
+
+    async def get_aliases(self) -> object:
+        return SimpleNamespace(
+            aliases=[
+                SimpleNamespace(alias_name=alias_name, collection_name=collection_name)
+                for alias_name, collection_name in self.aliases.items()
+            ]
+        )
+
+    async def delete_collection(self, collection_name: str) -> None:
+        self.collections.discard(collection_name)
+        self.collection_infos.pop(collection_name, None)
+        self.deleted_collections.append(collection_name)
+        self.aliases = {
+            alias_name: target
+            for alias_name, target in self.aliases.items()
+            if target != collection_name
+        }
+
+    async def close(self) -> None:
+        return None
+
+
+def _alias_collection_info() -> object:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            params=SimpleNamespace(
+                vectors={
+                    "dense": VectorParams(
+                        size=1024,
+                        distance=Distance.COSINE,
+                    )
+                },
+                sparse_vectors={"sparse": SparseVectorParams()},
+            )
+        ),
+        payload_schema={},
+    )
 
 
 class _FakeIndex:
