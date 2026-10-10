@@ -176,6 +176,57 @@ docker compose --env-file .env -f infra/compose.yaml --project-name codex-task15
 
 协同服务和 Compose 部署由 `collaboration-worker` 提供，健康检查、单事件投影重建、死信处理、通知降级、双版本核验和大屏验收请参阅 [工作组协同与指挥大厅运行手册](docs/runbooks/workgroup-collaboration-command-hall.md)。
 
+## 运维、测试与演练
+
+运维子系统由 `operations-worker`、`/operations` 页面和 `app.operations` 后端模块组成。每日测试按 `Asia/Shanghai` 时区在配置窗口内随机触发一次，范围默认 `5.0-5.9` 级；手工测试、演练和手工正式事件入口彼此独立。真实正式报或手工正式事件激活后，待执行测试延后，运行中测试按现有真实事件优先规则终止，演练冲突策略可配置为 `pause` 或 `terminate`。
+
+运维子系统继续使用既有事件、评估、27 类图件、全部报告、工作组协同和成果生产链路。测试事件和成果保留 400 天，演练事件和成果保留 2 年，正式和人工事件长期保留。测试/演练标识不可由任务、成果或运维接口重新打开或移除。
+
+使用隔离 Compose project `codex-operations` 启动：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations build
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d postgres temporal-postgres temporal qdrant embedding
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api alembic upgrade head
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations up -d
+```
+
+启动后访问运维页面：
+
+```text
+http://localhost:5173/operations
+```
+
+`operations-worker` 健康检查：
+
+```powershell
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations ps
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations exec operations-worker python -m app.process_health operations
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations logs --tail=100 operations-worker
+```
+
+每日测试、手工测试和演练的真实后端验收：
+
+```powershell
+# 每日调度、触发、真实事件优先和保留清理
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm api pytest tests/test_operations_worker.py tests/test_operations_scheduler.py tests/test_operations_priority.py -v
+
+# /operations 页面行为
+docker compose --env-file .env -f infra/compose.yaml --project-name codex-operations run --rm frontend npm test -- OperationsPage.test.tsx
+
+# 真实登录、真实数据库和真实 API 的 E2E
+cd frontend
+npm ci
+npx playwright install chromium
+$env:E2E_SUPERADMIN_USERNAME = "<超级管理员用户名>"
+$env:E2E_SUPERADMIN_PASSWORD = "<超级管理员密码>"
+$env:E2E_BASE_URL = "http://127.0.0.1:5173"
+$env:E2E_API_BASE_URL = "http://127.0.0.1:8000"
+npm run test:e2e -- operations.spec.ts
+```
+
+E2E 缺失真实凭据或真实 API 不可用时必须 skip 并报告原因，不会伪造通过。运维页面、每日计划、手工触发、真实事件优先、保留核验、worker 恢复和只读 SQL 的完整操作步骤请参阅 [运维、测试与演练运行手册](docs/runbooks/operations-test-drill.md)。
+
 ## 端到端测试
 
 E2E 使用真实登录和真实后端数据库，准备测试事件、39 项专业成果、七个工作组任务、自动/人工双版本和指挥大厅投影，再验证事件、任务、权限、错误状态、SSE 和轮询降级。测试不读取或写入浏览器存储，登录 token 仅保存在 React 内存中。
