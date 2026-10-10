@@ -405,6 +405,16 @@ function highlightedPointFeature(
   };
 }
 
+function highlightLayerIds(layer: QaCatalogLayer): {
+  sourceId: string;
+  layerId: string;
+} {
+  return {
+    sourceId: `${layer.source}-qa-highlight`,
+    layerId: `${layer.id}-qa-highlight`,
+  };
+}
+
 export function applyQaMapAction(
   map: QaActionMap,
   action: QaMapAction,
@@ -485,6 +495,7 @@ export function applyQaMapAction(
       ? action.coordinates
       : undefined;
     if (coordinates) {
+      const { sourceId, layerId } = highlightLayerIds(layer);
       const data: GeoJSON.FeatureCollection<GeoJSON.Point> = {
         type: "FeatureCollection",
         features: [
@@ -495,15 +506,39 @@ export function applyQaMapAction(
           ),
         ],
       };
-      const existingSource = map.getSource(layer.source);
+      const existingSource = map.getSource(sourceId);
       if (existingSource && "setData" in (existingSource as object)) {
         (existingSource as unknown as GeoJsonSourceLike).setData(data);
       } else {
-        map.addSource(layer.source, {
+        map.addSource(sourceId, {
           type: "geojson",
           data,
         } satisfies GeoJSONSourceSpecification);
       }
+      if (!map.getLayer(layerId)) {
+        map.addLayer({
+          id: layerId,
+          type: "circle",
+          source: sourceId,
+          layout: {
+            visibility: "visible",
+          },
+          paint: {
+            "circle-radius": 7,
+            "circle-color": "#f2a33c",
+            "circle-stroke-color": "#ffffff",
+            "circle-stroke-width": 2,
+          },
+        } as LayerSpecification);
+      } else {
+        map.setLayoutProperty(layerId, "visibility", "visible");
+      }
+      map.setFilter(layerId, [
+        "==",
+        ["get", layer.featureIdProperty],
+        featureId,
+      ]);
+      return true;
     }
     map.setFilter(layer.id, [
       "==",
@@ -562,6 +597,14 @@ export function applyQaMapAction(
         "visibility",
         (visibleValues[key] ?? false) ? "visible" : "none",
       );
+      const highlightLayerId = highlightLayerIds(layer).layerId;
+      if (map.getLayer(highlightLayerId)) {
+        map.setLayoutProperty(
+          highlightLayerId,
+          "visibility",
+          (visibleValues[key] ?? false) ? "visible" : "none",
+        );
+      }
     }
     return true;
   }

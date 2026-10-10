@@ -177,13 +177,19 @@ vi.mock("maplibre-gl", () => {
   };
 });
 
-function LossActionHarness({ action }: { action: QaMapAction }) {
+function LossActionHarness({ actions }: { actions: QaMapAction[] }) {
   const publish = useMapActionPublisher();
   return (
     <div>
-      <button type="button" onClick={() => publish("event-1", action)}>
-        publish loss action
-      </button>
+      {actions.map((action, index) => (
+        <button
+          type="button"
+          key={`${action.action_type}-${index}`}
+          onClick={() => publish("event-1", action)}
+        >
+          {index === 0 ? "publish loss action" : `publish loss action ${index + 1}`}
+        </button>
+      ))}
       <LossMap
         center={[31.2, 121.5]}
         tileUrlTemplate="http://localhost/tiles/{z}/{x}/{y}.png"
@@ -199,7 +205,7 @@ async function renderLossActionHarness(action: QaMapAction) {
   setAccessToken("loss-map-test-token");
   const utils = render(
     <MapActionProvider eventId="event-1">
-      <LossActionHarness action={action} />
+      <LossActionHarness actions={[action]} />
     </MapActionProvider>,
   );
   await waitFor(() => expect(mapModule().__maps.length).toBeGreaterThan(0));
@@ -207,6 +213,22 @@ async function renderLossActionHarness(action: QaMapAction) {
   await waitFor(() =>
     expect(map.getSource("loss-map-amap")).toBeTruthy(),
   );
+  return {
+    ...utils,
+    map,
+  };
+}
+
+async function renderLossActionSequence(actions: QaMapAction[]) {
+  setAccessToken("loss-map-test-token");
+  const utils = render(
+    <MapActionProvider eventId="event-1">
+      <LossActionHarness actions={actions} />
+    </MapActionProvider>,
+  );
+  await waitFor(() => expect(mapModule().__maps.length).toBeGreaterThan(0));
+  const map = mapModule().__maps.at(-1) as MockMap;
+  await waitFor(() => expect(map.getSource("loss-map-amap")).toBeTruthy());
   return {
     ...utils,
     map,
@@ -815,14 +837,21 @@ it("applies a non-loss highlight through production LossMap QA layers", async ()
       "highlight",
     ),
   );
-  expect(map.setFilter).toHaveBeenCalledWith("loss-map-qa-faults", [
+  expect(map.setFilter).toHaveBeenCalledWith(
+    "loss-map-qa-faults-qa-highlight",
+    [
     "==",
     ["get", "fault_key"],
     "f1",
-  ]);
-  const faultSource = map.sources.get("loss-map-qa-faults-source") as
+    ],
+  );
+  const baseFaultSource = map.sources.get("loss-map-qa-faults-source") as
+    | { data?: GeoJSON.FeatureCollection<GeoJSON.Geometry> }
+    | undefined;
+  const faultSource = map.sources.get("loss-map-qa-faults-source-qa-highlight") as
     | { data?: GeoJSON.FeatureCollection<GeoJSON.Point> }
     | undefined;
+  expect(baseFaultSource?.data?.features).toHaveLength(0);
   expect(faultSource?.data?.features).toHaveLength(1);
   expect(faultSource?.data?.features[0]?.properties).toMatchObject({
     fault_key: "f1",
@@ -830,6 +859,49 @@ it("applies a non-loss highlight through production LossMap QA layers", async ()
   expect(faultSource?.data?.features[0]?.geometry).toMatchObject({
     type: "Point",
     coordinates: [121.1, 31.1],
+  });
+  expect(map.getLayer("loss-map-qa-faults-qa-highlight")).toMatchObject({
+    type: "circle",
+  });
+  expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
+it("keeps the real loss base source intact for a coordinate loss highlight", async () => {
+  const { map } = await renderLossActionHarness({
+    action_type: "highlight",
+    target_ref: "loss:310115001",
+    layer_id: "loss",
+    feature_id: "310115001",
+    coordinates: [121.2, 31.2],
+    reason: "突出受灾街镇点位",
+    valid_until: "2099-01-01T00:00:00Z",
+  });
+
+  await waitFor(() =>
+    expect(map.getSource("loss-map-town-loss")).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "highlight",
+    ),
+  );
+  const baseLossSource = map.sources.get("loss-map-town-loss") as
+    | { data?: GeoJSON.FeatureCollection<GeoJSON.Polygon> }
+    | undefined;
+  const highlightSource = map.sources.get("loss-map-town-loss-qa-highlight") as
+    | { data?: GeoJSON.FeatureCollection<GeoJSON.Point> }
+    | undefined;
+  expect(baseLossSource?.data?.features).toHaveLength(1);
+  expect(baseLossSource?.data?.features[0]?.geometry?.type).toBe("Polygon");
+  expect(highlightSource?.data?.features).toHaveLength(1);
+  expect(highlightSource?.data?.features[0]?.geometry).toMatchObject({
+    type: "Point",
+    coordinates: [121.2, 31.2],
+  });
+  expect(map.getLayer("loss-map-town-fill-qa-highlight")).toMatchObject({
+    type: "circle",
   });
   expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
 });
@@ -874,6 +946,58 @@ it("applies a multi-layer set_layers action through production LossMap QA layers
     "visible",
   );
   expect(screen.queryByTestId("loss-map-action-error")).not.toBeInTheDocument();
+});
+
+it("hides a point highlight overlay when set_layers hides its base layer", async () => {
+  const { map } = await renderLossActionSequence([
+    {
+      action_type: "highlight",
+      target_ref: "fault:f1",
+      layer_id: "faults",
+      feature_id: "f1",
+      coordinates: [121.1, 31.1],
+      reason: "突出断裂带",
+      valid_until: "2099-01-01T00:00:00Z",
+    },
+    {
+      action_type: "set_layers",
+      layers: {
+        faults: false,
+      },
+      visibility: {
+        faults: false,
+      },
+      reason: "隐藏断裂带",
+      valid_until: "2099-01-01T00:00:00Z",
+    },
+  ]);
+
+  fireEvent.click(screen.getByRole("button", { name: "publish loss action" }));
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "highlight",
+    ),
+  );
+  expect(map.getLayer("loss-map-qa-faults-qa-highlight")).toBeTruthy();
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "publish loss action 2" }),
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId("loss-map-last-action")).toHaveTextContent(
+      "set_layers",
+    ),
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "loss-map-qa-faults-qa-highlight",
+    "visibility",
+    "none",
+  );
+  expect(map.setLayoutProperty).toHaveBeenCalledWith(
+    "loss-map-qa-faults",
+    "visibility",
+    "none",
+  );
 });
 
 function spatializedProduct(
