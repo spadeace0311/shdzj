@@ -46,6 +46,13 @@ class DailyTestScheduler:
         schedule, _created = await self._ensure_schedule(session, observed_at)
         return schedule
 
+    async def ensure_schedule_with_created(
+        self,
+        session: AsyncSession,
+        observed_at: datetime,
+    ) -> tuple[OperationsTestSchedule, bool]:
+        return await self._ensure_schedule(session, observed_at)
+
     async def dispatch_due(
         self,
         observed_at: datetime,

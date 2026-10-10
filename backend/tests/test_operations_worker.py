@@ -4,18 +4,25 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app import process_health
 from app.collaboration.retention import CollaborationRetentionResult
+from app.config import settings
 from app.operations.health import (
     OperationsHealthState,
     get_operations_health_state,
     health_app,
     set_operations_health_state,
 )
-from app.operations.scheduler import OperationsSchedulerResult
+from app.operations.models import OperationsTestSchedule
+from app.operations.scheduler import DailyTestScheduler, OperationsSchedulerResult
+from app.operations.service import OperationsService
 from app.operations.worker import (
     OperationsWorkerCycleResult,
     run_operations_cycle,
@@ -51,6 +58,15 @@ class _FakeScheduler:
         del session, observed_at
         self.calls.append("ensure_schedule")
         return object()
+
+    async def ensure_schedule_with_created(
+        self,
+        session: object,
+        observed_at: datetime,
+    ) -> tuple[object, bool]:
+        del session, observed_at
+        self.calls.append("ensure_schedule")
+        return object(), self.result.created > 0
 
     async def dispatch_due(
         self,
@@ -228,6 +244,54 @@ async def test_schedule_failure_does_not_block_retention() -> None:
     assert result.schedules_failed == 1
     assert result.retention_ran is True
     assert result.retention_test_deleted == 1
+
+
+async def test_real_scheduler_reports_created_only_for_first_cycle() -> None:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    observed_at = datetime(2026, 10, 7, 17, 0, tzinfo=UTC)
+    local_date = observed_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    scheduler = DailyTestScheduler(session_factory=session_factory)
+    operations_service = OperationsService(
+        session_factory=session_factory,
+        now=lambda: observed_at,
+    )
+
+    try:
+        first = await run_operations_cycle(
+            session_factory=session_factory,
+            observed_at=observed_at,
+            configured=_configured(),
+            scheduler=scheduler,
+            operations_service=operations_service,
+            priority_guard=_FakePriorityGuard(),
+            retention_service=_FakeRetentionService(),
+            health_state=_FakeHealthState(),
+            last_retention_at=observed_at,
+        )
+        second = await run_operations_cycle(
+            session_factory=session_factory,
+            observed_at=observed_at,
+            configured=_configured(),
+            scheduler=scheduler,
+            operations_service=operations_service,
+            priority_guard=_FakePriorityGuard(),
+            retention_service=_FakeRetentionService(),
+            health_state=_FakeHealthState(),
+            last_retention_at=observed_at,
+        )
+    finally:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(OperationsTestSchedule).where(
+                        OperationsTestSchedule.local_date == local_date
+                    )
+                )
+        await engine.dispose()
+
+    assert first.schedules_created == 1
+    assert second.schedules_created == 0
 
 
 async def test_worker_loop_stops_before_cycle_when_event_is_set() -> None:

@@ -75,7 +75,11 @@ async def run_operations_cycle(
 
     async with session_factory() as session:
         async with session.begin():
-            await scheduler.ensure_schedule(session, observed_at)
+            schedules_created = await _ensure_schedule(
+                scheduler,
+                session,
+                observed_at,
+            )
 
     scheduler_result: OperationsSchedulerResult = await scheduler.dispatch_due(
         observed_at,
@@ -103,7 +107,7 @@ async def run_operations_cycle(
 
     health_state.mark_alive(observed_at)
     result = OperationsWorkerCycleResult(
-        schedules_created=scheduler_result.created,
+        schedules_created=schedules_created,
         schedules_due=scheduler_result.due,
         tests_triggered=scheduler_result.triggered,
         tests_deferred=scheduler_result.deferred,
@@ -114,6 +118,21 @@ async def run_operations_cycle(
     )
     _log_worker_cycle(result)
     return result
+
+
+async def _ensure_schedule(
+    scheduler: object,
+    session: object,
+    observed_at: datetime,
+) -> int:
+    if hasattr(scheduler, "ensure_schedule_with_created"):
+        _schedule, created = await scheduler.ensure_schedule_with_created(
+            session,
+            observed_at,
+        )
+        return 1 if created else 0
+    await scheduler.ensure_schedule(session, observed_at)
+    return 0
 
 
 async def run_operations_worker(
