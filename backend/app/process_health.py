@@ -16,12 +16,13 @@ def find_process(
         "worker": ("app.artifacts.worker", "worker"),
         "dispatcher": ("app.artifacts.worker", "dispatcher"),
         "collaboration": ("app.collaboration.worker",),
+        "operations": ("app.operations.worker",),
     }
     try:
         expected = process_modes[mode]
     except KeyError as exc:
         raise ValueError(
-            "mode must be worker, dispatcher, or collaboration"
+            "mode must be worker, dispatcher, collaboration, or operations"
         ) from exc
     current_pid = os.getpid() if own_pid is None else own_pid
     for process_dir in proc_root.iterdir():
@@ -57,7 +58,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "process",
-        choices=("worker", "dispatcher", "collaboration"),
+        choices=("worker", "dispatcher", "collaboration", "operations"),
     )
     args = parser.parse_args()
     return 0 if find_process(args.process) is not None else 1

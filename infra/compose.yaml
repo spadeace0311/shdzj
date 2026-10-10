@@ -300,6 +300,25 @@ services:
       retries: 10
       start_period: 20s
 
+  operations-worker:
+    build:
+      context: ../backend
+    env_file:
+      - ../.env
+    environment:
+      OPERATIONS_WORKER_ENABLED: "true"
+    command: ["python", "-m", "app.operations.worker"]
+    restart: unless-stopped
+    volumes:
+      - ../backend:/app
+      - ../config:/config
+      - artifact-data:/var/lib/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.process_health", "operations"]
+
   collector:
     build:
       context: ../backend
