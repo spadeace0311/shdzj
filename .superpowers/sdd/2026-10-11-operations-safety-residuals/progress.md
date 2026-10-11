@@ -29,7 +29,15 @@ Preflight rulings:
 
 ## Task Log
 
-- Task 1: pending.
+- Task 1: implementer `Ohm the 2nd` (`01a12b7a-6953-75e3-85b0-bbd57ece90b9`) dispatched from base `577a64c`.
+- Task 1: implementer `DONE`, commit `8a7c55b`; focused `26 passed`, Ruff clean.
+- Task 1: independent review `Ptolemy the 2nd` (`01a12b87-9a65-7160-9c45-9e6cdc34a9a2`) found 1 Critical and 1 Important.
+- Task 1: fix round 1/5 commit `3fcfe43`; focused `27 passed`, event service `32 passed`, Ruff clean.
+- Task 1: scoped re-review found 1 new Critical and 1 new Important because post-commit cleanup could race with collaboration dispatch and event scalar rollback was incomplete.
+- Task 1: fix round 2/5 commit `0b0ef4a`; scheduled event/revision/outbox/run now commit atomically through an EventService callback; no post-commit deletion remains.
+- Task 1: fix round 2 verification `30 passed`, event service `33 passed`, collaboration generation `14 passed`, priority/collected regression `27 passed`, Ruff clean.
+- Task 1: scoped re-review round 2 clean, all findings addressed, no new Critical/Important.
+- Task 1: complete (commits `577a64c..0b0ef4a`, review clean after 2 fix rounds).
 - Task 2: pending.
 - Task 3: pending.
 - Task 4: pending.
@@ -39,7 +47,7 @@ Preflight rulings:
 
 ## Progress
 
-- [ ] Task 1: scheduler upgrade recovery
+- [x] Task 1: scheduler upgrade recovery
 - [ ] Task 2: run reconciliation and idempotent drill resume
 - [ ] Task 3: atomic scenario boundary handoff
 - [ ] Task 4: active artifact retention protection
