@@ -4,20 +4,46 @@
 
 - Plan: `docs/superpowers/plans/2026-10-10-operations-test-drill-automation.md`
 - Branch: `codex/operations-automation`
-- Reviewed implementation range: `5a5dcaf..909d110`
-- Final verification status: `DONE_WITH_CONCERNS`
+- Reviewed implementation range: `6d55b8e..89cec18`
+- Final implementation head: `b3ff90f`
+- Final review/report head: `89cec18`
+- Final verification status: `NOT MERGE-READY`
 
-The full backend suite, migration round-trip, operations worker tests, and frontend unit suite are green. The operations E2E remains explicitly skipped because the real superadmin password and purge gate are not available. Existing deferred Minors remain open for follow-up.
+The pre-hardening full backend suite, migration round-trip, operations worker tests, and frontend unit suite were green. The final whole-branch review then found safety issues; one concentrated fix wave closed all three original Critical findings, but the single scoped re-review still found one new Critical, two new Important issues, four original Important findings not fully addressed, and the externally blocked live E2E. The branch is therefore suitable for remote backup and continued work on `codex/operations-automation`, but it is not ready to merge into `main`.
+
+This report's later command tables and acceptance checklist preserve the earlier `c66e2d0` verification record for traceability. They are not the final merge verdict. The authoritative post-review outcome is in "Final Whole-Branch Review Outcome" below.
 
 ## Commit Scope
 
-- Implementation range contains 24 commits and `44 files changed, 9413 insertions(+), 14 deletions(-)`.
+- Final range contains 29 commits and `74 files changed, 13935 insertions(+), 64 deletions(-)`.
 - Verification fixes in this task cover:
   - `backend/tests/test_qa_audit_schema.py`: QA-audit migration is now verified as an ancestor of the current Alembic head and restores `0026_operations_automation`.
   - `frontend/vite.config.ts`: Vitest is pinned to `TZ=Asia/Shanghai` so date tests do not depend on the host timezone.
   - `README.md`: full backend verification now documents starting `postgres temporal-postgres temporal` in `codex-operations` before `pytest`.
   - SDD verification reports and ledger.
-- No business implementation code was changed in Task 9.
+  - `b3ff90f`: one final-review fix wave covering legacy-entry protection, correction priority, marker enforcement, retention, boundary validation, health checks, and audit behavior.
+  - `0027_operations_safety_hardening`: migration for activation/closure timestamps and immutable operation-marker metadata.
+
+## Final Whole-Branch Review Outcome
+
+- Original review: `3 Critical`, `10 Important`; original review report: `final-review-c66e2d0.md`.
+- Concentrated fix: `b3ff90f`; fix report: `final-review-fix-report.md`.
+- Scoped re-review: `1 Critical`, `2 Important` new; `4` original Important incomplete; live E2E still skipped; report: `re-review-89cec18.md`.
+- All three original Critical findings are addressed: legacy test/drill API bypass, correction dropping real-event priority, and removable collaborative/artifact markers.
+- The fix wave introduced or exposed a destructive scheduled-key upgrade path: a crash between run creation and schedule marking, followed by upgrade to the renamed scheduler key, can delete the canonical event instead of recovering it (`backend/app/operations/service.py:110`, `backend/app/operations/scheduler.py:218-274`, `backend/app/operations/service.py:691-730`).
+- Run reconciliation/resume remains incomplete: missing production rows can be marked completed, and repeated resume can create duplicate replacement drills without closing the source run (`backend/app/operations/service.py:295-429`).
+- Boundary generation is still split across transactions: a concurrent boundary activation can make the generated point resolve against a different active version (`backend/app/operations/service.py:488-518`, `backend/app/regions/service.py:77-81`, `backend/app/events/service.py:347-364`).
+- Artifact retention can still delete generated artifacts that belong to an active mixed production run because it does not exclude active `ProductionRun`/`ProductionTask` state (`backend/app/artifacts/retention.py:50-70`, `backend/app/operations/worker.py:139-150`).
+- `artifact_retention_enabled=false` is no longer honored by the integrated operations worker path (`backend/app/operations/worker.py:123-150`).
+- A pre-existing invalid timezone row cannot be repaired through the API because reads validate before applying the replacement patch (`backend/app/operations/repository.py:97`, `326-332`).
+- The E2E health URL fallback is still incorrect when `E2E_API_BASE_URL` is absent (`frontend/e2e/operations.spec.ts:4-9`), and the live operations E2E remains `1 skipped` because the real superadmin password and purge authorization are absent.
+- Post-fix evidence is focused rather than a complete backend rerun: `301 passed`, then `75 passed`; migration round-trip `4 passed`; affected Temporal `3 passed`; frontend `218 passed`; Ruff, typecheck, build, and Compose config passed. The post-fix full backend suite does not have a completed green result.
+
+## Final Adjudication
+
+- Ruling: do not merge this branch to `main` while the residual Critical/Important findings above remain open. Cost if wrong: the next development round must remediate issues that could otherwise have been integrated immediately.
+- Ruling: push the feature branch to `origin/codex/operations-automation` as a recoverable checkpoint because the user explicitly requested GitHub push and the worktree is clean. Cost if wrong: the remote contains a feature branch that reviewers must not merge until the residual findings are closed.
+- Ruling: preserve the live E2E skip as an external verification limitation rather than fabricate credentials or mark it as a pass. Cost if wrong: the end-to-end 39-artifact workflow remains unverified on this host.
 
 ## Commands Executed
 

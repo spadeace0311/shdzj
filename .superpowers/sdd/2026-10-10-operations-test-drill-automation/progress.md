@@ -139,6 +139,18 @@ Preflight rulings:
 - Task 9: post-fix backend full suite passed `1746 passed, 3 skipped, 8 deselected, 0 failed`; QA-audit focused regression `2 passed`; migration/operations worker `32 passed`; frontend `216 passed` without `TZ` override; operations E2E `1 skipped`; final `alembic current` `0026_operations_automation (head)`.
 - Task 9: final status `DONE_WITH_CONCERNS`: live operations E2E remains pending credentials/purge authorization; Shanghai MDB host integration remains skipped; existing deferred Minors remain open.
 
+## Final Branch Review
+
+- Final whole-branch review range `6d55b8e..c66e2d0` found `3 Critical`, `10 Important`; report `final-review-c66e2d0.md`.
+- Fix wave implementation `b3ff90f`, report `89cec18`; all three original Critical findings are addressed.
+- Scoped re-review `c66e2d0..89cec18` found one new Critical, two new Important, four original Important incomplete, and the live E2E dependency still skipped; report `re-review-89cec18.md`.
+- Residual Critical: the scheduler idempotency-key rename has no upgrade recovery path; a crash between run creation and schedule update can make the new worker delete the canonical event while trying to recover the old-key run.
+- Residual Important: operations run reconciliation/resume can mark missing production work completed or create duplicate replacement drills; boundary generation and ingestion still use split transactions; artifact retention can delete active mixed-production artifacts and ignores `artifact_retention_enabled=false`; an existing invalid timezone row cannot be repaired through the API; the E2E health fallback still targets the frontend when `E2E_API_BASE_URL` is absent.
+- Post-fix verification evidence is broad focused, not a completed full backend rerun: backend focused `301 passed` plus late regressions `75 passed`, migration round-trip `4 passed`, affected Temporal `3 passed`, frontend `218 passed`, Ruff/typecheck/build/Compose passed, live E2E `1 skipped`.
+- Ruling: no second fix wave is permitted by the SDD process after the single scoped re-review. Residual load-bearing findings are recorded and surfaced instead of silently repaired.
+- Ruling: preserve the branch as a pushed checkpoint but do not merge to `main`. Cost if wrong: GitHub retains a non-merge-ready feature branch until the residual findings are assigned to a new development round.
+- Ruling: do not fabricate or request secrets to convert the live E2E skip into a pass. Cost if wrong: the full 39-artifact live workflow remains unverified pending real credentials and purge authorization.
+
 ## Progress
 
 - [x] Task 1: 运维 schema、配置与 `0026` 迁移
