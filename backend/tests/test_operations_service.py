@@ -164,6 +164,55 @@ async def _seed_real_event(
     return event
 
 
+async def _seed_legacy_scheduled_run(
+    session,
+) -> tuple[OperationsTestSchedule, EarthquakeEvent, OperationsRun]:
+    schedule = OperationsTestSchedule(
+        local_date=OBSERVED_AT.date(),
+        window_start=OBSERVED_AT - timedelta(hours=2),
+        window_end=OBSERVED_AT,
+        scheduled_at=OBSERVED_AT - timedelta(minutes=5),
+        state="due",
+        random_seed=123,
+    )
+    session.add(schedule)
+    await session.flush()
+
+    event = EarthquakeEvent(
+        id=uuid.uuid4(),
+        source=SOURCE,
+        canonical_source_id=(
+            f"operations:operations-test:scheduled:{schedule.id.hex}"
+        ),
+        event_type="test",
+        origin_time=OBSERVED_AT,
+        longitude=Decimal("121.500000"),
+        latitude=Decimal("31.200000"),
+        depth_km=Decimal("10.00"),
+        magnitude=Decimal("5.5"),
+        place="legacy scheduled operations event",
+        geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+        lifecycle_state="not_applicable",
+    )
+    session.add(event)
+    await session.flush()
+
+    revision_id = uuid.uuid4()
+    run = OperationsRun(
+        event_id=event.id,
+        schedule_id=schedule.id,
+        trigger_mode="scheduled_test",
+        operation_state="queued",
+        priority=10,
+        idempotency_key=f"scheduled:{schedule.id}",
+        triggered_by="operations-scheduler",
+        detail={"revision_id": str(revision_id)},
+    )
+    session.add(run)
+    await session.flush()
+    return schedule, event, run
+
+
 def _service(**kwargs) -> OperationsService:
     return OperationsService(SessionFactory, now=lambda: OBSERVED_AT, **kwargs)
 
@@ -806,3 +855,80 @@ async def test_manual_key_cannot_impersonate_scheduled_trigger() -> None:
     assert scheduled_result.run_id is not None
     assert run_count == 1
     assert scheduled_run_count == 1
+
+
+async def test_legacy_scheduler_idempotency_key_reuses_existing_run() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            schedule, event, existing_run = await _seed_legacy_scheduled_run(session)
+
+    result = await _service().trigger_scheduled_test(
+        schedule.id,
+        "operations-scheduler",
+    )
+
+    assert result.event_id == event.id
+    assert result.run_id == existing_run.id
+    assert result.revision_id == existing_run.detail["revision_id"]
+    assert result.idempotency_key == existing_run.idempotency_key
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "test")
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+        stored_event = await session.get(EarthquakeEvent, event.id)
+        stored_run = await session.get(OperationsRun, existing_run.id)
+
+    assert event_count == 1
+    assert run_count == 1
+    assert stored_event is not None
+    assert stored_run is not None
+    assert stored_run.idempotency_key == f"scheduled:{schedule.id}"
+
+
+async def test_legacy_scheduler_conflict_recovers_existing_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            schedule, event, existing_run = await _seed_legacy_scheduled_run(session)
+
+    service = _service()
+
+    async def miss_preflight(_schedule_id: uuid.UUID) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_scheduled_run", miss_preflight)
+    result = await service.trigger_scheduled_test(
+        schedule.id,
+        "operations-scheduler",
+    )
+
+    assert result.event_id == event.id
+    assert result.run_id == existing_run.id
+    assert result.revision_id == existing_run.detail["revision_id"]
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "test")
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+        stored_event = await session.get(EarthquakeEvent, event.id)
+        stored_run = await session.get(OperationsRun, existing_run.id)
+
+    assert event_count == 1
+    assert run_count == 1
+    assert stored_event is not None
+    assert stored_run is not None
+    assert stored_run.event_id == event.id

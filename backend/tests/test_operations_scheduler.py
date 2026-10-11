@@ -11,8 +11,9 @@ import pytest
 from geoalchemy2.elements import WKTElement
 from sqlalchemy import delete, func, select, update
 
+from app.collaboration.models import CollaborationSettings
 from app.db import SessionFactory, engine
-from app.events.models import EarthquakeEvent
+from app.events.models import EarthquakeEvent, EventLifecycleOutbox, RawMessage
 from app.operations.models import (
     OperationsAuditLog,
     OperationsRun,
@@ -50,6 +51,17 @@ async def _cleanup_data() -> None:
             await session.execute(
                 delete(EarthquakeEvent).where(EarthquakeEvent.source == SOURCE)
             )
+            await session.execute(
+                delete(EarthquakeEvent).where(
+                    EarthquakeEvent.source == "operations"
+                )
+            )
+            await session.execute(
+                delete(RawMessage).where(
+                    RawMessage.source.in_((SOURCE, "operations"))
+                )
+            )
+            await session.execute(delete(EventLifecycleOutbox))
 
 
 async def _ensure_settings(*, enabled: bool = True) -> None:
@@ -57,6 +69,59 @@ async def _ensure_settings(*, enabled: bool = True) -> None:
         async with session.begin():
             settings = await OperationsRepository().get_settings(session)
             settings.daily_test_enabled = enabled
+
+
+async def _ensure_boundary() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            existing = await session.scalar(
+                select(RegionBoundary).where(
+                    RegionBoundary.is_active.is_(True)
+                ).limit(1)
+            )
+            if existing is not None:
+                return
+            session.add(
+                RegionBoundary(
+                    version=f"scheduler-test-boundary-{uuid.uuid4().hex}",
+                    name="scheduler test boundary",
+                    local_buffer_km=Decimal("50"),
+                    geom=WKTElement(
+                        "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                        "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                        srid=4326,
+                    ),
+                    maritime_geom=WKTElement(
+                        "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                        "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                        srid=4326,
+                    ),
+                    source_uri="test://operations-scheduler-boundary",
+                    checksum="b" * 64,
+                    is_active=True,
+                )
+            )
+            await session.flush()
+
+
+async def _ensure_collaboration_settings() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            existing = await session.scalar(
+                select(CollaborationSettings.id).limit(1)
+            )
+            if existing is not None:
+                return
+            session.add(
+                CollaborationSettings(
+                    id=uuid.UUID(
+                        "00000000-0000-0000-0000-000000000031"
+                    ),
+                    intensity_threshold=Decimal("2.0"),
+                    row_version=1,
+                )
+            )
+            await session.flush()
 
 
 async def _seed_event() -> EarthquakeEvent:
@@ -79,6 +144,58 @@ async def _seed_event() -> EarthquakeEvent:
             session.add(event)
             await session.flush()
             return event
+
+
+async def _seed_legacy_due_run() -> tuple[
+    OperationsTestSchedule,
+    EarthquakeEvent,
+    OperationsRun,
+]:
+    async with SessionFactory() as session:
+        async with session.begin():
+            schedule = OperationsTestSchedule(
+                local_date=OBSERVED_AT.astimezone(SHANGHAI).date(),
+                window_start=OBSERVED_AT - timedelta(hours=2),
+                window_end=OBSERVED_AT,
+                scheduled_at=OBSERVED_AT - timedelta(minutes=5),
+                state="due",
+                random_seed=123,
+            )
+            session.add(schedule)
+            await session.flush()
+
+            event = EarthquakeEvent(
+                id=uuid.uuid4(),
+                source=SOURCE,
+                canonical_source_id=(
+                    f"operations:operations-test:scheduled:{schedule.id.hex}"
+                ),
+                event_type="test",
+                origin_time=OBSERVED_AT,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.5"),
+                place="legacy scheduler recovery event",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="not_applicable",
+            )
+            session.add(event)
+            await session.flush()
+
+            run = OperationsRun(
+                event_id=event.id,
+                schedule_id=schedule.id,
+                trigger_mode="scheduled_test",
+                operation_state="queued",
+                priority=10,
+                idempotency_key=f"scheduled:{schedule.id}",
+                triggered_by="operations-scheduler",
+                detail={"revision_id": str(uuid.uuid4())},
+            )
+            session.add(run)
+            await session.flush()
+            return schedule, event, run
 
 
 async def _ensure_schedule(observed_at: datetime) -> OperationsTestSchedule:
@@ -373,3 +490,51 @@ async def test_no_active_boundary_fails_without_infinite_retry() -> None:
                         .where(RegionBoundary.id.in_(tuple(active_before)))
                         .values(is_active=True)
                     )
+
+
+async def test_due_legacy_run_recovers_schedule_without_second_run() -> None:
+    await _ensure_settings()
+    await _ensure_boundary()
+    await _ensure_collaboration_settings()
+    schedule, event, existing_run = await _seed_legacy_due_run()
+
+    service = OperationsService(SessionFactory, now=lambda: OBSERVED_AT)
+
+    async def service_trigger(
+        schedule_id: object,
+        actor: object,
+    ) -> OperationsTriggerResult:
+        return await service.trigger_scheduled_test(schedule_id, actor)
+
+    result = await DailyTestScheduler().dispatch_due(
+        OBSERVED_AT,
+        service_trigger,
+    )
+
+    assert result.triggered == 1
+    assert result.failed == 0
+
+    async with SessionFactory() as session:
+        stored_schedule = await session.get(
+            OperationsTestSchedule,
+            schedule.id,
+        )
+        stored_event = await session.get(EarthquakeEvent, event.id)
+        stored_run = await session.get(OperationsRun, existing_run.id)
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "test")
+        )
+
+    assert stored_schedule is not None
+    assert stored_schedule.state == "triggered"
+    assert stored_schedule.event_id == event.id
+    assert stored_event is not None
+    assert stored_run is not None
+    assert stored_run.idempotency_key == f"scheduled:{schedule.id}"
+    assert run_count == 1
+    assert event_count == 1

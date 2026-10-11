@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.artifacts.models import ProductionRun, ProductionTask
@@ -109,7 +110,7 @@ class OperationsService:
         actor_name = _actor_name(actor)
         key = f"operations-scheduler:{schedule_uuid}"
 
-        existing_run = await self._get_run_by_idempotency_key(key)
+        existing_run = await self._get_scheduled_run(schedule_uuid)
         if existing_run is not None:
             if (
                 existing_run.trigger_mode != TriggerMode.SCHEDULED_TEST.value
@@ -117,12 +118,11 @@ class OperationsService:
             ):
                 raise ValueError("idempotency_key conflicts with a different operation")
             async with self._session_factory() as session:
-                event = await session.get(
-                    EarthquakeEvent,
-                    existing_run.event_id,
+                await self._validate_scheduled_run(
+                    session,
+                    existing_run,
+                    schedule_uuid,
                 )
-            if event is None or event.event_type != EventKind.TEST.value:
-                raise ValueError("idempotency_key conflicts with a different operation")
             return _trigger_result(
                 existing_run,
                 revision_id=_revision_id_from_run(existing_run),
@@ -190,6 +190,7 @@ class OperationsService:
             triggered_by=actor_name,
             observed_at=observed_at,
             triggered_assessment=outcome.triggered_assessment,
+            event_is_new=outcome.is_new,
         )
 
     async def list_schedules(
@@ -529,6 +530,7 @@ class OperationsService:
             triggered_by=actor_name,
             observed_at=observed_at,
             triggered_assessment=outcome.triggered_assessment,
+            event_is_new=outcome.is_new,
         )
 
     async def _prepare_manual_scenario(
@@ -635,6 +637,56 @@ class OperationsService:
                     .limit(1)
                 )
 
+    async def _get_scheduled_run(
+        self,
+        schedule_uuid: uuid.UUID,
+    ) -> OperationsRun | None:
+        current_key = f"operations-scheduler:{schedule_uuid}"
+        legacy_key = f"scheduled:{schedule_uuid}"
+        async with self._session_factory() as session:
+            async with session.begin():
+                current_run = await session.scalar(
+                    select(OperationsRun)
+                    .where(
+                        OperationsRun.schedule_id == schedule_uuid,
+                        OperationsRun.idempotency_key == current_key,
+                    )
+                    .order_by(
+                        OperationsRun.created_at.desc(),
+                        OperationsRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+                if current_run is not None:
+                    return current_run
+                return await session.scalar(
+                    select(OperationsRun)
+                    .where(
+                        OperationsRun.schedule_id == schedule_uuid,
+                        OperationsRun.idempotency_key == legacy_key,
+                    )
+                    .order_by(
+                        OperationsRun.created_at.desc(),
+                        OperationsRun.id.desc(),
+                    )
+                    .limit(1)
+                )
+
+    async def _validate_scheduled_run(
+        self,
+        session: AsyncSession,
+        run: OperationsRun,
+        schedule_uuid: uuid.UUID,
+    ) -> None:
+        if (
+            run.trigger_mode != TriggerMode.SCHEDULED_TEST.value
+            or run.schedule_id != schedule_uuid
+        ):
+            raise ValueError("idempotency_key conflicts with a different operation")
+        event = await session.get(EarthquakeEvent, run.event_id)
+        if event is None or event.event_type != EventKind.TEST.value:
+            raise ValueError("idempotency_key conflicts with a different operation")
+
     async def _finalize_trigger(
         self,
         *,
@@ -648,12 +700,19 @@ class OperationsService:
         triggered_by: str,
         observed_at: datetime,
         triggered_assessment: bool,
+        event_is_new: bool,
     ) -> OperationsTriggerResult:
         event_uuid = _coerce_uuid(event_id, "event_id")
+        schedule_uuid = (
+            _coerce_uuid(schedule_id, "schedule_id")
+            if schedule_id is not None
+            else None
+        )
         blocked_state: str | None = None
         real_event_rejected = False
-        conflict_error: ValueError | None = None
+        conflict_error: Exception | None = None
         run: OperationsRun | None = None
+        recovered_revision_id: str | None = None
 
         async with self._session_factory() as session:
             async with session.begin():
@@ -662,7 +721,8 @@ class OperationsService:
                     session,
                     observed_at,
                 ):
-                    await self._delete_rejected_event(session, event_uuid)
+                    if event_is_new:
+                        await self._delete_rejected_event(session, event_uuid)
                     if trigger_mode is TriggerMode.MANUAL_TEST:
                         real_event_rejected = True
                     elif trigger_mode is TriggerMode.DRILL:
@@ -676,21 +736,58 @@ class OperationsService:
                         blocked_state = "deferred"
                 else:
                     try:
-                        run = await self._persist_run(
-                            session,
-                            event_id=event_uuid,
-                            revision_id=revision_id,
-                            schedule_id=schedule_id,
-                            trigger_mode=trigger_mode.value,
-                            operation_state="queued",
-                            priority=priority,
-                            idempotency_key=idempotency_key,
-                            triggered_by=triggered_by,
-                            observed_at=observed_at,
-                        )
-                    except ValueError as exc:
+                        async with session.begin_nested():
+                            run = await self._persist_run(
+                                session,
+                                event_id=event_uuid,
+                                revision_id=revision_id,
+                                schedule_id=schedule_uuid,
+                                trigger_mode=trigger_mode.value,
+                                operation_state="queued",
+                                priority=priority,
+                                idempotency_key=idempotency_key,
+                                triggered_by=triggered_by,
+                                observed_at=observed_at,
+                            )
+                    except (ValueError, IntegrityError) as exc:
                         conflict_error = exc
-                        await self._delete_rejected_event(session, event_uuid)
+                        existing_run = None
+                        if schedule_uuid is not None:
+                            existing_run = await session.scalar(
+                                select(OperationsRun)
+                                .where(
+                                    OperationsRun.schedule_id == schedule_uuid
+                                )
+                                .with_for_update()
+                            )
+                        if existing_run is not None:
+                            try:
+                                await self._validate_scheduled_run(
+                                    session,
+                                    existing_run,
+                                    schedule_uuid,
+                                )
+                            except ValueError as validation_error:
+                                conflict_error = validation_error
+                            else:
+                                if (
+                                    event_is_new
+                                    and event_uuid != existing_run.event_id
+                                ):
+                                    await self._delete_rejected_event(
+                                        session,
+                                        event_uuid,
+                                    )
+                                run = existing_run
+                                recovered_revision_id = _revision_id_from_run(
+                                    existing_run
+                                )
+                                conflict_error = None
+                        if conflict_error is not None and event_is_new:
+                            await self._delete_rejected_event(
+                                session,
+                                event_uuid,
+                            )
 
         if real_event_rejected:
             raise RealEventPriorityActive()
@@ -706,7 +803,11 @@ class OperationsService:
         assert run is not None
         return _trigger_result(
             run,
-            revision_id=str(revision_id),
+            revision_id=(
+                recovered_revision_id
+                if recovered_revision_id is not None
+                else str(revision_id)
+            ),
             trigger_mode=trigger_mode.value,
             event_kind=event_kind.value,
             triggered_assessment=triggered_assessment,
