@@ -1,3 +1,4 @@
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import logging
@@ -184,6 +185,9 @@ class EventService:
         response_input: ResponseInput | None,
         region_context: RegionContext | None,
         trigger_reason: str = "live",
+        before_side_effects: (
+            Callable[[AsyncSession, EventIngestResult], Awaitable[None]] | None
+        ) = None,
     ) -> LifecycleIngestOutcome:
         if not isinstance(event, NormalizedEvent):
             raise TypeError("event must be a NormalizedEvent")
@@ -224,6 +228,8 @@ class EventService:
                     ingested_at=normalized_received_at,
                     region_context=region_context,
                 )
+                if before_side_effects is not None:
+                    await before_side_effects(session, result)
                 if result.is_new and result.is_current:
                     await self._production_controller.apply_current_event_transition(
                         session,

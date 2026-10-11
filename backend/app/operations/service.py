@@ -21,9 +21,9 @@ from app.events.domain import EventKind
 from app.events.models import (
     EarthquakeEvent,
     EarthquakeRevision,
-    EventLifecycleOutbox,
     RawMessage,
 )
+from app.events.repository import EventIngestResult
 from app.events.service import EventService
 from app.operations.domain import OperationsScenario, TriggerMode
 from app.operations.models import (
@@ -46,6 +46,16 @@ from app.operations.schemas import (
     OperationsTriggerResult,
 )
 from app.regions.service import RegionContextResolver
+
+
+class _ExistingScheduledRunSignal(Exception):
+    def __init__(self, run_id: uuid.UUID) -> None:
+        super().__init__("existing scheduled run")
+        self.run_id = run_id
+
+
+class _ScheduledTriggerDeferredSignal(Exception):
+    pass
 
 
 class OperationsService:
@@ -167,32 +177,96 @@ class OperationsService:
             boundary_version=scenario.boundary_version,
         )
         event = self._scenario_generator.scenario_to_event(scenario)
-        outcome = await self._event_service.ingest_collected(
-            raw_payload={
-                "idempotency_key": key,
-                "mode": TriggerMode.SCHEDULED_TEST.value,
-            },
-            event=event,
-            provider="api",
-            lane="http",
-            received_at=observed_at,
-            response_input=None,
-            region_context=region_context,
-            trigger_reason="live",
-        )
-        return await self._finalize_trigger(
-            event_id=outcome.event_id,
-            revision_id=outcome.revision_id,
-            schedule_id=schedule_uuid,
-            trigger_mode=TriggerMode.SCHEDULED_TEST,
-            event_kind=EventKind.TEST,
-            priority=self.SCHEDULED_PRIORITY,
-            idempotency_key=key,
-            triggered_by=actor_name,
-            observed_at=observed_at,
+
+        async def persist_scheduled_run(
+            session: AsyncSession,
+            result: EventIngestResult,
+        ) -> None:
+            await _acquire_priority_lock(session)
+            await _acquire_scheduled_trigger_lock(session, schedule_uuid)
+            real_event_active = await self._priority_guard.has_active_real_event(
+                session,
+                observed_at,
+            )
+            existing_scheduled_run = await self._find_scheduled_run(
+                session,
+                schedule_uuid,
+                for_update=True,
+            )
+            if existing_scheduled_run is not None:
+                await self._validate_scheduled_run(
+                    session,
+                    existing_scheduled_run,
+                    schedule_uuid,
+                )
+                raise _ExistingScheduledRunSignal(existing_scheduled_run.id)
+            if real_event_active:
+                raise _ScheduledTriggerDeferredSignal()
+
+            try:
+                async with session.begin_nested():
+                    await self._persist_run(
+                        session,
+                        event_id=result.event_id,
+                        revision_id=result.revision_id,
+                        schedule_id=schedule_uuid,
+                        trigger_mode=TriggerMode.SCHEDULED_TEST.value,
+                        operation_state="queued",
+                        priority=self.SCHEDULED_PRIORITY,
+                        idempotency_key=key,
+                        triggered_by=actor_name,
+                        observed_at=observed_at,
+                    )
+            except (ValueError, IntegrityError, RuntimeError):
+                existing_scheduled_run = await self._find_scheduled_run(
+                    session,
+                    schedule_uuid,
+                    for_update=True,
+                )
+                if existing_scheduled_run is None:
+                    raise
+                await self._validate_scheduled_run(
+                    session,
+                    existing_scheduled_run,
+                    schedule_uuid,
+                )
+                raise _ExistingScheduledRunSignal(
+                    existing_scheduled_run.id
+                ) from None
+
+        try:
+            outcome = await self._event_service.ingest_collected(
+                raw_payload={
+                    "idempotency_key": key,
+                    "mode": TriggerMode.SCHEDULED_TEST.value,
+                },
+                event=event,
+                provider="api",
+                lane="http",
+                received_at=observed_at,
+                response_input=None,
+                region_context=region_context,
+                trigger_reason="live",
+                before_side_effects=persist_scheduled_run,
+            )
+        except _ExistingScheduledRunSignal as signal:
+            return await self._scheduled_trigger_result(
+                schedule_uuid,
+                run_id=signal.run_id,
+                triggered_assessment=False,
+            )
+        except _ScheduledTriggerDeferredSignal:
+            return _blocked_trigger_result(
+                key=key,
+                trigger_mode=TriggerMode.SCHEDULED_TEST.value,
+                event_kind=EventKind.TEST.value,
+                operation_state="deferred",
+            )
+
+        return await self._scheduled_trigger_result(
+            schedule_uuid,
+            run_id=None,
             triggered_assessment=outcome.triggered_assessment,
-            revision_created=outcome.is_new,
-            event_created=outcome.event_created,
         )
 
     async def list_schedules(
@@ -524,7 +598,6 @@ class OperationsService:
         return await self._finalize_trigger(
             event_id=outcome.event_id,
             revision_id=outcome.revision_id,
-            schedule_id=None,
             trigger_mode=trigger_mode,
             event_kind=event_kind,
             priority=self.MANUAL_PRIORITY,
@@ -532,7 +605,6 @@ class OperationsService:
             triggered_by=actor_name,
             observed_at=observed_at,
             triggered_assessment=outcome.triggered_assessment,
-            revision_created=outcome.is_new,
             event_created=outcome.event_created,
         )
 
@@ -644,36 +716,32 @@ class OperationsService:
         self,
         schedule_uuid: uuid.UUID,
     ) -> OperationsRun | None:
-        current_key = f"operations-scheduler:{schedule_uuid}"
-        legacy_key = f"scheduled:{schedule_uuid}"
         async with self._session_factory() as session:
             async with session.begin():
-                current_run = await session.scalar(
-                    select(OperationsRun)
-                    .where(
-                        OperationsRun.schedule_id == schedule_uuid,
-                        OperationsRun.idempotency_key == current_key,
-                    )
-                    .order_by(
-                        OperationsRun.created_at.desc(),
-                        OperationsRun.id.desc(),
-                    )
-                    .limit(1)
+                return await self._find_scheduled_run(
+                    session,
+                    schedule_uuid,
                 )
-                if current_run is not None:
-                    return current_run
-                return await session.scalar(
-                    select(OperationsRun)
-                    .where(
-                        OperationsRun.schedule_id == schedule_uuid,
-                        OperationsRun.idempotency_key == legacy_key,
-                    )
-                    .order_by(
-                        OperationsRun.created_at.desc(),
-                        OperationsRun.id.desc(),
-                    )
-                    .limit(1)
-                )
+
+    async def _find_scheduled_run(
+        self,
+        session: AsyncSession,
+        schedule_uuid: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> OperationsRun | None:
+        statement = (
+            select(OperationsRun)
+            .where(OperationsRun.schedule_id == schedule_uuid)
+            .order_by(
+                OperationsRun.created_at.desc(),
+                OperationsRun.id.desc(),
+            )
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await session.scalar(statement)
 
     async def _validate_scheduled_run(
         self,
@@ -690,12 +758,43 @@ class OperationsService:
         if event is None or event.event_type != EventKind.TEST.value:
             raise ValueError("idempotency_key conflicts with a different operation")
 
+    async def _scheduled_trigger_result(
+        self,
+        schedule_uuid: uuid.UUID,
+        *,
+        run_id: uuid.UUID | None,
+        triggered_assessment: bool,
+    ) -> OperationsTriggerResult:
+        async with self._session_factory() as session:
+            async with session.begin():
+                run = (
+                    await session.get(OperationsRun, run_id)
+                    if run_id is not None
+                    else await self._find_scheduled_run(
+                        session,
+                        schedule_uuid,
+                    )
+                )
+                if run is None:
+                    raise RuntimeError("scheduled operations run could not be found")
+                await self._validate_scheduled_run(
+                    session,
+                    run,
+                    schedule_uuid,
+                )
+                return _trigger_result(
+                    run,
+                    revision_id=_revision_id_from_run(run),
+                    trigger_mode=TriggerMode.SCHEDULED_TEST.value,
+                    event_kind=EventKind.TEST.value,
+                    triggered_assessment=triggered_assessment,
+                )
+
     async def _finalize_trigger(
         self,
         *,
         event_id: object,
         revision_id: object,
-        schedule_id: object | None,
         trigger_mode: TriggerMode,
         event_kind: EventKind,
         priority: int,
@@ -703,53 +802,18 @@ class OperationsService:
         triggered_by: str,
         observed_at: datetime,
         triggered_assessment: bool,
-        revision_created: bool,
         event_created: bool,
     ) -> OperationsTriggerResult:
         event_uuid = _coerce_uuid(event_id, "event_id")
-        schedule_uuid = (
-            _coerce_uuid(schedule_id, "schedule_id")
-            if schedule_id is not None
-            else None
-        )
         blocked_state: str | None = None
         real_event_rejected = False
         conflict_error: Exception | None = None
         run: OperationsRun | None = None
-        recovered_revision_id: str | None = None
-        recovered_run = False
 
         async with self._session_factory() as session:
             async with session.begin():
                 await _acquire_priority_lock(session)
-                existing_scheduled_run = None
-                if schedule_uuid is not None:
-                    existing_scheduled_run = await session.scalar(
-                        select(OperationsRun)
-                        .where(OperationsRun.schedule_id == schedule_uuid)
-                        .with_for_update()
-                    )
-
-                if existing_scheduled_run is not None:
-                    await self._validate_scheduled_run(
-                        session,
-                        existing_scheduled_run,
-                        schedule_uuid,
-                    )
-                    await self._discard_rejected_scheduled_ingest(
-                        session,
-                        event_id=event_uuid,
-                        revision_id=revision_id,
-                        existing_run=existing_scheduled_run,
-                        revision_created=revision_created,
-                        event_created=event_created,
-                    )
-                    run = existing_scheduled_run
-                    recovered_revision_id = _revision_id_from_run(
-                        existing_scheduled_run
-                    )
-                    recovered_run = True
-                elif await self._priority_guard.has_active_real_event(
+                if await self._priority_guard.has_active_real_event(
                     session,
                     observed_at,
                 ):
@@ -773,7 +837,7 @@ class OperationsService:
                                 session,
                                 event_id=event_uuid,
                                 revision_id=revision_id,
-                                schedule_id=schedule_uuid,
+                                schedule_id=None,
                                 trigger_mode=trigger_mode.value,
                                 operation_state="queued",
                                 priority=priority,
@@ -783,44 +847,8 @@ class OperationsService:
                             )
                     except (ValueError, IntegrityError) as exc:
                         conflict_error = exc
-                        existing_run = None
-                        if schedule_uuid is not None:
-                            existing_run = await session.scalar(
-                                select(OperationsRun)
-                                .where(
-                                    OperationsRun.schedule_id == schedule_uuid
-                                )
-                                .with_for_update()
-                            )
-                        if existing_run is not None:
-                            try:
-                                await self._validate_scheduled_run(
-                                    session,
-                                    existing_run,
-                                    schedule_uuid,
-                                )
-                            except ValueError as validation_error:
-                                conflict_error = validation_error
-                            else:
-                                await self._discard_rejected_scheduled_ingest(
-                                    session,
-                                    event_id=event_uuid,
-                                    revision_id=revision_id,
-                                    existing_run=existing_run,
-                                    revision_created=revision_created,
-                                    event_created=event_created,
-                                )
-                                run = existing_run
-                                recovered_revision_id = _revision_id_from_run(
-                                    existing_run
-                                )
-                                recovered_run = True
-                                conflict_error = None
-                        if conflict_error is not None and event_created:
-                            await self._delete_rejected_event(
-                                session,
-                                event_uuid,
-                            )
+                        if event_created:
+                            await self._delete_rejected_event(session, event_uuid)
 
         if real_event_rejected:
             raise RealEventPriorityActive()
@@ -836,80 +864,11 @@ class OperationsService:
         assert run is not None
         return _trigger_result(
             run,
-            revision_id=(
-                recovered_revision_id
-                if recovered_revision_id is not None
-                else str(revision_id)
-            ),
+            revision_id=str(revision_id),
             trigger_mode=trigger_mode.value,
             event_kind=event_kind.value,
-            triggered_assessment=(
-                False if recovered_run else triggered_assessment
-            ),
+            triggered_assessment=triggered_assessment,
         )
-
-    async def _discard_rejected_scheduled_ingest(
-        self,
-        session: AsyncSession,
-        *,
-        event_id: uuid.UUID,
-        revision_id: object,
-        existing_run: OperationsRun,
-        revision_created: bool,
-        event_created: bool,
-    ) -> None:
-        if event_id != existing_run.event_id:
-            if event_created:
-                await self._delete_rejected_event(session, event_id)
-            return
-        if not revision_created:
-            return
-        stored_revision_id = _revision_uuid_from_run(existing_run)
-        revision_uuid = _coerce_uuid(revision_id, "revision_id")
-        if stored_revision_id is None or revision_uuid == stored_revision_id:
-            return
-
-        event = await session.get(
-            EarthquakeEvent,
-            event_id,
-            with_for_update=True,
-        )
-        if event is None:
-            return
-
-        revision = await session.get(
-            EarthquakeRevision,
-            revision_uuid,
-            with_for_update=True,
-        )
-        if revision is None or revision.event_id != event_id:
-            return
-        raw_message_id = revision.raw_message_id
-
-        stored_revision = await session.get(
-            EarthquakeRevision,
-            stored_revision_id,
-            with_for_update=True,
-        )
-        if stored_revision is None or stored_revision.event_id != event_id:
-            return
-
-        await session.execute(
-            delete(EventLifecycleOutbox).where(
-                EventLifecycleOutbox.event_id == event_id,
-                EventLifecycleOutbox.revision_id == revision_uuid,
-            )
-        )
-        await session.delete(revision)
-        await session.flush()
-        await session.execute(
-            delete(RawMessage).where(RawMessage.id == raw_message_id)
-        )
-
-        stored_revision.is_current = True
-        event.current_revision_id = stored_revision.id
-        event.latest_trigger_revision_id = stored_revision.id
-        await session.flush()
 
     async def _delete_rejected_event(
         self,
@@ -1082,6 +1041,16 @@ async def _acquire_priority_lock(session: AsyncSession) -> None:
     )
 
 
+async def _acquire_scheduled_trigger_lock(
+    session: AsyncSession,
+    schedule_uuid: uuid.UUID,
+) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"operations-service-trigger:{schedule_uuid}"},
+    )
+
+
 def _trigger_result(
     run: OperationsRun,
     *,
@@ -1109,16 +1078,6 @@ def _revision_id_from_run(run: OperationsRun) -> str | None:
         return None
     revision_id = detail.get("revision_id")
     return str(revision_id) if revision_id is not None else None
-
-
-def _revision_uuid_from_run(run: OperationsRun) -> uuid.UUID | None:
-    revision_id = _revision_id_from_run(run)
-    if revision_id is None:
-        return None
-    try:
-        return uuid.UUID(revision_id)
-    except ValueError:
-        return None
 
 
 def _blocked_trigger_result(

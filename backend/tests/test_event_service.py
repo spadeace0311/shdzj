@@ -11,6 +11,7 @@ from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
 from app.events.repository import EventIngestResult, EventRepository
 from app.events.service import EventService
+from app.regions.domain import RegionContext
 
 ORIGIN_TIME = datetime(2026, 9, 17, 2, 30, 5, tzinfo=UTC)
 RECEIVED_AT = datetime(2026, 9, 17, 2, 31, tzinfo=UTC)
@@ -254,6 +255,66 @@ class _RecordingRepository:
             event_kind=event.kind,
             is_current=True,
         )
+
+    async def enqueue_collaboration(
+        self,
+        session: _ServiceSession,
+        **kwargs: object,
+    ) -> None:
+        assert session is self.session
+        self.events.append("enqueue_collaboration")
+
+    async def enqueue_assessment(
+        self,
+        session: _ServiceSession,
+        **kwargs: object,
+    ) -> bool:
+        assert session is self.session
+        self.events.append("enqueue_assessment")
+        return True
+
+    async def get_current_response_levels(
+        self,
+        session: _ServiceSession,
+        event_id: object,
+    ) -> tuple[None, None]:
+        assert session is self.session
+        self.events.append("get_current_response_levels")
+        return None, None
+
+    async def get_event_lifecycle_snapshot(
+        self,
+        session: _ServiceSession,
+        event_id: object,
+    ) -> tuple[str, None]:
+        assert session is self.session
+        self.events.append("get_event_lifecycle_snapshot")
+        return "not_applicable", None
+
+
+class _RecordingProductionController:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def apply_current_event_transition(
+        self,
+        session: _ServiceSession,
+        **kwargs: object,
+    ) -> tuple[()]:
+        self.events.append("apply_current_event_transition")
+        return ()
+
+
+class _RecordingRosterService:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def snapshot_for_event(
+        self,
+        session: _ServiceSession,
+        event_id: uuid.UUID,
+    ) -> None:
+        self.events.append("snapshot_for_event")
 
 
 def _compiled(statement: Any) -> tuple[str, dict[str, object]]:
@@ -969,6 +1030,61 @@ async def test_repository_acquires_source_scoped_transaction_advisory_lock() -> 
     assert "pg_advisory_xact_lock" in sql
     assert "hashtextextended" in sql
     assert session.executed_parameters == [{"lock_key": "earthquake-ingest:cenc"}]
+
+
+async def test_ingest_collected_callback_runs_before_lifecycle_side_effects() -> None:
+    events: list[str] = []
+    session_factory = _ServiceSessionFactory(events)
+    repository = _RecordingRepository(events)
+    service = EventService(
+        session_factory,
+        repository=repository,
+        production_controller=_RecordingProductionController(events),
+        roster_service=_RecordingRosterService(events),
+    )
+    payload = {"type": "test", "EventID": "CENC-TEST-1"}
+    event = _event(kind=EventKind.TEST, source_event_id="CENC-TEST-1")
+
+    async def before_side_effects(session: object, result: EventIngestResult) -> None:
+        assert session is session_factory.session
+        assert result.event_kind is EventKind.TEST
+        events.append("before_side_effects")
+
+    result = await service.ingest_collected(
+        raw_payload=payload,
+        event=event,
+        provider="api",
+        lane="http",
+        received_at=RECEIVED_AT,
+        response_input=None,
+        region_context=RegionContext(
+            inside_shanghai=True,
+            distance_to_boundary_km=None,
+            boundary_version="test-boundary",
+            computed_at=RECEIVED_AT,
+        ),
+        trigger_reason="live",
+        before_side_effects=before_side_effects,
+    )
+
+    assert events == [
+        "session:create",
+        "session:enter",
+        "begin",
+        "acquire_ingest_lock",
+        "get_or_create_raw_message",
+        "append_revision",
+        "before_side_effects",
+        "apply_current_event_transition",
+        "enqueue_collaboration",
+        "snapshot_for_event",
+        "enqueue_assessment",
+        "get_current_response_levels",
+        "get_event_lifecycle_snapshot",
+        "commit",
+        "session:exit",
+    ]
+    assert result.event_kind is EventKind.TEST
 
 
 async def test_service_wraps_raw_event_and_revision_work_in_one_transaction() -> None:
