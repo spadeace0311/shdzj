@@ -156,7 +156,11 @@ class ArtifactActivities:
         async with self._session_factory() as session:
             async with session.begin():
                 run = await session.get(ProductionRun, request.production_run_id)
-                event = await session.get(EarthquakeEvent, request.event_id)
+                event = await session.get(
+                    EarthquakeEvent,
+                    request.event_id,
+                    with_for_update=True,
+                )
                 revision = await session.get(EarthquakeRevision, request.revision_id)
                 if run is None or event is None or revision is None:
                     raise LookupError("artifact production inputs were not found")

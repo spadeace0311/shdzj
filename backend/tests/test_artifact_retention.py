@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 from app.artifacts import retention as retention_module
 from app.artifacts import worker as artifact_worker
@@ -21,6 +21,8 @@ from app.artifacts.models import (
 from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.retention import ArtifactRetentionResult, ArtifactRetentionService
 from app.artifacts.storage import ArtifactStore, StoredArtifactFile
+from app.artifacts.worker import ArtifactActivities
+from app.artifacts.workflow import ArtifactProductionWorkflowInput
 from app.collaboration.models import (
     TaskDeliverable,
     TaskDeliverableVersion,
@@ -331,6 +333,166 @@ async def test_retention_rechecks_same_event_rebuild_after_candidate_lock(
 
     assert result.test_deleted == 0
     assert await session.get(GeneratedArtifact, artifact.id) is not None
+
+
+async def test_retention_and_preparation_share_event_then_run_lock_order(
+    seeded_artifact_assessment,
+    session_factory,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await _terminalize_run_tasks(
+                session,
+                artifact.production_run_id,
+            )
+
+    candidate_selected = asyncio.Event()
+    allow_retention_lock = asyncio.Event()
+    original_lock_event_write = retention_module.lock_event_write
+
+    async def pause_retention_after_candidate_selection(
+        target_session,
+        event_id,
+        **kwargs,
+    ) -> None:
+        if event_id == seeded_artifact_assessment.event_id:
+            candidate_selected.set()
+            await asyncio.wait_for(allow_retention_lock.wait(), timeout=5)
+        await original_lock_event_write(target_session, event_id, **kwargs)
+
+    monkeypatch.setattr(
+        retention_module,
+        "lock_event_write",
+        pause_retention_after_candidate_selection,
+    )
+    retention_session_ready = asyncio.Event()
+    retention_pid: int | None = None
+
+    async def retain_candidate() -> ArtifactRetentionResult:
+        nonlocal retention_pid
+        async with session_factory() as session:
+            async with session.begin():
+                retention_pid = int(
+                    await session.scalar(text("SELECT pg_backend_pid()"))
+                )
+                retention_session_ready.set()
+                return await ArtifactRetentionService().retain_expired(
+                    session,
+                    observed_at=seeded_artifact_assessment.now,
+                    storage_namespace=ArtifactStore(
+                        settings.artifact_storage_root
+                    ).storage_namespace,
+                )
+
+    retention_task = asyncio.create_task(retain_candidate())
+    await asyncio.wait_for(retention_session_ready.wait(), timeout=5)
+    await asyncio.wait_for(candidate_selected.wait(), timeout=5)
+
+    async with session_factory() as session:
+        async with session.begin():
+            rebuild = await ArtifactProductionRepository().create_run(
+                session,
+                seeded_artifact_assessment.rebuild_command(
+                    "doc.rapid_brief",
+                    production_mode="test",
+                ),
+            )
+
+    preparation_ready = asyncio.Event()
+    allow_preparation = asyncio.Event()
+    original_create_input_snapshot = (
+        ArtifactProductionRepository.create_input_snapshot
+    )
+
+    async def pause_preparation_after_run_lock(
+        repository,
+        session,
+        production_run_id,
+        *,
+        context_fingerprint,
+        region_id,
+        manifest,
+        items=(),
+    ):
+        if production_run_id == rebuild.id:
+            preparation_ready.set()
+            await asyncio.wait_for(allow_preparation.wait(), timeout=5)
+        return await original_create_input_snapshot(
+            repository,
+            session,
+            production_run_id,
+            context_fingerprint=context_fingerprint,
+            region_id=region_id,
+            manifest=manifest,
+            items=items,
+        )
+
+    monkeypatch.setattr(
+        ArtifactProductionRepository,
+        "create_input_snapshot",
+        pause_preparation_after_run_lock,
+    )
+    request = ArtifactProductionWorkflowInput(
+        production_run_id=str(rebuild.id),
+        assessment_run_id=str(seeded_artifact_assessment.assessment_run_id),
+        event_id=str(seeded_artifact_assessment.event_id),
+        revision_id=str(seeded_artifact_assessment.revision_id),
+        deadline_at=rebuild.deadline_at.isoformat(),
+        catalog_version=seeded_artifact_assessment.catalog.catalog_version,
+        context_fingerprint="",
+        launch_mode=rebuild.launch_mode,
+        generation_seq=rebuild.generation_seq,
+        generation_scope=rebuild.generation_scope,
+        required_outputs=tuple(rebuild.required_outputs),
+        render_concurrency=settings.artifact_render_concurrency,
+        deadline_basis_at=rebuild.deadline_basis_at.isoformat(),
+    )
+    preparation_task = asyncio.create_task(
+        ArtifactActivities(session_factory).prepare_artifact_production(
+            request
+        )
+    )
+    await asyncio.wait_for(preparation_ready.wait(), timeout=10)
+
+    allow_retention_lock.set()
+    assert retention_pid is not None
+    wait_deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < wait_deadline:
+        async with session_factory() as observer:
+            wait_event_type, wait_query = (
+                await observer.execute(
+                    text(
+                        "SELECT wait_event_type, query FROM pg_stat_activity "
+                        "WHERE pid = :pid"
+                    ),
+                    {"pid": retention_pid},
+                )
+            ).one()
+        if (
+            wait_event_type == "Lock"
+            and wait_query
+            and "earthquake_events" in wait_query
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("retention did not enter a PostgreSQL lock wait")
+    allow_preparation.set()
+
+    retention_result, preparation_result = await asyncio.wait_for(
+        asyncio.gather(retention_task, preparation_task),
+        timeout=10,
+    )
+
+    assert retention_result.test_deleted == 0
+    assert preparation_result["production_run_id"] == str(rebuild.id)
+    async with session_factory() as session:
+        assert await session.get(GeneratedArtifact, artifact.id) is not None
 
 
 async def _publish_artifact(
