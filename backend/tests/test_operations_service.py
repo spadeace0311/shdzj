@@ -33,7 +33,7 @@ from app.operations.models import (
 from app.operations.priority import OperationsPriorityGuard
 from app.operations.repository import OperationsRepository
 from app.operations.schemas import DrillTriggerRequest, ManualTestTriggerRequest
-from app.operations.scenario import ScenarioGenerator
+from app.operations.scenario import OperationsConfigurationError, ScenarioGenerator
 from app.operations.service import OperationsService, RealEventPriorityActive
 from app.regions.models import RegionBoundary
 
@@ -601,6 +601,97 @@ async def test_trigger_keeps_generated_boundary_version_after_post_generation_sw
     assert revision.inside_shanghai is True
     assert revision.distance_to_boundary_km == Decimal("0")
     assert revision.region_boundary_version == generated_version
+    assert revision.region_computed_at == OBSERVED_AT
+
+
+async def test_precomputed_schedule_outside_boundary_is_rejected_without_ingest() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(RegionBoundary))
+            boundary = RegionBoundary(
+                version="precomputed-outside-boundary-v1",
+                name="precomputed scenario test boundary",
+                local_buffer_km=Decimal("50"),
+                geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, "
+                    "121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                maritime_geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, 122.2 31.8, "
+                    "121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                source_uri="test://precomputed-outside-boundary",
+                checksum="e" * 64,
+                is_active=True,
+            )
+            session.add(boundary)
+            await session.flush()
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            schedule = OperationsTestSchedule(
+                local_date=OBSERVED_AT.date(),
+                window_start=OBSERVED_AT - timedelta(hours=2),
+                window_end=OBSERVED_AT,
+                scheduled_at=OBSERVED_AT - timedelta(minutes=5),
+                state="due",
+                random_seed=456,
+                scenario={
+                    "origin_time": OBSERVED_AT.isoformat(),
+                    "longitude": "119.0",
+                    "latitude": "29.0",
+                    "depth_km": "10.00",
+                    "magnitude": "5.5",
+                    "place": "outside precomputed scenario",
+                    "random_seed": 456,
+                    "boundary_version": boundary.version,
+                },
+            )
+            session.add(schedule)
+            await session.flush()
+            schedule_id = schedule.id
+
+    service = _service()
+
+    with pytest.raises(
+        OperationsConfigurationError,
+        match="active_shanghai_boundary_required",
+    ):
+        await service.trigger_scheduled_test(
+            schedule_id,
+            "operations-scheduler",
+        )
+
+    async with SessionFactory() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        revision_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeRevision)
+            .join(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        raw_count = await session.scalar(
+            select(func.count())
+            .select_from(RawMessage)
+            .where(RawMessage.source == "operations")
+        )
+        outbox_count = await session.scalar(
+            select(func.count()).select_from(EventLifecycleOutbox)
+        )
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
+
+    assert event_count == 0
+    assert revision_count == 0
+    assert raw_count == 0
+    assert outbox_count == 0
+    assert run_count == 0
 
 
 async def test_run_reconciliation_uses_current_terminal_state() -> None:

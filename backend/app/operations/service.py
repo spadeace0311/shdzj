@@ -34,7 +34,7 @@ from app.operations.models import (
 )
 from app.operations.priority import OperationsPriorityGuard, RealEventPriorityActive
 from app.operations.repository import OperationsRepository
-from app.operations.scenario import ScenarioGenerator
+from app.operations.scenario import OperationsConfigurationError, ScenarioGenerator
 from app.operations.schemas import (
     DrillTriggerRequest,
     ManualTestTriggerRequest,
@@ -927,6 +927,13 @@ class OperationsService:
                 observed_at=observed_at,
                 seed=schedule.random_seed,
             )
+        elif not await self._scenario_generator.region_contains(
+            session,
+            scenario,
+        ):
+            raise OperationsConfigurationError(
+                "active_shanghai_boundary_required"
+            )
         region_context = self._scenario_generator.region_context(
             scenario,
             observed_at,
@@ -950,9 +957,12 @@ class OperationsService:
         if not isinstance(value, dict):
             return None
         try:
+            origin_time = value["origin_time"]
+            if isinstance(origin_time, str):
+                origin_time = datetime.fromisoformat(origin_time)
             return OperationsScenario(
                 origin_time=_require_aware_datetime(
-                    value["origin_time"],
+                    origin_time,
                     "scenario.origin_time",
                 ),
                 longitude=Decimal(str(value["longitude"])),
