@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.events.domain import EventKind, NormalizedEvent
 from app.operations.domain import OperationsScenario
 from app.operations.models import OperationsSettings
+from app.regions.domain import RegionContext
 from app.regions.models import RegionBoundary
 
 
@@ -117,6 +118,23 @@ class ScenarioGenerator:
             depth_km=scenario.depth_km,
             magnitude=scenario.magnitude,
             place=scenario.place,
+        )
+
+    def region_context(
+        self,
+        scenario: OperationsScenario,
+        computed_at: datetime,
+    ) -> RegionContext:
+        computed_at = _require_aware_datetime(computed_at, "computed_at")
+        if not scenario.boundary_version:
+            raise OperationsConfigurationError(
+                "active_shanghai_boundary_required"
+            )
+        return RegionContext(
+            inside_shanghai=True,
+            distance_to_boundary_km=Decimal("0"),
+            boundary_version=scenario.boundary_version,
+            computed_at=computed_at,
         )
 
     async def region_contains(

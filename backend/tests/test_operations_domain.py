@@ -265,3 +265,49 @@ async def test_region_contains_keeps_scenario_boundary_version(session) -> None:
 
     assert scenario.boundary_version == first.version
     assert await generator.region_contains(session, scenario) is True
+
+
+async def test_region_context_keeps_generated_boundary_version_after_deactivation(
+    session,
+) -> None:
+    await _reset_domain_tables(session)
+    first = await _active_boundary(session)
+    settings_record = await _settings(session)
+    generator = ScenarioGenerator()
+    scenario = await generator.generate_test(
+        session,
+        settings_record,
+        observed_at=datetime(2026, 10, 10, 2, tzinfo=UTC),
+        seed=20261010,
+    )
+    computed_at = datetime(2026, 10, 10, 2, 1, tzinfo=UTC)
+
+    context = generator.region_context(scenario, computed_at)
+
+    first.is_active = False
+    session.add(
+        RegionBoundary(
+            version="operations-test-boundary-v3",
+            name="replacement boundary",
+            local_buffer_km=Decimal("50"),
+            geom=WKTElement(
+                "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+                "119.0 30.0, 119.0 29.0)))",
+                srid=4326,
+            ),
+            maritime_geom=WKTElement(
+                "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+                "119.0 30.0, 119.0 29.0)))",
+                srid=4326,
+            ),
+            source_uri="test://operations-boundary-v3",
+            checksum="d" * 64,
+            is_active=True,
+        )
+    )
+    await session.flush()
+
+    assert context.inside_shanghai is True
+    assert context.distance_to_boundary_km == Decimal("0")
+    assert context.boundary_version == first.version
+    assert context.computed_at == computed_at

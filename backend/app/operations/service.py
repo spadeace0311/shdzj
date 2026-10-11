@@ -45,7 +45,7 @@ from app.operations.schemas import (
     OperationsSettingsUpdateRequest,
     OperationsTriggerResult,
 )
-from app.regions.service import RegionContextResolver
+from app.regions.domain import RegionContext
 
 
 class _ExistingScheduledRunSignal(Exception):
@@ -85,7 +85,6 @@ class OperationsService:
         self._repository = repository or OperationsRepository()
         self._scenario_generator = scenario_generator or ScenarioGenerator()
         self._priority_guard = OperationsPriorityGuard(repository=self._repository)
-        self._region_resolver = RegionContextResolver(session_factory)
         self._now = now
 
     async def trigger_manual_test(
@@ -165,18 +164,13 @@ class OperationsService:
                     )
 
                 settings = await self._repository.get_settings(session)
-                scenario = await self._scheduled_scenario(
+                scenario, region_context = await self._scheduled_scenario(
                     session,
                     schedule,
                     settings,
                     observed_at,
                 )
 
-        region_context = await self._region_resolver.resolve(
-            scenario.longitude,
-            scenario.latitude,
-            boundary_version=scenario.boundary_version,
-        )
         event = self._scenario_generator.scenario_to_event(scenario)
 
         async def persist_scheduled_run(
@@ -821,7 +815,7 @@ class OperationsService:
                 triggered_assessment=False,
             )
 
-        scenario, blocked = await self._prepare_manual_scenario(
+        scenario, region_context, blocked = await self._prepare_manual_scenario(
             trigger_mode=trigger_mode,
             event_kind=event_kind,
             key=key,
@@ -832,12 +826,8 @@ class OperationsService:
         if blocked is not None:
             return blocked
         assert scenario is not None
+        assert region_context is not None
 
-        region_context = await self._region_resolver.resolve(
-            scenario.longitude,
-            scenario.latitude,
-            boundary_version=scenario.boundary_version,
-        )
         event = self._scenario_generator.scenario_to_event(scenario)
         if event_kind is EventKind.DRILL:
             event = replace(event, kind=EventKind.DRILL)
@@ -877,7 +867,11 @@ class OperationsService:
         observed_at: datetime,
         seed: int,
         source_event_id: str,
-    ) -> tuple[OperationsScenario | None, OperationsTriggerResult | None]:
+    ) -> tuple[
+        OperationsScenario | None,
+        RegionContext | None,
+        OperationsTriggerResult | None,
+    ]:
         async with self._session_factory() as session:
             async with session.begin():
                 settings = await self._repository.get_settings(session)
@@ -890,11 +884,15 @@ class OperationsService:
                     state = (
                         "canceled" if settings.drill_conflict_policy == "terminate" else "deferred"
                     )
-                    return None, _blocked_trigger_result(
-                        key=key,
-                        trigger_mode=trigger_mode.value,
-                        event_kind=event_kind.value,
-                        operation_state=state,
+                    return (
+                        None,
+                        None,
+                        _blocked_trigger_result(
+                            key=key,
+                            trigger_mode=trigger_mode.value,
+                            event_kind=event_kind.value,
+                            operation_state=state,
+                        ),
                     )
 
                 scenario = await self._scenario_generator.generate_test(
@@ -903,12 +901,16 @@ class OperationsService:
                     observed_at=observed_at,
                     seed=seed,
                 )
+                region_context = self._scenario_generator.region_context(
+                    scenario,
+                    observed_at,
+                )
                 scenario = replace(
                     scenario,
                     source_event_id=source_event_id,
                     random_seed=seed,
                 )
-                return scenario, None
+                return scenario, region_context, None
 
     async def _scheduled_scenario(
         self,
@@ -916,7 +918,7 @@ class OperationsService:
         schedule: OperationsTestSchedule,
         settings: OperationsSettings,
         observed_at: datetime,
-    ) -> OperationsScenario:
+    ) -> tuple[OperationsScenario, RegionContext]:
         scenario = self._scenario_from_schedule(schedule)
         if scenario is None:
             scenario = await self._scenario_generator.generate_test(
@@ -925,10 +927,19 @@ class OperationsService:
                 observed_at=observed_at,
                 seed=schedule.random_seed,
             )
-        return replace(
+        region_context = self._scenario_generator.region_context(
             scenario,
-            source_event_id=(f"operations-test:scheduled:{schedule.id.hex}"),
-            random_seed=schedule.random_seed,
+            observed_at,
+        )
+        return (
+            replace(
+                scenario,
+                source_event_id=(
+                    f"operations-test:scheduled:{schedule.id.hex}"
+                ),
+                random_seed=schedule.random_seed,
+            ),
+            region_context,
         )
 
     @staticmethod

@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, event, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.artifacts.models import ProductionRun, ProductionTask
@@ -96,6 +96,41 @@ async def _ensure_boundary(session) -> RegionBoundary:
     session.add(boundary)
     await session.flush()
     return boundary
+
+
+async def _replace_active_boundary(
+    session,
+    previous_version: str,
+) -> RegionBoundary:
+    active = await session.scalar(
+        select(RegionBoundary)
+        .where(RegionBoundary.version == previous_version)
+        .with_for_update()
+    )
+    assert active is not None
+    active.is_active = False
+
+    replacement = RegionBoundary(
+        version=f"boundary-replacement-{uuid.uuid4().hex}",
+        name="replacement service test boundary",
+        local_buffer_km=Decimal("50"),
+        geom=WKTElement(
+            "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+            "119.0 30.0, 119.0 29.0)))",
+            srid=4326,
+        ),
+        maritime_geom=WKTElement(
+            "MULTIPOLYGON (((119.0 29.0, 120.0 29.0, 120.0 30.0, "
+            "119.0 30.0, 119.0 29.0)))",
+            srid=4326,
+        ),
+        source_uri="test://operations-service-boundary-replacement",
+        checksum="d" * 64,
+        is_active=True,
+    )
+    session.add(replacement)
+    await session.flush()
+    return replacement
 
 
 async def _ensure_collaboration_settings(session) -> None:
@@ -457,6 +492,115 @@ async def test_manual_test_uses_real_event_service_and_creates_shanghai_event() 
     assert audit is not None
     assert revision is not None
     assert revision.inside_shanghai is True
+
+
+@pytest.mark.parametrize("trigger_kind", ["manual_test", "drill", "scheduled_test"])
+async def test_trigger_keeps_generated_boundary_version_after_post_generation_switch(
+    trigger_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            generated_boundary = await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            schedule = (
+                await _seed_due_schedule(session)
+                if trigger_kind == "scheduled_test"
+                else None
+            )
+
+    generated_version = generated_boundary.version
+    service = _service()
+    boundary_switched = asyncio.Event()
+    original_generate = service._scenario_generator.generate_test
+    original_ingest = service._event_service.ingest_collected
+
+    async def generate_and_schedule_boundary_switch(
+        session,
+        settings,
+        *,
+        observed_at,
+        seed,
+    ):
+        scenario = await original_generate(
+            session,
+            settings,
+            observed_at=observed_at,
+            seed=seed,
+        )
+        assert scenario.boundary_version == generated_version
+
+        async def switch_boundary() -> None:
+            async with SessionFactory() as switch_session:
+                async with switch_session.begin():
+                    await _replace_active_boundary(
+                        switch_session,
+                        generated_version,
+                    )
+            boundary_switched.set()
+
+        def switch_after_commit(_session) -> None:
+            asyncio.create_task(switch_boundary())
+
+        event.listen(
+            session.sync_session,
+            "after_commit",
+            switch_after_commit,
+            once=True,
+        )
+        return scenario
+
+    async def ingest_after_boundary_switch(*args, **kwargs):
+        await boundary_switched.wait()
+        return await original_ingest(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service._scenario_generator,
+        "generate_test",
+        generate_and_schedule_boundary_switch,
+    )
+    monkeypatch.setattr(
+        service._event_service,
+        "ingest_collected",
+        ingest_after_boundary_switch,
+    )
+
+    if trigger_kind == "manual_test":
+        result = await service.trigger_manual_test(
+            ManualTestTriggerRequest(
+                idempotency_key=f"boundary-version-manual-{trigger_kind}"
+            ),
+            "operator",
+        )
+    elif trigger_kind == "drill":
+        result = await service.trigger_drill(
+            DrillTriggerRequest(
+                idempotency_key=f"boundary-version-drill-{trigger_kind}"
+            ),
+            "operator",
+        )
+    else:
+        assert schedule is not None
+        result = await service.trigger_scheduled_test(
+            schedule.id,
+            "operations-scheduler",
+        )
+
+    assert result.event_id is not None
+    assert result.run_id is not None
+
+    async with SessionFactory() as session:
+        revision = await session.scalar(
+            select(EarthquakeRevision)
+            .where(EarthquakeRevision.event_id == result.event_id)
+            .limit(1)
+        )
+
+    assert revision is not None
+    assert revision.inside_shanghai is True
+    assert revision.distance_to_boundary_km == Decimal("0")
+    assert revision.region_boundary_version == generated_version
 
 
 async def test_run_reconciliation_uses_current_terminal_state() -> None:
