@@ -28,7 +28,10 @@ from app.collaboration.models import (
 )
 from app.collaboration.notifications import DeadlineScheduler
 from app.collaboration.roster import MemberInput, RosterService
-from app.collaboration.retention import CollaborationRetentionResult
+from app.collaboration.retention import (
+    CollaborationRetentionResult,
+    CollaborationRetentionService,
+)
 from app.config import settings
 from app.events.models import (
     EarthquakeEvent,
@@ -52,6 +55,7 @@ from app.operations.repository import OperationsRepository
 from app.operations.scheduler import DailyTestScheduler, OperationsSchedulerResult
 from app.operations.schemas import ManualTestTriggerRequest
 from app.operations.service import OperationsService
+from app.operations import worker as operations_worker_module
 from app.operations.worker import (
     OperationsWorkerCycleResult,
     run_operations_cycle,
@@ -142,6 +146,22 @@ class _FakeRetentionService:
         return self.result
 
 
+class _FakeArtifactRetentionService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[datetime, str]] = []
+
+    async def retain_expired(
+        self,
+        session: object,
+        *,
+        observed_at: datetime,
+        storage_namespace: str,
+    ) -> SimpleNamespace:
+        del session
+        self.calls.append((observed_at, storage_namespace))
+        return SimpleNamespace(test_deleted=0, drill_deleted=0)
+
+
 class _FakeHealthState:
     def __init__(self) -> None:
         self.marked_at: datetime | None = None
@@ -167,9 +187,14 @@ def _scheduler_result(
     )
 
 
-def _configured(*, interval_seconds: int = 60) -> SimpleNamespace:
+def _configured(
+    *,
+    interval_seconds: int = 60,
+    artifact_retention_enabled: bool = True,
+) -> SimpleNamespace:
     return SimpleNamespace(
         operations_retention_interval_seconds=interval_seconds,
+        artifact_retention_enabled=artifact_retention_enabled,
     )
 
 
@@ -850,6 +875,70 @@ async def test_cycle_uses_integrated_retention_and_cleanup(
         )
     assert event is None
     assert artifact.id is not None
+
+
+async def test_cycle_skips_disabled_artifact_retention_but_processes_cleanup(
+    monkeypatch,
+) -> None:
+    store = ArtifactStore(
+        "/tmp/operations-disabled-artifact-retention",
+        namespace="operations-disabled-artifact-retention",
+    )
+    artifact_retention = _FakeArtifactRetentionService()
+    retention = CollaborationRetentionService()
+    cleanup_calls: list[tuple[object, object]] = []
+
+    async def fake_purge_due(
+        session: object,
+        observed_at: datetime,
+        *,
+        storage_namespace: str,
+    ) -> CollaborationRetentionResult:
+        del session, observed_at, storage_namespace
+        return CollaborationRetentionResult()
+
+    async def fake_process_cleanup(
+        session_factory: object,
+        artifact_store: object,
+    ) -> SimpleNamespace:
+        cleanup_calls.append((session_factory, artifact_store))
+        return SimpleNamespace(
+            succeeded=True,
+            failed_count=0,
+            dead_letter_count=0,
+            namespace_mismatch_count=0,
+            unprocessable_count=0,
+        )
+
+    monkeypatch.setattr(retention, "purge_due", fake_purge_due)
+    monkeypatch.setattr(
+        operations_worker_module,
+        "process_cleanup_intents",
+        fake_process_cleanup,
+    )
+    session_factory = _FakeSessionFactory()
+
+    result = await run_operations_cycle(
+        session_factory=session_factory,
+        observed_at=OBSERVED_AT,
+        configured=_configured(artifact_retention_enabled=False),
+        scheduler=_FakeScheduler(_scheduler_result()),
+        priority_guard=_FakePriorityGuard(),
+        retention_service=retention,
+        artifact_retention_service=artifact_retention,
+        artifact_store=store,
+        health_state=_FakeHealthState(),
+        last_retention_at=(
+            OBSERVED_AT - timedelta(seconds=61)
+        ),
+    )
+
+    assert artifact_retention.calls == []
+    assert result.artifact_test_deleted == 0
+    assert result.artifact_drill_deleted == 0
+    assert result.retention_ran is True
+    assert result.cleanup_failed_count == 0
+    assert cleanup_calls == [(session_factory, store)]
 
 
 async def test_worker_loop_stops_before_cycle_when_event_is_set() -> None:

@@ -9,8 +9,14 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import delete, func, select
 
+from app.artifacts import retention as retention_module
 from app.artifacts import worker as artifact_worker
-from app.artifacts.models import ArtifactPublication, GeneratedArtifact
+from app.artifacts.models import (
+    ArtifactPublication,
+    GeneratedArtifact,
+    ProductionRun,
+    ProductionTask,
+)
 from app.artifacts.retention import ArtifactRetentionResult, ArtifactRetentionService
 from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.collaboration.models import (
@@ -57,6 +63,8 @@ async def test_retention_removes_expired_test_and_drill_but_not_live(
         production_mode="live",
         age_days=10_000,
     )
+    await _terminalize_run_tasks(session, test_artifact.production_run_id)
+    await _terminalize_run_tasks(session, drill_artifact.production_run_id)
 
     removed = await artifact_retention_service.retain_expired(
         session,
@@ -70,6 +78,156 @@ async def test_retention_removes_expired_test_and_drill_but_not_live(
     assert await session.get(type(test_artifact), test_artifact.id) is None
     assert await session.get(type(drill_artifact), drill_artifact.id) is None
     assert await session.get(type(live_artifact), live_artifact.id) is not None
+
+
+async def _terminalize_run_tasks(
+    session,
+    production_run_id,
+) -> None:
+    run = await session.get(ProductionRun, production_run_id)
+    assert run is not None
+    run.status = "completed"
+    tasks = (
+        await session.scalars(
+            select(ProductionTask).where(
+                ProductionTask.production_run_id == production_run_id
+            )
+        )
+    ).all()
+    for task in tasks:
+        task.status = "succeeded"
+    await session.flush()
+
+
+@pytest.mark.parametrize("active_status", ["pending", "running"])
+async def test_retention_protects_active_production_runs(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+    active_status: str,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    run = await session.get(ProductionRun, artifact.production_run_id)
+    assert run is not None
+    await _terminalize_run_tasks(session, run.id)
+    run.status = active_status
+    await session.flush()
+
+    protected = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert protected.test_deleted == 0
+    assert await session.get(GeneratedArtifact, artifact.id) is not None
+
+    run.status = "completed"
+    await session.flush()
+    removed = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert removed.test_deleted == 1
+    assert await session.get(GeneratedArtifact, artifact.id) is None
+
+
+@pytest.mark.parametrize("active_status", ["pending", "ready", "running"])
+async def test_retention_protects_active_production_tasks(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+    active_status: str,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    run = await session.get(ProductionRun, artifact.production_run_id)
+    task = await session.get(ProductionTask, artifact.production_task_id)
+    assert run is not None and task is not None
+    await _terminalize_run_tasks(session, run.id)
+    run.status = "completed"
+    task.status = active_status
+    await session.flush()
+
+    protected = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert protected.test_deleted == 0
+    assert await session.get(GeneratedArtifact, artifact.id) is not None
+
+    task.status = "succeeded"
+    await session.flush()
+    removed = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert removed.test_deleted == 1
+    assert await session.get(GeneratedArtifact, artifact.id) is None
+
+
+async def test_retention_rechecks_active_production_after_candidate_lock(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+    session_factory,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    async with session_factory() as terminal_session:
+        async with terminal_session.begin():
+            await _terminalize_run_tasks(
+                terminal_session,
+                artifact.production_run_id,
+            )
+    original_lock_event_write = retention_module.lock_event_write
+
+    async def activate_run_after_candidate_selection(
+        target_session,
+        event_id,
+        **kwargs,
+    ) -> None:
+        await original_lock_event_write(target_session, event_id, **kwargs)
+        if event_id != seeded_artifact_assessment.event_id:
+            return
+        async with session_factory() as race_session:
+            async with race_session.begin():
+                run = await race_session.get(
+                    ProductionRun,
+                    artifact.production_run_id,
+                    with_for_update=True,
+                )
+                assert run is not None
+                run.status = "running"
+
+    monkeypatch.setattr(
+        retention_module,
+        "lock_event_write",
+        activate_run_after_candidate_selection,
+    )
+
+    result = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert result.test_deleted == 0
+    assert await session.get(GeneratedArtifact, artifact.id) is not None
 
 
 async def _publish_artifact(
@@ -114,6 +272,8 @@ async def test_retention_protects_current_and_superseded_publications(
         production_mode="test",
         age_days=402,
     )
+    await _terminalize_run_tasks(session, current.production_run_id)
+    await _terminalize_run_tasks(session, superseded.production_run_id)
     current_publication = await _publish_artifact(
         seeded_artifact_assessment,
         session,
@@ -170,6 +330,7 @@ async def test_retention_preserves_shared_object_referenced_by_live_artifact(
         "map.epicenter",
         version=2,
     )
+    await _terminalize_run_tasks(session, expired.production_run_id)
     stored_survivor = await session.get(type(survivor), survivor.id)
     assert stored_survivor is not None
     stored_survivor.storage_path = expired.storage_path
@@ -202,6 +363,7 @@ async def test_retention_uses_cross_table_reference_count_for_manual_version(
         production_mode="test",
         age_days=401,
     )
+    await _terminalize_run_tasks(session, expired.production_run_id)
     store = ArtifactStore(settings.artifact_storage_root)
     path = store.resolve(expired.storage_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +445,12 @@ async def test_retention_defers_unlink_until_db_commit_and_rollback_keeps_file(
         production_mode="test",
         age_days=401,
     )
+    async with session_factory() as terminal_session:
+        async with terminal_session.begin():
+            await _terminalize_run_tasks(
+                terminal_session,
+                artifact.production_run_id,
+            )
     store = ArtifactStore(settings.artifact_storage_root)
     path = store.resolve(artifact.storage_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +518,12 @@ async def test_retention_cleanup_can_retry_same_intent_after_unlink_failure(
         production_mode="test",
         age_days=401,
     )
+    async with session_factory() as terminal_session:
+        async with terminal_session.begin():
+            await _terminalize_run_tasks(
+                terminal_session,
+                artifact.production_run_id,
+            )
     store = FlakyCleanupStore(tmp_path / "artifacts")
     source_path = store.resolve(artifact.storage_path)
     source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +569,7 @@ async def test_retention_reports_postcommit_cleanup_intent(
         production_mode="test",
         age_days=401,
     )
+    await _terminalize_run_tasks(session, artifact.production_run_id)
 
     result = await artifact_retention_service.retain_expired(
         session,
@@ -426,6 +601,12 @@ async def test_retention_loop_retries_failed_unlink_on_next_cycle(
         production_mode="test",
         age_days=401,
     )
+    async with session_factory() as terminal_session:
+        async with terminal_session.begin():
+            await _terminalize_run_tasks(
+                terminal_session,
+                artifact.production_run_id,
+            )
     store = FlakyCleanupStore(tmp_path / "artifacts")
     source_path = store.resolve(artifact.storage_path)
     source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -477,6 +658,12 @@ async def test_retention_loop_recovers_committed_intent_after_crash(
         production_mode="test",
         age_days=401,
     )
+    async with session_factory() as terminal_session:
+        async with terminal_session.begin():
+            await _terminalize_run_tasks(
+                terminal_session,
+                artifact.production_run_id,
+            )
     store = ArtifactStore(tmp_path / "artifacts")
     source_path = store.resolve(artifact.storage_path)
     source_path.parent.mkdir(parents=True, exist_ok=True)

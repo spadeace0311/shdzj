@@ -3,10 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.artifacts.models import ArtifactPublication, GeneratedArtifact, ProductionRun
+from app.artifacts.models import (
+    ArtifactPublication,
+    GeneratedArtifact,
+    ProductionRun,
+    ProductionTask,
+)
 from app.event_object_cleanup import (
     ARTIFACT_RETENTION_CLEANUP_SOURCE,
     enqueue_object_cleanup_intent,
@@ -18,6 +23,10 @@ from app.event_object_locks import (
 )
 from app.events.models import EarthquakeEvent
 from app.operations.retention_clock import retention_cutoff
+
+
+ACTIVE_PRODUCTION_RUN_STATUSES = ("pending", "running")
+ACTIVE_PRODUCTION_TASK_STATUSES = ("pending", "ready", "running")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +72,7 @@ class ArtifactRetentionService:
                     .where(
                         ProductionRun.production_mode == production_mode,
                         EarthquakeEvent.origin_time <= cutoff,
+                        *_inactive_production_predicates(),
                     )
                     .order_by(GeneratedArtifact.id)
                 )
@@ -82,10 +92,36 @@ class ArtifactRetentionService:
         for storage_path in sorted(expired_paths):
             await lock_artifact_object(session, storage_path)
 
+        production_run_ids = {
+            artifact.production_run_id for artifact in expired
+        }
+        await session.scalars(
+            select(ProductionRun.id)
+            .where(ProductionRun.id.in_(production_run_ids))
+            .order_by(ProductionRun.id)
+            .with_for_update()
+        )
+        await session.scalars(
+            select(ProductionTask.id)
+            .where(ProductionTask.production_run_id.in_(production_run_ids))
+            .order_by(
+                ProductionTask.production_run_id,
+                ProductionTask.id,
+            )
+            .with_for_update()
+        )
+
         current_expired = (
             await session.scalars(
                 select(GeneratedArtifact)
-                .where(GeneratedArtifact.id.in_(list(expired_by_id)))
+                .join(
+                    ProductionRun,
+                    ProductionRun.id == GeneratedArtifact.production_run_id,
+                )
+                .where(
+                    GeneratedArtifact.id.in_(list(expired_by_id)),
+                    *_inactive_production_predicates(),
+                )
                 .order_by(GeneratedArtifact.id)
                 .with_for_update()
             )
@@ -174,3 +210,15 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("observed_at must include timezone information")
     return value.astimezone(UTC)
+
+
+def _inactive_production_predicates():
+    return (
+        ProductionRun.status.not_in(ACTIVE_PRODUCTION_RUN_STATUSES),
+        ~exists(
+            select(ProductionTask.id).where(
+                ProductionTask.production_run_id == ProductionRun.id,
+                ProductionTask.status.in_(ACTIVE_PRODUCTION_TASK_STATUSES),
+            )
+        ),
+    )
