@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.artifacts.models import (
     ArtifactPublication,
@@ -72,7 +73,7 @@ class ArtifactRetentionService:
                     .where(
                         ProductionRun.production_mode == production_mode,
                         EarthquakeEvent.origin_time <= cutoff,
-                        *_inactive_production_predicates(),
+                        *_inactive_event_production_predicates(),
                     )
                     .order_by(GeneratedArtifact.id)
                 )
@@ -92,18 +93,29 @@ class ArtifactRetentionService:
         for storage_path in sorted(expired_paths):
             await lock_artifact_object(session, storage_path)
 
-        production_run_ids = {
-            artifact.production_run_id for artifact in expired
-        }
+        event_ids = sorted(
+            {artifact.event_id for artifact in expired},
+            key=str,
+        )
+        await session.scalars(
+            select(EarthquakeEvent.id)
+            .where(EarthquakeEvent.id.in_(event_ids))
+            .order_by(EarthquakeEvent.id)
+            .with_for_update()
+        )
         await session.scalars(
             select(ProductionRun.id)
-            .where(ProductionRun.id.in_(production_run_ids))
-            .order_by(ProductionRun.id)
+            .where(ProductionRun.event_id.in_(event_ids))
+            .order_by(ProductionRun.event_id, ProductionRun.id)
             .with_for_update()
         )
         await session.scalars(
             select(ProductionTask.id)
-            .where(ProductionTask.production_run_id.in_(production_run_ids))
+            .join(
+                ProductionRun,
+                ProductionRun.id == ProductionTask.production_run_id,
+            )
+            .where(ProductionRun.event_id.in_(event_ids))
             .order_by(
                 ProductionTask.production_run_id,
                 ProductionTask.id,
@@ -120,7 +132,7 @@ class ArtifactRetentionService:
                 )
                 .where(
                     GeneratedArtifact.id.in_(list(expired_by_id)),
-                    *_inactive_production_predicates(),
+                    *_inactive_event_production_predicates(),
                 )
                 .order_by(GeneratedArtifact.id)
                 .with_for_update()
@@ -212,13 +224,26 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _inactive_production_predicates():
+def _inactive_event_production_predicates():
+    active_run = aliased(ProductionRun)
+    active_task = aliased(ProductionTask)
+    task_run = aliased(ProductionRun)
     return (
-        ProductionRun.status.not_in(ACTIVE_PRODUCTION_RUN_STATUSES),
         ~exists(
-            select(ProductionTask.id).where(
-                ProductionTask.production_run_id == ProductionRun.id,
-                ProductionTask.status.in_(ACTIVE_PRODUCTION_TASK_STATUSES),
+            select(active_run.id).where(
+                active_run.event_id == GeneratedArtifact.event_id,
+                active_run.status.in_(ACTIVE_PRODUCTION_RUN_STATUSES),
+            )
+        ),
+        ~exists(
+            select(active_task.id)
+            .join(
+                task_run,
+                task_run.id == active_task.production_run_id,
+            )
+            .where(
+                task_run.event_id == GeneratedArtifact.event_id,
+                active_task.status.in_(ACTIVE_PRODUCTION_TASK_STATUSES),
             )
         ),
     )

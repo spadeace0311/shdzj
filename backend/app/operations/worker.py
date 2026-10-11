@@ -134,9 +134,13 @@ async def run_operations_cycle(
                     None,
                 ),
             )
-            if getattr(configured, "artifact_retention_enabled", True):
-                async with session_factory() as session:
-                    async with session.begin():
+            async with session_factory() as session:
+                async with session.begin():
+                    if getattr(
+                        configured,
+                        "artifact_retention_enabled",
+                        True,
+                    ):
                         artifact_retention_result = (
                             await artifact_retention_service.retain_expired(
                                 session,
@@ -144,8 +148,6 @@ async def run_operations_cycle(
                                 storage_namespace=artifact_store.storage_namespace,
                             )
                         )
-            async with session_factory() as session:
-                async with session.begin():
                     retention_result = await retention_service.purge_due(
                         session,
                         observed_at,

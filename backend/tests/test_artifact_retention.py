@@ -13,10 +13,12 @@ from app.artifacts import retention as retention_module
 from app.artifacts import worker as artifact_worker
 from app.artifacts.models import (
     ArtifactPublication,
+    ArtifactTaskDependencyBinding,
     GeneratedArtifact,
     ProductionRun,
     ProductionTask,
 )
+from app.artifacts.repository import ArtifactProductionRepository
 from app.artifacts.retention import ArtifactRetentionResult, ArtifactRetentionService
 from app.artifacts.storage import ArtifactStore, StoredArtifactFile
 from app.collaboration.models import (
@@ -65,6 +67,7 @@ async def test_retention_removes_expired_test_and_drill_but_not_live(
     )
     await _terminalize_run_tasks(session, test_artifact.production_run_id)
     await _terminalize_run_tasks(session, drill_artifact.production_run_id)
+    await _terminalize_run_tasks(session, live_artifact.production_run_id)
 
     removed = await artifact_retention_service.retain_expired(
         session,
@@ -230,6 +233,106 @@ async def test_retention_rechecks_active_production_after_candidate_lock(
     assert await session.get(GeneratedArtifact, artifact.id) is not None
 
 
+async def test_retention_protects_old_final_artifact_for_same_event_rebuild(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    await _terminalize_run_tasks(session, artifact.production_run_id)
+    repository = ArtifactProductionRepository()
+    rebuild = await repository.create_run(
+        session,
+        seeded_artifact_assessment.rebuild_command(
+            "doc.rapid_brief",
+            production_mode="test",
+        ),
+    )
+    prepared_tasks = await repository.prepare_dependencies(session, rebuild.id)
+    rebuild_task = next(
+        task for task in prepared_tasks if task.artifact_key == "doc.rapid_brief"
+    )
+    binding = await session.scalar(
+        select(ArtifactTaskDependencyBinding).where(
+            ArtifactTaskDependencyBinding.production_task_id == rebuild_task.id,
+            ArtifactTaskDependencyBinding.dependency_kind == "artifact",
+            ArtifactTaskDependencyBinding.dependency_key == "map.epicenter",
+        )
+    )
+    assert binding is not None
+    assert binding.bound_entity_id == artifact.id
+
+    protected = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert protected.test_deleted == 0
+    assert await session.get(GeneratedArtifact, artifact.id) is not None
+
+    await _terminalize_run_tasks(session, rebuild.id)
+    removed = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert removed.test_deleted == 1
+    assert await session.get(GeneratedArtifact, artifact.id) is None
+
+
+async def test_retention_rechecks_same_event_rebuild_after_candidate_lock(
+    seeded_artifact_assessment,
+    artifact_retention_service,
+    session,
+    session_factory,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    await _terminalize_run_tasks(session, artifact.production_run_id)
+    original_lock_event_write = retention_module.lock_event_write
+
+    async def activate_rebuild_after_candidate_selection(
+        target_session,
+        event_id,
+        **kwargs,
+    ) -> None:
+        await original_lock_event_write(target_session, event_id, **kwargs)
+        if event_id != seeded_artifact_assessment.event_id:
+            return
+        async with session_factory() as race_session:
+            async with race_session.begin():
+                await ArtifactProductionRepository().create_run(
+                    race_session,
+                    seeded_artifact_assessment.rebuild_command(
+                        "doc.rapid_brief",
+                        production_mode="test",
+                    ),
+                )
+
+    monkeypatch.setattr(
+        retention_module,
+        "lock_event_write",
+        activate_rebuild_after_candidate_selection,
+    )
+
+    result = await artifact_retention_service.retain_expired(
+        session,
+        observed_at=seeded_artifact_assessment.now,
+        storage_namespace=ArtifactStore(settings.artifact_storage_root).storage_namespace,
+    )
+
+    assert result.test_deleted == 0
+    assert await session.get(GeneratedArtifact, artifact.id) is not None
+
+
 async def _publish_artifact(
     seeded_artifact_assessment,
     session,
@@ -331,6 +434,7 @@ async def test_retention_preserves_shared_object_referenced_by_live_artifact(
         version=2,
     )
     await _terminalize_run_tasks(session, expired.production_run_id)
+    await _terminalize_run_tasks(session, survivor.production_run_id)
     stored_survivor = await session.get(type(survivor), survivor.id)
     assert stored_survivor is not None
     stored_survivor.storage_path = expired.storage_path

@@ -11,12 +11,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from geoalchemy2.elements import WKTElement
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app import process_health
-from app.artifacts.models import ProductionRun, ProductionTask
+from app.artifacts.models import GeneratedArtifact, ProductionRun, ProductionTask
 from app.artifacts.storage import ArtifactStore
 from app.assessment.models import AssessmentRun
 from app.auth.models import User
@@ -33,6 +33,10 @@ from app.collaboration.retention import (
     CollaborationRetentionService,
 )
 from app.config import settings
+from app.event_object_cleanup import (
+    ARTIFACT_RETENTION_CLEANUP_SOURCE,
+    EventObjectCleanupIntent,
+)
 from app.events.models import (
     EarthquakeEvent,
     EarthquakeRevision,
@@ -66,6 +70,15 @@ from app.regions.models import RegionBoundary
 
 OBSERVED_AT = datetime(2026, 10, 11, 2, 30, tzinfo=UTC)
 WORKER_REMINDER_SOURCE = "operations-worker-reminder-test"
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_engine_between_worker_tests():
+    from app.db import engine
+
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 class _FakeSession:
@@ -939,6 +952,92 @@ async def test_cycle_skips_disabled_artifact_retention_but_processes_cleanup(
     assert result.retention_ran is True
     assert result.cleanup_failed_count == 0
     assert cleanup_calls == [(session_factory, store)]
+
+
+async def test_cycle_rolls_back_artifact_retention_when_collaboration_fails(
+    seeded_artifact_assessment,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = await seeded_artifact_assessment.expired_artifact(
+        production_mode="test",
+        age_days=401,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            run = await session.get(ProductionRun, artifact.production_run_id)
+            assert run is not None
+            run.status = "completed"
+            tasks = (
+                await session.scalars(
+                    select(ProductionTask).where(
+                        ProductionTask.production_run_id == run.id
+                    )
+                )
+            ).all()
+            for task in tasks:
+                task.status = "succeeded"
+
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        namespace="operations-retention-rollback",
+    )
+    source_path = store.resolve(artifact.storage_path)
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"operations-retention-rollback")
+    retention = CollaborationRetentionService()
+
+    async def fail_collaboration_retention(
+        session: object,
+        observed_at: datetime,
+        *,
+        storage_namespace: str,
+    ) -> CollaborationRetentionResult:
+        del session, observed_at, storage_namespace
+        raise RuntimeError("collaboration retention failed")
+
+    monkeypatch.setattr(retention, "purge_due", fail_collaboration_retention)
+
+    with pytest.raises(RuntimeError, match="collaboration retention failed"):
+        await run_operations_cycle(
+            session_factory=session_factory,
+            observed_at=seeded_artifact_assessment.now,
+            configured=_configured(),
+            scheduler=_FakeScheduler(_scheduler_result()),
+            operations_service=OperationsService(
+                session_factory=session_factory,
+                now=lambda: seeded_artifact_assessment.now,
+            ),
+            priority_guard=_FakePriorityGuard(),
+            retention_service=retention,
+            artifact_store=store,
+            health_state=_FakeHealthState(),
+            last_retention_at=(
+                seeded_artifact_assessment.now - timedelta(seconds=61)
+            ),
+        )
+
+    async with session_factory() as session:
+        persisted = await session.get(GeneratedArtifact, artifact.id)
+        intent_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(EventObjectCleanupIntent)
+                .where(
+                    EventObjectCleanupIntent.event_id == artifact.event_id,
+                    EventObjectCleanupIntent.source_kind
+                    == ARTIFACT_RETENTION_CLEANUP_SOURCE,
+                    EventObjectCleanupIntent.source_key == str(artifact.id),
+                )
+            )
+            or 0
+        )
+
+    assert persisted is not None
+    assert intent_count == 0
+    assert source_path.is_file()
+    assert source_path.read_bytes() == b"operations-retention-rollback"
 
 
 async def test_worker_loop_stops_before_cycle_when_event_is_set() -> None:
