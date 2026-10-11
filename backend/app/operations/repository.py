@@ -56,10 +56,12 @@ class OperationsRepository:
         session: AsyncSession,
         *,
         for_update: bool = False,
+        validate_timezone: bool = True,
     ) -> OperationsSettings:
         settings = await session.scalar(_settings_select(for_update=for_update))
         if settings is not None:
-            _validate_timezone(settings.timezone)
+            if validate_timezone:
+                _validate_timezone(settings.timezone)
             return settings
 
         await session.execute(
@@ -72,7 +74,8 @@ class OperationsRepository:
         settings = await session.scalar(_settings_select(for_update=for_update))
         if settings is None:
             raise RuntimeError("operations settings could not be initialized")
-        _validate_timezone(settings.timezone)
+        if validate_timezone:
+            _validate_timezone(settings.timezone)
         return settings
 
     async def update_settings(
@@ -94,7 +97,11 @@ class OperationsRepository:
             raise ValueError(f"unsupported_settings_field: {field}")
         observed_at = _require_aware_datetime(observed_at or datetime.now(UTC))
 
-        settings = await self._get_or_create_settings(session, for_update=True)
+        settings = await self._get_or_create_settings(
+            session,
+            for_update=True,
+            validate_timezone=False,
+        )
 
         if int(settings.row_version) != int(expected_version):
             raise StaleOperationsSettings(
@@ -104,6 +111,7 @@ class OperationsRepository:
 
         before = _settings_state(settings)
         normalized_patch = self._normalize_patch(settings, patch)
+        _validate_timezone(normalized_patch.get("timezone", settings.timezone))
         for field, value in normalized_patch.items():
             setattr(settings, field, value)
         settings.row_version += 1

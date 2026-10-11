@@ -23,7 +23,11 @@ from app.events.models import (
     RawMessage,
 )
 from app.main import app
-from app.operations.models import OperationsAuditLog, OperationsRun
+from app.operations.models import (
+    OperationsAuditLog,
+    OperationsRun,
+    OperationsSettings,
+)
 from app.operations.repository import (
     OperationsRepository,
     StaleOperationsSettings,
@@ -578,6 +582,67 @@ def test_superadmin_can_update_settings() -> None:
 
     assert response.status_code == 200
     assert response.json()["row_version"] == 2
+
+
+async def test_superadmin_can_repair_invalid_operations_timezone() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(OperationsSettings))
+    await _ensure_api_operations_environment()
+    async with SessionFactory() as session:
+        async with session.begin():
+            await session.execute(delete(OperationsSettings))
+            session.add(
+                OperationsSettings(
+                    settings_key="default",
+                    timezone="Not/AZone",
+                    row_version=1,
+                )
+            )
+
+    previous_service = app.dependency_overrides.get(get_operations_service)
+    previous_user = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_operations_service] = lambda: OperationsService(
+        SessionFactory,
+        now=lambda: API_OBSERVED_AT,
+    )
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        "superadmin",
+        "superadmin",
+        None,
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.put(
+                "/api/v1/operations/settings",
+                json={
+                    "expected_version": 1,
+                    "timezone": "Europe/London",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["timezone"] == "Europe/London"
+        assert response.json()["row_version"] == 2
+        assert response.json()["updated_by"] == "superadmin"
+    finally:
+        if previous_service is None:
+            app.dependency_overrides.pop(get_operations_service, None)
+        else:
+            app.dependency_overrides[get_operations_service] = previous_service
+        if previous_user is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous_user
+        async with SessionFactory() as session:
+            async with session.begin():
+                await session.execute(delete(OperationsSettings))
+                await OperationsRepository().get_settings(session)
+        await engine.dispose()
 
 
 def test_trigger_error_mapping() -> None:

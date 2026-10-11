@@ -235,6 +235,103 @@ async def test_get_settings_reports_existing_invalid_timezone_stably(session) ->
         await OperationsRepository().get_settings(session)
 
 
+async def test_update_settings_repairs_existing_invalid_timezone(session) -> None:
+    await _reset_repository_tables(session)
+    settings = OperationsSettings(
+        settings_key="default",
+        timezone="Not/AZone",
+        row_version=3,
+    )
+    session.add(settings)
+    await session.flush()
+    observed_at = datetime(2026, 10, 10, 2, tzinfo=UTC)
+
+    updated = await OperationsRepository().update_settings(
+        session,
+        "operations-test",
+        settings.row_version,
+        {"timezone": "Europe/London"},
+        observed_at=observed_at,
+    )
+
+    assert updated.timezone == "Europe/London"
+    assert updated.row_version == 4
+    assert updated.updated_by == "operations-test"
+    assert updated.updated_at == observed_at.astimezone(UTC)
+
+    audit = await session.scalar(
+        select(OperationsAuditLog)
+        .where(OperationsAuditLog.action == "settings.updated")
+        .order_by(OperationsAuditLog.created_at.desc(), OperationsAuditLog.id.desc())
+        .limit(1)
+    )
+    assert audit is not None
+    assert audit.before_state["timezone"] == "Not/AZone"
+    assert audit.before_state["row_version"] == 3
+    assert audit.after_state["timezone"] == "Europe/London"
+    assert audit.after_state["row_version"] == 4
+
+
+async def test_update_settings_requires_timezone_repair_for_invalid_row(
+    session,
+) -> None:
+    await _reset_repository_tables(session)
+    settings = OperationsSettings(
+        settings_key="default",
+        timezone="Not/AZone",
+        row_version=3,
+    )
+    session.add(settings)
+    await session.flush()
+
+    with pytest.raises(
+        OperationsConfigurationError,
+        match="invalid_operations_timezone",
+    ):
+        await OperationsRepository().update_settings(
+            session,
+            "operations-test",
+            settings.row_version,
+            {"daily_test_enabled": False},
+        )
+
+    assert settings.timezone == "Not/AZone"
+    assert settings.row_version == 3
+    assert settings.daily_test_enabled is True
+    audit_count = await session.scalar(
+        select(OperationsAuditLog.id).where(
+            OperationsAuditLog.action == "settings.updated"
+        )
+    )
+    assert audit_count is None
+
+
+async def test_update_settings_checks_stale_version_before_invalid_timezone_repair(
+    session,
+) -> None:
+    await _reset_repository_tables(session)
+    settings = OperationsSettings(
+        settings_key="default",
+        timezone="Not/AZone",
+        row_version=3,
+    )
+    session.add(settings)
+    await session.flush()
+
+    with pytest.raises(StaleOperationsSettings) as exc_info:
+        await OperationsRepository().update_settings(
+            session,
+            "operations-test",
+            2,
+            {"timezone": "Europe/London"},
+        )
+
+    assert exc_info.value.expected_version == 2
+    assert exc_info.value.actual_version == 3
+    assert settings.timezone == "Not/AZone"
+    assert settings.row_version == 3
+
+
 async def test_update_settings_initializes_missing_row(session) -> None:
     await _reset_repository_tables(session)
     repository = OperationsRepository()
