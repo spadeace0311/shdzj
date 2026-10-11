@@ -38,7 +38,14 @@ Preflight rulings:
 - Task 1: fix round 2 verification `30 passed`, event service `33 passed`, collaboration generation `14 passed`, priority/collected regression `27 passed`, Ruff clean.
 - Task 1: scoped re-review round 2 clean, all findings addressed, no new Critical/Important.
 - Task 1: complete (commits `577a64c..0b0ef4a`, review clean after 2 fix rounds).
-- Task 2: pending.
+- Task 2: implementer `Epicurus the 2nd` (`01a12bbf-3b4c-7810-99a0-f5777e742774`) dispatched from base `ecaae38`.
+- Task 2: implementer `DONE`, commit `8299ba3`; focused `52 passed`, Ruff clean.
+- Task 2: independent review `Raman the 2nd` (`01a12bd4-8e25-7783-9984-9b77cb14c1ec`) found 3 Important.
+- Task 2: fix round 1/5 commit `a1b6718`; focused `58 passed`, Ruff clean.
+- Task 2: scoped re-review addressed all 3 Important but found 1 new Important resume/artifact-override ABBA lock order.
+- Task 2: fix round 2/5 commit `35693c9`; focused `59 passed`, artifact override `14 passed`, Ruff clean.
+- Task 2: scoped re-review round 2 clean, lock order addressed, no new Critical/Important.
+- Task 2: complete (commits `ecaae38..35693c9`, review clean after 2 fix rounds; Minor interrupted-terminalization replay remains deferred).
 - Task 3: pending.
 - Task 4: pending.
 - Task 5: pending.
@@ -48,7 +55,7 @@ Preflight rulings:
 ## Progress
 
 - [x] Task 1: scheduler upgrade recovery
-- [ ] Task 2: run reconciliation and idempotent drill resume
+- [x] Task 2: run reconciliation and idempotent drill resume
 - [ ] Task 3: atomic scenario boundary handoff
 - [ ] Task 4: active artifact retention protection
 - [ ] Task 5: invalid timezone repair
