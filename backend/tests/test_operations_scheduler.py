@@ -13,7 +13,12 @@ from sqlalchemy import delete, func, select, update
 
 from app.collaboration.models import CollaborationSettings
 from app.db import SessionFactory, engine
-from app.events.models import EarthquakeEvent, EventLifecycleOutbox, RawMessage
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
 from app.operations.models import (
     OperationsAuditLog,
     OperationsRun,
@@ -150,6 +155,9 @@ async def _seed_legacy_due_run() -> tuple[
     OperationsTestSchedule,
     EarthquakeEvent,
     OperationsRun,
+    EarthquakeRevision,
+    RawMessage,
+    EventLifecycleOutbox,
 ]:
     async with SessionFactory() as session:
         async with session.begin():
@@ -183,6 +191,43 @@ async def _seed_legacy_due_run() -> tuple[
             session.add(event)
             await session.flush()
 
+            legacy_received_at = OBSERVED_AT - timedelta(minutes=10)
+            raw = RawMessage(
+                id=uuid.uuid4(),
+                source=SOURCE,
+                source_message_id=f"legacy-scheduled:{schedule.id}",
+                message_kind="test",
+                received_at=legacy_received_at,
+                checksum=uuid.uuid4().hex,
+                payload={"legacy_schedule_id": str(schedule.id)},
+            )
+            session.add(raw)
+            await session.flush()
+
+            revision = EarthquakeRevision(
+                id=uuid.uuid4(),
+                event_id=event.id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="test",
+                source_event_id=(
+                    f"operations-test:scheduled:{schedule.id.hex}"
+                ),
+                origin_time=event.origin_time,
+                longitude=event.longitude,
+                latitude=event.latitude,
+                depth_km=event.depth_km,
+                magnitude=event.magnitude,
+                place=event.place,
+                ingested_at=legacy_received_at,
+                is_current=True,
+                created_at=legacy_received_at,
+            )
+            session.add(revision)
+            await session.flush()
+            event.current_revision_id = revision.id
+            event.latest_trigger_revision_id = revision.id
+
             run = OperationsRun(
                 event_id=event.id,
                 schedule_id=schedule.id,
@@ -191,11 +236,28 @@ async def _seed_legacy_due_run() -> tuple[
                 priority=10,
                 idempotency_key=f"scheduled:{schedule.id}",
                 triggered_by="operations-scheduler",
-                detail={"revision_id": str(uuid.uuid4())},
+                detail={"revision_id": str(revision.id)},
             )
             session.add(run)
             await session.flush()
-            return schedule, event, run
+
+            outbox = EventLifecycleOutbox(
+                event_id=event.id,
+                revision_id=revision.id,
+                trigger_type="collaboration.requested",
+                trigger_reason="live",
+                payload={
+                    "event_id": str(event.id),
+                    "revision_id": str(revision.id),
+                    "revision_no": revision.revision_no,
+                },
+                status="published",
+                created_at=legacy_received_at,
+                available_at=legacy_received_at,
+            )
+            session.add(outbox)
+            await session.flush()
+            return schedule, event, run, revision, raw, outbox
 
 
 async def _ensure_schedule(observed_at: datetime) -> OperationsTestSchedule:
@@ -496,7 +558,14 @@ async def test_due_legacy_run_recovers_schedule_without_second_run() -> None:
     await _ensure_settings()
     await _ensure_boundary()
     await _ensure_collaboration_settings()
-    schedule, event, existing_run = await _seed_legacy_due_run()
+    (
+        schedule,
+        event,
+        existing_run,
+        legacy_revision,
+        _legacy_raw,
+        _legacy_outbox,
+    ) = await _seed_legacy_due_run()
 
     service = OperationsService(SessionFactory, now=lambda: OBSERVED_AT)
 
@@ -529,6 +598,11 @@ async def test_due_legacy_run_recovers_schedule_without_second_run() -> None:
             .select_from(EarthquakeEvent)
             .where(EarthquakeEvent.event_type == "test")
         )
+        revision_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeRevision)
+            .where(EarthquakeRevision.event_id == event.id)
+        )
 
     assert stored_schedule is not None
     assert stored_schedule.state == "triggered"
@@ -536,5 +610,7 @@ async def test_due_legacy_run_recovers_schedule_without_second_run() -> None:
     assert stored_event is not None
     assert stored_run is not None
     assert stored_run.idempotency_key == f"scheduled:{schedule.id}"
+    assert stored_event.current_revision_id == legacy_revision.id
     assert run_count == 1
     assert event_count == 1
+    assert revision_count == 1

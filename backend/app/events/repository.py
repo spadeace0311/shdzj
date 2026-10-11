@@ -47,6 +47,7 @@ class EventIngestResult:
     event_kind: EventKind
     is_current: bool
     is_new: bool = True
+    event_created: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +360,7 @@ class EventRepository:
             event_kind=revision_kind,
             is_current=becomes_current,
             is_new=True,
+            event_created=not canonical_existed,
         )
 
     async def enqueue_assessment(

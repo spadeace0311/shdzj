@@ -41,6 +41,7 @@ class LifecycleIngestOutcome:
     institutional_level: str | None
     service_level: int | None
     t1_at: datetime | None
+    event_created: bool = False
 
 
 _ALLOWED_PROVIDERS = {"fan", "wolfx", "api"}
@@ -330,6 +331,7 @@ class EventService:
             institutional_level=institutional_level,
             service_level=service_level,
             t1_at=t1_at,
+            event_created=result.event_created,
         )
 
     async def _resolve_assessment_boundary(

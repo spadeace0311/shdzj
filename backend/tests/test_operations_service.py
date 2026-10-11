@@ -166,7 +166,14 @@ async def _seed_real_event(
 
 async def _seed_legacy_scheduled_run(
     session,
-) -> tuple[OperationsTestSchedule, EarthquakeEvent, OperationsRun]:
+) -> tuple[
+    OperationsTestSchedule,
+    EarthquakeEvent,
+    OperationsRun,
+    EarthquakeRevision,
+    RawMessage,
+    EventLifecycleOutbox,
+]:
     schedule = OperationsTestSchedule(
         local_date=OBSERVED_AT.date(),
         window_start=OBSERVED_AT - timedelta(hours=2),
@@ -197,7 +204,41 @@ async def _seed_legacy_scheduled_run(
     session.add(event)
     await session.flush()
 
-    revision_id = uuid.uuid4()
+    legacy_received_at = OBSERVED_AT - timedelta(minutes=10)
+    raw = RawMessage(
+        id=uuid.uuid4(),
+        source=SOURCE,
+        source_message_id=f"legacy-scheduled:{schedule.id}",
+        message_kind="test",
+        received_at=legacy_received_at,
+        checksum=uuid.uuid4().hex,
+        payload={"legacy_schedule_id": str(schedule.id)},
+    )
+    session.add(raw)
+    await session.flush()
+
+    revision = EarthquakeRevision(
+        id=uuid.uuid4(),
+        event_id=event.id,
+        raw_message_id=raw.id,
+        revision_no=1,
+        revision_kind="test",
+        source_event_id=f"operations-test:scheduled:{schedule.id.hex}",
+        origin_time=event.origin_time,
+        longitude=event.longitude,
+        latitude=event.latitude,
+        depth_km=event.depth_km,
+        magnitude=event.magnitude,
+        place=event.place,
+        ingested_at=legacy_received_at,
+        is_current=True,
+        created_at=legacy_received_at,
+    )
+    session.add(revision)
+    await session.flush()
+    event.current_revision_id = revision.id
+    event.latest_trigger_revision_id = revision.id
+
     run = OperationsRun(
         event_id=event.id,
         schedule_id=schedule.id,
@@ -206,11 +247,28 @@ async def _seed_legacy_scheduled_run(
         priority=10,
         idempotency_key=f"scheduled:{schedule.id}",
         triggered_by="operations-scheduler",
-        detail={"revision_id": str(revision_id)},
+        detail={"revision_id": str(revision.id)},
     )
     session.add(run)
     await session.flush()
-    return schedule, event, run
+
+    outbox = EventLifecycleOutbox(
+        event_id=event.id,
+        revision_id=revision.id,
+        trigger_type="collaboration.requested",
+        trigger_reason="live",
+        payload={
+            "event_id": str(event.id),
+            "revision_id": str(revision.id),
+            "revision_no": revision.revision_no,
+        },
+        status="published",
+        created_at=legacy_received_at,
+        available_at=legacy_received_at,
+    )
+    session.add(outbox)
+    await session.flush()
+    return schedule, event, run, revision, raw, outbox
 
 
 def _service(**kwargs) -> OperationsService:
@@ -863,7 +921,14 @@ async def test_legacy_scheduler_idempotency_key_reuses_existing_run() -> None:
             await _ensure_boundary(session)
             await _ensure_collaboration_settings(session)
             await OperationsRepository().get_settings(session)
-            schedule, event, existing_run = await _seed_legacy_scheduled_run(session)
+            (
+                schedule,
+                event,
+                existing_run,
+                _legacy_revision,
+                _legacy_raw,
+                _legacy_outbox,
+            ) = await _seed_legacy_scheduled_run(session)
 
     result = await _service().trigger_scheduled_test(
         schedule.id,
@@ -900,9 +965,17 @@ async def test_legacy_scheduler_conflict_recovers_existing_run(
             await _ensure_boundary(session)
             await _ensure_collaboration_settings(session)
             await OperationsRepository().get_settings(session)
-            schedule, event, existing_run = await _seed_legacy_scheduled_run(session)
+            (
+                schedule,
+                event,
+                existing_run,
+                legacy_revision,
+                _legacy_raw,
+                _legacy_outbox,
+            ) = await _seed_legacy_scheduled_run(session)
 
-    service = _service()
+    recovery_at = OBSERVED_AT + timedelta(minutes=10)
+    service = OperationsService(SessionFactory, now=lambda: recovery_at)
 
     async def miss_preflight(_schedule_id: uuid.UUID) -> None:
         return None
@@ -916,6 +989,7 @@ async def test_legacy_scheduler_conflict_recovers_existing_run(
     assert result.event_id == event.id
     assert result.run_id == existing_run.id
     assert result.revision_id == existing_run.detail["revision_id"]
+    assert result.triggered_assessment is False
 
     async with SessionFactory() as session:
         event_count = await session.scalar(
@@ -924,11 +998,101 @@ async def test_legacy_scheduler_conflict_recovers_existing_run(
             .where(EarthquakeEvent.event_type == "test")
         )
         run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+        revision_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeRevision)
+            .where(EarthquakeRevision.event_id == event.id)
+        )
+        raw_count = await session.scalar(
+            select(func.count())
+            .select_from(RawMessage)
+            .where(RawMessage.source.in_((SOURCE, "operations")))
+        )
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(EventLifecycleOutbox)
+            .where(EventLifecycleOutbox.event_id == event.id)
+        )
         stored_event = await session.get(EarthquakeEvent, event.id)
         stored_run = await session.get(OperationsRun, existing_run.id)
+        stored_revision = await session.get(
+            EarthquakeRevision,
+            legacy_revision.id,
+        )
 
     assert event_count == 1
     assert run_count == 1
+    assert revision_count == 1
+    assert raw_count == 1
+    assert outbox_count == 1
     assert stored_event is not None
     assert stored_run is not None
+    assert stored_revision is not None
     assert stored_run.event_id == event.id
+    assert stored_event.current_revision_id == legacy_revision.id
+    assert stored_event.latest_trigger_revision_id == legacy_revision.id
+    assert stored_revision.is_current is True
+
+
+async def test_legacy_scheduler_active_real_event_keeps_existing_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+            (
+                schedule,
+                event,
+                existing_run,
+                legacy_revision,
+                _legacy_raw,
+                _legacy_outbox,
+            ) = await _seed_legacy_scheduled_run(session)
+
+    recovery_at = OBSERVED_AT + timedelta(minutes=10)
+    service = OperationsService(SessionFactory, now=lambda: recovery_at)
+    service._priority_guard = SequencedPriorityGuard()
+
+    async def miss_preflight(_schedule_id: uuid.UUID) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_get_scheduled_run", miss_preflight)
+    result = await service.trigger_scheduled_test(
+        schedule.id,
+        "operations-scheduler",
+    )
+
+    assert result.event_id == event.id
+    assert result.run_id == existing_run.id
+    assert result.revision_id == existing_run.detail["revision_id"]
+    assert result.triggered_assessment is False
+
+    async with SessionFactory() as session:
+        stored_event = await session.get(EarthquakeEvent, event.id)
+        stored_run = await session.get(OperationsRun, existing_run.id)
+        stored_revision = await session.get(
+            EarthquakeRevision,
+            legacy_revision.id,
+        )
+        revision_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeRevision)
+            .where(EarthquakeRevision.event_id == event.id)
+        )
+        run_count = await session.scalar(select(func.count()).select_from(OperationsRun))
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(EventLifecycleOutbox)
+            .where(EventLifecycleOutbox.event_id == event.id)
+        )
+
+    assert stored_event is not None
+    assert stored_run is not None
+    assert stored_revision is not None
+    assert stored_event.current_revision_id == legacy_revision.id
+    assert stored_revision.is_current is True
+    assert revision_count == 1
+    assert run_count == 1
+    assert outbox_count == 1

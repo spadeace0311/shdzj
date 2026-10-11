@@ -21,6 +21,7 @@ from app.events.domain import EventKind
 from app.events.models import (
     EarthquakeEvent,
     EarthquakeRevision,
+    EventLifecycleOutbox,
     RawMessage,
 )
 from app.events.service import EventService
@@ -190,7 +191,8 @@ class OperationsService:
             triggered_by=actor_name,
             observed_at=observed_at,
             triggered_assessment=outcome.triggered_assessment,
-            event_is_new=outcome.is_new,
+            revision_created=outcome.is_new,
+            event_created=outcome.event_created,
         )
 
     async def list_schedules(
@@ -530,7 +532,8 @@ class OperationsService:
             triggered_by=actor_name,
             observed_at=observed_at,
             triggered_assessment=outcome.triggered_assessment,
-            event_is_new=outcome.is_new,
+            revision_created=outcome.is_new,
+            event_created=outcome.event_created,
         )
 
     async def _prepare_manual_scenario(
@@ -700,7 +703,8 @@ class OperationsService:
         triggered_by: str,
         observed_at: datetime,
         triggered_assessment: bool,
-        event_is_new: bool,
+        revision_created: bool,
+        event_created: bool,
     ) -> OperationsTriggerResult:
         event_uuid = _coerce_uuid(event_id, "event_id")
         schedule_uuid = (
@@ -713,15 +717,43 @@ class OperationsService:
         conflict_error: Exception | None = None
         run: OperationsRun | None = None
         recovered_revision_id: str | None = None
+        recovered_run = False
 
         async with self._session_factory() as session:
             async with session.begin():
                 await _acquire_priority_lock(session)
-                if await self._priority_guard.has_active_real_event(
+                existing_scheduled_run = None
+                if schedule_uuid is not None:
+                    existing_scheduled_run = await session.scalar(
+                        select(OperationsRun)
+                        .where(OperationsRun.schedule_id == schedule_uuid)
+                        .with_for_update()
+                    )
+
+                if existing_scheduled_run is not None:
+                    await self._validate_scheduled_run(
+                        session,
+                        existing_scheduled_run,
+                        schedule_uuid,
+                    )
+                    await self._discard_rejected_scheduled_ingest(
+                        session,
+                        event_id=event_uuid,
+                        revision_id=revision_id,
+                        existing_run=existing_scheduled_run,
+                        revision_created=revision_created,
+                        event_created=event_created,
+                    )
+                    run = existing_scheduled_run
+                    recovered_revision_id = _revision_id_from_run(
+                        existing_scheduled_run
+                    )
+                    recovered_run = True
+                elif await self._priority_guard.has_active_real_event(
                     session,
                     observed_at,
                 ):
-                    if event_is_new:
+                    if event_created:
                         await self._delete_rejected_event(session, event_uuid)
                     if trigger_mode is TriggerMode.MANUAL_TEST:
                         real_event_rejected = True
@@ -770,20 +802,21 @@ class OperationsService:
                             except ValueError as validation_error:
                                 conflict_error = validation_error
                             else:
-                                if (
-                                    event_is_new
-                                    and event_uuid != existing_run.event_id
-                                ):
-                                    await self._delete_rejected_event(
-                                        session,
-                                        event_uuid,
-                                    )
+                                await self._discard_rejected_scheduled_ingest(
+                                    session,
+                                    event_id=event_uuid,
+                                    revision_id=revision_id,
+                                    existing_run=existing_run,
+                                    revision_created=revision_created,
+                                    event_created=event_created,
+                                )
                                 run = existing_run
                                 recovered_revision_id = _revision_id_from_run(
                                     existing_run
                                 )
+                                recovered_run = True
                                 conflict_error = None
-                        if conflict_error is not None and event_is_new:
+                        if conflict_error is not None and event_created:
                             await self._delete_rejected_event(
                                 session,
                                 event_uuid,
@@ -810,8 +843,73 @@ class OperationsService:
             ),
             trigger_mode=trigger_mode.value,
             event_kind=event_kind.value,
-            triggered_assessment=triggered_assessment,
+            triggered_assessment=(
+                False if recovered_run else triggered_assessment
+            ),
         )
+
+    async def _discard_rejected_scheduled_ingest(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: uuid.UUID,
+        revision_id: object,
+        existing_run: OperationsRun,
+        revision_created: bool,
+        event_created: bool,
+    ) -> None:
+        if event_id != existing_run.event_id:
+            if event_created:
+                await self._delete_rejected_event(session, event_id)
+            return
+        if not revision_created:
+            return
+        stored_revision_id = _revision_uuid_from_run(existing_run)
+        revision_uuid = _coerce_uuid(revision_id, "revision_id")
+        if stored_revision_id is None or revision_uuid == stored_revision_id:
+            return
+
+        event = await session.get(
+            EarthquakeEvent,
+            event_id,
+            with_for_update=True,
+        )
+        if event is None:
+            return
+
+        revision = await session.get(
+            EarthquakeRevision,
+            revision_uuid,
+            with_for_update=True,
+        )
+        if revision is None or revision.event_id != event_id:
+            return
+        raw_message_id = revision.raw_message_id
+
+        stored_revision = await session.get(
+            EarthquakeRevision,
+            stored_revision_id,
+            with_for_update=True,
+        )
+        if stored_revision is None or stored_revision.event_id != event_id:
+            return
+
+        await session.execute(
+            delete(EventLifecycleOutbox).where(
+                EventLifecycleOutbox.event_id == event_id,
+                EventLifecycleOutbox.revision_id == revision_uuid,
+            )
+        )
+        await session.delete(revision)
+        await session.flush()
+        await session.execute(
+            delete(RawMessage).where(RawMessage.id == raw_message_id)
+        )
+
+        stored_revision.is_current = True
+        event.current_revision_id = stored_revision.id
+        event.latest_trigger_revision_id = stored_revision.id
+        await session.flush()
 
     async def _delete_rejected_event(
         self,
@@ -1011,6 +1109,16 @@ def _revision_id_from_run(run: OperationsRun) -> str | None:
         return None
     revision_id = detail.get("revision_id")
     return str(revision_id) if revision_id is not None else None
+
+
+def _revision_uuid_from_run(run: OperationsRun) -> uuid.UUID | None:
+    revision_id = _revision_id_from_run(run)
+    if revision_id is None:
+        return None
+    try:
+        return uuid.UUID(revision_id)
+    except ValueError:
+        return None
 
 
 def _blocked_trigger_result(
