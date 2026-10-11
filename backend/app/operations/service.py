@@ -506,7 +506,6 @@ class OperationsService:
         replacement_event = await session.get(
             EarthquakeEvent,
             replacement.event_id,
-            with_for_update=True,
         )
         if (
             replacement_event is None

@@ -762,6 +762,76 @@ async def test_resume_drill_is_idempotent_and_cancels_source() -> None:
     assert run_count == 2
 
 
+async def test_resume_replay_repairs_interrupted_source_terminalization() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    source = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="resume-interrupted-source"),
+        "operator",
+    )
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, source.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.paused_at = OBSERVED_AT
+
+    replacement = await _service().resume_drill(
+        source.run_id,
+        "superadmin",
+    )
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, source.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.canceled_at = None
+            run.paused_at = OBSERVED_AT
+            detail = dict(run.detail or {})
+            detail.pop("resumed_by_run_id", None)
+            run.detail = detail
+
+    replay = await _service().resume_drill(source.run_id, "superadmin")
+
+    async with SessionFactory() as session:
+        source_run = await session.get(OperationsRun, source.run_id)
+        replacement_run = await session.get(
+            OperationsRun,
+            replacement.run_id,
+        )
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "drill")
+        )
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
+
+    assert replay.run_id == replacement.run_id
+    assert replay.event_id == replacement.event_id
+    assert source_run is not None
+    assert source_run.operation_state == "canceled"
+    assert source_run.resume_required is False
+    assert source_run.canceled_at == OBSERVED_AT
+    assert source_run.detail["resumed_by_run_id"] == str(
+        replacement.run_id
+    )
+    assert replacement_run is not None
+    assert replacement_run.detail["resumed_from_source_run_id"] == str(
+        source.run_id
+    )
+    assert event_count == 2
+    assert run_count == 2
+
+
 @pytest.mark.parametrize(
     "persisted_source_link",
     [None, str(uuid.UUID(int=0))],

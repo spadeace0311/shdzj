@@ -18,6 +18,7 @@ from app.artifacts.models import (
     ArtifactPublication,
     GeneratedArtifact,
     ProductionRun,
+    ProductionTask,
 )
 from app.artifacts.service import (
     ArtifactOverrideResponse,
@@ -27,13 +28,24 @@ from app.artifacts.service import (
     sha256_json,
 )
 from app.artifacts.storage import ArtifactStore
+from app.collaboration.models import CollaborationSettings
 from app.db import engine
-from app.events.models import EarthquakeEvent, EarthquakeRevision, RawMessage
-from app.operations.models import OperationsRun
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
+from app.operations.models import OperationsAuditLog, OperationsRun
 from app.operations.priority import (
+    OperationsPriorityGuard,
     OperationsWorkBlocked,
     RealEventPriorityActive,
 )
+from app.operations.repository import OperationsRepository
+from app.operations.schemas import DrillTriggerRequest
+from app.operations.service import OperationsService
+from app.regions.models import RegionBoundary
 
 
 @pytest.fixture(autouse=True)
@@ -62,17 +74,73 @@ def _marked_test_jpeg_bytes() -> bytes:
     return output.getvalue()
 
 
+def _marked_drill_jpeg_bytes() -> bytes:
+    image = Image.new("RGB", (4761, 3369), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 80, 1200, 1200), fill=(0, 0, 255))
+    image.info["comment"] = "【演练】"
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=35, dpi=(300, 300))
+    return output.getvalue()
+
+
 _VALID_JPEG_BYTES = _jpeg_bytes((255, 0, 0))
 _MARKED_TEST_JPEG_BYTES = _marked_test_jpeg_bytes()
+_MARKED_DRILL_JPEG_BYTES = _marked_drill_jpeg_bytes()
 _OTHER_JPEG_BYTES = _jpeg_bytes((0, 0, 255))
 _VALID_JPEG_CHECKSUM = hashlib.sha256(_VALID_JPEG_BYTES).hexdigest()
 _VALID_JPEG_SIZE = len(_VALID_JPEG_BYTES)
+_LOCK_ORDER_OBSERVED_AT = datetime(2040, 1, 15, 4, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
 class EventReference:
     id: uuid.UUID
     current_revision_id: uuid.UUID
+
+
+class _OverrideLockOrderGuard:
+    def __init__(
+        self,
+        *,
+        event_locked: asyncio.Event,
+        resume_reached: asyncio.Event,
+    ) -> None:
+        self.event_locked = event_locked
+        self.resume_reached = resume_reached
+        self._guard = OperationsPriorityGuard()
+
+    async def ensure_event_work_allowed(self, session, event_id) -> None:
+        self.event_locked.set()
+        await self.resume_reached.wait()
+        await self._guard.ensure_event_work_allowed(session, event_id)
+
+    async def has_active_real_event(self, session, observed_at) -> bool:
+        return await self._guard.has_active_real_event(
+            session,
+            observed_at,
+        )
+
+
+class _ResumeReplayLockOrderService(OperationsService):
+    def __init__(self, *args, resume_reached: asyncio.Event, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.resume_reached = resume_reached
+
+    async def _validate_resume_replacement(
+        self,
+        session,
+        source,
+        replacement,
+        source_run_id,
+    ) -> None:
+        self.resume_reached.set()
+        await super()._validate_resume_replacement(
+            session,
+            source,
+            replacement,
+            source_run_id,
+        )
 
 
 @pytest.fixture
@@ -91,6 +159,132 @@ def seeded_event(seeded_artifact_assessment) -> EventReference:
         id=seeded_artifact_assessment.event_id,
         current_revision_id=seeded_artifact_assessment.revision_id,
     )
+
+
+async def _ensure_operations_lock_order_environment(session) -> None:
+    active_boundary = await session.scalar(
+        select(RegionBoundary)
+        .where(RegionBoundary.is_active.is_(True))
+        .limit(1)
+    )
+    if active_boundary is None:
+        session.add(
+            RegionBoundary(
+                version=f"override-lock-boundary-{uuid.uuid4().hex}",
+                name="override lock boundary",
+                local_buffer_km=Decimal("50"),
+                geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                    "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                maritime_geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                    "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                source_uri="test://override-lock-boundary",
+                checksum="a" * 64,
+                is_active=True,
+            )
+        )
+    collaboration_settings = await session.scalar(
+        select(CollaborationSettings.id).limit(1)
+    )
+    if collaboration_settings is None:
+        session.add(
+            CollaborationSettings(
+                id=uuid.UUID("00000000-0000-0000-0000-000000000024"),
+                intensity_threshold=Decimal("2.0"),
+                row_version=1,
+            )
+        )
+    await OperationsRepository().get_settings(session)
+
+
+async def _cleanup_lock_order_event(
+    session_factory,
+    event_id: uuid.UUID,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(ArtifactOverrideRequest).where(
+                    ArtifactOverrideRequest.event_id == event_id
+                )
+            )
+            production_ids = list(
+                await session.scalars(
+                    select(ProductionRun.id).where(
+                        ProductionRun.event_id == event_id
+                    )
+                )
+            )
+            await session.execute(
+                delete(ArtifactPublication).where(
+                    ArtifactPublication.production_run_id.in_(
+                        production_ids
+                    )
+                )
+            )
+            await session.execute(
+                delete(GeneratedArtifact).where(
+                    GeneratedArtifact.production_run_id.in_(
+                        production_ids
+                    )
+                )
+            )
+            await session.execute(
+                delete(ProductionTask).where(
+                    ProductionTask.production_run_id.in_(
+                        production_ids
+                    )
+                )
+            )
+            await session.execute(
+                delete(ProductionRun).where(
+                    ProductionRun.event_id == event_id
+                )
+            )
+            run_ids = list(
+                await session.scalars(
+                    select(OperationsRun.id).where(
+                        OperationsRun.event_id == event_id
+                    )
+                )
+            )
+            await session.execute(
+                delete(OperationsAuditLog).where(
+                    OperationsAuditLog.resource_id.in_(
+                        [str(run_id) for run_id in run_ids]
+                    )
+                )
+            )
+            await session.execute(
+                delete(OperationsRun).where(
+                    OperationsRun.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.event_id == event_id
+                )
+            )
+            raw_ids = list(
+                await session.scalars(
+                    select(EarthquakeRevision.raw_message_id).where(
+                        EarthquakeRevision.event_id == event_id
+                    )
+                )
+            )
+            await session.execute(
+                delete(EarthquakeEvent).where(
+                    EarthquakeEvent.id == event_id
+                )
+            )
+            await session.execute(
+                delete(RawMessage).where(RawMessage.id.in_(raw_ids))
+            )
 
 
 @pytest.fixture
@@ -133,6 +327,113 @@ async def test_same_idempotency_key_and_fingerprint_returns_same_result(
 
     assert second.artifact_id == first.artifact_id
     assert second.production_run_id == first.production_run_id
+
+
+async def test_resume_replay_and_override_do_not_deadlock_on_same_event(
+    session_factory,
+    tmp_path,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            await _ensure_operations_lock_order_environment(session)
+
+    operations_service = OperationsService(
+        session_factory=session_factory,
+        now=lambda: _LOCK_ORDER_OBSERVED_AT,
+    )
+    source = await operations_service.trigger_drill(
+        DrillTriggerRequest(
+            idempotency_key=f"override-lock-source-{uuid.uuid4()}"
+        ),
+        "operator",
+    )
+    assert source.run_id is not None and source.event_id is not None
+
+    async with session_factory() as session:
+        async with session.begin():
+            source_run = await session.get(OperationsRun, source.run_id)
+            assert source_run is not None
+            source_run.operation_state = "paused"
+            source_run.resume_required = True
+            source_run.paused_at = _LOCK_ORDER_OBSERVED_AT
+
+    replacement = await operations_service.resume_drill(
+        source.run_id,
+        "superadmin",
+    )
+    assert (
+        replacement.run_id is not None
+        and replacement.event_id is not None
+        and replacement.revision_id is not None
+    )
+
+    event_locked = asyncio.Event()
+    resume_reached = asyncio.Event()
+    override_guard = _OverrideLockOrderGuard(
+        event_locked=event_locked,
+        resume_reached=resume_reached,
+    )
+    override_service = ArtifactOverrideService(
+        session_factory=session_factory,
+        storage_root=tmp_path / "artifacts",
+        lease_seconds=2.0,
+        poll_interval=0.01,
+        priority_guard=override_guard,
+    )
+    replay_service = _ResumeReplayLockOrderService(
+        session_factory,
+        now=lambda: _LOCK_ORDER_OBSERVED_AT,
+        resume_reached=resume_reached,
+    )
+
+    try:
+        override_task = asyncio.create_task(
+            override_service.override(
+                actor_id="superadmin",
+                event_id=replacement.event_id,
+                artifact_key="map.epicenter",
+                output_profile="a3v-professional",
+                revision_id=uuid.UUID(replacement.revision_id),
+                reason="并发覆盖",
+                expected_current_artifact_id=None,
+                idempotency_key=str(uuid.uuid4()),
+                upload=io.BytesIO(_MARKED_DRILL_JPEG_BYTES),
+            )
+        )
+        await asyncio.wait_for(event_locked.wait(), timeout=10)
+
+        replay_task = asyncio.create_task(
+            replay_service.resume_drill(source.run_id, "superadmin")
+        )
+        await asyncio.wait_for(resume_reached.wait(), timeout=10)
+        override_result, replay_result = await asyncio.gather(
+            override_task,
+            replay_task,
+            return_exceptions=True,
+        )
+
+        assert not isinstance(override_result, Exception)
+        assert not isinstance(replay_result, Exception)
+        assert override_result.production_mode == "drill"
+        assert override_result.marker == "drill"
+        assert replay_result.run_id == replacement.run_id
+        assert replay_result.event_id == replacement.event_id
+
+        async with session_factory() as session:
+            source_run = await session.get(OperationsRun, source.run_id)
+
+        assert source_run is not None
+        assert source_run.operation_state == "canceled"
+        assert source_run.resume_required is False
+    finally:
+        await _cleanup_lock_order_event(
+            session_factory,
+            replacement.event_id,
+        )
+        await _cleanup_lock_order_event(
+            session_factory,
+            source.event_id,
+        )
 
 
 async def test_same_idempotency_key_with_different_fingerprint_conflicts(
