@@ -1,12 +1,15 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 
+import { resolveApiHealthUrl } from "./operations.config";
+
 const USERNAME = process.env.E2E_SUPERADMIN_USERNAME ?? "superadmin";
-const API_BASE_URL = (process.env.E2E_API_BASE_URL ?? "").replace(/\/+$/, "");
-const API_HEALTH_URL = (
-  process.env.E2E_API_HEALTH_URL ??
-  API_BASE_URL ??
-  "http://127.0.0.1:8000"
-).replace(/\/+$/, "");
+const API_BASE_URL = (process.env.E2E_API_BASE_URL ?? "")
+  .trim()
+  .replace(/\/+$/, "");
+const API_HEALTH_URL = resolveApiHealthUrl(
+  process.env.E2E_API_HEALTH_URL,
+  process.env.E2E_API_BASE_URL,
+);
 const ALLOW_EVENT_PURGE = process.env.E2E_ALLOW_EVENT_PURGE === "1";
 const TEST_PLACE = "上海市（系统测试）";
 const PRODUCTION_TIMEOUT_MS = 240_000;

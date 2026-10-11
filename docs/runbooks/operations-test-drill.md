@@ -428,7 +428,7 @@ E2E 使用真实登录、真实数据库和真实 API，不使用 mock。需要�
 - `E2E_ALLOW_EVENT_PURGE=1`（必填）：仅允许在专用一次性 `codex-operations` 验收环境运行。测试会创建手工正式事件并在 `finally` 中调用超级管理员 `DELETE /api/v1/admin/events/{event_id}/purge` 清理；未设置该变量时测试直接 skip，避免正式/人工长期保留数据被污染。
 - `E2E_BASE_URL`（可选，默认 `http://localhost:5173`）。
 - `E2E_API_BASE_URL`（可选，设为绝对 API 地址后只有 Playwright 控制请求直连该地址，页面仍走 Vite `/api` 代理）。
-- `E2E_API_HEALTH_URL`（可选，真实 API 健康检查地址；未设置时优先使用 `E2E_API_BASE_URL`，再回退到 `http://127.0.0.1:8000`）。
+- `E2E_API_HEALTH_URL`（可选，真实 API 健康检查地址；未设置、留空或仅包含空白时优先使用非空的 `E2E_API_BASE_URL`，两者均无有效值时回退到 `http://127.0.0.1:8000`）。
 
 ```powershell
 cd frontend
