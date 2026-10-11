@@ -10,13 +10,13 @@ import pytest
 from fastapi.testclient import TestClient
 from geoalchemy2.elements import WKTElement
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
 from app.collaboration.models import CollaborationSettings
-from app.db import SessionFactory
+from app.db import SessionFactory, engine
 from app.events.models import (
     EarthquakeEvent,
     EventLifecycleOutbox,
@@ -393,6 +393,107 @@ async def test_repeated_drill_resume_posts_are_idempotent() -> None:
         else:
             app.dependency_overrides[get_current_user] = previous_user
         await _cleanup_api_operations_events()
+        await engine.dispose()
+
+
+async def test_public_triggers_cannot_preempt_resume_namespace() -> None:
+    await _ensure_api_operations_environment()
+    service = OperationsService(
+        SessionFactory,
+        now=lambda: API_OBSERVED_AT,
+    )
+    source = await service.trigger_drill(
+        DrillTriggerRequest(
+            idempotency_key=f"api-resume-preempt-source-{uuid4()}"
+        ),
+        "operator",
+    )
+    assert source.run_id is not None
+    resume_key = f"resume:{source.run_id}"
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, source.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.paused_at = API_OBSERVED_AT
+
+    previous_service = app.dependency_overrides.get(get_operations_service)
+    previous_user = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_operations_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        "leader",
+        "group_leader",
+        None,
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            manual_preempt = await client.post(
+                "/api/v1/operations/test-trigger",
+                json={},
+                headers={"Idempotency-Key": resume_key},
+            )
+            drill_preempt = await client.post(
+                "/api/v1/operations/drill-trigger",
+                json={},
+                headers={"Idempotency-Key": resume_key},
+            )
+
+            app.dependency_overrides[get_current_user] = lambda: AuthUser(
+                "superadmin",
+                "superadmin",
+                None,
+            )
+            resumed = await client.post(
+                f"/api/v1/operations/runs/{source.run_id}/resume"
+            )
+
+        assert manual_preempt.status_code == 422
+        assert drill_preempt.status_code == 422
+        assert "reserved namespace" in manual_preempt.text
+        assert "reserved namespace" in drill_preempt.text
+        assert resumed.status_code == 201
+        assert resumed.json()["idempotency_key"] == resume_key
+
+        async with SessionFactory() as session:
+            manual_preempt_count = await session.scalar(
+                select(func.count())
+                .select_from(OperationsRun)
+                .where(
+                    OperationsRun.idempotency_key == resume_key,
+                    OperationsRun.trigger_mode == "manual_test",
+                )
+            )
+            replacement = await session.get(
+                OperationsRun,
+                UUID(resumed.json()["run_id"]),
+            )
+            source_run = await session.get(OperationsRun, source.run_id)
+
+        assert manual_preempt_count == 0
+        assert replacement is not None
+        assert replacement.trigger_mode == "drill"
+        assert replacement.detail["resumed_from_source_run_id"] == str(
+            source.run_id
+        )
+        assert source_run is not None
+        assert source_run.detail["resumed_by_run_id"] == str(replacement.id)
+    finally:
+        if previous_service is None:
+            app.dependency_overrides.pop(get_operations_service, None)
+        else:
+            app.dependency_overrides[get_operations_service] = previous_service
+        if previous_user is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous_user
+        await _cleanup_api_operations_events()
+        await engine.dispose()
 
 
 @pytest.mark.parametrize("role", ["viewer", "group_member"])

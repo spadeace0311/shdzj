@@ -381,6 +381,40 @@ class CommittedRealEventPriorityGuard:
         )
 
 
+class _PrefetchDelayedResumeService(OperationsService):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._prefetch_lock = asyncio.Lock()
+        self._prefetch_calls = 0
+        self.first_prefetch_started = asyncio.Event()
+        self.second_prefetch_started = asyncio.Event()
+        self.replacement_committed = asyncio.Event()
+
+    async def _get_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> OperationsRun | None:
+        if idempotency_key.startswith("resume:"):
+            async with self._prefetch_lock:
+                self._prefetch_calls += 1
+                prefetch_number = self._prefetch_calls
+            if prefetch_number == 1:
+                self.first_prefetch_started.set()
+            elif prefetch_number == 2:
+                self.second_prefetch_started.set()
+                await self.replacement_committed.wait()
+                return None
+        return await super()._get_run_by_idempotency_key(
+            idempotency_key
+        )
+
+    async def _link_resumed_source(self, *args, **kwargs) -> None:
+        try:
+            await super()._link_resumed_source(*args, **kwargs)
+        finally:
+            self.replacement_committed.set()
+
+
 async def test_manual_test_uses_real_event_service_and_creates_shanghai_event() -> None:
     async with SessionFactory() as session:
         async with session.begin():
@@ -530,6 +564,7 @@ async def test_run_reconciliation_keeps_running_without_production() -> None:
     )
     assert result.run_id is not None
 
+    assessment_id = uuid.uuid4()
     async with SessionFactory() as session:
         async with session.begin():
             event = await session.get(EarthquakeEvent, result.event_id)
@@ -545,12 +580,12 @@ async def test_run_reconciliation_keeps_running_without_production() -> None:
             assert event is not None and outbox is not None
             session.add(
                 AssessmentRun(
-                    id=uuid.uuid4(),
+                    id=assessment_id,
                     event_id=event.id,
                     revision_id=revision_id,
                     outbox_id=outbox.id,
                     run_no=1,
-                    status="completed",
+                    status="pending",
                     priority=100,
                     deadline_at=OBSERVED_AT + timedelta(minutes=5),
                     snapshot={},
@@ -561,34 +596,56 @@ async def test_run_reconciliation_keeps_running_without_production() -> None:
 
     async with SessionFactory() as session:
         async with session.begin():
-            reconciled = await _service().reconcile_runs(
+            first_reconciled = await _service().reconcile_runs(
+                session,
+                OBSERVED_AT,
+            )
+            assessment = await session.get(AssessmentRun, assessment_id)
+            assert assessment is not None
+            assessment.status = "completed"
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            second_reconciled = await _service().reconcile_runs(
                 session,
                 OBSERVED_AT,
             )
 
-    assert reconciled == 1
+    async with SessionFactory() as session:
+        async with session.begin():
+            third_reconciled = await _service().reconcile_runs(
+                session,
+                OBSERVED_AT,
+            )
+
+    assert first_reconciled == 1
+    assert second_reconciled == 1
+    assert third_reconciled == 0
 
     async with SessionFactory() as session:
         run = await session.get(OperationsRun, result.run_id)
-        audit = await session.scalar(
-            select(OperationsAuditLog)
-            .where(
-                OperationsAuditLog.resource_type == "operations_run",
-                OperationsAuditLog.resource_id == str(result.run_id),
-                OperationsAuditLog.action == "operations.run.running",
+        audits = (
+            await session.scalars(
+                select(OperationsAuditLog)
+                .where(
+                    OperationsAuditLog.resource_type == "operations_run",
+                    OperationsAuditLog.resource_id == str(result.run_id),
+                    OperationsAuditLog.action == "operations.run.running",
+                    OperationsAuditLog.detail["reason"].astext
+                    == "production_pending",
+                )
+                .order_by(
+                    OperationsAuditLog.created_at.desc(),
+                    OperationsAuditLog.id.desc(),
+                )
             )
-            .order_by(
-                OperationsAuditLog.created_at.desc(),
-                OperationsAuditLog.id.desc(),
-            )
-            .limit(1)
-        )
+        ).all()
 
     assert run is not None
     assert run.operation_state == "running"
     assert run.completed_at is None
-    assert audit is not None
-    assert audit.detail["reason"] == "production_pending"
+    assert len(audits) == 1
+    assert audits[0].detail["reason"] == "production_pending"
 
 
 @pytest.mark.parametrize("assessment_status", ["failed", "canceled"])
@@ -701,6 +758,131 @@ async def test_resume_drill_is_idempotent_and_cancels_source() -> None:
     assert new_run is not None
     assert new_run.operation_state == "queued"
     assert new_run.idempotency_key == resumed.idempotency_key
+    assert event_count == 2
+    assert run_count == 2
+
+
+@pytest.mark.parametrize(
+    "persisted_source_link",
+    [None, str(uuid.UUID(int=0))],
+)
+async def test_resume_replay_rejects_unlinked_or_mismatched_drill_replacement(
+    persisted_source_link: str | None,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    source = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="resume-poison-source"),
+        "operator",
+    )
+    attacker = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="resume-poison-attacker"),
+        "operator",
+    )
+    assert source.run_id is not None
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            source_run = await session.get(OperationsRun, source.run_id)
+            attacker_run = await session.get(OperationsRun, attacker.run_id)
+            assert source_run is not None and attacker_run is not None
+            source_run.operation_state = "paused"
+            source_run.resume_required = True
+            source_run.paused_at = OBSERVED_AT
+            attacker_run.idempotency_key = f"resume:{source.run_id}"
+            if persisted_source_link is not None:
+                attacker_detail = dict(attacker_run.detail or {})
+                attacker_detail["resumed_from_source_run_id"] = (
+                    persisted_source_link
+                )
+                attacker_run.detail = attacker_detail
+
+    service = _service()
+    with pytest.raises(ValueError, match="idempotency_key conflicts"):
+        await service.resume_drill(source.run_id, "superadmin")
+
+    async with SessionFactory() as session:
+        source_run = await session.get(OperationsRun, source.run_id)
+
+    assert source_run is not None
+    assert source_run.operation_state == "paused"
+    assert source_run.resume_required is True
+    assert "resumed_by_run_id" not in source_run.detail
+
+
+async def test_concurrent_resume_prefetch_race_returns_one_replacement() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    source = await _service().trigger_drill(
+        DrillTriggerRequest(idempotency_key="resume-concurrent-source"),
+        "operator",
+    )
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, source.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.paused_at = OBSERVED_AT
+
+    service = _PrefetchDelayedResumeService(
+        SessionFactory,
+        now=lambda: OBSERVED_AT,
+    )
+    first_task = asyncio.create_task(
+        service.resume_drill(source.run_id, "superadmin")
+    )
+    await asyncio.wait_for(
+        service.first_prefetch_started.wait(),
+        timeout=10,
+    )
+    second_task = asyncio.create_task(
+        service.resume_drill(source.run_id, "superadmin")
+    )
+    await asyncio.wait_for(
+        service.second_prefetch_started.wait(),
+        timeout=10,
+    )
+    first, second = await asyncio.gather(
+        first_task,
+        second_task,
+        return_exceptions=True,
+    )
+
+    assert not isinstance(first, Exception)
+    assert not isinstance(second, Exception)
+    assert first.run_id == second.run_id
+    assert first.event_id == second.event_id
+    assert first.idempotency_key == second.idempotency_key
+
+    async with SessionFactory() as session:
+        source_run = await session.get(OperationsRun, source.run_id)
+        replacement_run = await session.get(OperationsRun, first.run_id)
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "drill")
+        )
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
+
+    assert source_run is not None
+    assert source_run.operation_state == "canceled"
+    assert source_run.resume_required is False
+    assert source_run.detail["resumed_by_run_id"] == str(first.run_id)
+    assert replacement_run is not None
+    assert replacement_run.detail["resumed_from_source_run_id"] == str(
+        source.run_id
+    )
     assert event_count == 2
     assert run_count == 2
 
@@ -1139,6 +1321,27 @@ async def test_manual_key_cannot_impersonate_scheduled_trigger() -> None:
     assert scheduled_result.run_id is not None
     assert run_count == 1
     assert scheduled_run_count == 1
+
+
+@pytest.mark.parametrize("trigger_kind", ["manual_test", "drill"])
+async def test_public_trigger_key_cannot_use_resume_namespace(
+    trigger_kind: str,
+) -> None:
+    service = _service()
+    source_id = uuid.uuid4()
+    request_key = f"resume:{source_id}"
+
+    with pytest.raises(ValueError, match="reserved namespace"):
+        if trigger_kind == "manual_test":
+            await service.trigger_manual_test(
+                ManualTestTriggerRequest(idempotency_key=request_key),
+                "operator",
+            )
+        else:
+            await service.trigger_drill(
+                DrillTriggerRequest(idempotency_key=request_key),
+                "operator",
+            )
 
 
 async def test_legacy_scheduler_idempotency_key_reuses_existing_run() -> None:

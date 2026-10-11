@@ -436,6 +436,23 @@ async def _cleanup_worker_reminder_context(
             )
 
 
+async def _run_worker_reconciliation_cycle(
+    session_factory: object,
+    operations_service: object,
+) -> OperationsWorkerCycleResult:
+    return await run_operations_cycle(
+        session_factory=session_factory,
+        observed_at=OBSERVED_AT,
+        configured=_configured(interval_seconds=60),
+        scheduler=_FakeScheduler(_scheduler_result()),
+        operations_service=operations_service,
+        priority_guard=_FakePriorityGuard(),
+        retention_service=_FakeRetentionService(),
+        health_state=_FakeHealthState(),
+        last_retention_at=OBSERVED_AT,
+    )
+
+
 async def test_worker_reconciliation_keeps_missing_production_running(
     session_factory,
 ) -> None:
@@ -458,6 +475,7 @@ async def test_worker_reconciliation_keeps_missing_production_running(
     assert triggered.run_id is not None
 
     try:
+        assessment_id = uuid.uuid4()
         async with session_factory() as session:
             async with session.begin():
                 event = await session.get(
@@ -476,12 +494,12 @@ async def test_worker_reconciliation_keeps_missing_production_running(
                 assert event is not None and outbox is not None
                 session.add(
                     AssessmentRun(
-                        id=uuid.uuid4(),
+                        id=assessment_id,
                         event_id=event.id,
                         revision_id=uuid.UUID(triggered.revision_id),
                         outbox_id=outbox.id,
                         run_no=1,
-                        status="completed",
+                        status="pending",
                         priority=100,
                         deadline_at=OBSERVED_AT + timedelta(minutes=5),
                         snapshot={},
@@ -490,40 +508,56 @@ async def test_worker_reconciliation_keeps_missing_production_running(
                     )
                 )
 
-        cycle_result = await run_operations_cycle(
-            session_factory=session_factory,
-            observed_at=OBSERVED_AT,
-            configured=_configured(interval_seconds=60),
-            scheduler=_FakeScheduler(_scheduler_result()),
-            operations_service=operations_service,
-            priority_guard=_FakePriorityGuard(),
-            retention_service=_FakeRetentionService(),
-            health_state=_FakeHealthState(),
-            last_retention_at=OBSERVED_AT,
+        first_cycle = await _run_worker_reconciliation_cycle(
+            session_factory,
+            operations_service,
+        )
+
+        async with session_factory() as session:
+            async with session.begin():
+                assessment = await session.get(
+                    AssessmentRun,
+                    assessment_id,
+                )
+                assert assessment is not None
+                assessment.status = "completed"
+
+        second_cycle = await _run_worker_reconciliation_cycle(
+            session_factory,
+            operations_service,
+        )
+        third_cycle = await _run_worker_reconciliation_cycle(
+            session_factory,
+            operations_service,
         )
 
         async with session_factory() as session:
             run = await session.get(OperationsRun, triggered.run_id)
-            audit = await session.scalar(
-                select(OperationsAuditLog)
-                .where(
-                    OperationsAuditLog.resource_type == "operations_run",
-                    OperationsAuditLog.resource_id == str(triggered.run_id),
-                    OperationsAuditLog.action == "operations.run.running",
+            audits = (
+                await session.scalars(
+                    select(OperationsAuditLog)
+                    .where(
+                        OperationsAuditLog.resource_type == "operations_run",
+                        OperationsAuditLog.resource_id == str(triggered.run_id),
+                        OperationsAuditLog.action == "operations.run.running",
+                        OperationsAuditLog.detail["reason"].astext
+                        == "production_pending",
+                    )
+                    .order_by(
+                        OperationsAuditLog.created_at.desc(),
+                        OperationsAuditLog.id.desc(),
+                    )
                 )
-                .order_by(
-                    OperationsAuditLog.created_at.desc(),
-                    OperationsAuditLog.id.desc(),
-                )
-                .limit(1)
-            )
+            ).all()
 
-        assert cycle_result.runs_reconciled == 1
+        assert first_cycle.runs_reconciled == 1
+        assert second_cycle.runs_reconciled == 1
+        assert third_cycle.runs_reconciled == 0
         assert run is not None
         assert run.operation_state == "running"
         assert run.completed_at is None
-        assert audit is not None
-        assert audit.detail["reason"] == "production_pending"
+        assert len(audits) == 1
+        assert audits[0].detail["reason"] == "production_pending"
     finally:
         await _cleanup_worker_operations_event(
             session_factory,
