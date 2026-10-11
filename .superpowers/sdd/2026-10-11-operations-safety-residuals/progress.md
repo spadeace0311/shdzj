@@ -46,18 +46,40 @@ Preflight rulings:
 - Task 2: fix round 2/5 commit `35693c9`; focused `59 passed`, artifact override `14 passed`, Ruff clean.
 - Task 2: scoped re-review round 2 clean, lock order addressed, no new Critical/Important.
 - Task 2: complete (commits `ecaae38..35693c9`, review clean after 2 fix rounds; Minor interrupted-terminalization replay remains deferred).
-- Task 3: pending.
-- Task 4: pending.
-- Task 5: pending.
-- Task 6: pending.
-- Task 7: pending.
+- Task 3: implementer `Huygens the 2nd` (`01a12c03-6be2-7511-9e90-342edc14f63e`) dispatched from base `809e43c`.
+- Task 3: implementer `DONE`, commit `00c5b51`; focused `54 passed`, Ruff clean.
+- Task 3: independent review found 1 Important in the precomputed schedule compatibility path.
+- Task 3: fix round 1/5 commit `d847e07`; focused `55 passed`, Ruff clean.
+- Task 3: scoped re-review round 1 clean, precomputed scenarios now validate the locked boundary version and `region_computed_at` is asserted.
+- Task 3: complete (commits `809e43c..d847e07`, review clean after 1 fix round; two low-risk test-gap Minors deferred).
+- Task 4: implementer `Fermat the 2nd` (`01a12c15-c8c5-7292-abca-0e7b55034335`) dispatched from base `00c5b51`.
+- Task 4: implementer `DONE`, commit `12e4a6f`; focused `34 passed`, Ruff clean, adjacent cleanup/retention regressions clean.
+- Task 4: independent review found 2 Important: active work is only checked on the artifact's owning run, and artifact/collaboration retention is split across transactions.
+- Task 4: fix round 1/5 commit `ae4ef2e`; focused `37 passed`, cleanup/retention/collaboration regressions clean.
+- Task 4: scoped re-review round 1 closed both original Important findings but found a new event/run lock-order inversion.
+- Task 4: fix round 2/5 commit `fcd42d9`; focused `38 passed`, preparation/context adjacent `18 passed`, Ruff clean.
+- Task 4: scoped re-review round 2 clean, lock order standardized to event -> run -> task with a real two-session regression.
+- Task 4: complete (commits `00c5b51..fcd42d9`, review clean after 2 fix rounds).
+- Task 5: implementer `Kepler the 2nd` (`01a12c25-dce1-7aa3-9a64-b65325ea4798`) dispatched from base `2ac68a9`.
+- Task 5: implementer `DONE`, commit `a69f5ec`; focused `34 passed`, adjacent `63 passed`, Ruff clean.
+- Task 5: independent review clean (0 Critical, 0 Important, 1 test-cleanup-only Minor).
+- Task 5: complete (commits `2ac68a9..a69f5ec`, review clean without a fix round).
+- Task 6: implementer `Hilbert the 2nd` (`01a12c23-3b42-7391-9ecb-df9329dcbfcc`) dispatched from base `d847e07`.
+- Task 6: implementer `DONE`, commit `2ac68a9`; focused `5 passed`, frontend `223 passed`, typecheck/build clean.
+- Task 6: independent review clean (0 Critical, 0 Important, 1 non-blocking documentation Minor).
+- Task 6: complete (commits `d847e07..2ac68a9`, review clean without a fix round).
+- Task 7: backend focused suite `138 passed`, migration/schema round-trip `35 passed`, frontend `223 passed`, typecheck/build clean, Ruff clean.
+- Task 7: first whole-branch review found one Important manual/drill crash window.
+- Task 7: fix commit `b8d7621`; focused crash/retry `3 passed`, adjacent service/scheduler/priority/API/event-service `112 passed`, Ruff clean.
+- Task 7: final code head re-verification `138 passed`; scoped whole-branch re-review `READY` with 0 Critical and 0 Important.
+- Task 7: final report and review package updated for code head `b8d7621`; push pending.
 
 ## Progress
 
 - [x] Task 1: scheduler upgrade recovery
 - [x] Task 2: run reconciliation and idempotent drill resume
-- [ ] Task 3: atomic scenario boundary handoff
-- [ ] Task 4: active artifact retention protection
-- [ ] Task 5: invalid timezone repair
-- [ ] Task 6: E2E health URL fallback
-- [ ] Task 7: residual whole-branch verification
+- [x] Task 3: atomic scenario boundary handoff
+- [x] Task 4: active artifact retention protection
+- [x] Task 5: invalid timezone repair
+- [x] Task 6: E2E health URL fallback
+- [x] Task 7: residual whole-branch verification
