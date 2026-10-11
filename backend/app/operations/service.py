@@ -376,6 +376,29 @@ class OperationsService:
     ) -> OperationsTriggerResult:
         run_uuid = _coerce_uuid(run_id, "run_id")
         observed_at = _as_utc(self._now())
+        actor_name = _actor_name(actor)
+        resume_key = f"resume:{run_uuid}"
+
+        existing_replacement = await self._get_run_by_idempotency_key(
+            resume_key
+        )
+        if existing_replacement is not None:
+            if existing_replacement.trigger_mode != TriggerMode.DRILL.value:
+                raise ValueError("idempotency_key conflicts with a different operation")
+            await self._link_resumed_source(
+                run_uuid,
+                replacement_id=existing_replacement.id,
+                actor_name=actor_name,
+                observed_at=observed_at,
+            )
+            return _trigger_result(
+                existing_replacement,
+                revision_id=_revision_id_from_run(existing_replacement),
+                trigger_mode=TriggerMode.DRILL.value,
+                event_kind=EventKind.DRILL.value,
+                triggered_assessment=False,
+            ).model_copy(update={"resumed_from_run_id": run_uuid})
+
         async with self._session_factory() as session:
             async with session.begin():
                 await _acquire_priority_lock(session)
@@ -399,10 +422,82 @@ class OperationsService:
                     raise RealEventPriorityActive()
 
         result = await self.trigger_drill(
-            DrillTriggerRequest(idempotency_key=str(uuid.uuid4())),
+            DrillTriggerRequest(idempotency_key=resume_key),
             actor,
         )
+        if result.run_id is not None:
+            await self._link_resumed_source(
+                run_uuid,
+                replacement_id=result.run_id,
+                actor_name=actor_name,
+                observed_at=observed_at,
+            )
         return result.model_copy(update={"resumed_from_run_id": run_uuid})
+
+    async def _link_resumed_source(
+        self,
+        source_run_id: uuid.UUID,
+        *,
+        replacement_id: uuid.UUID,
+        actor_name: str,
+        observed_at: datetime,
+    ) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                await _acquire_priority_lock(session)
+                source = await session.get(
+                    OperationsRun,
+                    source_run_id,
+                    with_for_update=True,
+                )
+                if source is None:
+                    return
+                if source.trigger_mode != TriggerMode.DRILL.value:
+                    raise ValueError(
+                        "idempotency_key conflicts with a different operation"
+                    )
+
+                detail = dict(source.detail or {})
+                replacement_link = str(replacement_id)
+                if source.operation_state == "paused":
+                    if not source.resume_required:
+                        raise ValueError(
+                            "drill run is not marked for resumption"
+                        )
+                    before = _run_state(source)
+                    source.operation_state = "canceled"
+                    source.resume_required = False
+                    source.canceled_at = observed_at
+                    source.updated_at = observed_at
+                    detail["resumed_by_run_id"] = replacement_link
+                    source.detail = detail
+                    session.add(
+                        OperationsAuditLog(
+                            action="operations.drill.resumed",
+                            actor=actor_name,
+                            resource_type="operations_run",
+                            resource_id=str(source.id),
+                            before_state=before,
+                            after_state=_run_state(source),
+                            detail={
+                                "resumed_by_run_id": replacement_link,
+                            },
+                            created_at=observed_at,
+                        )
+                    )
+                elif source.operation_state in {
+                    "canceled",
+                    "failed",
+                    "completed",
+                }:
+                    if detail.get("resumed_by_run_id") != replacement_link:
+                        detail["resumed_by_run_id"] = replacement_link
+                        source.detail = detail
+                        source.updated_at = observed_at
+                else:
+                    raise ValueError(
+                        "only paused drill runs can be resumed"
+                    )
 
     async def reconcile_runs(
         self,
@@ -482,6 +577,7 @@ class OperationsService:
                 continue
 
             next_state: str | None = None
+            production_pending = False
             if any(
                 status in {"pending", "running", "ready"}
                 for status in statuses
@@ -492,6 +588,13 @@ class OperationsService:
                 for status in statuses
             ):
                 next_state = "failed"
+            elif (
+                assessment_statuses
+                and not production_statuses
+                and not task_statuses
+            ):
+                next_state = "running"
+                production_pending = True
             elif all(
                 status
                 in {
@@ -528,6 +631,11 @@ class OperationsService:
                     detail={
                         "reconciliation": True,
                         "event_id": str(run.event_id),
+                        **(
+                            {"reason": "production_pending"}
+                            if production_pending
+                            else {}
+                        ),
                     },
                     created_at=observed_at,
                 )

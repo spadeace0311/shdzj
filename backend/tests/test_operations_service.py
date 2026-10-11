@@ -517,7 +517,141 @@ async def test_run_reconciliation_uses_current_terminal_state() -> None:
     assert run.operation_state == "completed"
 
 
-async def test_resume_drill_creates_a_new_authorized_operation() -> None:
+async def test_run_reconciliation_keeps_running_without_production() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    result = await _service().trigger_manual_test(
+        ManualTestTriggerRequest(idempotency_key="reconcile-production-pending"),
+        "operator",
+    )
+    assert result.run_id is not None
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            event = await session.get(EarthquakeEvent, result.event_id)
+            revision_id = uuid.UUID(result.revision_id)
+            outbox = await session.scalar(
+                select(EventLifecycleOutbox)
+                .where(
+                    EventLifecycleOutbox.event_id == event.id,
+                    EventLifecycleOutbox.trigger_type == "assessment.requested",
+                )
+                .limit(1)
+            )
+            assert event is not None and outbox is not None
+            session.add(
+                AssessmentRun(
+                    id=uuid.uuid4(),
+                    event_id=event.id,
+                    revision_id=revision_id,
+                    outbox_id=outbox.id,
+                    run_no=1,
+                    status="completed",
+                    priority=100,
+                    deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                    snapshot={},
+                    report_ingested_at=OBSERVED_AT,
+                    deadline_basis_at=OBSERVED_AT,
+                )
+            )
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            reconciled = await _service().reconcile_runs(
+                session,
+                OBSERVED_AT,
+            )
+
+    assert reconciled == 1
+
+    async with SessionFactory() as session:
+        run = await session.get(OperationsRun, result.run_id)
+        audit = await session.scalar(
+            select(OperationsAuditLog)
+            .where(
+                OperationsAuditLog.resource_type == "operations_run",
+                OperationsAuditLog.resource_id == str(result.run_id),
+                OperationsAuditLog.action == "operations.run.running",
+            )
+            .order_by(
+                OperationsAuditLog.created_at.desc(),
+                OperationsAuditLog.id.desc(),
+            )
+            .limit(1)
+        )
+
+    assert run is not None
+    assert run.operation_state == "running"
+    assert run.completed_at is None
+    assert audit is not None
+    assert audit.detail["reason"] == "production_pending"
+
+
+@pytest.mark.parametrize("assessment_status", ["failed", "canceled"])
+async def test_run_reconciliation_keeps_failed_assessment_failed(
+    assessment_status: str,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            await OperationsRepository().get_settings(session)
+
+    result = await _service().trigger_manual_test(
+        ManualTestTriggerRequest(
+            idempotency_key=f"reconcile-assessment-{assessment_status}"
+        ),
+        "operator",
+    )
+    assert result.run_id is not None
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            event = await session.get(EarthquakeEvent, result.event_id)
+            revision_id = uuid.UUID(result.revision_id)
+            outbox = await session.scalar(
+                select(EventLifecycleOutbox)
+                .where(
+                    EventLifecycleOutbox.event_id == event.id,
+                    EventLifecycleOutbox.trigger_type == "assessment.requested",
+                )
+                .limit(1)
+            )
+            assert event is not None and outbox is not None
+            session.add(
+                AssessmentRun(
+                    id=uuid.uuid4(),
+                    event_id=event.id,
+                    revision_id=revision_id,
+                    outbox_id=outbox.id,
+                    run_no=1,
+                    status=assessment_status,
+                    priority=100,
+                    deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                    snapshot={},
+                    report_ingested_at=OBSERVED_AT,
+                    deadline_basis_at=OBSERVED_AT,
+                )
+            )
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _service().reconcile_runs(session, OBSERVED_AT)
+
+    async with SessionFactory() as session:
+        run = await session.get(OperationsRun, result.run_id)
+
+    assert run is not None
+    assert run.operation_state == "failed"
+    assert run.completed_at == OBSERVED_AT
+    assert run.resume_required is False
+
+
+async def test_resume_drill_is_idempotent_and_cancels_source() -> None:
     async with SessionFactory() as session:
         async with session.begin():
             await _ensure_boundary(session)
@@ -537,19 +671,38 @@ async def test_resume_drill_creates_a_new_authorized_operation() -> None:
             run.paused_at = OBSERVED_AT
 
     resumed = await _service().resume_drill(first.run_id, "superadmin")
+    replayed = await _service().resume_drill(first.run_id, "superadmin")
 
     async with SessionFactory() as session:
         old_run = await session.get(OperationsRun, first.run_id)
         new_run = await session.get(OperationsRun, resumed.run_id)
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.event_type == "drill")
+        )
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
 
     assert resumed.run_id is not None
     assert resumed.resumed_from_run_id == first.run_id
+    assert replayed.run_id == resumed.run_id
+    assert replayed.event_id == resumed.event_id
+    assert replayed.revision_id == resumed.revision_id
     assert resumed.run_id != first.run_id
+    assert resumed.idempotency_key == f"resume:{first.run_id}"
+    assert replayed.idempotency_key == resumed.idempotency_key
     assert old_run is not None
-    assert old_run.operation_state == "paused"
-    assert old_run.resume_required is True
+    assert old_run.operation_state == "canceled"
+    assert old_run.resume_required is False
+    assert old_run.canceled_at == OBSERVED_AT
+    assert old_run.detail["resumed_by_run_id"] == str(resumed.run_id)
     assert new_run is not None
     assert new_run.operation_state == "queued"
+    assert new_run.idempotency_key == resumed.idempotency_key
+    assert event_count == 2
+    assert run_count == 2
 
 
 async def test_drill_uses_real_event_service_and_marks_drill() -> None:

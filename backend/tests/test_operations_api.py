@@ -8,14 +8,29 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from geoalchemy2.elements import WKTElement
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.auth.router import get_current_user
 from app.auth.service import AuthUser
+from app.collaboration.models import CollaborationSettings
+from app.db import SessionFactory
+from app.events.models import (
+    EarthquakeEvent,
+    EventLifecycleOutbox,
+    RawMessage,
+)
 from app.main import app
-from app.operations.repository import StaleOperationsSettings
+from app.operations.models import OperationsAuditLog, OperationsRun
+from app.operations.repository import (
+    OperationsRepository,
+    StaleOperationsSettings,
+)
 from app.operations.router import get_operations_service
 from app.operations.schemas import (
+    DrillTriggerRequest,
     OperationsOverviewRecord,
     OperationsRunRecord,
     OperationsScheduleRecord,
@@ -23,7 +38,11 @@ from app.operations.schemas import (
     OperationsTriggerResult,
 )
 from app.operations.scenario import OperationsConfigurationError
-from app.operations.service import RealEventPriorityActive
+from app.operations.service import OperationsService, RealEventPriorityActive
+from app.regions.models import RegionBoundary
+
+
+API_OBSERVED_AT = datetime(2040, 1, 15, 4, 0, tzinfo=UTC)
 
 
 class FakeOperationsService:
@@ -136,6 +155,95 @@ class FakeOperationsService:
         ]
 
 
+async def _ensure_api_operations_environment() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            active_boundary = await session.scalar(
+                select(RegionBoundary)
+                .where(RegionBoundary.is_active.is_(True))
+                .limit(1)
+            )
+            if active_boundary is None:
+                session.add(
+                    RegionBoundary(
+                        version=f"api-test-boundary-{uuid4().hex}",
+                        name="api test boundary",
+                        local_buffer_km=Decimal("50"),
+                        geom=WKTElement(
+                            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                            "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                            srid=4326,
+                        ),
+                        maritime_geom=WKTElement(
+                            "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                            "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                            srid=4326,
+                        ),
+                        source_uri="test://operations-api-boundary",
+                        checksum="a" * 64,
+                        is_active=True,
+                    )
+                )
+            collaboration_settings = await session.scalar(
+                select(CollaborationSettings.id).limit(1)
+            )
+            if collaboration_settings is None:
+                session.add(
+                    CollaborationSettings(
+                        id=UUID("00000000-0000-0000-0000-000000000022"),
+                        intensity_threshold=Decimal("2.0"),
+                        row_version=1,
+                    )
+                )
+            await OperationsRepository().get_settings(session)
+
+
+async def _cleanup_api_operations_events() -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            event_ids = list(
+                await session.scalars(
+                    select(EarthquakeEvent.id).where(
+                        EarthquakeEvent.source == "operations"
+                    )
+                )
+            )
+            if not event_ids:
+                return
+            run_ids = list(
+                await session.scalars(
+                    select(OperationsRun.id).where(
+                        OperationsRun.event_id.in_(event_ids)
+                    )
+                )
+            )
+            await session.execute(
+                delete(OperationsAuditLog).where(
+                    OperationsAuditLog.resource_id.in_(
+                        [str(run_id) for run_id in run_ids]
+                    )
+                )
+            )
+            await session.execute(
+                delete(OperationsRun).where(
+                    OperationsRun.event_id.in_(event_ids)
+                )
+            )
+            await session.execute(
+                delete(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.event_id.in_(event_ids)
+                )
+            )
+            await session.execute(
+                delete(EarthquakeEvent).where(
+                    EarthquakeEvent.id.in_(event_ids)
+                )
+            )
+            await session.execute(
+                delete(RawMessage).where(RawMessage.source == "operations")
+            )
+
+
 def _settings_record(*, row_version: int = 1) -> OperationsSettingsRecord:
     return OperationsSettingsRecord(
         row_version=row_version,
@@ -216,6 +324,75 @@ def test_drill_resume_requires_superadmin_and_returns_run_link() -> None:
     assert resumed.json()["resumed_from_run_id"] == (
         "00000000-0000-4000-8000-000000000001"
     )
+
+
+async def test_repeated_drill_resume_posts_are_idempotent() -> None:
+    await _ensure_api_operations_environment()
+    service = OperationsService(
+        SessionFactory,
+        now=lambda: API_OBSERVED_AT,
+    )
+    source = await service.trigger_drill(
+        DrillTriggerRequest(
+            idempotency_key=f"api-resume-source-{uuid4()}"
+        ),
+        "operator",
+    )
+    assert source.run_id is not None
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            run = await session.get(OperationsRun, source.run_id)
+            assert run is not None
+            run.operation_state = "paused"
+            run.resume_required = True
+            run.paused_at = API_OBSERVED_AT
+
+    previous_service = app.dependency_overrides.get(get_operations_service)
+    previous_user = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_operations_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(
+        "superadmin",
+        "superadmin",
+        None,
+    )
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            first = await client.post(
+                f"/api/v1/operations/runs/{source.run_id}/resume"
+            )
+            second = await client.post(
+                f"/api/v1/operations/runs/{source.run_id}/resume"
+            )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["run_id"] == second.json()["run_id"]
+        assert first.json()["event_id"] == second.json()["event_id"]
+        assert first.json()["idempotency_key"] == f"resume:{source.run_id}"
+
+        async with SessionFactory() as session:
+            old_run = await session.get(OperationsRun, source.run_id)
+
+        assert old_run is not None
+        assert old_run.operation_state == "canceled"
+        assert old_run.resume_required is False
+        assert old_run.canceled_at == API_OBSERVED_AT
+        assert old_run.detail["resumed_by_run_id"] == first.json()["run_id"]
+    finally:
+        if previous_service is None:
+            app.dependency_overrides.pop(get_operations_service, None)
+        else:
+            app.dependency_overrides[get_operations_service] = previous_service
+        if previous_user is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous_user
+        await _cleanup_api_operations_events()
 
 
 @pytest.mark.parametrize("role", ["viewer", "group_member"])

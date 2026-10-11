@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
+from decimal import Decimal
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
 from fastapi.testclient import TestClient
+from geoalchemy2.elements import WKTElement
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -15,9 +19,23 @@ from app import process_health
 from app.artifacts.models import ProductionRun, ProductionTask
 from app.artifacts.storage import ArtifactStore
 from app.assessment.models import AssessmentRun
+from app.auth.models import User
+from app.collaboration.domain import DutyRole
+from app.collaboration.models import (
+    CollaborationSettings,
+    NotificationDelivery,
+    WorkgroupTask,
+)
+from app.collaboration.notifications import DeadlineScheduler
+from app.collaboration.roster import MemberInput, RosterService
 from app.collaboration.retention import CollaborationRetentionResult
 from app.config import settings
-from app.events.models import EarthquakeEvent, EarthquakeRevision
+from app.events.models import (
+    EarthquakeEvent,
+    EarthquakeRevision,
+    EventLifecycleOutbox,
+    RawMessage,
+)
 from app.operations.health import (
     OperationsHealthState,
     get_operations_health_state,
@@ -25,17 +43,25 @@ from app.operations.health import (
     read_health_payload,
     set_operations_health_state,
 )
-from app.operations.models import OperationsTestSchedule
+from app.operations.models import (
+    OperationsAuditLog,
+    OperationsRun,
+    OperationsTestSchedule,
+)
+from app.operations.repository import OperationsRepository
 from app.operations.scheduler import DailyTestScheduler, OperationsSchedulerResult
+from app.operations.schemas import ManualTestTriggerRequest
 from app.operations.service import OperationsService
 from app.operations.worker import (
     OperationsWorkerCycleResult,
     run_operations_cycle,
     run_operations_worker,
 )
+from app.regions.models import RegionBoundary
 
 
 OBSERVED_AT = datetime(2026, 10, 11, 2, 30, tzinfo=UTC)
+WORKER_REMINDER_SOURCE = "operations-worker-reminder-test"
 
 
 class _FakeSession:
@@ -145,6 +171,405 @@ def _configured(*, interval_seconds: int = 60) -> SimpleNamespace:
     return SimpleNamespace(
         operations_retention_interval_seconds=interval_seconds,
     )
+
+
+async def _ensure_worker_operations_environment(session: object) -> None:
+    active_boundary = await session.scalar(
+        select(RegionBoundary)
+        .where(RegionBoundary.is_active.is_(True))
+        .limit(1)
+    )
+    if active_boundary is None:
+        session.add(
+            RegionBoundary(
+                version=f"worker-test-boundary-{uuid.uuid4().hex}",
+                name="worker test boundary",
+                local_buffer_km=Decimal("50"),
+                geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                    "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                maritime_geom=WKTElement(
+                    "MULTIPOLYGON (((121.0 30.8, 122.2 30.8, "
+                    "122.2 31.8, 121.0 31.8, 121.0 30.8)))",
+                    srid=4326,
+                ),
+                source_uri="test://operations-worker-boundary",
+                checksum="a" * 64,
+                is_active=True,
+            )
+        )
+    collaboration_settings = await session.scalar(
+        select(CollaborationSettings.id).limit(1)
+    )
+    if collaboration_settings is None:
+        session.add(
+            CollaborationSettings(
+                id=uuid.UUID("00000000-0000-0000-0000-000000000023"),
+                intensity_threshold=Decimal("2.0"),
+                row_version=1,
+            )
+        )
+    await OperationsRepository().get_settings(session)
+
+
+async def _cleanup_worker_operations_event(
+    session_factory: object,
+    event_id: uuid.UUID,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            run_ids = list(
+                await session.scalars(
+                    select(OperationsRun.id).where(
+                        OperationsRun.event_id == event_id
+                    )
+                )
+            )
+            await session.execute(
+                delete(OperationsAuditLog).where(
+                    OperationsAuditLog.resource_id.in_(
+                        [str(run_id) for run_id in run_ids]
+                    )
+                )
+            )
+            await session.execute(
+                delete(AssessmentRun).where(
+                    AssessmentRun.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(ProductionRun).where(
+                    ProductionRun.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(EventLifecycleOutbox).where(
+                    EventLifecycleOutbox.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(OperationsRun).where(
+                    OperationsRun.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(EarthquakeEvent).where(
+                    EarthquakeEvent.id == event_id
+                )
+            )
+            await session.execute(
+                delete(RawMessage).where(
+                    RawMessage.source == "operations"
+                )
+            )
+
+
+async def _seed_worker_reminder_context(
+    session_factory: object,
+    operation_state: str,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    event_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            event = EarthquakeEvent(
+                id=event_id,
+                source=WORKER_REMINDER_SOURCE,
+                canonical_source_id=(
+                    f"{WORKER_REMINDER_SOURCE}:{event_id}"
+                ),
+                event_type="test",
+                origin_time=OBSERVED_AT,
+                longitude=Decimal("121.500000"),
+                latitude=Decimal("31.200000"),
+                depth_km=Decimal("10.00"),
+                magnitude=Decimal("5.2"),
+                place="worker reminder event",
+                geom=WKTElement("POINT(121.5 31.2)", srid=4326),
+                lifecycle_state="not_applicable",
+            )
+            session.add(event)
+            await session.flush()
+
+            raw = RawMessage(
+                id=uuid.uuid4(),
+                source=WORKER_REMINDER_SOURCE,
+                source_message_id=f"worker-reminder:{event_id}",
+                message_kind="test",
+                checksum=uuid.uuid4().hex,
+                payload={"event_id": str(event_id)},
+            )
+            session.add(raw)
+            await session.flush()
+
+            revision = EarthquakeRevision(
+                id=revision_id,
+                event_id=event_id,
+                raw_message_id=raw.id,
+                revision_no=1,
+                revision_kind="test",
+                origin_time=event.origin_time,
+                longitude=event.longitude,
+                latitude=event.latitude,
+                depth_km=event.depth_km,
+                magnitude=event.magnitude,
+                place=event.place,
+                is_current=True,
+                ingested_at=OBSERVED_AT,
+            )
+            session.add(revision)
+            await session.flush()
+            event.current_revision_id = revision.id
+
+            run = OperationsRun(
+                event_id=event_id,
+                trigger_mode="manual_test",
+                operation_state=operation_state,
+                priority=100,
+                idempotency_key=f"worker-reminder:{uuid.uuid4()}",
+                triggered_by="worker-test",
+                resume_required=False,
+                detail={},
+                started_at=OBSERVED_AT,
+                completed_at=(
+                    OBSERVED_AT if operation_state == "failed" else None
+                ),
+                canceled_at=(
+                    OBSERVED_AT if operation_state == "canceled" else None
+                ),
+            )
+            session.add(run)
+
+            user = User(
+                id=user_id,
+                username=f"worker-leader-{uuid.uuid4().hex[:8]}",
+                password_hash="not-used",
+                role="group_leader",
+                workgroup="monitoring_forecast",
+                is_active=True,
+            )
+            session.add(user)
+            await session.flush()
+
+            roster = RosterService()
+            await roster.replace_group_members(
+                session,
+                "monitoring_forecast",
+                [MemberInput(user.id, DutyRole.LEADER)],
+                actor=WORKER_REMINDER_SOURCE,
+            )
+            await roster.snapshot_for_event(session, event_id)
+            await roster.set_attendance(
+                session,
+                event_id,
+                "monitoring_forecast",
+                user_id,
+                "present",
+                WORKER_REMINDER_SOURCE,
+            )
+
+            session.add(
+                WorkgroupTask(
+                    id=task_id,
+                    event_id=event_id,
+                    trigger_revision_id=revision_id,
+                    task_code=f"worker-reminder-{uuid.uuid4().hex}",
+                    source_type="ad_hoc",
+                    workgroup_code="monitoring_forecast",
+                    title="worker reminder task",
+                    instruction="complete work",
+                    priority=100,
+                    status="pending",
+                    timeliness_state="on_time",
+                    activated_at=OBSERVED_AT,
+                    due_at=OBSERVED_AT + timedelta(minutes=10),
+                    row_version=1,
+                    created_by=WORKER_REMINDER_SOURCE,
+                    created_at=OBSERVED_AT,
+                    updated_at=OBSERVED_AT,
+                )
+            )
+
+    return event_id, task_id, user_id
+
+
+async def _cleanup_worker_reminder_context(
+    session_factory: object,
+    event_id: uuid.UUID,
+    task_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> None:
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(NotificationDelivery).where(
+                    NotificationDelivery.task_id == task_id
+                )
+            )
+            await session.execute(
+                delete(WorkgroupTask).where(
+                    WorkgroupTask.id == task_id
+                )
+            )
+            await session.execute(
+                delete(OperationsRun).where(
+                    OperationsRun.event_id == event_id
+                )
+            )
+            await session.execute(
+                delete(EarthquakeEvent).where(
+                    EarthquakeEvent.id == event_id
+                )
+            )
+            await session.execute(
+                delete(RawMessage).where(
+                    RawMessage.source == WORKER_REMINDER_SOURCE
+                )
+            )
+            await session.execute(
+                delete(User).where(User.id == user_id)
+            )
+
+
+async def test_worker_reconciliation_keeps_missing_production_running(
+    session_factory,
+) -> None:
+    await session_factory.kw["bind"].dispose()
+    operations_service = OperationsService(
+        session_factory=session_factory,
+        now=lambda: OBSERVED_AT,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            await _ensure_worker_operations_environment(session)
+
+    triggered = await operations_service.trigger_manual_test(
+        ManualTestTriggerRequest(
+            idempotency_key=f"worker-reconcile-{uuid.uuid4()}"
+        ),
+        "worker-test",
+    )
+    assert triggered.event_id is not None
+    assert triggered.run_id is not None
+
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                event = await session.get(
+                    EarthquakeEvent,
+                    triggered.event_id,
+                )
+                outbox = await session.scalar(
+                    select(EventLifecycleOutbox)
+                    .where(
+                        EventLifecycleOutbox.event_id == triggered.event_id,
+                        EventLifecycleOutbox.trigger_type
+                        == "assessment.requested",
+                    )
+                    .limit(1)
+                )
+                assert event is not None and outbox is not None
+                session.add(
+                    AssessmentRun(
+                        id=uuid.uuid4(),
+                        event_id=event.id,
+                        revision_id=uuid.UUID(triggered.revision_id),
+                        outbox_id=outbox.id,
+                        run_no=1,
+                        status="completed",
+                        priority=100,
+                        deadline_at=OBSERVED_AT + timedelta(minutes=5),
+                        snapshot={},
+                        report_ingested_at=OBSERVED_AT,
+                        deadline_basis_at=OBSERVED_AT,
+                    )
+                )
+
+        cycle_result = await run_operations_cycle(
+            session_factory=session_factory,
+            observed_at=OBSERVED_AT,
+            configured=_configured(interval_seconds=60),
+            scheduler=_FakeScheduler(_scheduler_result()),
+            operations_service=operations_service,
+            priority_guard=_FakePriorityGuard(),
+            retention_service=_FakeRetentionService(),
+            health_state=_FakeHealthState(),
+            last_retention_at=OBSERVED_AT,
+        )
+
+        async with session_factory() as session:
+            run = await session.get(OperationsRun, triggered.run_id)
+            audit = await session.scalar(
+                select(OperationsAuditLog)
+                .where(
+                    OperationsAuditLog.resource_type == "operations_run",
+                    OperationsAuditLog.resource_id == str(triggered.run_id),
+                    OperationsAuditLog.action == "operations.run.running",
+                )
+                .order_by(
+                    OperationsAuditLog.created_at.desc(),
+                    OperationsAuditLog.id.desc(),
+                )
+                .limit(1)
+            )
+
+        assert cycle_result.runs_reconciled == 1
+        assert run is not None
+        assert run.operation_state == "running"
+        assert run.completed_at is None
+        assert audit is not None
+        assert audit.detail["reason"] == "production_pending"
+    finally:
+        await _cleanup_worker_operations_event(
+            session_factory,
+            triggered.event_id,
+        )
+        await session_factory.kw["bind"].dispose()
+
+
+@pytest.mark.parametrize("operation_state", ["failed", "canceled"])
+async def test_frozen_operations_runs_suppress_worker_deadline_reminders(
+    session_factory,
+    operation_state: str,
+) -> None:
+    await session_factory.kw["bind"].dispose()
+    event_id, task_id, user_id = await _seed_worker_reminder_context(
+        session_factory,
+        operation_state,
+    )
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                result = await DeadlineScheduler(
+                    channels=("in_app", "wecom")
+                ).run_once(session, observed_at=OBSERVED_AT)
+                deliveries = (
+                    await session.scalars(
+                        select(NotificationDelivery).where(
+                            NotificationDelivery.task_id == task_id
+                        )
+                    )
+                ).all()
+
+        assert result.tasks_scanned == 0
+        assert result.assigned_created == 0
+        assert result.due_soon_created == 0
+        assert result.overdue_reminder_count == 0
+        assert deliveries == []
+        assert user_id is not None
+    finally:
+        await _cleanup_worker_reminder_context(
+            session_factory,
+            event_id,
+            task_id,
+            user_id,
+        )
+        await session_factory.kw["bind"].dispose()
 
 
 async def test_cycle_ensures_before_dispatch_and_aggregates_counts() -> None:
@@ -452,7 +877,7 @@ def test_health_state_returns_ok_until_stale_window() -> None:
 
 def test_health_endpoint_uses_operations_state() -> None:
     state = OperationsHealthState(stale_seconds=30)
-    state.mark_alive(OBSERVED_AT)
+    state.mark_alive(datetime.now(UTC))
     set_operations_health_state(state)
 
     try:
