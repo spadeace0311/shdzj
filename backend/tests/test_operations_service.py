@@ -11,9 +11,9 @@ from sqlalchemy import delete, event, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.artifacts.models import ProductionRun, ProductionTask
-from app.assessment.models import AssessmentRun
+from app.assessment.models import AssessmentRun, AssessmentTask
 from app.collaboration.generation import CollaborationOutboxDispatcher
-from app.collaboration.models import CollaborationSettings
+from app.collaboration.models import CollaborationOutbox, CollaborationSettings
 from app.db import SessionFactory, engine
 from app.events.domain import EventKind, NormalizedEvent
 from app.events.models import (
@@ -24,6 +24,7 @@ from app.events.models import (
 )
 from app.events.repository import EventRepository
 from app.events.service import LifecycleIngestOutcome
+from app.operations.domain import TriggerMode
 from app.operations.models import (
     OperationsAuditLog,
     OperationsRun,
@@ -1308,9 +1309,7 @@ async def test_drill_during_real_event_does_not_create_event(
     assert run_count == 0
 
 
-async def test_retry_repairs_missing_run_after_event_creation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_retry_repairs_missing_run_after_event_creation() -> None:
     async with SessionFactory() as session:
         async with session.begin():
             await _ensure_boundary(session)
@@ -1318,40 +1317,229 @@ async def test_retry_repairs_missing_run_after_event_creation(
             await OperationsRepository().get_settings(session)
 
     service = _service()
-    original = service._persist_run
-    failed = False
+    key = "repair-key"
+    seed = service._derive_seed(key)
+    scenario, region_context, blocked = await service._prepare_manual_scenario(
+        trigger_mode=TriggerMode.MANUAL_TEST,
+        event_kind=EventKind.TEST,
+        key=key,
+        observed_at=OBSERVED_AT,
+        seed=seed,
+        source_event_id=service._derive_source_event_id(
+            key,
+            EventKind.TEST,
+        ),
+    )
+    assert blocked is None
+    assert scenario is not None
+    assert region_context is not None
+    event = service._scenario_generator.scenario_to_event(scenario)
+    seeded = await service._event_service.ingest_collected(
+        raw_payload={
+            "idempotency_key": key,
+            "mode": TriggerMode.MANUAL_TEST.value,
+        },
+        event=event,
+        provider="api",
+        lane="http",
+        received_at=OBSERVED_AT,
+        response_input=None,
+        region_context=region_context,
+        trigger_reason="live",
+    )
 
-    async def flaky_persist(session, **kwargs):
-        nonlocal failed
-        if not failed:
-            failed = True
-            raise SQLAlchemyError("simulated run insert failure")
-        return await original(session, **kwargs)
-
-    monkeypatch.setattr(service, "_persist_run", flaky_persist)
-
-    with pytest.raises(SQLAlchemyError):
-        await service.trigger_manual_test(
-            ManualTestTriggerRequest(idempotency_key="repair-key"),
-            "operator",
+    async with SessionFactory() as session:
+        run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
         )
 
-    monkeypatch.setattr(service, "_persist_run", original)
+    assert run_count == 0
+
     result = await service.trigger_manual_test(
-        ManualTestTriggerRequest(idempotency_key="repair-key"),
+        ManualTestTriggerRequest(idempotency_key=key),
         "operator",
     )
 
-    assert result.event_id is not None
+    assert str(result.event_id) == seeded.event_id
+    assert result.revision_id == seeded.revision_id
     assert result.run_id is not None
 
     async with SessionFactory() as session:
         run = await session.get(OperationsRun, result.run_id)
         event = await session.get(EarthquakeEvent, result.event_id)
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        revision_count = await session.scalar(
+            select(func.count())
+            .select_from(EarthquakeRevision)
+            .join(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        raw_count = await session.scalar(
+            select(func.count())
+            .select_from(RawMessage)
+            .where(RawMessage.source == "operations")
+        )
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(EventLifecycleOutbox)
+            .join(EarthquakeEvent)
+            .where(EarthquakeEvent.source == "operations")
+        )
+        stored_run_count = await session.scalar(
+            select(func.count()).select_from(OperationsRun)
+        )
 
     assert run is not None
     assert event is not None
     assert run.event_id == event.id
+    assert event_count == 1
+    assert revision_count == 1
+    assert raw_count == 1
+    assert outbox_count == 2
+    assert stored_run_count == 1
+
+
+@pytest.mark.parametrize("trigger_kind", ["manual_test", "drill"])
+async def test_manual_crash_then_real_event_retry_leaves_no_runless_work(
+    trigger_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _ensure_boundary(session)
+            await _ensure_collaboration_settings(session)
+            settings = await OperationsRepository().get_settings(session)
+            settings.drill_conflict_policy = "pause"
+
+    service = _service()
+
+    async def fail_persist_run(session, **kwargs) -> OperationsRun:
+        raise SQLAlchemyError("simulated process crash before run persistence")
+
+    async def work_counts() -> tuple[int, int, int, int, int, int, int]:
+        async with SessionFactory() as session:
+            runless_count = await session.scalar(
+                select(func.count())
+                .select_from(EarthquakeEvent)
+                .outerjoin(
+                    OperationsRun,
+                    OperationsRun.event_id == EarthquakeEvent.id,
+                )
+                .where(
+                    EarthquakeEvent.source == "operations",
+                    OperationsRun.id.is_(None),
+                )
+            )
+            revision_count = await session.scalar(
+                select(func.count())
+                .select_from(EarthquakeRevision)
+                .join(EarthquakeEvent)
+                .where(EarthquakeEvent.source == "operations")
+            )
+            raw_count = await session.scalar(
+                select(func.count())
+                .select_from(RawMessage)
+                .where(RawMessage.source == "operations")
+            )
+            outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(EventLifecycleOutbox)
+                .join(EarthquakeEvent)
+                .where(EarthquakeEvent.source == "operations")
+            )
+            collaboration_outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(CollaborationOutbox)
+                .join(
+                    EarthquakeEvent,
+                    EarthquakeEvent.id == CollaborationOutbox.event_id,
+                )
+                .where(EarthquakeEvent.source == "operations")
+            )
+            assessment_run_count = await session.scalar(
+                select(func.count())
+                .select_from(AssessmentRun)
+                .join(
+                    EarthquakeEvent,
+                    EarthquakeEvent.id == AssessmentRun.event_id,
+                )
+                .where(EarthquakeEvent.source == "operations")
+            )
+            assessment_task_count = await session.scalar(
+                select(func.count())
+                .select_from(AssessmentTask)
+                .join(
+                    AssessmentRun,
+                    AssessmentRun.id == AssessmentTask.run_id,
+                )
+                .join(
+                    EarthquakeEvent,
+                    EarthquakeEvent.id == AssessmentRun.event_id,
+                )
+                .where(EarthquakeEvent.source == "operations")
+            )
+            return (
+                runless_count,
+                revision_count,
+                raw_count,
+                outbox_count,
+                collaboration_outbox_count,
+                assessment_run_count,
+                assessment_task_count,
+            )
+
+    monkeypatch.setattr(service, "_persist_run", fail_persist_run)
+    key = f"crash-before-real-event-{trigger_kind}"
+
+    with pytest.raises(SQLAlchemyError, match="simulated process crash"):
+        if trigger_kind == "manual_test":
+            await service.trigger_manual_test(
+                ManualTestTriggerRequest(idempotency_key=key),
+                "operator",
+            )
+        else:
+            await service.trigger_drill(
+                DrillTriggerRequest(idempotency_key=key),
+                "operator",
+            )
+
+    assert sum(await work_counts()) == 0
+    dispatched = await CollaborationOutboxDispatcher(
+        session_factory=SessionFactory,
+        catalog_path="config/collaboration/shanghai-2026-tasks.yaml",
+        now=lambda: OBSERVED_AT,
+    ).dispatch_once()
+    assert dispatched == 0
+
+    async with SessionFactory() as session:
+        async with session.begin():
+            await _seed_real_event(session)
+
+    if trigger_kind == "manual_test":
+        with pytest.raises(RealEventPriorityActive):
+            await service.trigger_manual_test(
+                ManualTestTriggerRequest(idempotency_key=key),
+                "operator",
+            )
+    else:
+        result = await service.trigger_drill(
+            DrillTriggerRequest(idempotency_key=key),
+            "operator",
+        )
+        assert result.outcome == "deferred"
+        assert result.event_id is None
+        assert result.run_id is None
+
+    assert sum(await work_counts()) == 0
+    async with SessionFactory() as session:
+        assert await OperationsPriorityGuard().has_active_real_event(
+            session,
+            OBSERVED_AT,
+        )
 
 
 async def test_scenario_seed_and_source_event_id_are_derived_from_key() -> None:

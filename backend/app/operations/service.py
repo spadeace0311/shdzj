@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -18,11 +18,7 @@ from app.artifacts.models import ProductionRun, ProductionTask
 from app.assessment.models import AssessmentRun
 from app.db import SessionFactory
 from app.events.domain import EventKind
-from app.events.models import (
-    EarthquakeEvent,
-    EarthquakeRevision,
-    RawMessage,
-)
+from app.events.models import EarthquakeEvent
 from app.events.repository import EventIngestResult
 from app.events.service import EventService
 from app.operations.domain import OperationsScenario, TriggerMode
@@ -56,6 +52,18 @@ class _ExistingScheduledRunSignal(Exception):
 
 class _ScheduledTriggerDeferredSignal(Exception):
     pass
+
+
+class _ExistingManualRunSignal(Exception):
+    def __init__(self, run_id: uuid.UUID) -> None:
+        super().__init__("existing manual operations run")
+        self.run_id = run_id
+
+
+class _ManualTriggerBlockedSignal(Exception):
+    def __init__(self, operation_state: str) -> None:
+        super().__init__("manual operations trigger blocked")
+        self.operation_state = operation_state
 
 
 class OperationsService:
@@ -831,31 +839,111 @@ class OperationsService:
         event = self._scenario_generator.scenario_to_event(scenario)
         if event_kind is EventKind.DRILL:
             event = replace(event, kind=EventKind.DRILL)
-        outcome = await self._event_service.ingest_collected(
-            raw_payload={
-                "idempotency_key": key,
-                "mode": trigger_mode.value,
-            },
-            event=event,
-            provider="api",
-            lane="http",
-            received_at=observed_at,
-            response_input=None,
-            region_context=region_context,
-            trigger_reason="live",
-        )
-        return await self._finalize_trigger(
-            event_id=outcome.event_id,
+        created_run: OperationsRun | None = None
+
+        async def persist_manual_run(
+            session: AsyncSession,
+            result: EventIngestResult,
+        ) -> None:
+            nonlocal created_run
+            await _acquire_priority_lock(session)
+            existing_manual_run = await self._find_run_by_idempotency_key(
+                session,
+                key,
+                for_update=True,
+            )
+            if existing_manual_run is not None:
+                await self._validate_manual_run(
+                    session,
+                    existing_manual_run,
+                    trigger_mode=trigger_mode,
+                    event_kind=event_kind,
+                )
+                raise _ExistingManualRunSignal(existing_manual_run.id)
+
+            if await self._priority_guard.has_active_real_event(
+                session,
+                observed_at,
+            ):
+                if trigger_mode is TriggerMode.MANUAL_TEST:
+                    raise RealEventPriorityActive()
+                settings = await self._repository.get_settings(session)
+                raise _ManualTriggerBlockedSignal(
+                    "canceled"
+                    if settings.drill_conflict_policy == "terminate"
+                    else "deferred"
+                )
+
+            try:
+                async with session.begin_nested():
+                    created_run = await self._persist_run(
+                        session,
+                        event_id=result.event_id,
+                        revision_id=result.revision_id,
+                        schedule_id=None,
+                        trigger_mode=trigger_mode.value,
+                        operation_state="queued",
+                        priority=self.MANUAL_PRIORITY,
+                        idempotency_key=key,
+                        triggered_by=actor_name,
+                        observed_at=observed_at,
+                        resume_source_run_id=resume_source_run_id,
+                    )
+            except (ValueError, IntegrityError, RuntimeError):
+                existing_manual_run = await self._find_run_by_idempotency_key(
+                    session,
+                    key,
+                    for_update=True,
+                )
+                if existing_manual_run is None:
+                    raise
+                await self._validate_manual_run(
+                    session,
+                    existing_manual_run,
+                    trigger_mode=trigger_mode,
+                    event_kind=event_kind,
+                )
+                raise _ExistingManualRunSignal(
+                    existing_manual_run.id
+                ) from None
+
+        try:
+            outcome = await self._event_service.ingest_collected(
+                raw_payload={
+                    "idempotency_key": key,
+                    "mode": trigger_mode.value,
+                },
+                event=event,
+                provider="api",
+                lane="http",
+                received_at=observed_at,
+                response_input=None,
+                region_context=region_context,
+                trigger_reason="live",
+                before_side_effects=persist_manual_run,
+            )
+        except _ExistingManualRunSignal as signal:
+            return await self._manual_trigger_result(
+                key=key,
+                run_id=signal.run_id,
+                trigger_mode=trigger_mode,
+                event_kind=event_kind,
+            )
+        except _ManualTriggerBlockedSignal as signal:
+            return _blocked_trigger_result(
+                key=key,
+                trigger_mode=trigger_mode.value,
+                event_kind=event_kind.value,
+                operation_state=signal.operation_state,
+            )
+
+        assert created_run is not None
+        return _trigger_result(
+            created_run,
             revision_id=outcome.revision_id,
-            trigger_mode=trigger_mode,
-            event_kind=event_kind,
-            priority=self.MANUAL_PRIORITY,
-            idempotency_key=key,
-            triggered_by=actor_name,
-            observed_at=observed_at,
+            trigger_mode=trigger_mode.value,
+            event_kind=event_kind.value,
             triggered_assessment=outcome.triggered_assessment,
-            event_created=outcome.event_created,
-            resume_source_run_id=resume_source_run_id,
         )
 
     async def _prepare_manual_scenario(
@@ -1008,6 +1096,47 @@ class OperationsService:
             statement = statement.with_for_update()
         return await session.scalar(statement)
 
+    async def _manual_trigger_result(
+        self,
+        *,
+        key: str,
+        run_id: uuid.UUID,
+        trigger_mode: TriggerMode,
+        event_kind: EventKind,
+    ) -> OperationsTriggerResult:
+        async with self._session_factory() as session:
+            async with session.begin():
+                run = await session.get(OperationsRun, run_id)
+                if run is None or run.idempotency_key != key:
+                    raise RuntimeError("manual operations run could not be found")
+                await self._validate_manual_run(
+                    session,
+                    run,
+                    trigger_mode=trigger_mode,
+                    event_kind=event_kind,
+                )
+                return _trigger_result(
+                    run,
+                    revision_id=_revision_id_from_run(run),
+                    trigger_mode=trigger_mode.value,
+                    event_kind=event_kind.value,
+                    triggered_assessment=False,
+                )
+
+    async def _validate_manual_run(
+        self,
+        session: AsyncSession,
+        run: OperationsRun,
+        *,
+        trigger_mode: TriggerMode,
+        event_kind: EventKind,
+    ) -> None:
+        if run.trigger_mode != trigger_mode.value:
+            raise ValueError("idempotency_key conflicts with a different operation")
+        event = await session.get(EarthquakeEvent, run.event_id)
+        if event is None or event.event_type != event_kind.value:
+            raise ValueError("idempotency_key conflicts with a different operation")
+
     async def _get_scheduled_run(
         self,
         schedule_uuid: uuid.UUID,
@@ -1085,108 +1214,6 @@ class OperationsService:
                     event_kind=EventKind.TEST.value,
                     triggered_assessment=triggered_assessment,
                 )
-
-    async def _finalize_trigger(
-        self,
-        *,
-        event_id: object,
-        revision_id: object,
-        trigger_mode: TriggerMode,
-        event_kind: EventKind,
-        priority: int,
-        idempotency_key: str,
-        triggered_by: str,
-        observed_at: datetime,
-        triggered_assessment: bool,
-        event_created: bool,
-        resume_source_run_id: uuid.UUID | None = None,
-    ) -> OperationsTriggerResult:
-        event_uuid = _coerce_uuid(event_id, "event_id")
-        blocked_state: str | None = None
-        real_event_rejected = False
-        conflict_error: Exception | None = None
-        run: OperationsRun | None = None
-
-        async with self._session_factory() as session:
-            async with session.begin():
-                await _acquire_priority_lock(session)
-                if await self._priority_guard.has_active_real_event(
-                    session,
-                    observed_at,
-                ):
-                    if event_created:
-                        await self._delete_rejected_event(session, event_uuid)
-                    if trigger_mode is TriggerMode.MANUAL_TEST:
-                        real_event_rejected = True
-                    elif trigger_mode is TriggerMode.DRILL:
-                        settings = await self._repository.get_settings(session)
-                        blocked_state = (
-                            "canceled"
-                            if settings.drill_conflict_policy == "terminate"
-                            else "deferred"
-                        )
-                    else:
-                        blocked_state = "deferred"
-                else:
-                    try:
-                        async with session.begin_nested():
-                            run = await self._persist_run(
-                                session,
-                                event_id=event_uuid,
-                                revision_id=revision_id,
-                                schedule_id=None,
-                                trigger_mode=trigger_mode.value,
-                                operation_state="queued",
-                                priority=priority,
-                                idempotency_key=idempotency_key,
-                                triggered_by=triggered_by,
-                                observed_at=observed_at,
-                                resume_source_run_id=resume_source_run_id,
-                            )
-                    except (ValueError, IntegrityError) as exc:
-                        conflict_error = exc
-                        if event_created:
-                            await self._delete_rejected_event(session, event_uuid)
-
-        if real_event_rejected:
-            raise RealEventPriorityActive()
-        if conflict_error is not None:
-            raise conflict_error
-        if blocked_state is not None:
-            return _blocked_trigger_result(
-                key=idempotency_key,
-                trigger_mode=trigger_mode.value,
-                event_kind=event_kind.value,
-                operation_state=blocked_state,
-            )
-        assert run is not None
-        return _trigger_result(
-            run,
-            revision_id=str(revision_id),
-            trigger_mode=trigger_mode.value,
-            event_kind=event_kind.value,
-            triggered_assessment=triggered_assessment,
-        )
-
-    async def _delete_rejected_event(
-        self,
-        session: AsyncSession,
-        event_id: uuid.UUID,
-    ) -> None:
-        raw_ids = (
-            await session.scalars(
-                select(EarthquakeRevision.raw_message_id).where(
-                    EarthquakeRevision.event_id == event_id
-                )
-            )
-        ).all()
-        event = await session.get(EarthquakeEvent, event_id)
-        if event is not None:
-            await session.delete(event)
-            await session.flush()
-        if raw_ids:
-            await session.execute(delete(RawMessage).where(RawMessage.id.in_(raw_ids)))
-        await session.flush()
 
     async def _persist_run(
         self,
